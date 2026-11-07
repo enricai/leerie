@@ -243,13 +243,33 @@ def test_a_diff_with_no_module_source_runs_no_related_selection(leerie,
     assert not any("related" in c or c == BLT["test"] for c in axes.values())
 
 
-def test_a_mixed_diff_hands_related_only_its_sources(leerie):
+def test_an_impact_runner_runs_only_the_named_tests_per_subtask(leerie):
+    """DESIGN §9 *A subtask runs the tests it names*: the tests a change
+    affects run once, on the integrated tree. On barnacle `related` was
+    400-890 of 1,092 files on every round of every subtask."""
     axes, scope = leerie._select_subtask_axes(
         BLT, RELATED, CONFIG_ONLY + ["src/a.ts", "src/b.test.tsx",
                                      "web/c.vue"], "base", "scoped",
-        direct=DIRECT)
-    assert axes["tests"] == ("npx vitest related --run src/a.ts "
-                             "src/b.test.tsx web/c.vue --passWithNoTests")
+        direct=DIRECT, named_tests=["src/n.test.ts", "src/a.ts"])
+    assert axes["tests"] == ("npx vitest run src/b.test.tsx src/n.test.ts "
+                             "--passWithNoTests")
+    assert scope == "scoped"
+
+
+def test_a_source_only_diff_naming_no_test_is_deferred(leerie):
+    axes, scope = leerie._select_subtask_axes(
+        BLT, RELATED, ["src/a.ts"], "base", "scoped", direct=DIRECT)
+    assert "tests" not in axes
+    assert scope == "deferred"
+    assert leerie._deferred_axes(axes, BLT, "scoped") == ["tests"]
+
+
+def test_a_non_impact_runner_is_as_it_was(leerie):
+    """pytest's template is over test files already; nothing changes."""
+    axes, scope = leerie._select_subtask_axes(
+        BLT, {"test": "pytest {test_files}"}, ["a.py", "tests/test_a.py"],
+        "base", "scoped", direct="pytest {test_files}")
+    assert axes["tests"] == "pytest tests/test_a.py"
     assert scope == "scoped"
 
 

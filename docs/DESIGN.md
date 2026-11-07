@@ -6950,14 +6950,18 @@ residuals surface as warnings on state and in the PR body. The pass is
 bounded by the same `conformance_rounds` cap and per-run worker budget; its
 `claude -p` invocation has no special standing.
 
-This pass always measures the repo's **canonical** build/lint/test
-commands, never a delta proxy — distinguishing it from the per-subtask
-phase, which may run a diff-scoped proxy instead (§9 *Per-subtask scope: a
-delta proxy, not the suite*). The three failures above are precisely the
-ones no diff-scoped selection can see: each arises from subtasks
-co-existing, not from any one subtask's diff, so a per-subtask selection
-would exclude them by construction. Together with the base-health baseline
-these are the only two places a run executes the whole suite.
+This pass's first measurement of the integrated tree always runs the repo's
+**canonical** build/lint/test commands, never a delta proxy — distinguishing
+it from the per-subtask phase, which runs a diff-scoped proxy instead (§9
+*Per-subtask scope: a delta proxy, not the suite*). The three failures above
+are precisely the ones no diff-scoped selection can see: each arises from
+subtasks co-existing, not from any one subtask's diff, so a per-subtask
+selection would exclude them by construction. After that first measurement
+the integrated tree's only differences from it are this pass's own, which a
+selection can see, so `tests` re-runs what they can reach (§8 *What ships is
+what was measured, once per change that can affect it*). Together with the
+base-health baseline these are the only two places a run executes the whole
+suite.
 
 ### When integration cannot succeed
 
@@ -13266,6 +13270,106 @@ directory). A restore that still leaves dirt stops setup, naming it. A killed
 integrator's half resolution goes with it, as it already did under a
 Ctrl-C's cleanup.
 
+**What ships is what was measured, once per change that can affect it.**
+*Designed 2026-11-07 (the barnacle runs, where a run spent nearly ten hours in
+near-whole test runs on a task that forbade the full suite).* The invariant: *a
+test's result is measured once per change that can affect it, and the tree that
+ships has every test's result traceable to a measurement on a tree that the
+later diff could not affect.*
+
+Measured on six barnacle runs (about 1,092 test files; every run ≥200 files
+attributed to the code that started it). A summary-counting
+reading of the logs saw 1,008 minutes; the real figure is 1,776, because a report
+run prints no summary (four of the six were still running when read):
+
+| Run | Runs ≥200 files | Minutes, summaries only | Minutes, all | Same tree again: runs / min | Unreachable in a final round: min | Per-subtask closure: min | Minutes left | Saved |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a2a825c2 | 25 | 293 | 581 | 6 / 258 | 25 | 143 | 155 | 73% |
+| 73751002 | 13 | 218 | 381 | 6 / 154 | 0 | 51 | 176 | 54% |
+| b24806a1 | 10 | 143 | 249 | 3 / 91 | 1 | 51 | 106 | 57% |
+| a79384a4 | 8 | 111 | 235 | 2 / 81 | 0 | 42 | 113 | 52% |
+| 8aa14a04 | 13 | 131 | 177 | 2 / 31 | 0 | 101 | 45 | 75% |
+| a41a09fd | 12 | 112 | 153 | 2 / 41 | 0 | 70 | 42 | 72% |
+| all six | 81 | 1,008 | 1,776 | 21 / 656 (37%) | 26 (1%) | 457 (26%) | 637 | 64% |
+
+(A selection's time is its files' share of the recorded per-file durations, applied to the run's wall time: an estimate. The wall of a silent run that shares a log gap with B\* discovery is an estimate too.)
+
+Three defects, by the time they cost:
+
+1. *The same tree, measured again.* 21 of the 81 runs measured a tree already
+   measured, 656 minutes, 37% of the time. A failing axis ran twice, verdict
+   then report (the rule was that a verdict is never measured with altered
+   flags: on a2a825c2 that second run took 36 minutes on a tree the first
+   had just measured); the delivery ratchet and the re-drive measured outside
+   the memo, so a tree the final conformer had just finished was run again (25
+   minutes) and phase 5 ran a repaired tree the ratchet had already run. The
+   verdict and the report now come from one run (§9 *Which failures are new*),
+   and every reader of a tree that ships goes through one memo.
+2. *Impact analysis on every subtask round.* 457 minutes, 26%. On a repo with
+   a hub file the tests a one-line change "affects" are most of the suite
+   (`vitest related` 400–890 of 1,092 files, about 400 of them importing the hub
+   directly), so a subtask's rounds measured what the whole-tree pass measures
+   anyway, under load: of the 593 failures that vanished from one per-subtask
+   measurement to the next, 359 did so across a diff that could not reach them.
+   A subtask now runs the tests it names; the closure runs once, on the
+   integrated tree (§9 *Per-subtask scope*).
+3. *A final round re-running what its diff cannot reach.* 26 minutes, 1%, on
+   these runs, because the rounds there nearly always edit a hub, which is
+   correct saturation; over the 83 later final-tree measurements of 40 recorded
+   runs it removes 12% of their time (12,110 of 97,360 s). It matters more for what it stops: a run
+   under load fails tests nothing touched (one round on 107cd8a3 failed 76
+   files after editing one test file), and each of those costs B\* budget.
+
+What is left after all three is 637 of the 1,776 minutes: the first measurement
+of the integrated tree, and each change that really reaches most of the suite.
+
+**How a result is carried.** Every measurement of the tree that ships
+(`_measure_axes` with `carry`: the final conformer, the acceptance gate's
+pre/post check, the delivery ratchet and re-drive, phase 5's refresh) enters
+per-file results in a ledger: test file → the tree it was measured on, and
+whether it passed. A later tree re-runs:
+
+- a file that failed there — a carried failure is always re-run, so it is never
+  a stale red, and a flake stays B\*'s to judge;
+- a file the diff from *that file's own measured tree* to this one can reach;
+- a file with no entry (a new test, one a crashed run did not report).
+
+The key is content: the diff is read from git between the two trees at every
+use, so a rollback, a re-integration or a revert cannot leave a stale entry
+standing, and no round counter is involved. A tree the ledger's trees differ
+from by nothing is a memo hit. The whole command is what the memo and the result
+answer for (`whole_command`); `command` says what ran and `carried` what did
+not. A forbidden command stays forbidden: the whole command there is its scoped
+replacement, the narrowed form passes the same gate, and a narrowing the task
+forbids is no narrowing.
+
+**A change's reach is never guessed.** `_change_reach` walks the import graph
+(through test helpers too, which the coupling for a forbidden command does not),
+and adds any test file or helper whose text names a changed file's basename (a
+test that reads a source as text, or spawns it). Nothing else counts as "cannot
+reach". The whole command runs when any changed path is one no graph holds — a
+manifest, lockfile, config, fixture, document, a deleted file, every path of a
+language leerie has no graph for, so a Go or Rust repository keeps running
+whole on every tree that differs — or a runner's configuration, or a file that reaches no test at
+all, since a `conftest.py` or `setupFiles` entry is reached through the runner,
+never an import. A run whose report does not account for its verdict (a red exit
+with no failing case, a failing case with no file) empties the ledger. What this
+cannot see is a test that finds a source file by directory walk without naming
+it: the replay below found none, and the first measurement of the integrated
+tree is whole regardless.
+
+**The replay**, mechanical and with no worker call, of the selection over the
+actual commits and failures of the 40 recorded runs with two or more measurements
+(36 on barnacle, 4 on `web`). 83 later final-tree measurements; 8 run whole for a
+path nobody can scope (a stylesheet, `eslint.config.mjs`, message catalogues, a
+document). 98 test files failed at a later measurement outside what the selection
+would have run. Each was examined: 87 passed again by the next measurement, and
+11, all on 107cd8a3, failed once more on the next, which is the load storm above,
+B\* calling all of them resource-affected; none is named new by B\*. All 8 IDs B\*
+confirmed new on a shipped tree are inside the selection. So nothing is missed on
+the final tree, and the 98 are noise this stops chasing. Delayed, not missed: the
+per-subtask failures counted in §9 *A subtask runs the tests it names*.
+
 **Every post-execution verdict is of the committed tree.** The invariant:
 *a verdict becomes `met` only on a read of a commit, or on a measurement
 the orchestrator itself made of the committed tree.* Review round 9
@@ -16608,10 +16712,11 @@ place cross-subtask interaction can be answered. What the per-subtask pass
 needs is whether *this diff* broke something.
 
 So the per-subtask axes may run a **delta proxy** — a cheaper command scoped
-to the changed files — while, under `scoped`, the canonical test command
-runs exactly twice per run: once at the base-health baseline and once (per
-round) on the integrated tree (a `build` with no proxy still runs
-canonically per subtask; see the absence rule below). Measured, the median
+to the changed files — while, under `scoped`, the whole test command runs
+once at the base-health baseline and once on the integrated tree, where each
+later change re-runs only what it can reach (§8 *What ships is what was
+measured, once per change that can affect it*; a `build` with no proxy still
+runs canonically per subtask; see the absence rule below). Measured, the median
 subtask in one run touched a single source file, yet every conformer round
 ran the whole ~990-file suite at ~499s a time against ~23s for a scoped run
 of the same repo.
@@ -16624,6 +16729,29 @@ template with `{files}` and `{base}`. It is **not a subset** of the
 canonical command and is not expected to be — `tsc --noEmit` catches a
 different set than `next build`. It is a cheap falsifier run once per
 subtask, backed by an expensive oracle run twice.
+
+**A subtask runs the tests it names, even on a runner that can do more.**
+*Designed 2026-11-07.* An impact-analysis runner's `tests` axis runs its direct
+form over the diff's own test files and the planner's named ones, and is
+deferred when there are none, as on every runner with no impact analysis. The
+tests a change *affects* run once, on the integrated tree. The bet "cheap
+falsifier once per subtask" was false wherever the repo has a hub: `related`
+was 400–890 of barnacle's 1,092 files on every round of every subtask, 193,424 s
+over the 40 recorded runs, against 1,917 s for the named tests. The `direct`
+middle (tests importing a changed file themselves) does not help: 405 test files
+import `recon-generate.ts` directly, so it saves 41%, and that is one repo's
+luck. The closure's early signal was mostly load: 593 per-subtask failures across those
+runs vanished by the next measurement; 359 across a diff that could not reach
+them, 99 across one with paths of unknown reach, 18 were at the final tree
+anyway. A real regression a
+subtask would have fixed itself reaches the integrated tree's first measurement
+instead, a measurement that exists either way, so it is caught later and never
+missed. At most 117 of those failures, in 13 of the 40 runs, are of that kind (a
+hub edit reaches everything, so most of these are load too). What each costs is
+room in a final-conformer round, whose cap is unchanged, and which re-measures
+what its fix reaches: a median 15 minutes on barnacle. On `web`, whose `related`
+was 5–6 files, the same rule gives up a cheap signal for the same reason: one
+rule, and its whole-tree pass is 10 minutes there.
 
 **Not every runner can map source to tests, and the ones that cannot need
 the file list filtered.** `vitest related` and `jest --findRelatedTests`
@@ -17758,7 +17886,16 @@ runner. On barnacle 7cc87f9a's early replay, all three passes recorded
 `baseline_failing_ids: null` on a red base, and the whole diff below never
 ran. The same resolution serves every place that asks a runner for its
 report: the axis IDs, the delivery ratchet and re-drive, and the held-out
-set runs. A final ID that did
+set runs. The report of an axis comes from the run that gave its verdict: the
+flags are added beside the runner's own output (vitest keeps its default
+reporter; JUnit, jest's `--json --outputFile` and rspec's second formatter are
+additive already) and the exit code still decides. Keeping that run "unaltered"
+cost a second whole run of every failing tree, 36 minutes for a 29-minute run on
+a2a825c2, and the two could disagree: a flake in one and not the other left a red
+verdict with no failing ID. Where the request cannot leave the output as it was,
+the verdict's run stays as written and the report is a second run, on failure
+only: `go test -json` and libtest's JSON replace their stdout, and a script with
+a `pre`/`post` hook, whose body is what takes the flags, would lose the hook. A final ID that did
 not fail on the base is only a *candidate*: one failing run is not evidence
 under load. Benched (Q9), "failed twice" — today's informal rule — labelled
 17 of 17 clean trials as having a new failure under sustained host load

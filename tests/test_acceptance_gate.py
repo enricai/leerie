@@ -2139,6 +2139,19 @@ def test_failures_section_is_names_only_and_hides_the_holdout(leerie, tmp_path):
     assert "add subtracts" in text
 
 
+def _script_axes(leerie, monkeypatch, fake) -> None:
+    """Script the gate's own test-axis measurements. The delivery ratchet
+    measures through `_measure_axes` too, and its verdict is not what these
+    tests script: it stays real, or it would eat the scripted sequence."""
+    real = leerie._measure_axes
+
+    async def routed(tree, axes, st_, caps, **kw):
+        if kw.get("log_prefix") == "delivery ratchet":
+            return await real(tree, axes, st_, caps, **kw)
+        return await fake(tree, axes, st_, caps, **kw)
+    monkeypatch.setattr(leerie, "_measure_axes", routed)
+
+
 def _run_gate(leerie, monkeypatch, st, fixer, measured=None,
               confirm_red=True):
     """`measured` scripts the test axis; a red post-repair axis is then
@@ -2157,7 +2170,7 @@ def _run_gate(leerie, monkeypatch, st, fixer, measured=None,
 
         async def fake_axes(tree, axes, st_, caps, **kw):
             return {"tests": seq.pop(0)}
-        monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+        _script_axes(leerie, monkeypatch, fake_axes)
 
         async def fake_confirm(*a, **kw):
             return (("turned the test axis red", {"new": ["t::x"]})
@@ -2266,7 +2279,7 @@ def test_a_confirmation_that_raises_falls_back_to_the_red_run(
         _commit_fix(Path(kw["cwd"]))
         return {}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    _script_axes(leerie, monkeypatch, fake_axes)
     monkeypatch.setattr(leerie, "_acceptance_confirm_red_axis", boom)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
@@ -2358,7 +2371,7 @@ def test_pre_repair_state_is_persisted_before_the_first_round(
         fixer(Path(kw["cwd"]))
         return {}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    _script_axes(leerie, monkeypatch, fake_axes)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert at_pre[0].get("before_sha") == before
@@ -2419,7 +2432,7 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
 
     async def fake_axes(tree, axes, st_, caps, **kw):
         return {"tests": seq.pop(0)}
-    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    _script_axes(leerie, monkeypatch, fake_axes)
     caps = _caps(leerie, 5)
     caps["max_total_workers"] = 1
     asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, MODELS,
@@ -2622,7 +2635,7 @@ def test_the_pre_repair_verdict_is_on_disk_before_round_one(
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": {"passed": True, "measured": True}}
     monkeypatch.setattr(leerie, "claude_p", dies)
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     monkeypatch.setattr(leerie.State, "bump_workers", lambda self, caps: None)
     with pytest.raises(_Killed):
         asyncio.run(leerie._run_acceptance_gate(
@@ -2667,7 +2680,7 @@ def test_every_round_is_on_disk_before_the_rollback_check(
     async def fixer_claude_p(**kw):
         _commit_fix(Path(kw["cwd"]))
         return {}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     monkeypatch.setattr(leerie, "claude_p", fixer_claude_p)
     with pytest.raises(_Killed):
         asyncio.run(leerie._run_acceptance_gate(
@@ -2769,7 +2782,7 @@ def test_an_errored_round_is_saved_and_the_round_before_still_counts(
         # process dies there.
         _commit_fix(Path(kw["cwd"]))
         raise leerie.WorkerError("conformer crashed")
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     monkeypatch.setattr(leerie, "claude_p", fails)
     caps = _caps(leerie, 5)
     caps["acceptance_repair_rounds"] = 1
@@ -2808,7 +2821,7 @@ def test_a_round_that_commits_then_errors_is_measured_again(
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": {"passed": True, "measured": True}}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
@@ -2932,7 +2945,7 @@ def test_two_unreadable_heads_still_count_as_moved(leerie, tmp_path,
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": {"passed": True, "measured": True}}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert st.data["acceptance"]["gate"]["rounds"][0].get("results")
@@ -2953,7 +2966,7 @@ def test_a_resumed_round_after_a_lost_commit_is_measured_again(
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": {"passed": True, "measured": True}}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
 
     async def commits_then_dies(**kw):
         _commit_fix(Path(kw["cwd"]))
@@ -3021,7 +3034,7 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": seq.pop(0)}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert failed == [1]
@@ -3061,7 +3074,7 @@ def test_a_failure_spawning_a_later_round_still_rolls_back(
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": seq.pop(0)}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
@@ -3276,7 +3289,7 @@ def test_a_test_axis_measurement_that_raises_never_escapes(
         if raises_on == "pre" or len(n) == 2:
             raise BlockingIOError(11, "Resource temporarily unavailable")
         return {"tests": {"passed": True, "measured": True}}
-    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    _script_axes(leerie, monkeypatch, axes)
     _run_gate(leerie, monkeypatch, st, _commit_fix)
     assert st.data["acceptance"]["gate"]["final"] is not None
 

@@ -8352,3 +8352,12 @@ bound, both measured on the first full local run under `--timeout=600`:
   tests opt out with `@pytest.mark.real_host_pressure`.
   `tests/test_bstar_confirm.py::test_conftest_makes_the_default_read_a_quiet_host`
   pins it.
+
+## One measurement per change
+
+`tests/test_one_measurement_per_change.py` (DESIGN §8 *What ships is what was
+measured, once per change that can affect it*). Real git, a real pytest run
+confined as a measurement is, only the worker stubbed. It counts what really
+ran through a spy on `_run_streaming` that calls through. `CMD` is a prefix of
+every narrowed command, so a whole run is asserted with `Run.ran_whole`, never a
+substring: the first draft of these tests passed `CMD in c` on a narrowed run.

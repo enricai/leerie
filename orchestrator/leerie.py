@@ -733,6 +733,9 @@ STATE_FIELDS = (
     "skip_budget_check",
     "strict_conformer",
     "subtask_tests",
+    # File -> the tree its result was last measured on (`_test_ledger`, DESIGN
+    # §8 *What ships is what was measured, once per change that can affect it*).
+    "test_ledger",
     "skip_base_baseline",
     "skip_repo_map",
     # The sticky run choices with no key of their own before (DESIGN §6 *A
@@ -43477,12 +43480,14 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     a deferred axis explicitly (`_deferred_axes`) so it is never silently
     absent. The scope label never claims a narrowing that did not happen.
 
-    A diff that changes its impact-analysis runner's own configuration
-    (`_is_runner_config`) is labelled `runner_config_changed`: its `tests`
-    axis is `direct` (the runner's direct form, `resolve_test_files_scoped`)
-    over only the named test files — the diff's own and `named_tests` (the
-    planner's) — or deferred when none is named (DESIGN §9 *An
-    impact-analysis runner is handed only its own module sources*)."""
+    An impact-analysis runner's `tests` axis is `direct` (the runner's direct
+    form, `resolve_test_files_scoped`) over only the named test files — the
+    diff's own and `named_tests` (the planner's) — or deferred when none is
+    named: the tests a change affects run once, on the integrated tree
+    (DESIGN §9 *Per-subtask scope*). A diff that changes that runner's own
+    configuration (`_is_runner_config`) is labelled `runner_config_changed`
+    (DESIGN §9 *An impact-analysis runner is handed only its own module
+    sources*)."""
     canonical = {"build": (blt.get("build") or "").strip(),
                  "lint": (blt.get("lint") or "").strip(),
                  "tests": (blt.get("test") or "").strip()}
@@ -43500,9 +43505,10 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
         # `scoped` is keyed like resolve_blt (`test`, singular); the axis
         # names are the conformer's (`tests`, plural). `_AXIS_CMD_KEY` is
         # the one place that mapping lives.
-        if axis == "tests" and config_changed:
-            # Impact analysis cannot answer a change to how every test runs:
-            # only the named test files run, directly.
+        if axis == "tests" and runner is not None and direct:
+            # On a repo with a hub file, impact analysis is most of the suite
+            # on every round of every subtask, and it cannot answer a change
+            # to how every test runs at all: only the named tests run here.
             named = list(dict.fromkeys([*files, *(named_tests or [])]))
             rendered = _render_scoped(direct, named, base_ref, test_globs)
         else:
@@ -45114,7 +45120,9 @@ def _round_axis_regressions(pre: dict[str, dict],
         b = (post or {}).get(axis) or {}
         if not _axis_measured(a) or not _axis_measured(b):
             continue
-        if a.get("command") != b.get("command"):
+        # A carried measurement ran part of the command it answers for.
+        if (a.get("whole_command") or a.get("command")) != (
+                b.get("whole_command") or b.get("command")):
             continue
         if a.get("passed") and not b.get("passed"):
             summary = (b.get("summary") or "").strip()[:300]
@@ -46413,7 +46421,8 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *,
                        label_prefix: str = "baseline",
                        measure_peak: bool = False,
                        run_id: str | None = None,
-                       forbidden: list[str | dict]) -> dict:
+                       forbidden: list[str | dict],
+                       report: dict | None = None) -> dict:
     """Run one build/lint/test axis command in `tree` and return its verdict.
 
     The single place leerie executes a repo's own BLT command. Extracted
@@ -46441,7 +46450,12 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *,
     record with `skip_kind: "forbidden_by_task"`.
 
     `grants`: the tree's measurement grant (`_measurement_grants`), which
-    the command runs confined to."""
+    the command runs confined to.
+
+    `report` (`_axis_report_request`): what actually runs is its `run_cmd`,
+    `cmd` with a structured report asked for beside its output, in its
+    `env`. The verdict is that same run's, and the result still names `cmd`
+    (DESIGN §9 *Which failures are new*)."""
     if not (cmd or "").strip():
         # Every axis dict carries `measured` so no consumer needs a
         # default; a not-applicable axis is unmeasured (and, being
@@ -46451,13 +46465,20 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *,
     peak = None
     try:
         argv = _blt_shell_argv(cmd, forbidden)
+        env: dict[str, str] | None = None
+        if report is not None:
+            # `source` is the command before the report flags, which a
+            # whole-suite match would read as test operands.
+            argv = _blt_shell_argv(report["run_cmd"], forbidden,
+                                   source=report["source"])
+            env = report["env"]
         if measure_peak:
             ran = await _run_contained(
                 argv, grants=grants, cwd=str(tree), name=f"measure-{axis}",
                 run_id=run_id, memory_max_bytes=0, pids_max=0,
                 timeout=timeout, log_path=log_path,
                 label=f"{label_prefix}-{axis}: {cmd}", verbosity=verbosity,
-                measure=True)
+                measure=True, env=env)
             peak = ran["peak"]
             if ran["timed_out"]:
                 raise subprocess.TimeoutExpired(cmd, timeout)
@@ -46466,7 +46487,7 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *,
             rc, tail = await _run_streaming(
                 argv, grants=grants, cwd=str(tree), timeout=timeout,
                 log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
-                verbosity=verbosity)
+                verbosity=verbosity, env=env)
         full = (tail or "").strip()
         summary = full[-400:]
         # Classification reads the FULL output; only the display summary is
@@ -47283,22 +47304,237 @@ async def _measured_tree(st: "State", tree: str | Path, caps: dict, *,
     return str(view)
 
 
+def _axis_report_request(st: "State", tree: str, cmd: str,
+                         label: str) -> dict | None:
+    """How the run of `cmd` that gives an axis its verdict also gives its
+    per-test report (DESIGN §9 *Which failures are new*): `{run_cmd, env,
+    source, kind, report, own}`, or None when it cannot, and the verdict's
+    run then stays as written. A package-manager script call runs its body
+    (`_runner_command`, as the report runs always have), but not when the
+    script has a `pre`/`post` hook, which the body would skip."""
+    resolved, path_env = _runner_command(cmd, tree, _RUNNER_REPORTS)
+    runner = _acceptance_runner(resolved, _RUNNER_REPORTS)
+    if runner is None:
+        return None
+    if resolved != cmd:
+        call = _PM_SCRIPT_CALL_RE.fullmatch(cmd)
+        scripts = _package_json_scripts(Path(tree))
+        if call is None or (f"pre{call.group(1)}" in scripts
+                            or f"post{call.group(1)}" in scripts):
+            return None
+    own = _measure_dir(st, tree)
+    report = own / "reports" / f"{label}-axis-{uuid.uuid4().hex[:8]}"
+    spec = _acceptance_report_spec(resolved, report, beside_output=True)
+    if spec is None:
+        return None
+    run_cmd, env, kind = spec
+    if path_env:
+        env = {**(env if env is not None else os.environ), **path_env}
+    try:
+        _mkdir_private(own / "reports", own)
+        _unlink_beneath(own, report)
+    except OSError:
+        return None
+    return {"run_cmd": run_cmd, "env": env, "source": resolved, "kind": kind,
+            "report": report, "own": own}
+
+
+def _read_axis_report(st: "State", tree: str, res: dict,
+                      request: dict | None) -> list[dict] | None:
+    """Take a measured axis's own report (`_axis_report_request`) into its
+    result: `failing_ids` / `failing_id_files`, `failing_messages`, and the
+    file durations B* sizes by, and remove the file, which is the command's
+    own and read without following a link it planted (DESIGN §6 *Leerie
+    never writes through a path confined code shaped*). The report's cases,
+    or None with `res` untouched: no request, no verdict (a timeout, a
+    crash), or no readable report, which the caller then captures the old
+    way."""
+    if request is None:
+        return None
+    own, report, kind = request["own"], request["report"], request["kind"]
+    data: bytes | None = None
+    with contextlib.suppress(OSError):
+        data = _read_beneath(own, report, limit=READ_LIMIT_LARGE)
+    with contextlib.suppress(OSError):
+        _unlink_beneath(own, report)
+    if (not res.get("ran") or not res.get("measured")
+            or str(res.get("summary", "")).startswith("timed out after")):
+        return None
+    ids = _runner_report_failing_ids(kind, data or None, str(tree))
+    cases = _runner_report_cases(kind, data or None, str(tree))
+    if ids is None or cases is None:
+        return None
+    _record_test_durations(st, _runner_report_file_durations(
+        kind, data or None, str(tree)))
+    res["failing_ids"], res["failing_id_files"] = sorted(ids), ids
+    if ids:
+        res["failing_messages"] = {
+            c["id"]: str(c.get("message") or "")[:400]
+            for c in cases if c["id"] in ids}
+    return cases
+
+
+def _test_ledger(st: "State") -> dict[str, dict]:
+    """test file -> `{tree, passed}`: the tree each file's result was last
+    measured on (DESIGN §8 *A test's result is measured once per change that
+    can affect it*). Keyed by content, never by a round: whether a result
+    still stands is `_carried_selection`'s reading of the diff from that
+    tree to the one being measured, every time."""
+    led = st.data.get("test_ledger")
+    return led if isinstance(led, dict) else {}
+
+
+def _ledger_record(st: "State", tree_sha: str, res: dict,
+                   cases: list[dict] | None, selection: dict | None) -> None:
+    """Enter what a measured `tests` run says, per file, for the tree it ran
+    on. Only a run whose report accounts for its verdict counts: a red exit
+    with no failing case (an unhandled error, a crashed pool) and a failing
+    case with no file say nothing a file can carry, and the next measurement
+    then runs the whole command. Files of the selection the report does not
+    list ran and said nothing, so they lose their entry and run again."""
+    if (cases is None or not isinstance(res.get("failing_ids"), list)
+            or (not res.get("passed") and not res["failing_ids"])):
+        st.data["test_ledger"] = {}
+        return
+    files: dict[str, bool] = {}
+    for c in cases:
+        f = c.get("file")
+        failed = c.get("status") in ("failed", "load_error")
+        if not f:
+            if failed:
+                st.data["test_ledger"] = {}
+                return
+            continue
+        files[f] = files.get(f, True) and not failed
+    led = dict(selection["kept"]) if selection is not None else {}
+    led.update({f: {"tree": tree_sha, "passed": ok}
+                for f, ok in files.items()})
+    st.data["test_ledger"] = led
+
+
+def _ledger_keep_carried(st: "State", selection: dict) -> None:
+    """A measurement with nothing to run leaves every carried file's entry
+    as it was: each still names the tree it was measured on."""
+    st.data["test_ledger"] = dict(selection["kept"])
+
+
+def _all_carried_result(cmd: str, selection: dict) -> dict:
+    """The `tests` result of a tree nothing needed measuring on: the change
+    since the last measurement reaches no test the command runs, and every
+    file there passed."""
+    n = len(selection["kept"])
+    return {"ran": True, "measured": True, "passed": True, "command": cmd,
+            "whole_command": cmd, "carried": selection["carried"],
+            "failing_ids": [], "failing_id_files": {},
+            "summary": (f"nothing to run: the change since the last "
+                        f"measurement reaches none of the {n} test file(s), "
+                        "each carried from the tree it passed on")}
+
+
+async def _carried_selection(st: "State", tree: str, tree_sha: str,
+                             whole_cmd: str, replacement: dict | None,
+                             forbidden: list[str | dict], *,
+                             log_prefix: str) -> dict | None:
+    """What of `whole_cmd`'s tests must run on `tree` (DESIGN §8 *A test's
+    result is measured once per change that can affect it*): `{command,
+    files, kept, carried}`, or None to run the whole command.
+
+    A file's entry in the ledger (`_test_ledger`) stands only when it passed
+    and the diff from the tree it was measured on to this one, read from git
+    now, cannot reach it (`_change_reach`). Anything with no standing entry
+    runs: a failure, a file no earlier run reported, a new test file. None
+    when there is no ledger, a diff cannot be read, the reach of a changed
+    path is unknown (it could reach anything), there is no scoped runner, or
+    the scoped command is forbidden: the whole command is the answer that
+    guesses nothing."""
+    ledger = _test_ledger(st)
+    if not ledger:
+        return None
+    head = await _branch_head_sha(tree)
+    if not head:
+        return None
+    globs = resolve_test_file_globs(st.repo_root)
+    # Per measured tree: each file answers only to the diff from its own.
+    reach_from: dict[str, set[str]] = {}
+    changed_cases: set[str] = set()
+    sources: dict[str, int] = {}
+    for measured in {e.get("tree") for e in ledger.values()}:
+        if not measured:
+            return None
+        reach_from[measured] = set()
+        if measured == tree_sha:
+            continue
+        got = await run_proc(["git", *_tree_git_args(tree), "diff",
+                              "--name-only", "--no-renames", "-z", measured,
+                              tree_sha], cwd=tree)
+        if got.returncode != 0:
+            log(f"  {log_prefix}: tests measured whole — the tree "
+                f"{measured[:12]} last measured cannot be read")
+            return None
+        changed = [p for p in got.stdout.split("\0") if p]
+        reached, unknown = _change_reach(tree, head, changed, globs)
+        if unknown:
+            log(f"  {log_prefix}: tests measured whole — nothing says what "
+                f"{len(unknown)} changed path(s) can reach: "
+                f"{', '.join(unknown[:5])}")
+            return None
+        reach_from[measured] = reached
+        changed_cases |= {c for c in changed if _is_test_case_file(c, globs)}
+    # A command with no list of its own runs what its last whole run reported,
+    # and a new test file, which that run could not.
+    whole = (set((replacement or {}).get("files") or ())
+             or set(ledger) | {t for t in changed_cases
+                               if (Path(tree) / t).is_file()})
+    kept = {f: e for f, e in ledger.items()
+            if f in whole and e.get("passed")
+            and f not in reach_from[e["tree"]]}
+    files = sorted(whole - set(kept))
+    if files and not kept:
+        return None
+    for e in kept.values():
+        sources[e["tree"]] = sources.get(e["tree"], 0) + 1
+    carried = {"files": len(kept), "from_trees": sources, "ran": len(files)}
+    if not files:
+        log(f"  {log_prefix}: tests carried — the change since the last "
+            f"measurement reaches none of the {len(kept)} test file(s)")
+        return {"command": whole_cmd, "files": [], "kept": kept,
+                "carried": carried}
+    scoped = _acceptance_cmd(st, files, tree)
+    if not scoped or _forbidden_command_hit(scoped, forbidden):
+        return None
+    log(f"  {log_prefix}: tests narrowed — running the {len(files)} test "
+        f"file(s) the change since the last measurement can reach or that "
+        f"failed there; carrying {len(kept)}")
+    return {"command": scoped, "files": files, "kept": kept,
+            "carried": carried}
+
+
 async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         caps: dict, *, log_path: Path, verbosity: str,
                         label_prefix: str = "baseline",
                         log_prefix: str = "base-baseline",
                         memo: bool = True,
                         failing_ids_axes: frozenset[str] | set[str] = frozenset(),
-                        measure_peak: bool = False
+                        measure_peak: bool = False,
+                        carry: bool = False
                         ) -> dict[str, dict]:
     """Measure each axis in `axes` (axis name → command) on `tree`, serving
     repeat measurements of an unchanged tree from `st.data["blt_results"]`.
 
     For an axis in `failing_ids_axes` a measured result also carries
     `failing_ids` / `failing_id_files` (DESIGN §9 *Which failures are new*):
-    `[]` when it passed, captured by a separate report run
-    (`_capture_failing_test_ids`) when it failed, absent when no report
-    could be read. A memo hit on a failed axis without them captures them.
+    `[]` when it passed, read from the report the same run wrote
+    (`_axis_report_request`), or, for a runner that cannot write one beside
+    its output, captured by a report run (`_capture_failing_test_ids`) when
+    it failed; absent when no report could be read. A memo hit on a failed
+    axis without them captures them.
+
+    `carry`, for a tree that ships: `tests` runs only what changed since its
+    last measurement can reach, the rest of its result carried with the tree
+    it was measured on (`_carried_selection`, DESIGN §8 *A test's result is
+    measured once per change that can affect it*). The result is the tests'
+    on this tree, stored under the whole command, and says so: `carried`,
+    `whole_command`, and `command`, what really ran.
 
     This is what makes measuring before *and* after a conformer round
     affordable: measured across a real 91-subtask run, 182 of 224 conformer
@@ -47381,7 +47617,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             if (axis in failing_ids_axes
                     and "failing_ids" not in results[axis]
                     and await _attach_failing_ids(
-                        results[axis], tree, cmd, st, caps,
+                        results[axis], tree,
+                        results[axis].get("command") or cmd, st, caps,
                         log_path=log_path, label=f"{label_prefix}-{axis}")):
                 store[key] = dict(results[axis])
                 st.save()
@@ -47401,6 +47638,29 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                 if tree_sha is None:
                     dirty = True
 
+        # What this tree's axis keeps: the whole command names the memo entry
+        # and the result's scope; `run_cmd` is what the change since the last
+        # measurement needs run (DESIGN §8 *A test's result is measured once
+        # per change that can affect it*).
+        whole_cmd = cmd
+        selection = (await _carried_selection(
+            st, tree, tree_sha, cmd, replacement, forbidden,
+            log_prefix=log_prefix)
+                     if carry and axis == "tests" and tree_sha and deps_ok
+                     else None)
+        if selection is not None and not selection["files"]:
+            res = _all_carried_result(cmd, selection)
+            if replacement is not None:
+                res["scoped_replacement"] = replacement
+            results[axis] = res
+            _ledger_keep_carried(st, selection)
+            store[_blt_memo_key(axis, whole_cmd, tree_sha)] = dict(res)
+            st.save()
+            continue
+        run_cmd = selection["command"] if selection is not None else cmd
+        request = (_axis_report_request(st, tree, run_cmd,
+                                        f"{label_prefix}-{axis}")
+                   if axis in failing_ids_axes else None)
         # The gate is held only around the command itself, never around the
         # memo lookup or the install: a hit must stay free, and serialising
         # installs would throttle the very worktrees waiting to be measured.
@@ -47410,12 +47670,14 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         if axis in _BUILD_CLASS_AXES
                         else contextlib.nullcontext()):
                 res = await _measure_blt(
-                    axis, cmd, tree, grants=_measurement_grants(st, tree),
+                    axis, run_cmd, tree, grants=_measurement_grants(st, tree),
                     timeout=float(caps.get("worker_timeout_sec")
                                   or DEFAULT_CAPS["worker_timeout_sec"]),
                     log_path=log_path, verbosity=verbosity,
                     label_prefix=label_prefix, measure_peak=measure_peak,
-                    run_id=getattr(st, "run_id", None), forbidden=forbidden)
+                    run_id=getattr(st, "run_id", None), forbidden=forbidden,
+                    report=request)
+        cases = _read_axis_report(st, tree, res, request)
         if not deps_ok:
             # Measured without its dependencies: the result says nothing
             # about the tree, on any axis (DESIGN §9 *A failed install is no
@@ -47427,17 +47689,23 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             # pre-existing, a final one is no regression. `deps_failed` says
             # why, for the readers that name it. No failing IDs either:
             # there is no verdict to take them from.
-            res = {**res, "measured": False, "passed": None,
+            res = {**{k: v for k, v in res.items()
+                      if k not in ("failing_ids", "failing_id_files",
+                                   "failing_messages")},
+                   "measured": False, "passed": None,
                    "deps_failed": True,
                    "summary": ("not measured: the dependency install "
                                "failed — "
                                + str(res.get("summary") or "")).strip()}
-        if axis in failing_ids_axes:
-            await _attach_failing_ids(res, tree, cmd, st, caps,
+        if axis in failing_ids_axes and "failing_ids" not in res:
+            await _attach_failing_ids(res, tree, run_cmd, st, caps,
                                       log_path=log_path,
                                       label=f"{label_prefix}-{axis}")
         if replacement is not None:
             res["scoped_replacement"] = replacement
+        if selection is not None:
+            res["whole_command"] = whole_cmd
+            res["carried"] = selection["carried"]
         results[axis] = res
 
         if not (memo and tree_sha) or not deps_ok:
@@ -47446,7 +47714,9 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             continue                      # crashed, or runner absent
         if str(res.get("summary", "")).startswith("timed out after"):
             continue                      # never reached a verdict
-        store[_blt_memo_key(axis, cmd, tree_sha)] = dict(res)
+        store[_blt_memo_key(axis, whole_cmd, tree_sha)] = dict(res)
+        if carry and axis == "tests":
+            _ledger_record(st, tree_sha, res, cases, selection)
         st.save()
 
     return results
@@ -51408,9 +51678,14 @@ def _orchestrator_results_digest(st: "State",
                    or a.get("deps_failed")
                    else "passed" if a.get("passed") else "failed")
         summary = str(a.get("summary") or "").replace("\n", " | ")[:200]
+        carried = a.get("carried") if isinstance(a.get("carried"), dict) else {}
         lines.append(f"[orchestrator final-tree {axis}] $ "
                      f"{str(a['command'])[:200]}\n    result: {verdict}"
-                     + (f" — {summary}" if summary else ""))
+                     + (f" — {summary}" if summary else "")
+                     + (f"\n    carried: {carried.get('files')} test file(s) "
+                        "from the trees they were measured on, which the "
+                        "later change cannot reach"
+                        if carried.get("files") else ""))
     diff = st.data.get("test_id_diff")
     if (isinstance(diff, dict) and diff.get("candidates") is not None
             and head_tree and diff.get("tree_sha") == head_tree):
@@ -52498,7 +52773,7 @@ def _py_imports(path: str, text: str, idx: dict[str, set[str]],
 
 def _py_source_graph(repo: str | Path, rev: str) -> dict:
     """The Python import graph at `rev`, in `_js_source_graph`'s shape
-    (`files`, `imp`, `importers`)."""
+    (`src`, `files`, `imp`, `importers`)."""
     key = (str(repo), f"py:{rev}")
     if key in _SOURCE_GRAPHS:
         return _SOURCE_GRAPHS[key]
@@ -52510,7 +52785,7 @@ def _py_source_graph(repo: str | Path, rev: str) -> dict:
     for p, deps in imp.items():
         for q in deps:
             importers.setdefault(q, set()).add(p)
-    g = {"files": files, "imp": imp, "importers": importers}
+    g = {"src": src, "files": files, "imp": imp, "importers": importers}
     if len(_SOURCE_GRAPHS) > 8:
         _SOURCE_GRAPHS.clear()
     _SOURCE_GRAPHS[key] = g
@@ -52558,6 +52833,66 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
                     elif not direct:
                         stack.append(b)
     return {t: sorted(v) for t, v in sorted(out.items())}
+
+
+def _change_reach(repo: str | Path, rev: str, changed: Iterable[str],
+                  globs: list[str] | None = None
+                  ) -> tuple[set[str], list[str]]:
+    """What a change can affect at `rev` (DESIGN §8 *A test's result is
+    measured once per change that can affect it*): `(the test files it
+    reaches, the changed paths whose reach nobody can say)`. A test file is
+    reached by being changed, by importing a changed file through any chain
+    (test helpers included, which `_coupled_test_files` does not walk), or by
+    a test file or test helper naming a changed file's basename in its text:
+    a read of a source file, a spawned script.
+
+    A path's reach is unknown, and the caller must then measure everything,
+    when no import graph holds it (a manifest, lockfile, config, fixture,
+    document, a deleted file, every path of a language with no graph), when
+    it is a runner's configuration, or when it reaches no test at all: a
+    setup file or `conftest.py` is reached through the runner, never an
+    import. Never raises: an unreadable graph holds nothing."""
+    changed = [c for c in changed if isinstance(c, str) and c]
+    graphs = []
+    for build in (_js_source_graph, _py_source_graph):
+        try:
+            graphs.append(build(repo, rev))
+        except Exception as e:
+            log(f"  change reach: import graph unreadable "
+                f"({type(e).__name__}: {e})")
+    importers: dict[str, set[str]] = {}
+    text: dict[str, str] = {}
+    support: set[str] = set()
+    for g in graphs:
+        text.update(g.get("src") or {})
+        support |= set(g.get("support") or ())
+        for k, v in (g.get("importers") or {}).items():
+            importers.setdefault(k, set()).update(v)
+    test_side = [p for p in text if p in support or _is_test_file(p, globs)]
+    reached: set[str] = set()
+    unknown: list[str] = []
+    for c in changed:
+        if (c not in text
+                or any(_is_runner_config(c, r) for r in _RUNNER_CONFIG_GLOBS)):
+            unknown.append(c)
+            continue
+        base = os.path.basename(c)
+        seen = {c}
+        stack = [c, *(p for p in test_side if p != c and base in text[p])]
+        hit: set[str] = set()
+        while stack:
+            cur = stack.pop()
+            seen.add(cur)
+            if _is_test_case_file(cur, globs):
+                hit.add(cur)
+                if cur != c:
+                    continue
+            stack.extend(b for b in importers.get(cur, ()) if b not in seen)
+        if hit:
+            reached |= hit
+        else:
+            unknown.append(c)
+    return reached, unknown
 
 
 def _git_recency(repo: str | Path, rev: str,
@@ -53251,6 +53586,12 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "go": ("go-json", "stdout:-json"),
     "cargo": ("libtest-json", "stdout:-- -Z unstable-options --format json"),
 }
+# The form of a report request that leaves the runner's own output as it was,
+# where `_RUNNER_REPORTS`' does not: `--reporter=json` alone replaces vitest's
+# default reporter (checked on vitest 4.1.11).
+_RUNNER_REPORTS_BESIDE_OUTPUT: dict[str, str] = {
+    "vitest": "--reporter=default --reporter=json --outputFile.json={path}",
+}
 # Extra environment a runner's report request needs: libtest's JSON format
 # is unstable-only, which RUSTC_BOOTSTRAP=1 unlocks on a stable toolchain.
 _RUNNER_REPORT_ENV: dict[str, dict[str, str]] = {
@@ -53306,15 +53647,24 @@ _PLACEMENT_PROBE = "--leerie-placement-probe"
 _PYTEST_JUNIT_OPTS = frozenset({"--junitxml", "--junit-xml"})
 
 
-def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
+def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = (),
+                            *, beside_output: bool = False
                             ) -> tuple[str, dict[str, str] | None, str] | None:
     """`(command, env, report kind)` asking the invoked runner to write a
     structured report to `path`, or None when the runner has no known report,
-    runs in another container, or the flags cannot be placed safely."""
+    runs in another container, or the flags cannot be placed safely. With
+    `beside_output` the runner's own output must survive the request, for a
+    run whose output is also read as the verdict's (`_axis_report_request`):
+    vitest keeps its default reporter, and a runner whose report IS its
+    stdout (go, cargo) gets none."""
     runner = _acceptance_runner(cmd, _RUNNER_REPORTS, files)
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
+    if beside_output:
+        if how.startswith("stdout:"):
+            return None
+        how = _RUNNER_REPORTS_BESIDE_OUTPUT.get(runner, how)
     raw = _strip_trailing_blank(cmd)
     scanned = _shell_scan(raw)
     tokens = scanned[0] if scanned is not None else None
@@ -57451,7 +57801,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     log_path=leerie_dir / "logs" / "acceptance-repair.log",
                     verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
                     label_prefix="acceptance-pre",
-                    log_prefix="acceptance")).get("tests") or {}
+                    log_prefix="acceptance", failing_ids_axes={"tests"},
+                    carry=True)).get("tests") or {}
             except Exception:
                 # Unmeasured: the test-axis rollback rule then cannot fire,
                 # the unmeasurable-sets rule still can.
@@ -57726,7 +58077,9 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                             verbosity=st.data.get("verbosity",
                                                   VERBOSITY_DEFAULT),
                             label_prefix="acceptance-post",
-                            log_prefix="acceptance")).get("tests") or {}
+                            log_prefix="acceptance",
+                            failing_ids_axes={"tests"},
+                            carry=True)).get("tests") or {}
                     except Exception:
                         post_tests = {"measured": False}
                     if (post_tests.get("measured", True)
@@ -62074,31 +62427,26 @@ async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
 
 async def _ratchet_test_ids(st: "State", caps: dict, tree: str, *,
                             label: str, log_path: Path) -> dict | None:
-    """The test axis's failing IDs on `tree` (`_capture_failing_test_ids`),
-    with the axis's command — or, when the task forbids it, its scoped
-    replacement over the coupled tests (DESIGN §9 *A command the task
-    forbids*). None: no command, nothing to run, or no report."""
+    """The test axis's failing IDs on `tree`, measured like every other
+    measurement of a tree that ships (`_measure_axes`, `carry`): the same
+    tree is never measured twice, a new one only where its change reaches,
+    and a command the task forbids is replaced by its scoped run over the
+    coupled tests (DESIGN §9 *A command the task forbids*). None: no command,
+    nothing to run, or no report."""
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"]) or "").strip()
     if not cmd:
         return None
-    forbidden = _forbidden_specs(st.data)
-    hit = _forbidden_command_hit(cmd, forbidden)
-    if hit:
-        rep = await _scoped_test_replacement(tree, st, cmd, hit, forbidden,
-                                             log_prefix="delivery ratchet")
-        if "scoped_replacement" not in rep:
-            return None
-        cmd = rep["command"]
-    got = await _capture_failing_test_ids(
-        tree, cmd, st, caps, label=label, log_path=log_path,
-        timeout=float(caps.get("worker_timeout_sec")
-                      or DEFAULT_CAPS["worker_timeout_sec"]))
-    if got is None:
+    res = (await _measure_axes(
+        tree, {"tests": cmd}, st, caps, log_path=log_path,
+        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+        label_prefix=label, log_prefix="delivery ratchet",
+        failing_ids_axes={"tests"}, carry=True)).get("tests") or {}
+    ids = res.get("failing_ids")
+    if not res.get("measured") or not isinstance(ids, list):
         return None
-    got["command"] = cmd
-    got["messages"] = {k: str(v)[:400]
-                       for k, v in (got.get("messages") or {}).items()}
-    return got
+    return {"ids": sorted(ids), "files": dict(res.get("failing_id_files") or {}),
+            "command": res.get("command"),
+            "messages": dict(res.get("failing_messages") or {})}
 
 
 async def _ratchet_exec(st: "State", caps: dict, staging: Path,
@@ -63519,7 +63867,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
             str(staging), {"tests": cmd}, st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
             label_prefix=label, log_prefix=log_prefix,
-            failing_ids_axes={"tests"})
+            failing_ids_axes={"tests"}, carry=True)
         got = await _confirm_final_test_failures(
             st, caps, str(staging), post, log_path=log_path, label=label,
             tree_sha=tree_sha)
@@ -64431,11 +64779,14 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         str(staging), working_branch, staging_before_sha)
     clobbered_files: list[str] = []
 
-    # The final pass always runs the CANONICAL commands, never a delta proxy
-    # (DESIGN §6). Its whole purpose is cross-subtask interaction breakage —
-    # a lint rule sensitive to file count, an import collision that compiled
-    # cleanly in isolation, a fixture two implementers each augmented — and
-    # none of that is visible to a diff-scoped selection.
+    # The final pass's first measurement of the integrated tree runs the
+    # CANONICAL commands, never a delta proxy (DESIGN §6). Its whole purpose
+    # is cross-subtask interaction breakage — a lint rule sensitive to file
+    # count, an import collision that compiled cleanly in isolation, a
+    # fixture two implementers each augmented — and none of that is visible
+    # to a diff-scoped selection. After it, `tests` runs what each change can
+    # reach (`carry`, DESIGN §8 *A test's result is measured once per change
+    # that can affect it*).
     final_axes = {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
                   for axis in ("build", "lint", "tests")}
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
@@ -64445,7 +64796,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             str(staging), final_axes, st, caps,
             log_path=_final_axes_log(leerie_dir, rnd),
             verbosity=verbosity, label_prefix=f"final-{label}",
-            log_prefix="final-conformer", failing_ids_axes={"tests"})
+            log_prefix="final-conformer", failing_ids_axes={"tests"},
+            carry=True)
 
     # The baseline `_conformance_clean` judges against. The failing-test-ID
     # diff (DESIGN §9 *Which failures are new*) refines it per round: when B*
