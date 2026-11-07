@@ -7229,10 +7229,13 @@ caller of the guard.
 | `_set_confirm_budget_gap(st, site, what, *, sized_out=(), where="on the final tree", whose="the run", tail="")` | Keeps at most one `needs_human_verification` entry per `site` `{source: "confirm_budget", site, detail}` (`CONFIRM_BUDGET_GAP_SOURCE`): `detail` is `"<site>: rerun these against the base by hand — failing <where>, but whether <whose> made them fail is unknown"`, then `tail` (a kept re-drive group's `"; check by hand the required item(s) its ratchet could not check: <items>"`), then `". "` and the lists joined by `"; "`: `"could not confirm within the budget: <what> (confirm_budget_sec cut their base/final reruns)"` for the candidates whose reruns the budget cut, and/or `"not rerun (sized out of the budget): <sized_out> (one base/final pair did not fit what was left of confirm_budget_sec)"` for those never rerun (each the first 10, then `(+N more)`); with neither list but a `tail`, `"<site>: <tail>"`; removed when all three are empty. Sites: `"failing-test-ID diff"` (`_confirm_final_test_failures`, the unsettled candidates' files), `"CI parity"` (`_run_ci_parity_final`, the unsettled check ids) and `"delivery re-drive"` (`_set_redrive_unsettled_gap(st, kept, normalized)`: every kept group's unsettled files from `delivery_redrive.kept_unsettled`, `where="after a re-drive group that was kept"`, `whose="the group"`, the tail naming the items its ratchet left unchecked). `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_coupled_test_files(repo, rev, changed, globs=None, *, direct=False)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). With `direct=True`, only test files that import a changed production file themselves count (no walk through other modules), and a changed test file is not coupled by itself: these are the import-coupled tests of the intermittent-regression rule. The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
 | `_change_reach(repo, rev, changed, globs=None) -> (set[str], list[str])` | DESIGN §8 *What ships is what was measured, once per change that can affect it*. `(test files the change reaches, changed paths whose reach is unknown)`. Reached: a changed test case itself; a test case importing a changed file through any chain, test helpers included (`_js_source_graph` and `_py_source_graph` `importers`); a test file or helper (`_is_test_file`, the JS graph's `support`) whose text holds a changed file's basename, then its importers. Unknown: a path in neither graph's `src`, a `_RUNNER_CONFIG_GLOBS` match, or a file reaching no test. Never raises. |
+| `_near_test_files(repo, rev, changed, globs=None) -> set[str]` | DESIGN §8 *A round's near tests are measured first*. A changed test case, and a test case in `importers` of a changed file (test helpers included; no walk, no mention), over `_js_source_graph` and `_py_source_graph` at `rev`. Never raises. |
+| `_near_selection(st, tree, tree_sha, pre_sha, whole_cmd, replacement, forbidden, named, *, log_prefix) -> dict \| None` | `{command, files, kept, carried, whole}`, or None to measure the closure at once: no ledger, no head, an unreadable diff, any unknown reach (`_change_reach` over the diff from `pre_sha`), no file left, the files being the whole set, no `_acceptance_cmd`, or a scoped command `_forbidden_command_hit` matches. `files`: `_near_test_files`, the ledger's failed files and `named`, within the whole set (`replacement.files`, else the ledger's files plus changed test cases), on disk, not already passed on `tree_sha`. `kept`: every other ledger entry, whatever its tree. `whole`: the size of the whole set. Logs `tests near first — running <n> of <m> test file(s)`. |
+| `_near_rejection(st, caps, staging, pre_sha, post_sha, before, *, label, log_path, named=()) -> dict \| None` | The round's first stage. `_ratchet_test_ids(near_of=pre_sha, near_named=named)`, label `<label>-near-ids`; with `near_stage` and an ID not in `before`, `_ratchet_exec(label=<label>-near)`. Its verdict, with `near_stage`, when `new` is non-empty, else None. None too when `before` is None, `pre_sha` is empty or staging's head is not `post_sha`, and nothing is measured. Called by the acceptance gate's `_round_ratchet` and by the re-drive, which passes each `pending_controls` `test` holding ` :: ` as `named` (its file). A None is followed by the round's usual `_ids_at` / `_redrive_test_ids` and `_ratchet_exec`. |
 | `_carried_selection(st, tree, tree_sha, whole_cmd, replacement, forbidden, *, log_prefix) -> dict \| None` | `{command, files, kept, carried: {files, ran, from_trees}}`, or None to run `whole_cmd`: no ledger, no head, a measured tree `git diff` cannot read, any unknown reach (`_change_reach` over `git diff --name-only --no-renames -z <measured> <tree_sha>`, one per distinct measured tree), nothing carried, no `_acceptance_cmd`, or a scoped command `_forbidden_command_hit` matches. `kept`: ledger entries that passed, are in the whole set (`replacement.files`, else the ledger's files plus changed test cases on disk) and no diff reaches. `files`: the whole set minus `kept`; empty means nothing to run. |
 | `_test_ledger(st)`, `_ledger_record(st, tree_sha, res, cases, selection)`, `_ledger_keep_carried(st, selection)`, `_all_carried_result(cmd, selection)` | `st.data["test_ledger"]`: test file → `{tree, passed}`. Recorded by `_measure_axes` for a `carry` `tests` result it would store in the memo: `kept` plus each file of the report's `cases` (a file passed when none of its cases is `failed` or `load_error`) on `tree_sha`. Emptied by a result with no cases or no `failing_ids`, a red one with no failing ID, or a failing case with no file. `_all_carried_result`: `{ran: True, measured: True, passed: True, command: cmd, whole_command, carried, failing_ids: [], failing_id_files: {}, summary}`. |
 | `_axis_report_request(st, tree, cmd, label) -> dict \| None`, `_read_axis_report(st, tree, res, request) -> list[dict] \| None`, `_acceptance_report_spec(cmd, path, files=(), *, beside_output=False)`, `_RUNNER_REPORTS_BESIDE_OUTPUT` | DESIGN §9 *Which failures are new*. An axis in `failing_ids_axes` runs `request["run_cmd"]`, its verdict and report one run: `{run_cmd, env, source, kind, report, own}` from `_runner_command` and the `beside_output` spec (vitest `--reporter=default --reporter=json --outputFile.json=<path>`; None for a `stdout:` runner). None too with no runner, a compound script call, or a `pre<name>`/`post<name>` script, and the axis then runs as written with `_attach_failing_ids` on failure. `_measure_blt(..., report=request)` runs it (`_blt_shell_argv(run_cmd, forbidden, source=source)` after the check of `cmd`), its result naming `cmd`. `_read_axis_report` reads and removes the file beneath the measurement directory and sets `failing_ids`, `failing_id_files`, `failing_messages` (each message's first 400 characters) and the file durations, returning the report's cases; None with `res` untouched when the run reached no verdict or left no readable report. |
-| `_measure_axes(..., carry=False)` | `carry` on `tests` with a clean tree and a good install: `_carried_selection` after the memo miss and the install, the run `selection["command"]`, the result gaining `whole_command` and `carried`, and stored under `_blt_memo_key(axis, whole_command, tree_sha)`; an empty selection runs nothing (`_all_carried_result`). Passed by `_measure_final`, `_refresh_test_id_diff`, `_ratchet_test_ids` and the acceptance gate's `acceptance-pre`/`acceptance-post` (each also with `failing_ids_axes={"tests"}`); `acceptance-post-again` (`memo=False`, no report) and every per-subtask and baseline call do not. `_orchestrator_results_digest` adds `carried: <n> test file(s) …` beneath a carried axis. |
+| `_measure_axes(..., carry=False, near_of=None, near_named=())` | `near_of`, with `carry`, on `tests`, on a memo miss after the install: `_near_selection` first, and when it gives one, the run is its `command` and the result has `near_stage: {files, of}`, `whole_command` and `carried`, is entered in the ledger (`_ledger_record`, `kept` the rest) and in no memo. With no selection under a `scoped_replacement`, it logs `tests measured whole — running all <n> test file(s) of the scoped replacement`. `carry` on `tests` with a clean tree and a good install: `_carried_selection` after the memo miss and the install, the run `selection["command"]`, the result gaining `whole_command` and `carried`, and stored under `_blt_memo_key(axis, whole_command, tree_sha)`; an empty selection runs nothing (`_all_carried_result`). Passed by `_measure_final`, `_refresh_test_id_diff`, `_ratchet_test_ids` and the acceptance gate's `acceptance-pre`/`acceptance-post` (each also with `failing_ids_axes={"tests"}`); `acceptance-post-again` (`memo=False`, no report) and every per-subtask and baseline call do not. `_orchestrator_results_digest` adds `carried: <n> test file(s) …` beneath a carried axis, and `near stage only: <n> of <m> test file(s) …` beneath a near stage. `_measure_final` passes `near_of` for a round's post measurement: a result with `near_stage` goes to `_confirm_final_test_failures`, and a confirmed new ID makes it the next round's `pre` (no `pre` measurement) and the round's `post`; otherwise `post` is measured again, which runs the closure. |
 | `_py_source_graph(repo, rev)` | The Python import graph at `rev` (`files`, `imp`, `importers`), cached in `_SOURCE_GRAPHS` under `(repo, "py:" + rev)`. Sources come from `_git_tree_sources(repo, rev, (".py",))`. `_py_module_index` maps every dotted suffix of a path's package parts to it. `_py_imports` reads `import` / `from … import` with `ast`: `from a import b` names `a.b` when that is a module, else `a`, and relative imports resolve against the importer's package. |
 | `_git_tree_sources(repo, rev, exts=_JS_SRC_EXT)` | `exts` selects the source suffixes read. |
 | `_jsonc_strip_comments(text)` | `tsconfig.json` text without `//` and `/* */` comments, scanned outside JSON strings only. `_ts_path_aliases` uses it, then drops trailing commas. Before, a regex strip took the `/**/` inside an `include` glob such as `"src/**/*.ts"` for a comment, the JSON stopped parsing, and every alias was lost. Measured on barnacle: no `@/` import edge was resolved, so 0 test files were coupled to `src/lib/random.ts` instead of 4 direct importers. |
@@ -8934,15 +8937,34 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   (`_residual_defects_reason`).
 - Intermittent regressions (DESIGN §9 *An intermittent failure the run
   introduced is evidence, not a verdict*). Before the confirm,
-  `_confirm_final_test_failures` calls `_intermittent_discovery`. Every ID
+  `_confirm_final_test_failures(st, caps, staging, post, *, log_path, label,
+  tree_sha=None, shipping=False)` first confirms the final candidates alone
+  (a same-tree prior verdict with the same candidates stands in for that).
+  It calls `_intermittent_discovery(partial_ok=shipping)` unless those are
+  rejected and it is not `shipping`, or the result is a `near_stage`, which
+  gets the confirm alone. Every ID
   that discovery failed and that is neither a baseline nor a final
-  candidate joins the candidates (its file joins the rerun files). The
-  verdict also records `final_candidates` (the final-run candidates alone;
+  candidate joins the candidates (its file joins the rerun files), and only
+  then is the whole list confirmed again. `_refresh_test_id_diff` is the one
+  `shipping=True` caller, and treats a same-tree verdict marked
+  `near_stage` or `discovery_deferred` as not settled: it measures (a memo
+  hit, or the closure) and confirms. A `near_stage` result writes neither
+  `final_failing_ids` nor, unless its confirm rejects it, `test_id_diff`
+  (`{new: [], near_stage: True}` is returned); a verdict that does is marked
+  `near_stage`. A verdict with no discovery run yet has `discovery_deferred`.
+  The verdict also records `final_candidates` (the final-run candidates alone;
   the memo compares these), `discovery` and `intermittent_regression`
   (from `_type_intermittent_regressions`). Each final-side B\* rerun also
   keeps its report messages for the typing.
 - `async _intermittent_discovery(st, caps, staging, cmd, base_sha, *,
-  log_path, label) -> dict`. The import-coupled tests are
+  log_path, label, clock=None, partial_ok=True) -> dict`. Without
+  `partial_ok` (DESIGN §9 *Discovery on a tree that may not ship*), when
+  `reps × Σ` the coupled files' recorded durations exceeds
+  `confirm_budget_sec`, before the gate, or when step 2 leaves any file
+  skipped, it runs no repeat and returns `deferred: true` with `coupled`,
+  `repeats_required: 0`, `files: []` and `skipped: "not repeated here: <k> of
+  <n> import-coupled test file(s) fit the budget, and the tree that ships is
+  repeated anyway"`. The import-coupled tests are
   `_coupled_test_files(repo, staging HEAD, _changed_files(staging,
   base_sha), globs, direct=True)` that exist in staging. With a scoped
   runner (`_acceptance_cmd`), and holding `_confirm_hold()` after one
@@ -10043,12 +10065,14 @@ nor void.
 - **Execution** (`_ratchet_exec(st, caps, staging, pre_sha, before, after,
   *, label, log_path)`): with either side unmeasured, `{unmeasured: true}`.
   Otherwise `_ratchet_exec_in` on staging (its test runs read staging's
-  committed view): `_intermittent_discovery` from `pre_sha` (the tests that
+  committed view): `_redrive_new_failures` confirms `after`'s candidates
+  under B\* against a worktree at `pre_sha` (it also returns the whole B\*
+  `verdict`). With none new and `after` no `near_stage`,
+  `_intermittent_discovery(partial_ok=False)` from `pre_sha` (the tests that
   directly import a file the repair changed, rerun
-  `confirm_intermittent_repeats` times); IDs it fails that `before` did not
-  join `after`'s IDs; `_redrive_new_failures` confirms the candidates under
-  B\* against a worktree at `pre_sha` (it now also returns the whole B\*
-  `verdict`); `_type_intermittent_regressions` types the evidence rows.
+  `confirm_intermittent_repeats` times if all fit); IDs it fails that neither
+  `before` nor `after` holds join `after`'s, and all are confirmed again.
+  `_type_intermittent_regressions` types the evidence rows.
   Returns `{new, pre_existing, no_verdict, resource_affected,
   budget_short_unsettled, unmeasured, files, intermittent_regression[],
   discovery}` (the first five as B\* split them). `_redrive_new_failures(
@@ -10302,9 +10326,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   forbids is replaced by its `_scoped_test_replacement`, or no verdict when
   there is nothing to run — never run raw), new ones confirmed
   against a `redrive-base` worktree at `pre_sha` by `_confirm_new_failures`
-  (`_redrive_new_failures`, through `_ratchet_exec`, which first runs the
-  intermittent discovery and types `intermittent_regression` rows, recorded
-  on the group). `_redrive_verdict` (pure): `worse` when any set
+  (`_redrive_new_failures`, through `_ratchet_exec`, which then runs the
+  intermittent discovery if none is new and types `intermittent_regression`
+  rows, recorded on the group), after the group's near stage
+  (`_near_rejection`), whose verdict stands for all of this when it rejects
+  the group. `_redrive_verdict` (pure): `worse` when any set
   case newly fails (`broke_cases`, from `_redrive_broken_cases(before,
   after)`: every case of a key failing only after — the key itself when it
   has no per-case record — plus, for a key failing on both sides with
@@ -13932,6 +13958,7 @@ find what is already covered:
 | Test file | What it covers |
 |---|---|
 | `test_test_files_proxy.py` | `_is_test_file` / `_render_scoped`'s `{test_files}` tier / `_select_subtask_axes`' deferral (DESIGN §9). The load-bearing case is the empty-AFTER-filter one: `files` is NON-empty so the pre-existing empty-list guard does not fire, yet every member is a non-test path — rendering there yields a bare `pytest`, which runs EVERYTHING, the same inversion the `{files}` rule forbids reached by a different route. Also pins that the shipped vitest/jest `{files}` templates take SOURCE files on purpose, the `lstrip("./")`-vs-`removeprefix` case, and declared `test_file_globs` REPLACING rather than extending the built-ins. |
+| `test_near_tests_first.py` | DESIGN §8 *A round's near tests are measured first*, §9 *Discovery on a tree that may not ship*, over real repositories and a real pytest: the stage's files, memo and ledger; rejection and flake; no stage for an unknown reach or a forbidden scoped command; a keeper pays no file twice; the final conformer's loop, the acceptance gate and the re-drive driven whole; phase 5 running the closure and the deferred discovery; the log lines. |
 | `test_one_measurement_per_change.py` | DESIGN §8 *What ships is what was measured, once per change that can affect it*, over real git and a real confined pytest: a red run's verdict and IDs from one run, an identical tree and the ratchet's read of one not run, a leaf change running only its coupled tests with each carried file's own tree, a hub running what it reaches, a lockfile, config, fixture, document, deleted file, unknown language or test-less source running the whole command, a carried failure re-run, staleness by tree diff through a revert and a rollback, a forbidden command replaced then narrowed and never run, the round loop's regression compare across a narrowed result, and the real `_run_final_conformance` plus phase 5. |
 | `test_scoped_proxy_corpus.py` | The measured basis for the `{test_files}` tier, frozen against `tests/fixtures/scoped_proxy_corpus/corpus.json` — 36 REAL per-subtask diffs recovered from leerie's own run branches. Exists because the ratio was first taken from the planner's `files_likely_touched` and was badly wrong (40% test-touching predicted vs 94% real). Each row must be ONE subtask's work (an integration merge's FIRST-PARENT diff, not a cumulative two-dot diff), and the fixture must retain its source-only rows or the render-nothing safety property (a test-less diff defers rather than rendering a bare runner) goes untested. |
 | `test_scoped_degrade_warning.py` | `_warn_scoped_degraded_once` (DESIGN §9): `scoped` is the default and an unresolvable `tests` proxy now defers that axis to the whole-tree pass, so a repo with no test proxy gets no per-subtask test signal at all — and must be told so once (an unresolvable `build` proxy still runs the canonical build, which the warning also states). The anti-vacuity partner `test_silent_when_a_proxy_resolves` is mandatory: without it a warning that fired unconditionally would pass, turning the signal into noise on the ~99% of repos where scoping works. Two wiring guards — the call precedes the baseline block, and an AST check that it is NOT nested under the `skip_base_baseline` guard (sentinel-skipped on resume, i.e. silent on exactly the runs that most need telling). |

@@ -13370,6 +13370,102 @@ confirmed new on a shipped tree are inside the selection. So nothing is missed o
 the final tree, and the 98 are noise this stops chasing. Delayed, not missed: the
 per-subtask failures counted in §9 *A subtask runs the tests it names*.
 
+**A round's near tests are measured first.** *Designed 2026-11-07, after 0.46.0
+removed the repeats: a round that edits a hub still re-ran nearly everything, and
+was then often rolled back for a test beside its own edit.* The invariant: *the
+tree that ships has every coupled test's result, once, and a round does not pay
+for the whole closure before its nearest tests have passed.*
+
+Measured over the 41 recorded runs with a shipping-tree verdict (`barnacle` and
+`web`, 526 hours of wall time with pauses removed) and the 114 rounds among them
+that committed and measured a large set: final conformer, acceptance repair,
+re-drive. Worker time is 39% of that wall. Discovery repeats cost 66 hours (133
+of them), against 26 for the closures of those 114 rounds at 0.46.0's rule. Of
+the 26 rounds with a verdict of a new failure:
+
+| Where the failing tests were | Rounds | IDs |
+|---|---:|---:|
+| At least one carried from the round's start (133 IDs), its own test (5) or a direct importer (16) | 24 | 154 |
+| None near: distance 2 (one round, one ID), distance 2–4 (one round, 53 IDs) | 2 | 54 |
+| Distance 2, in a round also rejected by a near ID | (3 of the 24) | 6 |
+
+(IDs a verdict's stored text does not list, past its first ten, are not counted;
+web 6f147a0c's 18 IDs have no measurement to place them against and are in
+neither row.) So a test beside the edit decides nearly every rejection, at about
+half the files of the closure (median 56%, by file; 38% by recorded duration).
+
+*The stage.* A round measures first the tests nearest its diff from its own
+start (`_near_test_files`: a changed test case; a test case importing a changed
+file itself, a test helper included), everything the ledger holds failed, and
+any test it was named (a control an earlier re-drive group broke). If one of them
+is confirmed new under B\*, the round is rejected there: a rollback for the
+acceptance repair and the re-drive, the next round for the final conformer,
+which starts from the tree as measured and does not pay for its closure either.
+If none is, the closure follows, and runs only what the stage did not settle:
+the ledger holds what the stage measured, on this tree, so a keeper pays for no
+test twice. One red run decides nothing: a near failure B\* does not confirm goes
+on to the closure like any other.
+
+A stage is never a tree's answer. Its result goes in no memo, says `near_stage`,
+and is recorded as the tree's failing-test-ID diff only when it rejects the
+round, marked the same way, which phase 5's refresh will not take for the tree's
+(*The final diff describes the tree that ships*): it measures, and with the
+ledger that runs the closure the rejected tree never had. The ledger is why
+nothing else had to change: each file answers to the diff from its own measured
+tree, so a far test skipped on a rejected tree is reached by the next change
+from where it was last measured.
+
+No stage is taken when nothing is nearer than the rest: a changed path of unknown
+reach (a lockfile, a config, a fixture), a stage that would be the closure, a
+scoped command the task forbids, or no ledger yet, so the first measurement of
+the integrated tree is whole as before.
+
+*Closure once was tried and is not done.* Measuring only near tests per round
+and the closure once on the final candidate would save 3.8 to 6.7 hours more over
+those runs (35 keeper closures that were not the run's last). Two rounds were
+rejected only by far tests: barnacle 83674caf's acceptance round 1 (an edit of
+`capture-filters.ts`, near set 16 files, 53 IDs at distance 2 to 4) and c33bef9e's
+round 2. Kept until the end, 83674caf's second round is built on the first and
+edits the same file, so finding the guilty round by bisection then undoes both,
+and the fix the second one made. A closure before a round is kept is what keeps
+that from being a late, expensive catch.
+
+**The replay**, with the shipping `_near_test_files` and `_change_reach`, over
+the recorded commits and failures of the 114 rounds. 101 take a stage. 19 are
+rejected on it (13 final conformer, 4 acceptance repair, 2 re-drive). On all 41
+shipping trees every confirmed-new ID was measured, and no failure stands
+carried from a tree the diff could not reach: **no regression missed on the
+final tree.** Three rounds are rejected with a far ID the closure would also have
+named: c33bef9e's acceptance round 1 (2 IDs) and re-drive group r1g0 (1), both
+rolled back, so those IDs leave with the round and only their naming to the next
+attempt is lost, at worst one more attempt; d8aff199's final conformer round 1 (2
+IDs, not rolled back), measured at the next round's closure, so a round later, at
+the cost of one more conformer round if they still fail. Those are all the late
+catches. One shipping tree (of 41) was last measured by a rejecting stage, so
+phase 5 runs its closure there: 189 file-runs that 0.46.0 had paid inside the
+round. Over the replay, file-runs drop from 65,205 to 62,125 (5%), recorded test
+seconds from 495,874 to 457,644 (8%). The closures of those rounds drop from 26.4 hours to 24.2 (23.6 by
+recorded durations), and the near B\* passes are smaller: 2.3 hours of confirm
+reruns of far candidates on rejected rounds, estimated from each phase's median
+confirm wall. A near failure B\* does not confirm can be confirmed a second time,
+if it fails again in the closure: 18 of the 80 rounds with both ID lists carry
+one, at most 4.6 hours, and of the 288 `resource_affected` IDs recorded 30 (10%) failed again on a rerun. A
+hub-edit round rejected near, a79384a4's round 1: closure 25 minutes, discovery 25
+(the "50 minutes of discovery" in its log's gap held both), B\* 5 today; about 10
+and 3.
+
+Most of what this saves is discovery (§9 *Discovery on a tree that may not
+ship*): together, the closures and discoveries of these runs go from 92.7 hours
+to 46.1, half.
+
+*What the recordings cannot say.* A real run's rounds may roll back differently
+once their worker hears only the near IDs of a mixed failure, and a kept round's
+near and far passes cost a second runner start-up. Near wall time is an estimate:
+each file's share of the run's wall, by count (conservative) and by recorded
+duration. And the replay's distances are over the import graphs of recorded
+trees, so a test reached only by a mention of a changed file's name counts as far
+(none of the verdicts here was).
+
 **Every post-execution verdict is of the committed tree.** The invariant:
 *a verdict becomes `met` only on a read of a commit, or on a measurement
 the orchestrator itself made of the committed tree.* Review round 9
@@ -18248,7 +18344,7 @@ adds two steps:
    `confirm_budget_sec`, as many of them as that budget holds at the full
    repeat count (*Sized to the budget*, below). Every ID that failed in the final run or a discovery
    repeat and not on the base joins the B\* candidates, so it gets base
-   reruns. The list is fixed before any B\* rerun: an ID that fails only
+   reruns. Each list is fixed before its B\* rerun: an ID that fails only
    in a B\* final rerun gets no base reruns and is not typed. At p = 0.105, R = 20 finds such a
    test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
    Discovery needs only the coupled test files and the base commit, not
@@ -18315,6 +18411,28 @@ adds two steps:
    the 1 s floor and the build-slot and BLT-gate waits (step 2 above). On barnacle's hub file (~3 s per importer) that is
    about 26 importers, each rerun all 20 times, instead of all 301 rerun
    twice; the other 275 are recorded as skipped, not silently dropped.
+   *Discovery on a tree that may not ship.* The run's own failures are
+   confirmed first, and a tree they reject is not repeated: it is already
+   rejected, and its findings would describe a tree about to change. Off the
+   tree that ships, discovery runs only when every coupled file fits at the
+   full repeat count; otherwise it records `deferred`, repeats nothing and
+   waits, and the tree that ships takes what fits, as above. Whether it fits
+   the durations on record is known before the gate wait or a calibration.
+   Measured over the 133 recorded discoveries (41 runs, 66.3 hours at their
+   walls, capped at the 2102 s above): 95 covered part of what they coupled off
+   the tree that ships (49.7 hours, a median of 4% of the files), and they found
+   anything once, on barnacle 54fb56c3's first round at one repeat, every ID of
+   which the whole run had already failed. They decided no verdict. All 11 that
+   covered everything off the tree that ships ran on small coupled sets (2.7
+   hours), and web 6f147a0c's two of them are the one case where discovery
+   decided anything: the whole command green, 16 and then 2 IDs red on every
+   repeat, confirmed new, and fixed by later rounds. Those still run in the
+   round. So 48 discoveries remain of the 133, 21.9 of the 66.3 hours. A
+   partial discovery the deferred rule moved found no failure in this record,
+   but the class it was built for (barnacle 7cc87f9a, a test failing one run in
+   ten) stays covered where it matters, on the tree that ships, as evidence: if
+   a round introduced one, it is reported there rather than rolling that round
+   back, which no recorded round's did.
 2. *Typing.* An ID is typed `intermittent_regression` only when all of
    these hold. Its base was clean: it is not in the baseline's failing IDs
    and failed none of B\*'s base reruns. It failed at least once on the
