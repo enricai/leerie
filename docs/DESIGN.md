@@ -12172,8 +12172,34 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   turn budget of its own pack size. Verdicts merge by `item_index`; a
   verdict for an index outside the pack is ignored. Packs run
   concurrently up to `max_parallel`. The dispute vote above applies per
-  pack (a pack whose first sample flags nothing costs one spawn). There
-  is **no per-item re-judge**.
+  pack (a pack whose first sample flags nothing costs one spawn). The
+  one per-item re-ask is the next rule's, for items a sample did not
+  inspect; an item a sample did judge is never re-judged item by item.
+- **Every item is judged before its vote counts.** A sample can hand an
+  item back unread: a verdict whose parts are typed `not_inspected` and
+  none `unmet` ("Not inspected."), or no verdict for it at all. Measured
+  on two barnacle runs of 34 required items each (2026-11-05/06, packs
+  of 14, 20 and 30): one sample in three left 5–21 of its pack's items
+  `not_inspected`, two returned 1 and 2 verdicts for a 14-item pack —
+  each finishing at 8–55 turns of a 90-turn budget, no call at the
+  budget. The judge stopped; nothing cut it off. Counted as votes, a
+  `not_inspected` verdict was an unmet vote and an omission a met one,
+  so an item no sample read was routed to the conformer as a defect —
+  9 of one run's 14 recheck residuals, all 7 of the other's — or shipped
+  `met` because a sample left it out (13 of 14 items in one final
+  detection pack). So code asks once more: the items a sample left
+  uninspected go back to the judge in the same prompt shape for exactly
+  those `item_index` values — a smaller pack, halved when the sample
+  inspected none of its pack — and the follow-up's verdicts replace the
+  sample's for them. An item still uninspected after that casts no vote
+  from that sample; one a majority of a pack's samples could not inspect
+  is `unknown` — never confirmed unmet, never met, named under "Needs
+  human verification", and read as `unknown` by every reader of the
+  pass, as a worker-only met is (*Execution-shaped items are judged from
+  the run's own records*). A first sample that leaves an item unknown
+  draws the two dispute samples, as a flag does. The pack size stays:
+  no sample reached its turn budget, so the budget a pack size sets is
+  not what left the items unread.
 - **Code settles what code can.** An item typed
   `verifiability: external` (a PR description, a deploy, a human
   action) is never judged: it goes to `state.data
