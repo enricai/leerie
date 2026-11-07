@@ -4646,7 +4646,7 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   resolved, or None) when it is in `<run>/tree-repos/`, else nothing
   (never a `die()`: no write is granted). `_RUN_NOTES_READERS`
   (implementer, conformer, integrator): `ro` `<run>/subtasks`,
-  `<run>/task.md`, `<run>/notes`. `notes_id`: `rw` `<run>/notes/<id>/`
+  `<run>/task.md`, `<run>/notes`, and `<run>/task-files` when it is a directory (`TASK_FILES_DIRNAME`). `notes_id`: `rw` `<run>/notes/<id>/`
   (created). `selfcheck_dir`: `ro` it, `rw` its `run/` (created). The
   tree's own stores (DESIGN §6 *A worker started in a tree leerie installed
   for runs on that tree's stores*): when `_installed_tree_stores(cwd)` is
@@ -13298,6 +13298,7 @@ Two concurrent runs in the same repository share no coordination state.
         ├── plan.json                merged planner output
         ├── task.md                  the task document verbatim, as plain markdown
         ├── subtasks/<id>.json       per-subtask spec handed to each implementer
+        ├── task-files/<repo path>   copies of the files the task references, made by `_write_plan` (`_stage_task_files` → `_copy_task_references`); read-only to `_RUN_NOTES_READERS`; named in the prompt by `_task_files_section(st) -> list[str]` (empty when there are none; at most `_TASK_FILES_LISTED` = 20 paths, the rest counted), extended onto the prompts of `_implementer_base_prompt`, `_append_conformer_context_sections` and the acceptance-repair conformer (DESIGN §6 *A report the task names is read, not searched for*; benched)
         ├── notes/<id>/criteria.md   informational success-criteria notes (DESIGN §9); the implementer's own directory (DESIGN §6 *A worker writes only where it is granted*)
         ├── artifacts/<id>.json      structured deliverables from an implementer's `artifacts` field (DESIGN §5); absent for code-implementation subtasks
         ├── notes/<id>/checkpoint.md handoff checkpoints (7-section schema)

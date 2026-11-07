@@ -2584,7 +2584,7 @@ the container's `/tmp`.
 
 | Kind | Workers | Tree | Run repository | Run files |
 |---|---|---|---|---|
-| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
+| committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `task-files/`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
 | committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
 | non-committing, own checkout | delivery judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
 | judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
@@ -2611,6 +2611,63 @@ An implementer's notes are `notes/<id>/criteria.md` and
 name a directory before either file exists; the earlier
 `criteria/<id>.md` and `checkpoints/<id>.md` could not be granted one
 subtask at a time.
+
+**A report the task names is read, not searched for.** *Added 2026-11-07;
+benched 2026-11-07, shipped on its pre-registered bar.* The files a task
+references are copied once, at plan time (`_write_plan` → `_stage_task_files`,
+through `_copy_task_references`), into `<run-dir>/task-files/<repository
+path>`, and the workers that read the run's specs (`_RUN_NOTES_READERS`:
+implementer, conformer, integrator) are granted that directory read-only. The
+implementer's and the conformers' user prompts list the copies by absolute
+path as data (`_task_files_section`: the implementer and the delivery
+re-drive, the per-subtask, final and acceptance-repair conformers). Before
+this the only copy was in the planning worktree (`_stage_worktree_extras`),
+and a worker's own tree is committed code: an untracked report is in none of
+them, and none may be given one (a tree a worker commits from is clean at I1).
+The user's checkout is not a place a worker looks: it is mounted read-only at
+`/work`, and every worker's grant reads everything outside the state root
+(`_worker_grants`), so `/work/<report>` is readable from a worker's shell
+(`_confined_argv`, with the CLI and without), but no prompt names it and no
+worker found it. Measured on 8 finished runs (the report analysis of
+2026-11-07), these workers made 28 tool calls that searched for the report and
+found it in none. The copies are in no tree, so no diff, clean-tree gate or
+held-out set sees them; the judgment workers keep the planning worktree's
+copy. Landlock holds `task-files/` read-only: readable and listable, write
+and append denied.
+
+*Measured.* 10 cases, 46 confined workers, each pair one sample of this
+change against today (its parent), under the real `_worker_grants`; design,
+cases and both code snapshots hashed before any worker ran.
+
+- Implementers opened the report in 12 of 15 samples (11 by the mechanical
+  count; one `cat` returned the text beside a denied glob, so the detector
+  marked the call an error), acceptance-repair conformers in 4 of 4,
+  per-subtask conformers in 0 of 4. Today: 0 of 15 implementers and 0 of 8 conformers.
+  The per-subtask conformer treats its job as build, lint and test triage and
+  committed nothing in either arm.
+- Where the spec had lost detail, 4 of 9 path samples kept it against 0 of 9
+  today. L2 (HTML token tracing) 3 of 3 against 0 of 3, and its held-out test
+  passed in 2 of 3 against 0 of 3, a test the worker never saw. L3 1 of 3
+  against 0 of 3. L1 0 of 3 each: no implementer opened the report there.
+- No widening beyond the task, no site naming and no cross-subtask work
+  attributable to the change; no write to `task-files/` and no report
+  committed.
+- The cost: the path arm changed more lines (median ratio 1.46 per
+  implementer case, against a bar of 1.5) and cost 1.39 times as much per
+  implementer case (bar 1.5); over all samples $9.60 against $8.66.
+
+*Not measured.* One round per worker: no continuation, no orchestrator
+evidence-gate re-run, no conformer after an implementer, no re-drive, ratchet
+or rollback. Trees were rebuilt from each run's recorded start, with the
+plans and specs older leerie versions wrote. The strict-output proxy and the
+cgroup broker were off. n is small, several passes sit at the bar (4 of 9; 5
+of 9 key passages reached; 1.46), and Q2 rests mainly on L2.
+
+*Open follow-up, not shipped.* A sentence in `prompts/implementer.md` and
+`prompts/conformer.md` telling the worker to read the files listed under
+*FILES THE TASK REFERENCES* before planning is the obvious lever for L1 and
+for the per-subtask conformer, which never open the report. It is unmeasured
+and is a change of its own that needs its own bench on fresh cases (§8).
 
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/` or
 anything else in the run directory, not `repo-settings/`, not staging or a
