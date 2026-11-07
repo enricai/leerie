@@ -8131,6 +8131,17 @@ sample's probe never counts for the next.
   refused, naming the entry, and nothing is written. Falsified on the host:
   with the two checks removed, the entry test and the 3 cases fail.
 
+## A done task stays done unless its recorded tests regress
+
+`tests/test_settled_bar.py` (DESIGN §8 *Done is a fixed bar per task*): real git
+repositories and the real runner in the held-out sandbox, with only `claude_p`
+stubbed (and, where real `_run_phases` is driven, the phases around the gate).
+Its `Workers` stub raises on any worker but the writer and the scope judge, which
+is what pins that nothing else is asked. It covers the 396c84e3 shape, the
+673a0cc6 shape, a bar whose control alone regressed (what the REST-GET replay
+turns on), an unmerged fix, a reworded task, an edited or unreadable report, old
+state, and a one-off flake.
+
 ## A test of one gate pins every other gate its path takes (CI, 2026-11-04)
 
 `tests/test_blt_semaphore.py::test_raising_the_cap_raises_the_peak` failed on
