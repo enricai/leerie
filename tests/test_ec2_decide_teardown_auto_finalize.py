@@ -37,6 +37,7 @@ def _run(tmp_path: Path, *, rc: int = 0, fetch_rc: int = 0,
     (leerie_repo / "scripts").mkdir(parents=True)
     (leerie_repo / "scripts" / "host-finalize.sh").write_text(
         'host_finalize() { echo "CALL host_finalize"; '
+        f'printf "%s\\n" "$@" > {tmp_path}/finalize_args; '
         f'return {finalize_rc}; }}\n')
     script = f"""
 source {EC2_PROVISION_SH}
@@ -98,6 +99,10 @@ def test_teardown_leaves_the_push_choice_to_host_finalize(tmp_path, kw):
     # reads the run's one record, run.json.no_push; a sidecar field or this
     # launcher's NO_PUSH is not a second owner and changes nothing here.
     assert _calls(_run(tmp_path, **kw)) == ["fetch", "host_finalize", "terminate"]
+    # ...and is handed the run directory alone: the record it reads is the
+    # run's own, so no flag or value from here rides along.
+    run_dir = tmp_path / "user_repo" / ".leerie" / "runs" / "rid-001"
+    assert (tmp_path / "finalize_args").read_text().splitlines() == [str(run_dir)]
 
 
 def test_launcher_cleanup_runs_once_on_the_exit_pass(tmp_path):
