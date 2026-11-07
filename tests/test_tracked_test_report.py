@@ -15,6 +15,8 @@ import subprocess
 
 import pytest
 
+from tests.conftest import run_git_cwd_first_stdout
+
 JS_BASE = """\
 describe("pay", () => {
   it("totals the cart", () => {
@@ -33,26 +35,19 @@ def test_parse():
 """
 
 
-def _git(cwd, *cmd):
-    r = subprocess.run(["git", *cmd], cwd=cwd, capture_output=True,
-                       text=True)
-    assert r.returncode == 0, f"git {cmd} in {cwd}: {r.stderr}"
-    return r.stdout.strip()
-
-
 @pytest.fixture
 def repo(tmp_path):
     root = tmp_path / "repo"
     (root / "tests").mkdir(parents=True)
     (root / "src").mkdir()
-    _git(root, "init", "-q", "-b", "main")
-    _git(root, "config", "user.email", "t@t")
-    _git(root, "config", "user.name", "t")
+    run_git_cwd_first_stdout(root, "init", "-q", "-b", "main")
+    run_git_cwd_first_stdout(root, "config", "user.email", "t@t")
+    run_git_cwd_first_stdout(root, "config", "user.name", "t")
     (root / "tests" / "pay.test.ts").write_text(JS_BASE)
     (root / "tests" / "test_parse.py").write_text(PY_BASE)
     (root / "src" / "pay.ts").write_text("export const total = 1;\n")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-qm", "init")
+    run_git_cwd_first_stdout(root, "add", "-A")
+    run_git_cwd_first_stdout(root, "commit", "-qm", "init")
     return root
 
 
@@ -89,11 +84,11 @@ class Run:
         st.data["working_branch"] = "main"
         self.repo = leerie._ensure_run_repo(st)
         self.wt = st.run_dir / "worktrees" / "staging"
-        _git(self.repo, "worktree", "add", "-q", "-b", "leerie/runs/r1",
+        run_git_cwd_first_stdout(self.repo, "worktree", "add", "-q", "-b", "leerie/runs/r1",
              str(self.wt), "main")
-        _git(self.wt, "config", "user.email", "t@t")
-        _git(self.wt, "config", "user.name", "t")
-        st.data["base_sha"] = _git(self.repo, "rev-parse", "main")
+        run_git_cwd_first_stdout(self.wt, "config", "user.email", "t@t")
+        run_git_cwd_first_stdout(self.wt, "config", "user.name", "t")
+        st.data["base_sha"] = run_git_cwd_first_stdout(self.repo, "rev-parse", "main")
         st.data.update({"waves": [["feat-001"]], "completed_waves": 1,
                         "worker_count": 1,
                         "subtask_status": {"feat-001": "complete"}})
@@ -104,12 +99,12 @@ class Run:
             p = self.wt / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
-        _git(self.wt, "add", "-A")
-        _git(self.wt, "commit", "-qm", "work")
+        run_git_cwd_first_stdout(self.wt, "add", "-A")
+        run_git_cwd_first_stdout(self.wt, "commit", "-qm", "work")
 
     def remove(self, rel):
-        _git(self.wt, "rm", "-q", rel)
-        _git(self.wt, "commit", "-qm", "rm")
+        run_git_cwd_first_stdout(self.wt, "rm", "-q", rel)
+        run_git_cwd_first_stdout(self.wt, "commit", "-qm", "rm")
 
     def finalize(self, leerie):
         asyncio.run(leerie.phase_finalize(
@@ -248,13 +243,13 @@ def test_the_stored_report_is_bounded(leerie, repo):
     k = leerie._TRACKED_TEST_ITEMS_MAX
     body = "".join(f"expect(v{i}).toBe({i});\n" for i in range(k + 5))
     (repo / "tests" / "big.test.ts").write_text(body)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "big")
-    base = _git(repo, "rev-parse", "HEAD")
+    run_git_cwd_first_stdout(repo, "add", "-A")
+    run_git_cwd_first_stdout(repo, "commit", "-qm", "big")
+    base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     (repo / "tests" / "big.test.ts").write_text("")
-    _git(repo, "commit", "-qam", "gut")
+    run_git_cwd_first_stdout(repo, "commit", "-qam", "gut")
     rec = leerie._tracked_test_report(
-        repo, base, _git(repo, "rev-parse", "HEAD"))["files"][0]
+        repo, base, run_git_cwd_first_stdout(repo, "rev-parse", "HEAD"))["files"][0]
     assert len(rec["removed"]) == k
     assert rec["removed"][0] == "expect(v0).toBe(0)"
     assert rec["omitted"] == 5
@@ -282,11 +277,11 @@ def test_worker_copy_of_the_heading_is_stripped(leerie):
 def test_escalation_gate_b_is_unchanged_in_what_it_counts(leerie, repo):
     """Gate (b) stays a count check: a changed expected value, same number
     of call sites, is invisible to it; the report is a separate path."""
-    base = _git(repo, "rev-parse", "HEAD")
+    base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     (repo / "tests" / "pay.test.ts").write_text(
         JS_BASE.replace("toBe(10)", "toBe(12)"))
-    _git(repo, "commit", "-qam", "edit")
-    head = _git(repo, "rev-parse", "HEAD")
+    run_git_cwd_first_stdout(repo, "commit", "-qam", "edit")
+    head = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     assert leerie._redrive_weakened_tests(repo, base, head) == []
     rep = leerie._tracked_test_report(repo, base, head)
     assert rep["files"][0]["removed"] == ["expect(total(cart)).toBe(10)"]
@@ -341,8 +336,8 @@ describe("report contract", () => {
 
 def _setup_repo(repo):
     (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "settle test")
+    run_git_cwd_first_stdout(repo, "add", "-A")
+    run_git_cwd_first_stdout(repo, "commit", "-qm", "settle test")
 
 
 def test_a_rewritten_setup_with_no_assertion_change_is_listed(leerie, st,
@@ -363,30 +358,30 @@ def test_a_rewritten_setup_with_no_assertion_change_is_listed(leerie, st,
 
 def test_blank_comment_reindent_and_moved_lines_count_nothing(leerie, repo):
     _setup_repo(repo)
-    base = _git(repo, "rev-parse", "HEAD")
+    base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     text = SETUP_BASE.replace("    snapshot,\n", "\n    // note\n    snapshot,\n")
     text = text.replace("  return io;", "      return   io;")
     (repo / "tests" / "settle.test.ts").write_text(text)
-    _git(repo, "commit", "-qam", "noise")
-    rep = leerie._tracked_test_report(repo, base, _git(repo, "rev-parse",
+    run_git_cwd_first_stdout(repo, "commit", "-qam", "noise")
+    rep = leerie._tracked_test_report(repo, base, run_git_cwd_first_stdout(repo, "rev-parse",
                                                        "HEAD"))
     assert rep["files"] == []
     # Deleting a blank line and a comment from a file that has them.
     (repo / "tests" / "settle.test.ts").write_text(text)
-    base2 = _git(repo, "rev-parse", "HEAD")
+    base2 = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE)
-    _git(repo, "commit", "-qam", "denoise")
+    run_git_cwd_first_stdout(repo, "commit", "-qam", "denoise")
     assert leerie._tracked_test_report(
-        repo, base2, _git(repo, "rev-parse", "HEAD"))["files"] == []
+        repo, base2, run_git_cwd_first_stdout(repo, "rev-parse", "HEAD"))["files"] == []
 
 
 def test_a_removed_assertion_alone_does_not_add_a_line_count(leerie, repo):
     _setup_repo(repo)
-    base = _git(repo, "rev-parse", "HEAD")
+    base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
     (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE.replace(
         "    expect(r.pageAdvanced).toBe(true);\n", ""))
-    _git(repo, "commit", "-qam", "drop")
+    run_git_cwd_first_stdout(repo, "commit", "-qam", "drop")
     rec = leerie._tracked_test_report(
-        repo, base, _git(repo, "rev-parse", "HEAD"))["files"][0]
+        repo, base, run_git_cwd_first_stdout(repo, "rev-parse", "HEAD"))["files"][0]
     assert rec["removed"] == ["expect(r.pageAdvanced).toBe(true)"]
     assert "lines_removed" not in rec
