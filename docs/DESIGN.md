@@ -7433,6 +7433,10 @@ present only when it has an entry:
   integration cannot succeed*).
 - `## Repository merge checks still red` — the CI-parity checks confirmed
   red on the final tree (§9 *The repository's own merge checks run too*).
+- `## Existing tests changed by this run` — assertions, cases, skip markers
+  and deleted files of tests the repository already had, base against the
+  final tree, report-only (§8 *Existing tests the run changed are listed in
+  the PR*).
 - `## Advisory (not verified by this run)` — the whole-PR review's verified
   findings, the contract-literal flags and the site-token hits (§8, §9),
   labelled advisory because nothing waited on them.
@@ -14650,6 +14654,69 @@ weakening a test, because it constructs *new* adversarial inputs the graded
 worker never anticipated. A verdict is a list of concrete found defects, not
 a score crossing a threshold — the invariant every new verifier must
 preserve.
+
+### Existing tests the run changed are listed in the PR
+
+A run can make its task pass by changing a test the repository already had:
+an expected value rewritten, an assertion dropped, a case deleted, a skip
+marker added, a file removed. Sometimes that is the task (the behaviour
+changed, so the old expectation is wrong); sometimes it is a weakening. The
+two look the same to code. At finalize, once, leerie measures the run
+branch's final tree against the run's own start (`_diff_base`) and lists
+every such change in the PR under `## Existing tests changed by this run`
+(§6 *The PR's end-state section*): per file, the assertions and cases the
+base had that the final tree lacks, then the ones it added, a skip count, a
+deleted file. The section says plainly that nothing verified these against
+the task and that the reviewer should read each before merging. It renders
+on every PR, a draft (`unconverged`) one included, and from the same
+`pr_end_state` text on the pr_writer path and the launcher's fallback.
+
+**It is report-only.** A flag changes no outcome, verdict, gate, retry or
+rollback, and a worker is not asked about it. Escalation gate (b) of the
+delivery re-drive (`_redrive_weakened_tests`: fewer expect/assert call sites,
+fewer cases, more skips, on the escalated round only) is a separate check
+and is unchanged.
+
+A rewritten setup lists too. A test can stop testing what it did without one
+assertion string changing: the call that drives the code under test is
+replaced, a fixture is reshaped, a `settle:` option dropped. So a file also
+gets a count line, `setup or other lines changed: N removed, M added`, when
+the final tree removes more non-blank, non-comment lines than the removed
+assertions and cases account for (each counted as one line). The count is
+over the file's lines with comments blanked (`_tt_mask`) and each line's
+whitespace collapsed, blank lines dropped, compared as multisets against
+the base: a deleted or added blank line or comment, a reindented or
+reflowed-in-place line and a moved line count nothing, a changed line counts
+one removed and one added. Nothing characterises those lines; the reviewer
+reads the diff. It over-reports on purpose (a removed case's body counts
+beyond its one line); a false positive costs a glance. A file only added to
+(0 removed lines) stays unlisted.
+
+Why not more. A branch built the stronger form: the same detector on every
+code-writing round, voiding a round that altered a tracked test unless the
+worker declared it with a quote of the task. A confined bench of that
+declaration failed: legitimate updates were declared correctly 6 of 12, and
+real weakenings evaded with a weak quote 4 of 6. A gate that voids honest
+rounds and passes dishonest ones is worse than a list. The detector itself
+held up: replayed over recorded runs it found real weakenings in 3 of 17
+hand-classified flagged rounds, one of which (run 73751002) had shipped.
+
+What it measures (mechanical, on test source with strings, comments and JS
+regex literals masked): an assertion statement (`expect(`, `assert(`,
+`assert.<m>(`, Python `assert`, `.assert<X>(`, `pytest.raises(`), compared
+whitespace- and trailing-comma-free; a case (`it(`/`test(` by title,
+`def test_*` by name); skip/only/todo/xfail markers; the file. Only a file
+present at the base counts, and only a change that survives to the final
+tree: a change a later commit reverted is not listed.
+
+What it does not do. It does not say which commit or round made a change
+(one comparison, base to final tree). It does not judge: a legitimate update
+and a weakening are listed alike, and so is a known false-positive shape,
+an assertion whose subject moved into a local variable, which reads as one
+removed and one added assertion. It sees only test-shaped paths. It lists at
+most `_TRACKED_TEST_ITEMS_MAX` items per list and `_TRACKED_TEST_FILES_MAX`
+files in state, and `_PR_TRACKED_TEST_SHOWN` entries in the PR, counting
+the rest.
 
 ### Held-out acceptance tests
 

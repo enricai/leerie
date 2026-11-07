@@ -112,6 +112,7 @@ Do **not** write any of these sections yourself: `## Unconverged`,
 `## Needs human verification`, `## Not verified by this run`,
 `## Untested after re-drive`,
 `## Integration content loss`, `## Repository merge checks still red`,
+`## Existing tests changed by this run`,
 `## Advisory (not verified by this run)` (nor a `## ⚠ Residual risks`
 section). The orchestrator renders them from the run's typed state and
 appends them after your body (DESIGN §6 — the append is code-owned so no

@@ -77,6 +77,10 @@ def _full_state() -> dict:
             {"verified": False, "path": "src/b.ts", "line_start": 1,
              "line_end": 1, "kind": "bug", "explanation": "unverified"},
         ]},
+        "tracked_test_report": {"files": [{
+            "file": "tests/pay.test.ts",
+            "removed": ["expect(total).toBe(10)"],
+            "added": ["expect(total).toBe(12)"]}], "files_omitted": 0},
         "contract_literal_checks": {"feat-001#0": {
             "owner_sid": "feat-001", "flag": True, "why": "near_variant",
             "extracted": {"counterpart_sid": "feat-002",
@@ -91,6 +95,7 @@ HEADINGS = ["## Unconverged", "## Needs human verification",
             "## Not verified by this run",
             "## Untested after re-drive", "## Integration content loss",
             "## Repository merge checks still red",
+            "## Existing tests changed by this run",
             "## Advisory (not verified by this run)"]
 
 
