@@ -11976,6 +11976,12 @@ dispute is bounded to two extra runs, not one, when the first goes unacted.
 (A run that reaches implementation has acted on its dispute, whatever its
 outcome.)
 
+The bound counts only *consecutive* disputes, so it does not make a done task
+stay done: in the barnacle lineage of §8 *Done is a fixed bar per task*,
+673a0cc6 did not dispute, which left 396c84e3 free to, on 9 counted cases none
+of which was genuine. That is the settled bar's job, and it acts before the
+settle: while a task's bar holds, the settle never runs.
+
 **A plan whose fixes are all already on HEAD ends as no work.** The
 satisfied-probe sweep could drop every subtask that fixes the reported
 symptom and still let the run ship, because the survivors (verification
@@ -14808,7 +14814,10 @@ failing defect case and so no set. The earliest same-task base is still
 looked up, but only as information: each valid set records
 `report_reproduced` — whether it also fails there — and nothing filters
 on it. Sets from earlier runs are never carried forward or re-validated;
-each run writes its own. The writer's checkout is a clone whose only
+each run writes its own. (A `done` run's *settled bar*, below, is not a
+set: it is a record of cases that passed on a tree carrying the fix, re-run
+but never re-validated, rewritten or shown to a writer — *Done is a fixed
+bar per task, not re-sampled each run*.) The writer's checkout is a clone whose only
 reachable commit is the own start — no branch, tag or run branch — so
 neither a later commit nor an earlier run's fix can steer the tests, and
 everything the writer runs runs on that base tree (fail-open to a plain
@@ -15603,6 +15612,161 @@ under option a): 242 of 246 in-scope failing cases counted and 102 of 102
 out-of-scope ones dropped; per set-sample, 15 of 15 with an in-scope case
 kept and 30 of 30 without one dropped; and the late runs of the two replayed
 chains (12 and 4) all converged, in every sample.
+
+**Done is a fixed bar per task, not re-sampled each run.** Own-start
+writing (above) re-decides "done" on every run from a fresh, stochastic
+sample of tests, and nothing tied that sample to what an earlier run of the
+same task had already accepted. So finished tasks kept reopening. On one
+report's lineage (barnacle, REST GET), 43bd4671 and 396c84e3 each overturned a
+confirmed no-work on counted failures with none genuine (8 of 8 and 9 of 9
+over-reach or test error), and 43bd4671's change introduced a real regression
+that the next run, 673a0cc6, spent itself fixing.
+
+The invariant: **a report-pointer task that ended `done` stays done as long as
+the tests that passed when it finished still pass. A later run's new failures
+are reported as advisory and create no work; a failure of those recorded tests
+reopens the task. No LLM takes part in this decision.** It is deliberately not
+a judgement of which fresh failures are real. Three benched attempts to have a
+worker make that judgement failed: the `set_auditor` dropped 2 of 17 bad cases,
+and `scope_judge` v4 and a structural version of it each lost genuine recall on
+held-out cases. So the judgement is removed, and what it costs is stated below.
+
+*The bar.* When a report-pointer run ends `done`, its counted cases that pass
+on the tree it ships, with the control files of their sets, are recorded as the
+task's **settled bar**: copies of the passed test files and the IDs of the
+cases, under the state root (`settled-bars/`), never inside one run's
+directory.
+
+The key is the stripped task text and the path and content hash of each report
+the task points at, as the run read them at its start. "The task" for this rule
+means what was asked, and a task that points at a report asks what the report
+says, so a new finding in the same report is a new question, not a fresh failure
+to withhold. So a run whose task text or report changed has no bar and is
+swallowed by none: rewording the task or editing the report starts a new bar. The
+trade-off is that even a trivial report edit, a typo fixed, resets it: the next
+run behaves as a task with no bar, and fresh sets may reopen it until a `done`
+run records a new one. Content cannot be told trivial from substantive without a
+judgement, and a false reset costs a run where a false match would hide a finding.
+A report that cannot be read leaves nothing to key on, so no bar applies, and
+that is logged. The key is the bar's alone: the same-task lookups for the prior
+residual and the dispute bound keep matching on the task text.
+
+The bar is a record of
+tests that passed, not a set: it is never validated, rewritten or shown to a
+writer or a fixer, and it carries no fix (I3). It reconciles with own-start
+writing and Q6 because what Q6 measured were sets written at an old base that
+never passed anywhere; a bar case passed on a tree that holds the fix.
+
+*The bar does not grow.* Once recorded it is fixed: a later `done` run adds
+nothing. The ratchet this replaces appended each `done` run's cases, which
+could only add what the rule now withholds, and it broke the check itself: a
+later run whose PR was never merged would leave its own cases failing beside
+older passing ones, which reads as a regression. Under this rule a later `done`
+run exists only after a regression, or after a bar found unlanded. A bar found
+unlanded is replaced by the `done` run that found it, since nothing of it ever
+reached the tree.
+
+*At each later run's own start*, after the fresh sets are written and typed and
+before planning or any no-work settle, the bar is re-run per case in the
+held-out sandbox. A failing file runs once more and a case counts as failed
+only when it failed both times, so one flake does not reopen a done task. Then:
+
+- A bar case that can no longer run — the runner reports that its file does
+  not load or holds no test, or the case is gone — is dropped for good, and
+  logged. Q6's lesson holds: no case is kept that demands a shape no later code
+  has. A file the environment could not run says nothing of its cases: they are
+  kept, and the bar is not applied in this run, which goes on as if it had none.
+- When every bar case from the report's own scenarios that ran fails again, as
+  it did before the run that settled it, the fix the bar records is not on this
+  tree (its PR was never merged, or the tree moved back). The bar is ignored,
+  logged: today's behaviour. This cannot be told from a regression of every
+  case, so a one-case bar's regression, or a total one, is ignored too and left
+  to the fresh sets, which still count here.
+- When some bar case fails and another passes, accepted work has regressed and
+  the task is reopened. The failing cases join the run as a held-out set of
+  their own, whose failing cases count. Its names are always shown: they are the
+  run's work and not new to anyone. It overturns a held no-work confirmation
+  without the dispute bound, which exists to stop re-sampled tests, and it is
+  never audited or rewritten, since no worker may type a regression away. Its
+  names reach the planners as the no-work dispute does. A run that then changes
+  nothing is `unconverged`, not `no_work`. The fresh sets stand as typed in this
+  run: the task is no longer done, so the rule that withholds them has lapsed.
+- When every bar case passes, the bar **holds**. Every fresh counted failing
+  case is withdrawn from its set's counted cases and recorded as advisory, with
+  no auditor call and no contradiction check, and the run ends `no_work` before
+  planning.
+
+*Nothing else starts work while a bar holds.* The rule is decided by the
+invariant, so it is not "no other work" in the sense of asking who else has an
+opinion. The classifier marking required items unmet with no held-out failure,
+the `no_work_judge` disputing the classifier's claim, a prior run's recorded
+residual, and a classifier that this time does not type the task `bug-fixing`
+(the bar is still run, with no fresh sets) all give way: a bar that holds ends
+the run. What bypasses the rule is what cannot measure it. An operator's
+`--skip-acceptance-check` runs no held-out test at all, a repository with no
+scoped test command has no way to run one, and a bar that could not be measured
+or errored fails open to the run having no bar.
+
+*The user sees what was withheld.* The advisory cases are the rule's whole cost,
+so they are listed in the run's final log, its no-work reasons and `run.json`,
+each with its set, file and name, with the plain statement that the task stays
+done on its recorded tests and that editing the report or rewording the task
+starts a new bar. A PR would
+carry the same list in its advisory section; no run that withholds a case makes
+one today, since a held bar ends with no commits. They never reach the next
+run's residual: the run has no gate, so nothing is handed on.
+
+*Tasks with no bar.* A run that ended `done` before this shipped left no bar,
+so the first later run of that task behaves as before; its own `done`, if any,
+records one. Nothing is backfilled. A task that has never ended `done` has no
+bar, however many of its runs have merged a PR.
+
+**What was measured.** A mechanical replay of the recorded barnacle runs through
+`_record_settled_bar` and `_settled_bar_withdraw`, with no worker and no
+repository code run; the bar's status at each own start was read from the
+commits. REST-GET's bar is 107cd8a3's one counted case and its set's control
+file. At 43bd4671's own start, which has #682 merged, it holds, so 43bd4671's 8
+hand-labelled over-reach cases are withheld and the run ends `no_work`. That
+removes the 8 of 17 bad cases that started the churn, and #685 with them. The
+runs after it then do not exist on these trees: the 8 genuine cases of 673a0cc6
+all trace to `isInstanceSlug`, which #685 added and which is absent from
+107cd8a3's end tree and #682's merge. Read on the recorded trees those runs did
+have, the bar is `regressed`, not held: its control file asserts `["lang", "en"]`
+and `/venues/time-machine/slots`, which #685 changed and every later tree keeps.
+So on those trees the rule withholds nothing: 673a0cc6's 8 genuine cases stay
+work, and so do 396c84e3's 2 test errors and 7 over-reach, which fresh sets may
+count on a reopened task. No hand-labelled genuine case is withheld in either
+view. a41a09fd's one counted case (compact date-window keys) has no hand label.
+Not covered, because no earlier run of the task ended `done`: 73751002 (3
+over-reach), 80e66fce, d7c06fe3, 0d1c4033 and a2a825c2.
+
+The report did not change across this lineage: the report text in the scope
+judge's prompts hashes the same in all six REST-GET runs, so the content key
+leaves these decisions as they are.
+
+**Known limits.**
+
+- *A real gap on a held tree creates no work. This is the accepted cost, and the
+  user chose it.* A real gap in a fresh sample, on a tree whose bar holds, is
+  listed as advisory and nothing more, until someone rewords the task or edits
+  the report. Its size is unmeasured: under the rule those samples are never
+  acted on, and no recorded run sampled a held tree after 43bd4671.
+- *A regression of every report case reads as unlanded.* Squash merges leave no
+  ancestry to tell the two apart, so a one-case bar's regression, or a total one,
+  is ignored and left to the fresh sets. REST-GET's bar has one counted case.
+- *A reopened task's fresh sets count.* On a regressed bar nothing is withheld, so
+  over-reach can come back into a reopened run: on their recorded trees,
+  396c84e3's 9 bad cases stay work. Withholding them too would also withhold
+  673a0cc6's 8 genuine ones there, so they stand.
+- *The bar is narrower than everything that passed.* It holds counted cases and
+  their sets' control files, not every case passing at the finish: 1 of the 24
+  cases in 107cd8a3's sets is counted. REST-GET's bar sees #685's regression only
+  through its control file, so a set with a less specific control sees less.
+
+**Not measured:** the bar's re-run at the own start in a real run, which runs
+repository code and so stays inside leerie's confinement; the statuses above are
+read, not executed. The re-run, its statuses and the no-work exit are exercised
+only by the test suite, on small real repositories.
 
 **A case has one name in every tree.** A set runs in several trees: its
 validation and its scope judge in its own (`acceptance-N`,

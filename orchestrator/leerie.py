@@ -7421,6 +7421,13 @@ def _pr_advisory(state: dict) -> list[str]:
                     + f"({_pr_entry(r.get('why')) or 'flagged'})")
     block("Contract literals another subtask may not honour",
           "contract_literal_checks", rows)
+    withheld = _settled_bar_advisory_lines(state)
+    if withheld:
+        # Whole, never capped: this list is the only place a withheld case
+        # is said (DESIGN §8 *Done is a fixed bar per task*).
+        out.extend(["**Held-out cases withheld by the task's settled bar**",
+                    *[f"- {_pr_entry(line.strip())}" for line in withheld],
+                    ""])
     acc = state.get("acceptance")
     gate = acc.get("gate") if isinstance(acc, dict) else None
     final = gate.get("final") if isinstance(gate, dict) else None
@@ -33534,20 +33541,27 @@ def _d1_split_sections(text: str, source: str, start: int) -> list[dict]:
     return out
 
 
-def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
-    """The reports to inline for the classifier: files the task names
-    (`_glob_task_references`) with a markdown suffix that no repository
-    holds (`_checkout_file_tracked`: a submodule's file is the repository's
-    too), each at most `D1_REPORT_MAX_BYTES`. Path and git-index checks
-    only; a file too large is named in the log and left to the
-    classifier's own tools."""
-    out: dict[str, str] = {}
+def _d1_report_paths(task: str, repo_root: Path) -> list[tuple[str, Path]]:
+    """The reports a task points at, `(path relative to the repository,
+    path)`: files it names (`_glob_task_references`) with a markdown suffix
+    that no repository holds (`_checkout_file_tracked`: a submodule's file is
+    the repository's too). Path and git-index checks only."""
+    out: list[tuple[str, Path]] = []
     for f in _glob_task_references(task, repo_root):
         if f.suffix.lower() not in _D1_REPORT_SUFFIXES:
             continue
         rel = _repo_rel(f, repo_root)
-        if _checkout_file_tracked(Path(repo_root), rel):
-            continue
+        if not _checkout_file_tracked(Path(repo_root), rel):
+            out.append((rel, f))
+    return out
+
+
+def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
+    """The reports to inline for the classifier (`_d1_report_paths`), each
+    at most `D1_REPORT_MAX_BYTES`; a file too large is named in the log and
+    left to the classifier's own tools."""
+    out: dict[str, str] = {}
+    for rel, f in _d1_report_paths(task, repo_root):
         try:
             if f.lstat().st_size > D1_REPORT_MAX_BYTES:
                 log(f"  requirement coverage: {rel} is over "
@@ -41445,6 +41459,13 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                     + ", which fails under B*; the probe is held-out "
                     "content no fixer could see, so no re-drive round was "
                     "spent on it")
+    # A regressed bar is work: a run that changed nothing did not do it
+    # (DESIGN §8 *Done is a fixed bar per task*).
+    regressed = (acc.get("settled_bar") or {}) if isinstance(acc, dict) else {}
+    if regressed.get("status") == "regressed" and not any_commits:
+        reasons.append(f"{int(regressed.get('failed') or 0)} test(s) that "
+                       "passed when this task last ended done fail on this "
+                       "tree, and the run changed nothing")
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
@@ -41477,7 +41498,15 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     st.data["outcome"] = outcome
     st.data["outcome_reasons"] = reasons
     st.save()
-    _write_run_json(st.run_dir, outcome=outcome)
+    if outcome == "done":
+        # The task's settled bar, when it has none yet (DESIGN §8 *Done is a
+        # fixed bar per task, not re-sampled each run*).
+        _record_settled_bar_safely(st)
+    withheld = _settled_bar_advisory(st.data)
+    _write_run_json(st.run_dir, outcome=outcome,
+                    **({"settled_bar_advisory": {
+                        "note": SETTLED_BAR_ADVISORY_NOTE,
+                        "cases": withheld}} if withheld else {}))
     log(f"outcome: {outcome}"
         + (f" — {'; '.join(reasons)}" if reasons else ""))
     return outcome
@@ -41566,6 +41595,8 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     log("done — task already satisfied on HEAD; no commits made, "
         "working branch unchanged" if outcome == "no_work" else
         f"done — {outcome}: no commits to push; working branch unchanged")
+    for line in _settled_bar_advisory_lines(st.data):
+        log(line)
     # Surface what the run cost — the classifier + one planner per
     # category still ran. Same shape as phase_finalize's run-weight
     # line so the no-work and normal paths report cost identically.
@@ -54512,11 +54543,17 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     parsed = (_parse_runner_report(spec[2], bytes(got_report) or None,
                                    str(tree))
               if spec else None)
+    # `ran_nothing`: the runner itself says this file does not load or holds
+    # no test, unlike every other None here, which is the environment's.
     if parsed is None:
         if rc in _acceptance_no_verdict_exits(cmd, [rel]):
+            if observed is not None:
+                observed["ran_nothing"] = True
             return None
         return rc == 0
     if parsed["collection_error"]:
+        if observed is not None:
+            observed["ran_nothing"] = True
         if failure_mode == "import":
             # Recorded so the set says what was SEEN on the base, not only
             # what the writer declared (the repair prompt relies on it).
@@ -54525,6 +54562,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             return False
         return None
     if parsed["executed"] == 0:
+        if observed is not None:
+            observed["ran_nothing"] = True
         return None
     # Per case (DESIGN §8): the report's own case statuses are the verdict,
     # not the exit code — a coverage threshold or a teardown error turns the
@@ -55002,7 +55041,23 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     if st.data.get("skip_acceptance_check"):
         return {"skipped": "--skip-acceptance-check"}
     if "bug-fixing" not in (st.data.get("categories") or []):
-        return {"skipped": "not a defect-fix run (no defect-scope audit)"}
+        # No sets to write, but the classifier does not decide whether a done
+        # task stays done (DESIGN §8 *Done is a fixed bar per task*).
+        skipped = {"skipped": "not a defect-fix run (no defect-scope audit)"}
+        base = _acceptance_own_start(st)
+        if not base or not resolve_test_files_scoped(st.repo_root):
+            return skipped
+        sets: list[dict] = []
+        key = _settled_bar_key(task, st.repo_root)
+        bar = await _settled_bar_at_own_start(key, st, caps, sets, base)
+        if not bar:
+            return skipped
+        if sets:
+            return {"validity_base": base,
+                    "report_base": _acceptance_report_base(st), "sets": sets,
+                    "written": 0, "discarded": [], "settled_bar_key": key,
+                    "settled_bar": bar}
+        return {**skipped, "settled_bar": bar}
     if not resolve_test_files_scoped(st.repo_root):
         canonical = _canonical_test_command(st.repo_root)
         _template, why = _infer_scoped_test_template(canonical)
@@ -55016,6 +55071,9 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     base = _acceptance_own_start(st)
     if not base:
         return {"skipped": "no validity base"}
+    # Before anything reads the report: a bar is recorded under the report
+    # this run worked from, whatever happens to the file meanwhile.
+    key = _settled_bar_key(task, st.repo_root)
     n = int(caps.get("acceptance_sets", DEFAULT_CAPS["acceptance_sets"]))
     log(f"phase 2: writing {n} held-out acceptance set(s) against the "
         f"run's own start {base[:12]} (DESIGN §8)")
@@ -55041,8 +55099,14 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     await _acceptance_scope_judge_sets(task, st, caps, models, efforts, sets)
     report_base = _acceptance_report_base(st)
     await _record_report_reproduced(st, caps, sets, base, report_base)
+    # The task's settled bar, re-run here at the own start before any
+    # planning or no-work settle (DESIGN §8 *Done is a fixed bar per task*).
+    bar = await _settled_bar_at_own_start(key, st, caps, sets, base,
+                                          written=n)
     return {"validity_base": base, "report_base": report_base,
-            "sets": sets, "written": n, "discarded": discarded}
+            "sets": sets, "written": n, "discarded": discarded,
+            **({"settled_bar_key": key} if key else {}),
+            **({"settled_bar": bar} if bar else {})}
 
 
 def _acceptance_own_start(st: "State") -> str | None:
@@ -55899,9 +55963,13 @@ def _acceptance_shown_indices(sets: list[dict]) -> set[int]:
     """Indices of the sets whose case names may leave the gate — to a repair
     round or a planner. With four or more valid sets the two highest-indexed
     are held back, so a fix fitted to the shown names still fails them
-    (DESIGN §8 *Held-out acceptance tests*); with fewer, all are shown."""
-    ordered = sorted(s_["index"] for s_ in sets)
-    return set(ordered[:-2]) if len(ordered) >= 4 else set(ordered)
+    (DESIGN §8 *Held-out acceptance tests*); with fewer, all are shown. A
+    regressed settled bar's set is always shown and never counts toward the
+    four: it is the run's work, and no name of it is new (DESIGN §8 *Done is
+    a fixed bar per task*)."""
+    bar = {s_["index"] for s_ in sets if s_.get("settled_bar")}
+    ordered = sorted(s_["index"] for s_ in sets if s_["index"] not in bar)
+    return (set(ordered[:-2]) if len(ordered) >= 4 else set(ordered)) | bar
 
 
 def _format_acceptance_task_section(task: str, items: list) -> str:
@@ -56603,6 +56671,10 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             if i in by_index and not results[i].get("passed")
             and not results[i].get("unmeasured")
             and not _acceptance_set_broken(by_index[i])
+            # A bar case that passed once and fails again is a regression:
+            # no worker may type it away or rewrite it (DESIGN §8 *Done is a
+            # fixed bar per task*).
+            and not by_index[i].get("settled_bar")
             and int(by_index[i].get("rewrite_rounds") or 0) < cap]
 
     def _save() -> None:
@@ -56719,6 +56791,516 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
         if sur.get("dir"):
             _remove_acceptance_checkout(st, Path(sur["dir"]))
     return [results.get(r["index"], r) for r in final]
+
+
+# --- The settled bar (DESIGN §8 *Done is a fixed bar per task, not
+# re-sampled each run*) ------------------------------------------------------
+
+SETTLED_BARS_DIRNAME = "settled-bars"
+SETTLED_BAR_FILE = "bar.json"
+SETTLED_BAR_ADVISORY_NOTE = (
+    "This task stays done on its recorded tests: they still pass on this "
+    "tree, so these failing held-out cases created no work. Editing the "
+    "report or rewording the task starts a new bar.")
+
+
+def _settled_bar_key(task: str, repo_root: Path) -> str | None:
+    """What a bar is keyed by: the stripped task text and the path and
+    content hash of each report it points at (`_d1_report_paths`), so a new
+    finding in the same report starts a new bar. Not the same-task match of
+    `_prior_delivery_residual` and `_prior_acceptance_dispute_record`, which
+    keep the task text alone. None on a task pointing at no report, and,
+    logged, when a report cannot be read: no bar applies."""
+    reports: list[list[str]] = []
+    for rel, f in _d1_report_paths(task, repo_root):
+        try:
+            if f.lstat().st_size > D1_REPORT_MAX_BYTES:
+                raise OSError(f"over {D1_REPORT_MAX_BYTES} bytes")
+            body = _read_beneath(repo_root, f, limit=READ_LIMIT_TEXT)
+        except OSError as e:
+            log(f"  settled bar: the report {rel} cannot be read ({e}) — no "
+                "bar applies to this run")
+            return None
+        reports.append([rel, hashlib.sha256(body).hexdigest()])
+    if not reports:
+        return None
+    text = json.dumps({"task": (task or "").strip(),
+                       "reports": sorted(reports)}, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
+def _settled_bar_dir(leerie_root: Path, key: str) -> Path:
+    return Path(leerie_root) / SETTLED_BARS_DIRNAME / key
+
+
+def _load_settled_bar(leerie_root: Path, key: str) -> dict:
+    """The task's bar record, `{"entries": []}` when there is none or it
+    cannot be read: an unreadable bar is no bar (behaviour as before it)."""
+    path = _settled_bar_dir(leerie_root, key) / SETTLED_BAR_FILE
+    try:
+        data = json.loads(_read_text_beneath(Path(leerie_root), path,
+                                             limit=READ_LIMIT_CONFIG))
+    except (OSError, ValueError):
+        return {"entries": []}
+    if not isinstance(data, dict) or not isinstance(data.get("entries"),
+                                                    list):
+        return {"entries": []}
+    data["entries"] = [e for e in data["entries"] if isinstance(e, dict)
+                       and isinstance(e.get("run"), str)
+                       and isinstance(e.get("defect"), dict)]
+    return data
+
+
+def _save_settled_bar(leerie_root: Path, key: str, bar: dict) -> None:
+    path = _settled_bar_dir(leerie_root, key) / SETTLED_BAR_FILE
+    _write_beneath(Path(leerie_root), path,
+                   (json.dumps(bar, indent=1, sort_keys=True) + "\n")
+                   .encode("utf-8"))
+
+
+def _settled_bar_entry_dir(leerie_root: Path, key: str, entry: dict) -> Path:
+    return (_settled_bar_dir(leerie_root, key) / entry["run"]
+            / f"set-{int(entry.get('set') or 0)}")
+
+
+def _settled_bar_entry_files(entry: dict) -> list[str]:
+    return sorted(set(list(entry.get("defect") or {})
+                      + list(entry.get("control") or [])
+                      + list(entry.get("support") or [])))
+
+
+def _record_settled_bar(st: "State") -> dict | None:
+    """When a report-pointer run ends `done`: record its counted cases that
+    pass on the tree it ships, with their sets' control files, as the task's
+    settled bar (DESIGN §8 *Done is a fixed bar per task*). Copies of the
+    passed test files go under the state root, never a fix. The bar is fixed
+    once recorded: a later done run replaces it only when this run found it
+    `unlanded`, and adds nothing to it otherwise. Idempotent per run. Returns
+    what was recorded, or None."""
+    task = (st.data.get("task") or "").strip()
+    acc = st.data.get("acceptance")
+    if not task or not isinstance(acc, dict):
+        return None
+    gate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
+    final = gate.get("final")
+    key = acc.get("settled_bar_key")
+    if not isinstance(final, list) or not key:
+        return None
+    root = Path(st.leerie_root)
+    bar = _load_settled_bar(root, key)
+    others = [e for e in bar["entries"] if e.get("run") != st.run_id]
+    status = (acc.get("settled_bar") or {}).get("status")
+    if others and status != "unlanded":
+        return None
+    results = {r.get("index"): r for r in final if isinstance(r, dict)}
+    entries: list[dict] = []
+    for s_ in acc.get("sets") or []:
+        if not isinstance(s_, dict) or _acceptance_set_broken(s_) \
+                or s_.get("settled_bar"):
+            continue
+        r = results.get(s_.get("index"))
+        if not isinstance(r, dict) or r.get("unmeasured"):
+            continue
+        failing_files = set(r.get("failing_files") or [])
+        failing_cases = (r.get("failing_cases")
+                         if isinstance(r.get("failing_cases"), dict) else {})
+        scope = s_.get("scope") if isinstance(s_.get("scope"), dict) else {}
+        if scope.get("bounded") is True:
+            counted = scope.get("counted_cases") or {}
+        else:
+            counted = s_.get("base_failing_cases") or {}
+        defect: dict[str, list[str]] = {}
+        for rel, ids in (counted.items() if isinstance(counted, dict)
+                         else ()):
+            if rel not in (s_.get("defect_files") or []) or not ids:
+                continue
+            if rel in failing_files:
+                still = failing_cases.get(rel)
+                if not isinstance(still, list) or not still:
+                    continue            # no per-case record: the file failed
+                ids = [c for c in ids if c not in set(still)]
+            if ids:
+                defect[rel] = [str(c) for c in ids]
+        if not defect:
+            continue
+        control = [rel for rel in s_.get("control_files") or []
+                   if rel not in failing_files]
+        entry = {"run": st.run_id, "set": int(s_["index"]),
+                 "recorded_at": now(), "own_start": acc.get("validity_base"),
+                 "tree": gate.get("final_sha"), "defect": defect,
+                 "control": control,
+                 "support": list(s_.get("support_files") or []),
+                 "modes": {rel: (s_.get("modes") or {}).get(rel, "assertion")
+                           for rel in defect}}
+        dest = _settled_bar_entry_dir(root, key, entry)
+        _remove_beneath(root, dest)
+        for rel in _settled_bar_entry_files(entry):
+            _copy_beneath(Path(s_["dir"]) / rel, root, dest / rel,
+                          src_anchor=st.run_dir, limit=READ_LIMIT_TEXT)
+        entries.append(entry)
+    if not entries:
+        return None
+    # An unlanded bar's files go with it: only this run's are the bar now.
+    for run in {e["run"] for e in others}:
+        _remove_beneath(root, _settled_bar_dir(root, key) / run)
+    bar["entries"] = entries
+    bar["task_sha256"] = _task_fingerprint(task)
+    _save_settled_bar(root, key, bar)
+    n = sum(len(ids) for e in entries for ids in e["defect"].values())
+    log(f"  settled bar: recorded {n} passing counted case(s) from "
+        f"{len(entries)} set(s) as this task's bar (DESIGN §8 *Done is a "
+        "fixed bar per task*)")
+    return {"entries": len(entries), "cases": n}
+
+
+def _record_settled_bar_safely(st: "State") -> None:
+    """`_record_settled_bar`, never raising: the bar is evidence for later
+    runs, and a failure to keep it must not change this run's outcome."""
+    try:
+        got = _record_settled_bar(st)
+    except Exception as e:
+        log(f"  settled bar: not recorded ({type(e).__name__}: {e})")
+        return
+    acc = st.data.get("acceptance")
+    if got and isinstance(acc, dict):
+        acc["settled_bar_recorded"] = got
+        st.save()
+
+
+def _settled_bar_advisory(state: dict) -> list[dict]:
+    """The fresh cases this run's held bar withheld, `{set, file, case}`.
+    Reads a plain state dict: the PR composer has no `State`."""
+    acc = state.get("acceptance") if isinstance(state, dict) else None
+    bar = acc.get("settled_bar") if isinstance(acc, dict) else None
+    got = bar.get("advisory") if isinstance(bar, dict) else None
+    return [a for a in got if isinstance(a, dict)] if isinstance(got,
+                                                                 list) else []
+
+
+def _settled_bar_advisory_lines(state: dict) -> list[str]:
+    """What the run says about its withheld cases: the plain statement, then
+    each case with its set, file and name. [] when none was withheld."""
+    cases = _settled_bar_advisory(state)
+    if not cases:
+        return []
+    lines = [f"settled bar: {len(cases)} held-out case(s) withheld as "
+             f"advisory. {SETTLED_BAR_ADVISORY_NOTE}"]
+    for a in cases:
+        rel, case = str(a.get("file") or "?"), a.get("case")
+        name = str(case).removeprefix(f"{rel} :: ") if case else "(whole file)"
+        lines.append(f"  set {a.get('set')}: {rel} :: {name}")
+    return lines
+
+
+async def _run_settled_bar_file(st: "State", caps: dict, wt: Path,
+                                entry_dir: Path, entry: dict, rel: str,
+                                label: str) -> dict:
+    """One bar file run at the own start: `{verdict, gone, status{case:
+    status}, failing[], messages{}}`. `verdict` None: no verdict, and `gone`
+    says the runner found the file no longer loads or holds no test, against
+    the environment failing to run it. A failing file runs once more, and a
+    case stays failed only when it failed both times: one flake must not
+    reopen a done task."""
+    place = tuple((str(entry_dir / r), r)
+                  for r in _settled_bar_entry_files(entry))
+    log_path = _held_out_logs(st.run_dir) / "acceptance-settled-bar.log"
+
+    async def _once() -> dict:
+        obs: dict = {}
+        verdict = await _run_acceptance_file(
+            st, caps, str(wt), rel, log_path, label, validating=True,
+            failure_mode=(entry.get("modes") or {}).get(rel, "assertion"),
+            observed=obs, place=place)
+        if obs.get("load_failure"):
+            verdict = None
+        return {"verdict": verdict, "gone": bool(obs.get("ran_nothing")),
+                "status": dict(obs.get("case_status") or {}),
+                "failing": list(obs.get("failing_cases") or []),
+                "messages": dict(obs.get("failure_messages") or {})}
+    first = await _once()
+    if first["verdict"] is not False:
+        return first
+    again = await _once()
+    if again["verdict"] is not False:
+        return again
+    if not (first["status"] and again["status"]):
+        return again                    # no per-case record: the file failed
+    before = {c for c, s in first["status"].items() if s == "failed"}
+    both = {c for c, s in again["status"].items()
+            if s == "failed" and c in before}
+    again["status"] = {c: ("failed" if c in both
+                           else "passed" if s == "failed" else s)
+                       for c, s in again["status"].items()}
+    again["failing"] = sorted(both)[:20]
+    again["messages"] = {c: m for c, m in again["messages"].items()
+                         if c in both}
+    if not both:
+        again["verdict"] = True
+    return again
+
+
+async def _settled_bar_at_own_start(key: str | None, st: "State", caps: dict,
+                                    sets: list[dict], base: str, *,
+                                    written: int = 0) -> dict | None:
+    """`_settled_bar_check`, failing open: any error leaves the fresh sets
+    as the scope judge typed them (behaviour as without a bar) and records
+    why."""
+    try:
+        return await _settled_bar_check(key, st, caps, sets, base,
+                                        written=written)
+    except Exception as e:
+        log(f"  settled bar: check failed ({type(e).__name__}: {e}) — the "
+            "fresh sets stand as typed")
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"[:300]}
+
+
+async def _settled_bar_check(key: str | None, st: "State", caps: dict,
+                             sets: list[dict], base: str, *,
+                             written: int = 0) -> dict | None:
+    """Re-run the task's settled bar at the own start and act on it (DESIGN
+    §8 *Done is a fixed bar per task, not re-sampled each run*): drop a bar
+    case that can no longer run, for good; ignore a bar whose report cases
+    all fail again (`unlanded`); add the failing cases of a regressed bar as
+    a counted set of their own (`regressed`); and, when the bar `holds`,
+    withdraw every fresh counted failing case as advisory. No worker takes
+    part. None with no key (`_settled_bar_key`) or no bar under it."""
+    if not key:
+        return None
+    root = Path(st.leerie_root)
+    bar = _load_settled_bar(root, key)
+    if not bar["entries"]:
+        return None
+    rec: dict = {"status": "empty", "entries": len(bar["entries"]),
+                 "passed": 0, "failed": 0, "dropped": [], "skipped": [],
+                 "unmeasured": [], "advisory": [], "injected": []}
+    async with _acceptance_tree(st, caps, base, "acceptance-bar",
+                                "settled-bar") as wt:
+        if wt is None:
+            log("  settled bar: the own-start tree could not be set up — "
+                "the fresh sets stand as typed")
+            return {**rec, "status": "unmeasured"}
+        runs: list[tuple[dict, Path, dict]] = []   # (entry, dir, per file)
+        changed = False
+        for entry in bar["entries"]:
+            edir = _settled_bar_entry_dir(root, key, entry)
+            tag = f"{entry['run'][:12]}/set-{entry.get('set')}"
+            if any(_lexists_beneath(wt, wt / r)
+                   for r in _settled_bar_entry_files(entry)):
+                rec["skipped"].append(tag)
+                log(f"  settled bar: {tag} not run — a path it uses exists "
+                    "in this tree")
+                continue
+            per: dict[str, dict] = {}
+            for rel in list(entry["defect"]) + list(entry.get("control")
+                                                    or []):
+                got = await _run_settled_bar_file(
+                    st, caps, wt, edir, entry, rel,
+                    f"settled-bar-{entry['run'][:12]}-{entry.get('set')}")
+                if got["verdict"] is None and not got["gone"]:
+                    # The environment's failure says nothing of the case:
+                    # it is neither dropped nor counted as passing.
+                    rec["unmeasured"].append(f"{tag}/{rel}")
+                    log(f"  settled bar: {rel} of {tag} could not be run "
+                        "here")
+                    continue
+                if got["verdict"] is None:
+                    # Cannot run any more (Q6): never demand a shape no
+                    # later code has.
+                    rec["dropped"].append(f"{tag}/{rel}")
+                    log(f"  settled bar: dropped {rel} of {tag} — it no "
+                        "longer runs on this tree")
+                    entry["defect"].pop(rel, None)
+                    if rel in (entry.get("control") or []):
+                        entry["control"].remove(rel)
+                    changed = True
+                    continue
+                if rel in entry["defect"]:
+                    keep = []
+                    for cid in entry["defect"][rel]:
+                        if got["status"] and cid not in got["status"]:
+                            rec["dropped"].append(f"{tag}/{cid}")
+                            log(f"  settled bar: dropped case {cid} — the "
+                                "runner no longer reports it")
+                            changed = True
+                            continue
+                        keep.append(cid)
+                    entry["defect"][rel] = keep
+                    if not keep:
+                        entry["defect"].pop(rel)
+                per[rel] = got
+            runs.append((entry, edir, per))
+        if changed:
+            bar["entries"] = [e for e in bar["entries"] if e["defect"]]
+            _save_settled_bar(root, key, bar)
+        # Every bar case's outcome here.
+        defect_out: list[bool] = []
+        failures: list[tuple[dict, Path, dict, dict[str, list[str]]]] = []
+        for entry, edir, per in runs:
+            if not entry["defect"]:
+                continue
+            fails: dict[str, list[str]] = {}
+            for rel, got in per.items():
+                if rel in entry["defect"]:
+                    for cid in entry["defect"][rel]:
+                        s = (got["status"].get(cid) if got["status"]
+                             else "passed" if got["verdict"] else "failed")
+                        if s == "passed":
+                            defect_out.append(True)
+                        elif s == "failed":
+                            defect_out.append(False)
+                            fails.setdefault(rel, []).append(cid)
+                elif got["verdict"] is False:
+                    fails[rel] = (got["failing"]
+                                  or [f"{rel} :: (whole file)"])
+            if fails:
+                failures.append((entry, edir, per, fails))
+        rec["passed"] = sum(1 for x in defect_out if x)
+        rec["failed"] = sum(len(v) for _e, _d, _p, f in failures
+                            for v in f.values())
+        if not defect_out:
+            if rec["unmeasured"]:
+                rec["status"] = "unmeasured"
+            log("  settled bar: no case of it ran here — not applied")
+            return rec
+        if not any(defect_out):
+            rec["status"] = "unlanded"
+            log(f"  settled bar: every one of its {len(defect_out)} report "
+                "case(s) fails again here, as before the run that settled "
+                "it — that fix is not on this tree; the bar is not applied")
+            return rec
+        if failures:
+            rec["status"] = "regressed"
+            rec["injected"] = _inject_settled_bar_sets(st, sets, failures,
+                                                       written)
+            log(f"  settled bar: {rec['failed']} accepted case(s) fail on "
+                "this tree — a regression; added as held-out set(s) "
+                f"{rec['injected']}, counted")
+            return rec
+        if rec["unmeasured"]:
+            rec["status"] = "unmeasured"
+            log(f"  settled bar: {len(rec['unmeasured'])} of its file(s) "
+                "could not be run here, so it cannot be said to hold — not "
+                "applied")
+            return rec
+        rec["status"] = "holds"
+        rec["advisory"] = _settled_bar_withdraw(sets)
+        log(f"  settled bar: holds — {rec['passed']} accepted case(s) pass "
+            f"here; {len(rec['advisory'])} fresh failing case(s) withheld as "
+            "advisory")
+    return rec
+
+
+def _inject_settled_bar_sets(st: "State", sets: list[dict],
+                             failures: list, written: int) -> list[int]:
+    """The failing cases of a regressed bar, as held-out sets of this run
+    whose failing cases count (DESIGN §8 *Done is a fixed bar per task*).
+    Appended to `sets`, indexed past every set written (valid or not, so a
+    discarded set's index is never reused); returns their indices."""
+    out: list[int] = []
+    root = Path(st.leerie_root)
+    acc_n = max([0, int(written or 0)]
+                + [int(s_.get("index") or 0) for s_ in sets])
+    for entry, edir, per, fails in failures:
+        acc_n += 1
+        dest = st.run_dir / "acceptance" / f"bar-{acc_n}"
+        _rmtree_owned(dest)
+        for rel in _settled_bar_entry_files(entry):
+            _copy_beneath(edir / rel, st.run_dir, dest / rel,
+                          src_anchor=root, limit=READ_LIMIT_TEXT)
+        files = list(entry["defect"]) + list(entry.get("control") or [])
+        defect = [rel for rel in files if rel in fails]
+        control = [rel for rel in files if rel not in fails and rel in per]
+        sets.append({
+            "index": acc_n, "valid": True, "dir": str(dest),
+            "defect_files": defect, "control_files": control,
+            "support_files": list(entry.get("support") or []),
+            "cases": {rel: list(fails[rel]) for rel in defect},
+            "modes": {rel: "assertion" for rel in defect},
+            "base_failing_cases": {rel: list(fails[rel]) for rel in defect},
+            "base_case_status": {rel: dict(per[rel]["status"])
+                                 for rel in defect if rel in per},
+            "base_failure_messages": {rel: dict(per[rel]["messages"])
+                                      for rel in defect if rel in per},
+            "scope": {"bounded": True, "by": "settled_bar", "judged": {},
+                      "counted_cases": {rel: list(fails[rel])
+                                        for rel in defect}},
+            "settled_bar": {"run": entry["run"], "set": entry.get("set")},
+            "report_reproduced": None})
+        out.append(acc_n)
+    return out
+
+
+def _settled_bar_withdraw(sets: list[dict]) -> list[dict]:
+    """While the bar holds: every fresh counted failing case leaves its
+    set's counted cases and is returned as advisory, `{set, file, case}`
+    (`case` None for a file that counted whole, with no per-case record).
+    A set the scope judge could not bound becomes bounded here, or its
+    failing files would still count."""
+    out: list[dict] = []
+    for s_ in sets:
+        scope = s_.get("scope") if isinstance(s_.get("scope"), dict) else {}
+        bounded = scope.get("bounded") is True
+        src = (scope.get("counted_cases") if bounded
+               else s_.get("base_failing_cases")) or {}
+        for rel, ids in src.items():
+            out.extend({"set": s_["index"], "file": rel, "case": str(c)}
+                       for c in ids or [])
+        if not bounded:
+            out.extend({"set": s_["index"], "file": rel, "case": None}
+                       for rel in s_.get("defect_files") or []
+                       if not src.get(rel))
+            scope = {"bounded": True, "by": "settled_bar", "judged": {},
+                     "unbounded_error": scope.get("error")}
+        scope["counted_cases"] = {}
+        s_["scope"] = scope
+    return out
+
+
+def _settled_bar_settles_run(st: "State") -> bool:
+    """Act on this run's settled bar before any planning or no-work settle
+    (DESIGN §8 *Done is a fixed bar per task*). A bar that holds ends the
+    run as no work, True, whatever the classifier, the `no_work_judge` or
+    the fresh sets said. A regressed bar overturns any held no-work
+    confirmation and tells the planners what regressed, without a re-measure
+    (the bar has just run on this tree) or the dispute bound (a bar case is
+    no re-sampled test). False on anything else: the run goes on as if it
+    had no bar."""
+    acc = st.data.get("acceptance")
+    bar = acc.get("settled_bar") if isinstance(acc, dict) else None
+    status = bar.get("status") if isinstance(bar, dict) else None
+    if status == "holds":
+        st.data.pop("no_work_pending", None)
+        withheld = _settled_bar_advisory_lines(st.data)[1:]
+        st.data["no_work_acceptance"] = {
+            "verdict": "settled_bar_holds",
+            "advisory": len(_settled_bar_advisory(st.data))}
+        _finish_no_work_run(st, {"<settled bar holds>": (
+            f"this task's {int(bar.get('passed') or 0)} recorded test "
+            "case(s) still pass on this tree"
+            + (f". {SETTLED_BAR_ADVISORY_NOTE} Withheld: "
+               + "; ".join(x.strip() for x in withheld) if withheld else ""))},
+            headline="settled bar: this task ended done on an earlier run "
+                     "and its recorded tests still pass — nothing to plan")
+        return True
+    if status == "regressed":
+        by_index = {s_.get("index"): s_ for s_ in acc.get("sets") or []}
+        cases = [str(c) for i in bar.get("injected") or []
+                 for ids in ((by_index.get(i) or {}).get("scope") or {})
+                 .get("counted_cases", {}).values() for c in ids]
+        conf = st.data.get("no_work_confirmation") or {}
+        st.data.pop("no_work_pending", None)
+        st.data["no_work_acceptance"] = {"verdict": "settled_bar_regressed",
+                                         "cases": cases[:20]}
+        st.data["no_work_dispute"] = {
+            "classifier_evidence": conf.get("classifier_evidence", ""),
+            "judge_evidence": ("Tests that passed when an earlier run of "
+                               "this task ended done now fail on HEAD: "
+                               + "; ".join(cases[:20])),
+            "checked": []}
+        st.save()
+        log(f"  settled bar: {len(cases)} accepted case(s) regressed — "
+            "planning the work")
+    return False
 
 
 async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
@@ -57854,6 +58436,27 @@ def _acceptance_all_fixed_by_execution(acc: dict) -> bool:
         for k in range(1, written + 1))
 
 
+def _settle_case_names(set_: dict, rel: str,
+                       failing_cases: dict | None) -> list[str]:
+    """The names a dispute gives for one failing file that is work: the
+    runner's failing case IDs, only the counted ones when the scope judge
+    bounded the set; with no per-case record, the counted IDs of a bounded
+    set, else the writer's declared names for the file (the file counts
+    whole)."""
+    failing = (failing_cases or {}).get(rel) if isinstance(
+        failing_cases, dict) else None
+    scope = set_.get("scope") if isinstance(set_.get("scope"), dict) else {}
+    counted = ((scope.get("counted_cases") or {}).get(rel)
+               if _acceptance_counted_files(set_) is not None else None)
+    if isinstance(failing, list) and failing:
+        if counted is None:
+            return [str(c) for c in failing]
+        return [str(c) for c in failing if c in set(counted)]
+    if counted is not None:
+        return [str(c) for c in counted]
+    return [str(c) for c in (set_.get("cases") or {}).get(rel, [])]
+
+
 async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     """Decide a held no-work confirmation on executed evidence (DESIGN §8
     *No work is declared on executed evidence, and a dispute is
@@ -57898,23 +58501,30 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     failing_sets = sum(1 for r in measured if not r["passed"])
     # Names from shown sets only: the dispute evidence reaches the planners
     # and through them the implementers, and the held-back sets must stay
-    # unseen until the gate re-judges on them (DESIGN §8).
+    # unseen until the gate re-judges on them (DESIGN §8). And only the
+    # failing cases that are work — counted ones, of a set that is work —
+    # never every case of a failing file (DESIGN §8 *No work is declared on
+    # executed evidence*).
     shown = _acceptance_shown_indices(list(sets.values()))
-    cases = [c for r in measured if not r["passed"] and r["index"] in shown
-             for rel in r["failing_files"]
-             for c in sets[r["index"]]["cases"].get(rel, [])][:20]
+    named: list[list[str]] = [
+        _settle_case_names(sets[r["index"]], rel, r.get("failing_cases"))
+        for r in measured if not r["passed"] and r["index"] in shown
+        and r["index"] in sets
+        and _acceptance_result_has_work(sets[r["index"]],
+                                        r.get("failing_files") or [],
+                                        r.get("failing_cases"))
+        for rel in r["failing_files"]
+        if _acceptance_counted_files(sets[r["index"]]) is None
+        or _acceptance_file_has_work(sets[r["index"]], rel,
+                                     r.get("failing_cases"))]
+    cases = [c for names in named for c in names][:20]
     # With no names, say why: held back, or a failing shown set named none.
     no_names = ("the failing cases were not named" if any(
         not r["passed"] and r["index"] in shown for r in measured)
         else "every failing case is held back from planning")
     # Named and unnamed failures mixed: say the names are not the whole list.
-    if cases and any(not sets[r["index"]]["cases"].get(rel)
-                     for r in measured
-                     if not r["passed"] and r["index"] in shown
-                     for rel in r["failing_files"]):
-        cases_note = "; other failing tests named no cases"
-    else:
-        cases_note = ""
+    cases_note = ("; other failing tests named no cases"
+                  if cases and any(not names for names in named) else "")
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
                                          "results": res, "cases": cases}
@@ -71345,6 +71955,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.data["acceptance"] = await _acceptance_write_or_skip(
                 task, st, caps, models, efforts)
             st.save()
+        # A done task stays done unless its bar regresses, whatever the
+        # classifier, the judge or the fresh sets say (DESIGN §8 *Done is a
+        # fixed bar per task*).
+        if ("plans_after_plan" not in st.data
+                and _settled_bar_settles_run(st)):
+            return
         if (st.data.get("no_work_pending")
                 and "no_work_acceptance" not in st.data):
             if await _settle_pending_no_work_failing_open(st, caps):
