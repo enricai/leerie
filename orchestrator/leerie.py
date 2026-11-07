@@ -51899,7 +51899,7 @@ async def _delivery_judge_unmet(
                     if v.get("item_index") not in gone]}
             return smp
 
-        async def _ask(prompt: str, max_turns: int, allowed: set[int],
+        async def _ask(prompt: str, turns: int, allowed: set[int],
                        sid: str) -> dict:
             st.bump_workers(caps)
             smp = await claude_p(
@@ -51907,7 +51907,7 @@ async def _delivery_judge_unmet(
                 system_prompt=_load_prompt("delivery_judge"),
                 schema_key="delivery_judge", cwd=str(judge_cwd[0]),
                 allowed_tools=SATISFIED_PROBE_TOOLS,
-                max_turns=max_turns,
+                max_turns=turns,
                 autonomous=False, caps=caps, st=st,
                 model=models.get("delivery_judge", MODEL_DEFAULT),
                 effort=efforts.get("delivery_judge"),
