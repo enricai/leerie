@@ -99,12 +99,31 @@ def _measure(leerie, st, staging, caps) -> Path:
         st, staging, caps, log_path=st.run_dir / "view.log", label="t")))
 
 
-def _ino(p: Path) -> int:
-    return os.lstat(p).st_ino
+@pytest.fixture()
+def hold():
+    """`hold(path)` opens the file and keeps it open for the test. A file
+    held open cannot have its inode freed, so no later file can be given the
+    same number: an inode compared after a delete can be reused and prove
+    nothing, but `_is_held(fd, path)` is true only if `path` is that very
+    file. (A second hard link would hold it as well, but linking changes the
+    file's ctime, which the install snapshot rightly reads as a change.)"""
+    fds: list[int] = []
+
+    def _hold(p: Path) -> int:
+        fds.append(os.open(p, os.O_RDONLY))
+        return fds[-1]
+    yield _hold
+    for fd in fds:
+        os.close(fd)
 
 
-def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
-    """The view moves: the install's own output stays (same inode), the
+def _is_held(fd: int, p: Path) -> bool:
+    return os.path.samestat(os.fstat(fd), os.stat(p))
+
+
+def test_a_new_tip_with_the_same_inputs_keeps_the_install(
+        leerie, env, hold):
+    """The view moves: the install's own output stays (the same file), the
     install runs again over it, the builds run again, and nothing else of
     the old tip — a measurement's report, a tool's cache under
     `node_modules`, a build's output, its own stores, its measurement
@@ -114,7 +133,7 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
     v1 = _measure(leerie, st, staging, caps)
     assert _git(v1, "rev-parse", "HEAD") == a
     dep = v1 / "node_modules" / "dep" / "index.js"
-    ino = _ino(dep)
+    held = hold(dep)
     assert (v1 / "node_modules" / ".gen" / "out").read_text() == "2"
     # What measurements left at tip a.
     (v1 / "report.txt").write_text("old")
@@ -130,7 +149,7 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
     v2 = _measure(leerie, st, staging, caps)
     assert v2 == v1
     assert _git(v2, "rev-parse", "HEAD") == b
-    assert _ino(dep) == ino                        # the install kept
+    assert _is_held(held, dep)           # the install kept
     assert count(v2) == 2                          # and run again over it
     assert (v2 / "dist" / "out.txt").read_text() == "3"
     for gone in ("report.txt", "dist/stale.txt", "node_modules/.cache",
@@ -142,20 +161,20 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(leerie, env):
     assert _git(v2, "status", "--porcelain") == ""
 
 
-def test_a_changed_install_input_makes_a_fresh_view(leerie, env):
+def test_a_changed_install_input_makes_a_fresh_view(leerie, env, hold):
     st, staging, caps, _count = env
     _commit(leerie, staging, {"src/a.txt": "2"})
     v1 = _measure(leerie, st, staging, caps)
-    ino = _ino(v1 / "node_modules")
+    held = hold(v1 / "node_modules" / "dep" / "index.js")
     c = _commit(leerie, staging, {"package.json": '{"name": "y"}\n'})
     v2 = _measure(leerie, st, staging, caps)
     assert _git(v2, "rev-parse", "HEAD") == c
-    assert _ino(v2 / "node_modules") != ino
+    assert not _is_held(held, v2 / "node_modules/dep/index.js")
     assert (v2 / "node_modules/dep/index.js").read_text() == \
         '{"name": "y"}\n'
 
 
-def test_an_install_a_measurement_changed_is_not_kept(leerie, env):
+def test_an_install_a_measurement_changed_is_not_kept(leerie, env, hold):
     """An in-place edit of a file the install made, even one that keeps its
     size and puts its mtime back, sends the view back to a fresh one."""
     st, staging, caps, _count = env
@@ -167,10 +186,10 @@ def test_an_install_a_measurement_changed_is_not_kept(leerie, env):
     with open(dep, "r+") as f:
         f.write("X" + text[1:])
     os.utime(dep, ns=(before.st_atime_ns, before.st_mtime_ns))
-    nm = _ino(v1 / "node_modules")
+    held = hold(dep)
     _commit(leerie, staging, {"src/a.txt": "3"})
     v2 = _measure(leerie, st, staging, caps)
-    assert _ino(v2 / "node_modules") != nm
+    assert not _is_held(held, v2 / "node_modules/dep/index.js")
     assert (v2 / "node_modules/dep/index.js").read_text() == text
 
 
