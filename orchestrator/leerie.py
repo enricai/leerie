@@ -70,7 +70,7 @@ import uuid
 import weakref
 import xml.etree.ElementTree as ElementTree
 import zlib
-from collections import deque
+from collections import Counter, deque
 from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
                              Iterator, Mapping, MutableMapping)
 from datetime import datetime, timedelta, timezone
@@ -960,6 +960,10 @@ STATE_FIELDS = (
     # re-driven*): per-sid {rounds[], last, final, uncovered, open_gaps?,
     # rolled_back?}; `final` covered / untested / rolled_back / unmeasured.
     "coverage_redrive",
+    # Existing tests the run changed (DESIGN §8 *Existing tests the run
+    # changed are listed in the PR*): {files: [...], files_omitted: n}, stored
+    # at finalize, report-only.
+    "tracked_test_report",
     # Write-ahead marker of a wave-end re-drive round on a subtask's branch
     # (DESIGN §6 *A re-drive interrupted mid-round is undone, never
     # integrated*): per-sid {kind, pre_sha, round, status}.
@@ -7091,6 +7095,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     "## Untested after re-drive",
     "## Integration content loss",
     "## Repository merge checks still red",
+    "## Existing tests changed by this run",
     "## Advisory (not verified by this run)",
 )
 # One rendered entry's text: one line, bounded (`_normalize_risk_text`).
@@ -7099,6 +7104,9 @@ _PR_ENTRY_MAX = 300
 _PR_ADVISORY_SHOWN = 10
 # Unexecuted line numbers listed per file under "Untested after re-drive".
 _PR_LINES_SHOWN = 20
+# Changed-test entries (one removed or added assertion or case, a deleted
+# file, a skip count) listed under "Existing tests changed by this run".
+_PR_TRACKED_TEST_SHOWN = 60
 
 
 def _strip_worker_risk_sections(body: str) -> tuple[str, bool]:
@@ -7435,14 +7443,66 @@ def _pr_advisory(state: dict) -> list[str]:
     return out
 
 
+def _pr_tracked_test_lines(state: dict) -> list[str]:
+    """The body of `## Existing tests changed by this run`, from the
+    `tracked_test_report` finalize stored: per file, what the base had and
+    the final tree lacks, then what the final tree added. Bounded by
+    `_PR_TRACKED_TEST_SHOWN` entries; the rest are counted. Never raises."""
+    rep = state.get("tracked_test_report")
+    files = rep.get("files") if isinstance(rep, dict) else None
+    if not isinstance(files, list):
+        return []
+    hidden = rep.get("files_omitted") if isinstance(
+        rep.get("files_omitted"), int) else 0
+    out: list[str] = []
+    shown = 0
+    for rec in files:
+        if not isinstance(rec, dict) or not _pr_entry(rec.get("file")):
+            continue
+        entries: list[str] = []
+        if rec.get("deleted") is True:
+            entries.append("- file deleted")
+        for key, label in (("removed", "removed assertion"),
+                           ("cases_removed", "removed case"),
+                           ("added", "added assertion"),
+                           ("cases_added", "added case")):
+            vals = rec.get(key)
+            entries += [f"- {label}: {_pr_code(v)}"
+                        for v in (vals if isinstance(vals, list) else [])
+                        if isinstance(v, str) and v.strip()]
+        n = rec.get("skips_added")
+        if isinstance(n, int) and n > 0:
+            entries.append(f"- skip markers added: {n}")
+        room = _PR_TRACKED_TEST_SHOWN - shown
+        extra = rec.get("omitted") if isinstance(rec.get("omitted"),
+                                                 int) else 0
+        if room <= 0:
+            hidden += len(entries) + extra
+            continue
+        if len(entries) > room:
+            hidden += len(entries) - room
+            entries = entries[:room]
+        hidden += extra
+        shown += len(entries)
+        out += [f"**{_pr_code(rec['file'])}**", *entries, ""]
+    if hidden:
+        out.append(f"({hidden} more changed assertions, cases or files "
+                   "not listed here; the run's state records up to "
+                   f"{_TRACKED_TEST_ITEMS_MAX} per list.)")
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to seven headed lists, each
+    rendered by code, from typed state*). Up to eight headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Needs human verification` (typed external resources only),
     `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
+    `## Existing tests changed by this run`,
     `## Advisory (not verified by this run)`.
 
     Rendered once at finalize and written to `run.json` as `pr_end_state`
@@ -7560,6 +7620,16 @@ def _format_pr_end_state_section(state: dict) -> str:
         sections.append(("## Repository merge checks still red", [
             "Checks the repository's CI runs before a merge, confirmed red "
             "on this branch and green on its base.", "", *lines]))
+
+    lines = _pr_tracked_test_lines(state)
+    if lines:
+        sections.append(("## Existing tests changed by this run", [
+            "Tests the repository already had, as the run's branch differs "
+            "from its base: assertions and cases the base had that the "
+            "branch lacks, and ones the branch added. Nothing verified "
+            "these against the task, and a legitimate update looks the "
+            "same as a weakened test: review each before merging.", "",
+            *lines]))
 
     lines = _pr_advisory(state)
     if lines:
@@ -61733,6 +61803,249 @@ def _redrive_weakened_tests(repo: str | Path, base: str, head: str
     return out
 
 
+# --- The run's changes to tests the repository already had -------------------
+# DESIGN §8 *Existing tests the run changed are listed in the PR*. Every
+# pattern here reads test source or paths — mechanical strings, never prose
+# (§12).
+
+# A test-shaped path: the escalation gate's shapes plus Python's own.
+_TRACKED_TEST_RE = re.compile(
+    r"(\.test\.|\.spec\.|/__tests__/|(^|/)tests?/|\.test-helper\."
+    r"|(^|/)test_[^/]*\.py$|_test\.py$)")
+# Where an assertion statement opens, in the code mask (`_tt_mask`).
+_TT_ASSERT_JS_RE = re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(")
+_TT_ASSERT_PY_RE = re.compile(
+    r"^[ \t]*assert\b|\.assert[A-Z]\w*\s*\(|\bpytest\.raises\s*\(", re.M)
+_TT_CASE_JS_RE = re.compile(r"(?<![\w.$])(?:it|test)\s*\(")
+_TT_CASE_PY_RE = re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+(test\w*)",
+                            re.M)
+_TT_SKIP_PY_RE = re.compile(
+    r"@pytest\.mark\.(?:skip|skipif|xfail)\b|\bpytest\.(?:skip|xfail)\s*\("
+    r"|@unittest\.(?:skip|skipIf|skipUnless|expectedFailure)\b"
+    r"|\.skipTest\s*\(")
+# A JS `/` after one of these (or at the start) opens a regex literal.
+_TT_REGEX_PREV = set("(,=:[!&|?{};+-*%<>~^")
+# The longest statement read; a scan that runs on is cut there.
+_TT_STMT_MAX = 4000
+# Marks string and regex-literal content in the mask.
+_TT_STR = "\x00"
+
+
+def _tt_mask(src: str, py: bool) -> tuple[str, str]:
+    """`(code, mask)`, both as long as `src`: `code` with comments blanked;
+    `mask` with comments blanked and every string and JS regex literal's
+    content replaced by `_TT_STR`, so a pattern matched on it never matches
+    inside a string and a bracket count never counts one."""
+    code = list(src)
+    mask = list(src)
+    n = len(src)
+    i = 0
+    prev = ""
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if src[k] != "\n":
+                code[k] = mask[k] = " "
+
+    while i < n:
+        c = src[i]
+        if (py and c == "#") or (not py and src.startswith("//", i)):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if not py and src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+            continue
+        regex = (not py and c == "/" and (prev == "" or prev in _TT_REGEX_PREV))
+        if c in "'\"" or (c == "`" and not py) or regex:
+            q = c * 3 if py and src.startswith(c * 3, i) else c
+            j = i + len(q)
+            end = n
+            in_class = False
+            while j < n:
+                d = src[j]
+                if d == "\\":
+                    j += 2
+                    continue
+                if regex:
+                    if d == "[":
+                        in_class = True
+                    elif d == "]":
+                        in_class = False
+                    elif d == "/" and not in_class:
+                        end = j
+                        j += 1
+                        break
+                    elif d == "\n":
+                        end = j
+                        break
+                    j += 1
+                    continue
+                if src.startswith(q, j):
+                    end = j
+                    j += len(q)
+                    break
+                if len(q) == 1 and c != "`" and d == "\n":
+                    end = j
+                    break
+                j += 1
+            for k in range(i + len(q), min(end, n)):
+                mask[k] = _TT_STR
+            prev = c
+            i = min(j, n)
+            continue
+        if not c.isspace():
+            prev = c
+        i += 1
+    return "".join(code), "".join(mask)
+
+
+def _tt_stmt(code: str, mask: str, i: int, py: bool, *,
+             args: bool = False) -> str:
+    """The normalised text of the statement opening at `i` — or, with
+    `args`, of the call argument starting there: read to a `;`, a top-level
+    newline (a JS line continuing with `.`/`?.` continues it; a Python
+    backslash continues it) or a closing bracket of the enclosing
+    expression; a top-level `,` ends a JS statement and every argument.
+    Whitespace outside strings is dropped — one space kept between two word
+    characters (`assert x`) — and a `,` before a closing bracket, so
+    reformatting reads as the same statement."""
+    out: list[str] = []
+    depth = 0
+    gap = False
+    end = min(len(mask), i + _TT_STMT_MAX)
+    while i < end:
+        c = mask[i]
+        if c == _TT_STR:
+            out.append(code[i])
+            i += 1
+            continue
+        if c.isspace():
+            if c == "\n" and depth == 0 and not args:
+                if py:
+                    if out and out[-1] == "\\":
+                        out.pop()
+                        i += 1
+                        continue
+                    break
+                k = i + 1
+                while k < end and mask[k].isspace():
+                    k += 1
+                if mask.startswith(".", k) or mask.startswith("?.", k):
+                    i = k
+                    continue
+                break
+            gap = True
+            i += 1
+            continue
+        if gap and out and (out[-1].isalnum() or out[-1] in "_$") and (
+                c.isalnum() or c in "_$"):
+            out.append(" ")
+        gap = False
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                break
+        elif depth == 0 and (c == ";" or (c == "," and (args or not py))):
+            break
+        out.append(c)
+        i += 1
+    return re.sub(r",(?=[)\]}])", "", "".join(out))
+
+
+def _tt_facts(src: str, path: str) -> dict:
+    """One test file's assertions and cases (multisets of their normalised
+    text) and its count of skip/only/todo markers."""
+    py = path.endswith(".py")
+    code, mask = _tt_mask(src, py)
+    if py:
+        asserts = Counter(_tt_stmt(code, mask, m.start(), True)
+                          for m in _TT_ASSERT_PY_RE.finditer(mask))
+        cases = Counter(m.group(1) for m in _TT_CASE_PY_RE.finditer(mask))
+        skips = len(_TT_SKIP_PY_RE.findall(mask))
+    else:
+        asserts = Counter(_tt_stmt(code, mask, m.start(), False)
+                          for m in _TT_ASSERT_JS_RE.finditer(mask))
+        cases = Counter(_tt_stmt(code, mask, m.end(), False, args=True)
+                        for m in _TT_CASE_JS_RE.finditer(mask))
+        skips = len(_TG_SKIP_RE.findall(mask))
+    return {"asserts": asserts, "cases": cases, "skips": skips}
+
+
+
+# What the report keeps of one file: at most this many items per list.
+_TRACKED_TEST_ITEMS_MAX = 20
+# Files the report keeps; the rest are counted.
+_TRACKED_TEST_FILES_MAX = 200
+
+
+def _tracked_test_report(repo: str | Path, base: str, head: str) -> dict:
+    """Every tracked test (a test-shaped file present at `base`) that `head`
+    changed, measured once over the whole run: the assertions and cases the
+    base had and `head` lacks (removed, loosened or a changed expected
+    value), the assertions and cases `head` has that the base lacked, skip
+    markers added, a deleted file. A change a later commit reverted is not
+    listed; a file only added to is not listed. Report-only: nothing reads
+    this to decide anything (DESIGN §8 *Existing tests the run changed are
+    listed in the PR*). Lists keep source order and are bounded; what a list
+    cut is counted in `omitted`."""
+    names = _redrive_git(repo, "diff", "--name-only", "-z", "--no-renames",
+                         base, head).split("\0")
+    files: list[dict] = []
+    skipped_files = 0
+    for f in sorted(x for x in names if x):
+        if (not _TRACKED_TEST_RE.search(f)
+                or not _redrive_exists_at(repo, base, f)):
+            continue
+        rec: dict = {"file": f}
+        if not _redrive_exists_at(repo, head, f):
+            rec["deleted"] = True
+        else:
+            fb = _tt_facts(_redrive_git(repo, "show", f"{base}:{f}"), f)
+            fh = _tt_facts(_redrive_git(repo, "show", f"{head}:{f}"), f)
+            lost = {"removed": fb["asserts"] - fh["asserts"],
+                    "cases_removed": fb["cases"] - fh["cases"]}
+            skips = fh["skips"] - fb["skips"]
+            if not any(lost.values()) and skips <= 0:
+                continue
+            gained = {"added": fh["asserts"] - fb["asserts"],
+                      "cases_added": fh["cases"] - fb["cases"]}
+            omitted = 0
+            for key, counter in (*lost.items(), *gained.items()):
+                items = [t[:_PR_ENTRY_MAX] for t in counter.elements()]
+                rec[key] = items[:_TRACKED_TEST_ITEMS_MAX]
+                omitted += max(0, len(items) - _TRACKED_TEST_ITEMS_MAX)
+            if skips > 0:
+                rec["skips_added"] = skips
+            if omitted:
+                rec["omitted"] = omitted
+        if len(files) < _TRACKED_TEST_FILES_MAX:
+            files.append(rec)
+        else:
+            skipped_files += 1
+    return {"files": files, "files_omitted": skipped_files}
+
+
+
+async def _store_tracked_test_report(st: "State", base: str) -> None:
+    """Measure the run branch against `base` and keep it in
+    `tracked_test_report`. Never raises: a report must not stop a finalize."""
+    try:
+        st.data["tracked_test_report"] = await asyncio.to_thread(
+            _tracked_test_report, _run_repo(st), base,
+            _compute_run_branch(st.run_id))
+    except Exception as e:
+        log(f"finalize: tracked-test report skipped "
+            f"({type(e).__name__}: {e})")
+
+
 _SG_ID = r"[A-Za-z_$][\w$]*"
 _SG_EMPTY_RE = re.compile(
     r"(\?\?|\|\|)\s*(\[\s*\]|\{\s*\}|new\s+Map\s*\(\s*\)|new\s+Set\s*\(\s*\))")
@@ -70068,6 +70381,11 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # The run branch carries commits; whether they finish the task is the
     # decider's call — `unconverged` makes the host open a draft PR.
     outcome = _decide_outcome(st, any_commits=True)
+    # Report-only (DESIGN §8 *Existing tests the run changed are listed in
+    # the PR*): measured once, base to final tree, after the outcome is
+    # decided and read by nothing that decides. Fail-open.
+    if base:
+        await _store_tracked_test_report(st, base)
     st.data["finished_at"] = now()
     st.save()
     will_push = not no_push

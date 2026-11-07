@@ -7254,6 +7254,22 @@ together.
 | `_forbidden_command_hook_main` | Denies a forbidden command first (`forbidden command: <cmd> — the task forbids it`), else, when `kills` is set, a `_process_kill_hit` (`process kill by name or pattern (<form>) — …TaskStop…`). |
 | `scripts/forbidden-command-hook.py` | Decodes the payload and the event itself, and for a kills-only payload allows any command whose text contains neither `kill` nor `fuser` without importing leerie (an import costs ~1.7 s where no bytecode cache can be written, and the hook runs before every Bash call of every acting worker). `tests/test_process_kill_deny.py` pins that every recognised kill form passes that prefilter. |
 
+### Existing tests the run changed (DESIGN §8)
+
+Report-only. `phase_finalize` calls `_tracked_test_report(_run_repo(st),
+base, run_branch)` once, after `_decide_outcome`, in a thread and
+fail-open, and stores it as `tracked_test_report`. It compares each
+test-shaped file (`_TRACKED_TEST_RE`) present at the run's own start with the
+final tree through `_tt_facts` (`_tt_mask` blanks comments and masks strings
+and JS regex literals; `_tt_stmt` reads an assertion statement or a case's
+title to its end, whitespace- and trailing-comma-free). Nothing reads the
+record except `_pr_tracked_test_lines`, which `_format_pr_end_state_section`
+renders as `## Existing tests changed by this run` (listed in
+`_PR_END_STATE_HEADINGS`, so a worker-written copy is stripped), and which
+therefore reaches the launcher's fallback through `pr_end_state` and draft
+PRs alike. It changes no `outcome`, gate or retry; `_redrive_weakened_tests`
+(escalation gate (b)) is separate and untouched.
+
 ### Finalize evidence: site tokens, contract literals, whole-PR review (DESIGN §5, §8, §9)
 
 All three are advisory: none gates, re-drives or changes `outcome`. Order in
@@ -13214,6 +13230,7 @@ command line overrides it.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier, typed `unverified_external` with its `resource` only when it names `unexercisable_resource`, else `test_missing`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` with a non-empty `resource` (or `simulated_interleaving`) to the PR's "Needs human verification", grouped by that resource (an `unverified_external` entry stored with none, by an older leerie, is not rendered); `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
+| `tracked_test_report` | dict | existing tests the run changed (`_tracked_test_report`, DESIGN §8 *Existing tests the run changed are listed in the PR*): `{files: [{file, deleted?, removed[], cases_removed[], added[], cases_added[], skips_added?, omitted?}], files_omitted}`, stored once at `phase_finalize` (base to final tree), report-only; rendered by `_pr_tracked_test_lines` under `## Existing tests changed by this run`. Lists are source-ordered and bounded by `_TRACKED_TEST_ITEMS_MAX` / `_TRACKED_TEST_FILES_MAX`; the PR shows at most `_PR_TRACKED_TEST_SHOWN` entries and counts the rest. |
 | `settled_heads` | dict[str, str] | per-sid subtask branch tip at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
