@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import types
@@ -1212,13 +1213,24 @@ def _detection_env(leerie, tmp_path, monkeypatch, *, judged=True,
 def _falsifier_stub(leerie, monkeypatch, st, behave):
     """Stub claude_p: a falsifier call runs `behave(kw, n)` (n = how many
     falsifier calls so far) in its own cwd and returns its result; a judge
-    call is recorded and answered all-met."""
+    call is recorded and answered all-met — one verdict per item it is
+    asked, citing the base tree's `calc.py` (an omitted item is re-asked,
+    not met: DESIGN §8 *Every item is judged before its vote counts*)."""
     calls: list[dict] = []
 
     async def fake_claude_p(**kw):
         calls.append(kw)
         if kw["schema_key"] == "delivery_judge":
-            return {"verdicts": []}
+            asked = sorted({int(x) for x in re.findall(
+                r'"item_index": (\d+)', kw["user_prompt"])})
+            return {"verdicts": [{
+                "item_index": i, "met": True, "evidence": "read",
+                "parts": [{"requirement": "r", "kind": "static",
+                           "status": "met", "cites": [{
+                               "path": "calc.py", "line_start": 1,
+                               "line_end": 1,
+                               "quote": "def add(a, b):"}]}]}
+                for i in asked]}
         assert kw["schema_key"] == "falsifier"
         n = sum(1 for c in calls if c["schema_key"] == "falsifier") - 1
         return behave(kw, n)

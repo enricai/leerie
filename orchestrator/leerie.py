@@ -7212,6 +7212,7 @@ def _needs_human_detail_groups() -> dict[str, str]:
     entries have shapes of their own and are rendered apart."""
     return {
         RECORD_WORKER_GAP_SOURCE: "Task requirements",
+        JUDGE_UNINSPECTED_GAP_SOURCE: "Task requirements",
         DELIVERY_JUDGE_GAP_SOURCE: "Task requirements",
         RATCHET_UNVERIFIED_GAP_SOURCE: "Task requirements",
         REGRESSION_GAP_SOURCE: "Regression checks the run could not settle",
@@ -51017,6 +51018,56 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     return {**sample, "verdicts": out}
 
 
+def _delivery_uninspected(sample: dict, indices: Iterable[int]) -> list[int]:
+    """The `indices` a screened judge sample did not inspect (DESIGN §8
+    *Every item is judged before its vote counts*): no verdict for the
+    index, or its last verdict has a part typed `not_inspected` and none
+    typed `unmet`. Typed fields only, never the evidence prose."""
+    last: dict[int, dict] = {}
+    for v in sample.get("verdicts") or []:
+        idx = v.get("item_index") if isinstance(v, dict) else None
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            last[idx] = v
+    out: list[int] = []
+    for i in indices:
+        v = last.get(i)
+        if v is None:
+            out.append(i)
+            continue
+        if v.get("settled_by"):
+            continue
+        status = {p.get("status") for p in v.get("parts") or []
+                  if isinstance(p, dict)}
+        if "not_inspected" in status and "unmet" not in status:
+            out.append(i)
+    return out
+
+
+def _delivery_reask_chunks(missing: list[int],
+                           pack_len: int) -> list[list[int]]:
+    """The follow-up packs for a sample's uninspected items: all of them in
+    one, smaller than the pack that left them — or, when the sample
+    inspected none of a pack of more than one, its two halves."""
+    if not missing:
+        return []
+    if len(missing) < pack_len or len(missing) < 2:
+        return [list(missing)]
+    h = (len(missing) + 1) // 2
+    return [list(missing[:h]), list(missing[h:])]
+
+
+def _delivery_merge_reask(sample: dict, reask: dict,
+                          indices: set[int]) -> dict:
+    """`sample` with its verdicts for `indices` replaced by the follow-up's
+    verdicts for them; everything else (contract, site verdicts) is the
+    sample's own."""
+    kept = [v for v in sample.get("verdicts") or []
+            if not (isinstance(v, dict) and v.get("item_index") in indices)]
+    new = [v for v in reask.get("verdicts") or []
+           if isinstance(v, dict) and v.get("item_index") in indices]
+    return {**sample, "verdicts": kept + new}
+
+
 # The "Needs human verification" source for a required item whose only
 # evidence is a command a worker ran (DESIGN §8 *Execution-shaped items are
 # judged from the run's own records*).
@@ -51105,6 +51156,37 @@ def _set_record_worker_gap(st: "State", judged: Iterable[int],
                        f"worker ran in its own working tree, which leerie "
                        f"does not re-run: {cmds}. Run it on the PR branch "
                        f"and check.")})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
+
+
+# The "Needs human verification" source for a required item a majority of
+# its pack's judge samples did not inspect, even when re-asked for it
+# (DESIGN §8 *Every item is judged before its vote counts*).
+JUDGE_UNINSPECTED_GAP_SOURCE = "delivery_judge_not_inspected"
+
+
+def _set_judge_uninspected_gap(st: "State", judged: Iterable[int],
+                               items: dict[int, str]) -> None:
+    """The `JUDGE_UNINSPECTED_GAP_SOURCE` entries: one per item the judge
+    left uninspected, replaced for the items this pass judged and kept for
+    the rest."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    judged = set(judged)
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == JUDGE_UNINSPECTED_GAP_SOURCE
+                       and e.get("item_index") in judged)]
+    for i, text in sorted(items.items()):
+        entries.append({
+            "source": JUDGE_UNINSPECTED_GAP_SOURCE, "item_index": i,
+            "detail": (f"{str(text)[:200]} — the delivery judge did not "
+                       "inspect it on this commit, even when re-asked for "
+                       "it. Check it on the PR branch by hand.")})
     if entries != (data.get("needs_human_verification") or []):
         data["needs_human_verification"] = entries
         with contextlib.suppress(Exception):
@@ -51589,6 +51671,12 @@ async def _delivery_judge_unmet(
     first says, so the same rule decides — one met sample never overturns
     a majority (DESIGN §8 *A re-check replaces a verdict only on a tree
     that changed, and only by the vote that made it*).
+    A sample's uninspected items (`_delivery_uninspected`) are re-asked
+    once in a smaller pack; one still uninspected casts no vote, and an
+    item most of its pack's samples could not inspect is unknown
+    (`not_inspected` detail, `routing["not_inspected"]`, a "Needs human
+    verification" entry) — DESIGN §8 *Every item is judged before its
+    vote counts*.
     Exceptions (WorkerError / timeout) propagate; the callers treat the
     whole gate as advisory."""
     # Normalize BEFORE numbering (review rounds 1–2): required_items
@@ -51777,17 +51865,53 @@ async def _delivery_judge_unmet(
         allowed = set(pack)
 
         async def _sample(k: int) -> dict:
+            smp = await _ask(user_prompt, judge_max_turns, allowed,
+                             f"{sid_base}-s{k}")
+            # Every item is judged before its vote counts (DESIGN §8): what
+            # the sample handed back unread goes back once, alone.
+            missing = _delivery_uninspected(smp, pack)
+            if not missing:
+                return smp
+            still: list[int] = []
+            for c, chunk in enumerate(
+                    _delivery_reask_chunks(missing, len(pack))):
+                try:
+                    again = await _ask(
+                        _pack_prompt(chunk, False),
+                        min(30 + 6 * len(chunk), 90), set(chunk),
+                        f"{sid_base}-s{k}-r{c}")
+                except (WorkerError, subprocess.TimeoutExpired) as e:
+                    log(f"  delivery_judge ({phase_label}) follow-up for "
+                        f"{len(chunk)} uninspected item(s) failed "
+                        f"({_brief_worker_exc(e)}) — they stay uninspected")
+                    still += chunk
+                    continue
+                smp = _delivery_merge_reask(smp, again, set(chunk))
+                still += _delivery_uninspected(smp, chunk)
+            log(f"  delivery_judge ({phase_label}) sample {k} left "
+                f"{len(missing)} of {len(pack)} item(s) uninspected; "
+                f"re-asked — {len(missing) - len(still)} judged"
+                + (f", still uninspected: {sorted(still)}" if still else ""))
+            if still:
+                gone = set(still)
+                smp = {**smp, "uninspected": sorted(gone), "verdicts": [
+                    v for v in smp.get("verdicts") or []
+                    if v.get("item_index") not in gone]}
+            return smp
+
+        async def _ask(prompt: str, turns: int, allowed: set[int],
+                       sid: str) -> dict:
             st.bump_workers(caps)
             smp = await claude_p(
-                user_prompt=user_prompt,
+                user_prompt=prompt,
                 system_prompt=_load_prompt("delivery_judge"),
                 schema_key="delivery_judge", cwd=str(judge_cwd[0]),
                 allowed_tools=SATISFIED_PROBE_TOOLS,
-                max_turns=judge_max_turns,
+                max_turns=turns,
                 autonomous=False, caps=caps, st=st,
                 model=models.get("delivery_judge", MODEL_DEFAULT),
                 effort=efforts.get("delivery_judge"),
-                sid=f"{sid_base}-s{k}",
+                sid=sid,
             )
             # Merge by item_index: a verdict for an index outside this
             # pack is not this prompt's to give.
@@ -51815,6 +51939,7 @@ async def _delivery_judge_unmet(
             samples = [await _sample(0)]
             if (allowed & majority_held
                     or _delivery_unmet_majority(samples, n_items)
+                    or samples[0].get("uninspected")
                     or _contract_flagged(samples[0], with_contract)):
                 for k in (1, 2):
                     samples.append(await _sample(k))
@@ -51834,14 +51959,30 @@ async def _delivery_judge_unmet(
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
     human: dict[int, dict] = {}
+    unread: dict[int, str] = {}
     n_samples = 0
     for pack, samples in zip(packs, per_pack):
         n_samples += len(samples)
+        # An item a strict majority of the pack's samples could not inspect,
+        # even when re-asked, is unknown: never an unmet vote's to confirm,
+        # never met (DESIGN §8 *Every item is judged before its vote
+        # counts*). It cannot also reach the unmet majority below.
+        threshold = len(samples) // 2 + 1
+        abstained = {i: sum(1 for s in samples
+                            if i in (s.get("uninspected") or ()))
+                     for i in pack}
+        for i in pack:
+            if abstained[i] >= threshold:
+                unread[i] = normalized[i].get("item", "")
         if item_details is not None:
             for i in pack:
                 d = {"item_index": i, "samples": len(samples),
                      "unmet_votes": 0, "rejected": 0, "unmet_parts": [],
                      "met_evidence": ""}
+                if abstained[i]:
+                    d["uninspected"] = abstained[i]
+                if i in unread:
+                    d["not_inspected"] = True
                 seen_parts: set[str] = set()
                 for smp in samples:
                     v = next((x for x in reversed(smp.get("verdicts") or [])
@@ -51889,6 +52030,13 @@ async def _delivery_judge_unmet(
                               "evidence": evidence})
     confirmed.sort(key=lambda u: u["item_index"])
     _set_record_worker_gap(st, judge_idx, human)
+    _set_judge_uninspected_gap(st, judge_idx, unread)
+    if unread:
+        log(f"  delivery_judge ({phase_label}): {len(unread)} required "
+            "item(s) uninspected even when re-asked — unknown, listed for "
+            "a human: " + "; ".join(t[:80] for _, t in sorted(unread.items())))
+        if routing is not None:
+            routing["not_inspected"] = sorted(unread)
     if untyped and per_pack:
         _settle_untyped_sites(st, untyped, per_pack[0], staging,
                               exec_digest, cite_cache)
@@ -59739,6 +59887,15 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                                "not re-run"))
             rows.append(row)
             continue
+        if not by and (details_by_idx.get(i) or {}).get("not_inspected"):
+            # No judge sample read it, even when re-asked for it: unknown,
+            # listed for a human (`_set_judge_uninspected_gap`), never met.
+            row.update(verdict="unknown", by=[], falsifier=fi,
+                       judge=details_by_idx.get(i),
+                       reason=("the delivery judge did not inspect it, even "
+                               "when re-asked for it"))
+            rows.append(row)
+            continue
         if crashed and not by and settled is None:
             # Nothing read this commit for the item: unknown, never met.
             row.update(verdict="unknown", by=[], falsifier=fi,
@@ -60956,7 +61113,8 @@ def _ratchet_prior_met_all(st: "State", items: list) -> dict[int, str]:
                if isinstance(d, dict)}
         for i, it in enumerate(normalized):
             if (it.get("verifiability") != "external" and i not in unmet
-                    and not (det.get(i) or {}).get("worker_only")):
+                    and not (det.get(i) or {}).get("worker_only")
+                    and not (det.get(i) or {}).get("not_inspected")):
                 met[i] = str((det.get(i) or {}).get("met_evidence") or "")
     later = _ratchet_record(st).get("evidence") or {}
     for i in met:
@@ -62096,7 +62254,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                 full_vote=_judge_majority_items(prior.values()))
             hit = {u["item_index"]: u for u in unmet
                    if u.get("item_index") in judge_idx}
-            human = set(routing.get("human_verification") or [])
+            human = (set(routing.get("human_verification") or [])
+                     | set(routing.get("not_inspected") or []))
             for i in judge_idx:
                 u = hit.get(i)
                 out[i] = {"unmet": u is not None,
@@ -62106,7 +62265,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                     out[i]["evidence_by"] = {
                         out[i]["by"][0]: out[i]["evidence"][:1200]}
                 if u is None and i in human:
-                    # A met resting only on a worker's run: unknown.
+                    # A met resting only on a worker's run, or an item no
+                    # sample read: unknown.
                     out[i]["unknown"] = True
         except Exception as e:
             log(f"  delivery re-drive: item re-judge failed "
