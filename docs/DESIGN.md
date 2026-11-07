@@ -14677,6 +14677,21 @@ delivery re-drive (`_redrive_weakened_tests`: fewer expect/assert call sites,
 fewer cases, more skips, on the escalated round only) is a separate check
 and is unchanged.
 
+A rewritten setup lists too. A test can stop testing what it did without one
+assertion string changing: the call that drives the code under test is
+replaced, a fixture is reshaped, a `settle:` option dropped. So a file also
+gets a count line, `setup or other lines changed: N removed, M added`, when
+the final tree removes more non-blank, non-comment lines than the removed
+assertions and cases account for (each counted as one line). The count is
+over the file's lines with comments blanked (`_tt_mask`) and each line's
+whitespace collapsed, blank lines dropped, compared as multisets against
+the base: a deleted or added blank line or comment, a reindented or
+reflowed-in-place line and a moved line count nothing, a changed line counts
+one removed and one added. Nothing characterises those lines; the reviewer
+reads the diff. It over-reports on purpose (a removed case's body counts
+beyond its one line); a false positive costs a glance. A file only added to
+(0 removed lines) stays unlisted.
+
 Why not more. A branch built the stronger form: the same detector on every
 code-writing round, voiding a round that altered a tracked test unless the
 worker declared it with a quote of the task. A confined bench of that

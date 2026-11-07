@@ -290,3 +290,103 @@ def test_escalation_gate_b_is_unchanged_in_what_it_counts(leerie, repo):
     assert leerie._redrive_weakened_tests(repo, base, head) == []
     rep = leerie._tracked_test_report(repo, base, head)
     assert rep["files"][0]["removed"] == ["expect(total(cart)).toBe(10)"]
+
+
+SETUP_BASE = """\
+function drive() {
+  const io = {
+    settle: async (): Promise<void> => {
+      const pre = await snapshot();
+      await settleAfterClick(
+        page,
+        { n: 0 },
+        0,
+        true,
+        read,
+        pre.visibleTextSignature,
+        idleQuiescence
+      );
+    },
+    snapshot,
+  };
+  return io;
+}
+describe("report contract", () => {
+  it("is credited", async () => {
+    const r = await readAdvance(drive());
+    expect(r.pageAdvanced).toBe(true);
+  });
+});
+"""
+SETUP_HEAD = """\
+function drive() {
+  const io = {
+    settle: async (...args: unknown[]): Promise<void> => {
+      const baseline = args[5] as string;
+      await settleAfterClick(page, { n: 0 }, 0, true, read, baseline, idleQuiescence);
+    },
+    snapshot,
+  };
+  return io;
+}
+describe("report contract", () => {
+  it("is credited", async () => {
+    const r = await readAdvance(drive());
+    expect(r.pageAdvanced).toBe(true);
+    expect(r.post.networkCount).toBe(0);
+  });
+});
+"""
+
+
+def _setup_repo(repo):
+    (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "settle test")
+
+
+def test_a_rewritten_setup_with_no_assertion_change_is_listed(leerie, st,
+                                                              repo):
+    _setup_repo(repo)
+    run = Run(leerie, st)
+    run.commit(**{"tests/settle.test.ts": SETUP_HEAD})
+    sec = run.finalize(leerie)
+    assert "**`tests/settle.test.ts`**" in sec
+    # 11 base lines are gone (the `settle:` header, `const pre` and the
+    # nine lines of the call); 4 are new (the header, `const baseline`, the
+    # one-line call and the added assertion). No assertion string went.
+    assert "- setup or other lines changed: 11 removed, 4 added" in sec, sec
+    assert "- removed assertion" not in sec
+    assert "- added assertion: `expect(r.post.networkCount).toBe(0)`" in sec
+    assert sec.index("setup or other") > sec.index("**`tests/settle")
+
+
+def test_blank_comment_reindent_and_moved_lines_count_nothing(leerie, repo):
+    _setup_repo(repo)
+    base = _git(repo, "rev-parse", "HEAD")
+    text = SETUP_BASE.replace("    snapshot,\n", "\n    // note\n    snapshot,\n")
+    text = text.replace("  return io;", "      return   io;")
+    (repo / "tests" / "settle.test.ts").write_text(text)
+    _git(repo, "commit", "-qam", "noise")
+    rep = leerie._tracked_test_report(repo, base, _git(repo, "rev-parse",
+                                                       "HEAD"))
+    assert rep["files"] == []
+    # Deleting a blank line and a comment from a file that has them.
+    (repo / "tests" / "settle.test.ts").write_text(text)
+    base2 = _git(repo, "rev-parse", "HEAD")
+    (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE)
+    _git(repo, "commit", "-qam", "denoise")
+    assert leerie._tracked_test_report(
+        repo, base2, _git(repo, "rev-parse", "HEAD"))["files"] == []
+
+
+def test_a_removed_assertion_alone_does_not_add_a_line_count(leerie, repo):
+    _setup_repo(repo)
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "tests" / "settle.test.ts").write_text(SETUP_BASE.replace(
+        "    expect(r.pageAdvanced).toBe(true);\n", ""))
+    _git(repo, "commit", "-qam", "drop")
+    rec = leerie._tracked_test_report(
+        repo, base, _git(repo, "rev-parse", "HEAD"))["files"][0]
+    assert rec["removed"] == ["expect(r.pageAdvanced).toBe(true)"]
+    assert "lines_removed" not in rec

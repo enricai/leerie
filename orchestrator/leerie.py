@@ -7473,6 +7473,10 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
         n = rec.get("skips_added")
         if isinstance(n, int) and n > 0:
             entries.append(f"- skip markers added: {n}")
+        lr, la = rec.get("lines_removed"), rec.get("lines_added")
+        if isinstance(lr, int) and isinstance(la, int) and lr > 0:
+            entries.append(f"- setup or other lines changed: {lr} removed, "
+                           f"{la} added")
         room = _PR_TRACKED_TEST_SHOWN - shown
         extra = rec.get("omitted") if isinstance(rec.get("omitted"),
                                                  int) else 0
@@ -61976,7 +61980,12 @@ def _tt_facts(src: str, path: str) -> dict:
         cases = Counter(_tt_stmt(code, mask, m.end(), False, args=True)
                         for m in _TT_CASE_JS_RE.finditer(mask))
         skips = len(_TG_SKIP_RE.findall(mask))
-    return {"asserts": asserts, "cases": cases, "skips": skips}
+    # Every non-blank line, comments blanked, whitespace collapsed: what the
+    # report counts for setup that no assertion or case string shows.
+    lines = Counter(" ".join(ln.split()) for ln in code.splitlines()
+                    if ln.strip())
+    return {"asserts": asserts, "cases": cases, "skips": skips,
+            "lines": lines}
 
 
 
@@ -62013,7 +62022,12 @@ def _tracked_test_report(repo: str | Path, base: str, head: str) -> dict:
             lost = {"removed": fb["asserts"] - fh["asserts"],
                     "cases_removed": fb["cases"] - fh["cases"]}
             skips = fh["skips"] - fb["skips"]
-            if not any(lost.values()) and skips <= 0:
+            gone = fb["lines"] - fh["lines"]
+            # Each removed assertion or case explains one removed line; any
+            # more is setup or other code the strings do not show.
+            extra = (sum(gone.values()) > sum(
+                sum(c.values()) for c in lost.values()))
+            if not any(lost.values()) and skips <= 0 and not extra:
                 continue
             gained = {"added": fh["asserts"] - fb["asserts"],
                       "cases_added": fh["cases"] - fb["cases"]}
@@ -62024,6 +62038,9 @@ def _tracked_test_report(repo: str | Path, base: str, head: str) -> dict:
                 omitted += max(0, len(items) - _TRACKED_TEST_ITEMS_MAX)
             if skips > 0:
                 rec["skips_added"] = skips
+            if extra:
+                rec["lines_removed"] = sum(gone.values())
+                rec["lines_added"] = sum((fh["lines"] - fb["lines"]).values())
             if omitted:
                 rec["omitted"] = omitted
         if len(files) < _TRACKED_TEST_FILES_MAX:
