@@ -5669,24 +5669,49 @@ The unprivileged route holds namespace capabilities only inside a child
 user namespace, which the evaluated code never holds after `exec`, and
 needs no privileged code.
 
-**A falsifier's probe is held-out content.** The falsifier reads every
-valid set, held-back ones included (its leads), so what it writes — the
-probe's source, its case title, its quoted assertion, its prose — can carry
-a held-back set's text. Its probe is therefore run as a set file is: placed
-in a sandbox over the pristine checkout of the final commit, never copied
-into a checkout (it was, for its confirm runs and its facts read, and the
-checkout outlives the sample); a saved probe (`acceptance/probes/`) is
-re-run only through the evaluation (`_evaluate_acceptance_sets`). What
-leaves a confirmed sample is the span of the item's own words the probe
-tests (checked verbatim in the item) and the fact that it fails under
-B\* — never the probe's text, its case title, or the sample's prose — and
-no fixer's grant reaches `acceptance/`, where saved probes are kept. That
-evidence names no failure a fixer can run, so it is never handed to one:
-an item unmet on it alone is not re-driven, and the span goes to the
-outcome and the PR instead (§8 *Delivery re-drive* rule 4). Once the run
-has ended, and only then, the probe itself goes to the PR and the run's
-report as well (§6 *What is still unmet when the run ends is shown as
-tests the reader can run*): no worker is steered by anything after that.
+**A falsifier reads only what a fixer may read, so its probe can be
+shown.** The falsifier's leads are the shown sets only: the valid sets
+`_acceptance_shown_indices` shows that are not typed broken — exactly the
+sets a re-drive group's self-check holds (`_falsifier_lead_sets`) — never a
+held-back one. Everything else it reads a fixer reads too: the finished
+tree, the task and the files it references, the run's diff stat, and the
+delivery judge's typed open parts (whose evidence and verified cites a
+re-drive note already carries). So what it writes — the probe's source,
+its case title, its quoted assertion, its prose — carries no held-back
+text, and a confirmed probe is shown content, like a shown set's file: the
+re-drive copies it into the self-check of the group it drives and names it
+in the note (§8 *Delivery re-drive* rule 4). Each sample records the sets
+it was given (`lead_sets`), and a probe is shown only when that record
+exists and names shown sets alone; a probe whose sample read a held-back
+set — every sample recorded before this rule, which read every valid set
+and carries no `lead_sets` — stays held-out content, and the item it alone
+makes unmet is not driven (`unreproducible`). The held-back sets keep their
+whole purpose: a fix fitted to what it was shown, the probe included,
+still fails them (§8 *Delivery re-drive* rule 6). The probe is still run
+as a set file is: placed in a sandbox over the pristine checkout of the
+final commit, never copied into a checkout (it was, for its confirm runs
+and its facts read, and the checkout outlives the sample); leerie re-runs
+a saved probe (`acceptance/probes/`) only through the evaluation
+(`_evaluate_acceptance_sets`); and no fixer's grant reaches `acceptance/`,
+where saved probes are kept — a fixer reads the copy in its self-check, as
+it reads a shown set's. Once the run has ended, every probe that still
+fails — a held-out one included — goes to the PR and the run's report as
+well (§6 *What is still unmet when the run ends is shown as tests the
+reader can run*): no worker is steered by anything after that.
+
+Until leerie 0.44.13 the leads were every valid set, held-back ones
+included, so every probe was held-out content: all a note could say was
+that some input in the item's words fails, and from 0.44.13 such an item
+was not driven at all. Neither closes it: 4 items unmet on a probe alone
+in 4 runs over three days (barnacle 4b5c564d, 54fb56c3, 83674caf,
+a192d275), none closed by a re-drive, every run `unconverged`. Showing a
+fixer only a verdict on a held-back-derived probe would not be the same
+thing: it lets a fixer evaluate held-back-derived content as often as it
+likes, which no held-back set allows. And the contamination was not
+hypothetical: in 4b5c564d the confirmed probe's author had read a
+held-back set's file before writing a probe of the same shape. The
+change of leads changes the falsifier's input, so it is benched against
+F+ before it is counted as F+ (§8 *What ships is what was measured*).
 
 **Residual.** The verdict itself (which files of which set failed), which
 is the evaluation's purpose; and its duration, which a later worker can
@@ -13100,9 +13125,10 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   of the final commit with dependencies installed (and, on a Prisma
   repository, a fresh throwaway database — §8 *Prisma repositories get
   a real database*), and gets the item,
-  the run's own diff (start commit and stat), the run's valid
-  held-out acceptance files (read-only, git-ignored in that checkout
-  only, leads only), and
+  the run's own diff (start commit and stat), the run's shown
+  held-out acceptance files, never a held-back one (§6 *A falsifier
+  reads only what a fixer may read*; read-only, git-ignored in that
+  checkout only, leads only), and
   the judge's typed unmet parts for that item (hypotheses, never
   expected values). It writes ONE new probe test through a public entry
   point, asserting the item's own words, and runs it.
@@ -13121,6 +13147,28 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
      1 of the prompt says each part is required and a part covering many
      places fails when any one of them falls short (bench SW, *The
      falsifier gets the item whole* below).
+  5. its leads are the shown sets only, where F+ read every valid set
+     (§6 *A falsifier reads only what a fixer may read*). This one is not
+     a mechanical difference: on a run with four or more valid sets it
+     takes two sets of leads away (132 of the 179 held-out corpus items;
+     16 of F+'s 23 held-out catches were on such runs). It is benched as
+     arm `shown` against arm `base` (F+ as frozen) on the same corpora —
+     on the items whose final commit still exists, 24 of the 31 held-out
+     targets and 125 of the 148 controls (measured 2026-11-06; most
+     barnacle run branches are gone) — held to a catch at most 2 below
+     base's and a false-unmet count not above base's
+     (`bench_falsifier_shown.py`). *Status: detection ran, closure did
+     not.* On the 102 of those items whose leads differ (12 targets, 90
+     controls; the other items' leads are byte-identical), catch is 10 of
+     12 in both arms and false unmet is 10 of 90 against base's recorded 9
+     of 90: one over the gate, with 5 items new and 4 gone, the arm fresh
+     against a record of 2026-10-26. No catch was lost. Whether a fixer
+     shown a probe closes the defect is what this input is for, and it has
+     its own bench, frozen before any worker ran: recorded genuine
+     falsifier-only items and a few that are not report defects, the probe
+     shown against the item words alone, on a bar of closure at least twice
+     the control and at least half. *That bench has not run.* The Q2
+     numbers below describe F+, not this input.
   The first shipped prompt also told the worker what the orchestrator
   checks and offered the executed-commands record as a lead, and its
   input carried that record: none of it was benched, so the Q2 numbers
@@ -13602,28 +13650,72 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    evidence and verified cites name code on the tree the fixer holds; a
    change under paths the item keeps unchanged, which `git` shows; a red
    merge check, whose command the note carries; a solution defect's
-   concrete case. A confirmed falsifier probe is none of these: it is
-   held-out content (§6 *A falsifier's probe is held-out content*), so
-   its fixer can neither run nor read it, and all a note could say is
-   that some input in the item's words fails. An item whose only unmet
-   evidence (`by`) is a falsifier probe is therefore not driven: it is
-   recorded as an `unrouted_item` with reason `unreproducible` (*An unmet
-   item reaches its owner, or is recorded as reaching none*, below),
-   stays unmet, and spends no round. An item unmet on a probe and on
-   reproducible evidence too is driven on the reproducible part alone:
-   its note carries only that evidence, never the probe's, and the
-   re-check after the drive still re-runs the saved probe, so the item
-   leaves `unmet_final` only when both are met. Code decides this from
-   the item's typed `by` and the evidence each source recorded
-   (`unmet_final[].evidence_by`), never from the evidence's prose, and
-   the same pre-drive check raises on an item note naming a falsifier
-   source. In barnacle 4b5c564d (leerie 0.44.10) item 1 was unmet on a
-   confirmed probe alone; its implementers were handed "a falsifier probe
-   of the item's words … fails under B\*", ran a self-check of the shown
-   sets that passed 18 of 18, and changed nothing in two rounds (about
-   413 s of re-drive budget and $0.30); across the 24 runs whose state
-   carried a delivery gate in the three days before, four such items in
-   four runs, and a re-drive closed none of them. After each
+   concrete case; a confirmed falsifier probe whose sample read shown
+   sets only (§6 *A falsifier reads only what a fixer may read*),
+   through its self-check. Such a probe is a shown file: the re-drive
+   copies the saved probe into the self-check of the group it drives, as
+   a set of its own (`sets/probe-i<k>/`), so the self-check's test files
+   include it, and the item's note names its file, its failing case, its
+   quoted assertion and the sample's reason; the fixer runs it as it runs
+   a shown set's file. A probe whose sample read a held-back set — a
+   sample with no `lead_sets`, recorded before leads were shown sets
+   only, or one whose `lead_sets` names a set the run holds back — is
+   held-out content: its fixer can neither run nor read it, and all a
+   note could say is that some input in the item's words fails. An item
+   whose only unmet evidence (`by`) is such a probe is therefore not
+   driven: it is recorded as an `unrouted_item` with reason
+   `unreproducible` (*An unmet item reaches its owner, or is recorded as
+   reaching none*, below), stays unmet, and spends no round. An item
+   unmet on such a probe and on reproducible evidence too is driven on
+   the reproducible part alone: its note carries only that evidence,
+   never the probe's, and the re-check after the drive still re-runs the
+   saved probe, so the item leaves `unmet_final` only when both are met.
+   Code decides this from the item's typed `by`, the evidence each
+   source recorded (`unmet_final[].evidence_by`) and the confirmed
+   sample's `lead_sets` against the run's shown sets, never from the
+   evidence's prose; the same pre-drive check raises on an item note
+   naming a falsifier source without a shown probe, or whose probe's
+   `lead_sets` names a held-back set. In barnacle 4b5c564d (leerie
+   0.44.10) item 1 was unmet on a confirmed probe alone; its
+   implementers were handed "a falsifier probe of the item's words …
+   fails under B\*", ran a self-check of the shown sets that passed 18 of
+   18, and changed nothing in two rounds (about 413 s of re-drive budget
+   and $0.30); across the 24 runs whose state carried a delivery gate in
+   the three days before, four such items in four runs, and a re-drive
+   closed none of them. That probe's author had read a held-back set
+   (§6), so it is not shown even now; under shown-only leads the fixer
+   would have been handed `p.test.ts`, whose `export const
+   XPayloadSchema` input the declaration matcher misses.
+
+   *A fixer may contest a shown probe, typed; the contest goes to a human
+   and the item is never dropped.* A probe can be a correct reading of the
+   item's words and still assert on an input the product never gives its
+   entry point — 4b5c564d's emitter writes `const …PayloadSchema`, never
+   `export const`, which the falsifier itself called "an edge case" — or
+   assert a behaviour another requirement of the task forbids. A fixer
+   handed such a probe should neither bend the code to it nor be told it
+   failed. The implementer's output carries `contested_probes[]`
+   (`{probe_test_file, kind: input_outside_domain | contradicts_task,
+   probe_quote, cites[{path, line_start, line_end, quote}], task_quote,
+   reason}`). Code accepts a contest only when its `probe_test_file` is a
+   probe the group was handed, its `probe_quote` is verbatim in that
+   probe's source, and the kind's evidence verifies: for
+   `input_outside_domain`, at least one cite verifies on the group's HEAD
+   (`_verify_delivery_cite`, `ok` or `drift`) — the code that shows what
+   the entry point is actually given; for `contradicts_task`, its
+   `task_quote` is verbatim in the task or in a required item. An accepted
+   contest is recorded (`delivery_redrive.contested_probes[]`); the item's
+   probe is not handed to a later group, so no round is spent chasing it
+   again; the item stays in `unmet_final`, re-checked at the end like any
+   other — the run is `unconverged` unless the probe now passes — and the
+   outcome's reasons and the PR name the probe, the kind and the fixer's
+   quoted evidence for a human to decide. A contest that fails a check is
+   recorded with why and changes nothing. A contest is never resolved in
+   code or by the contesting worker: routing it to a judge instead of a
+   human is a later step, because that is a new judgment over the
+   falsifier's evidence — the contract judge's `conflict` path of *A probe
+   that breaks another part of its own item is a contested reading* —
+   and is benched with that design. After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
@@ -13765,10 +13857,11 @@ unreproducible}`). So is an item rule 4 does not drive, with reason
 `unreproducible` and the item words its probe tested (`probed`); the
 outcome's reasons say for it that a confirmed falsifier probe of those
 words fails under B\* and that the probe is held-out content no fixer
-could see, so a reader knows why no worker was handed it; once the
-run has ended the PR shows the probe itself, its case, failing assertion
-and source (§6 *What is still unmet when the run ends is shown as tests
-the reader can run*). It is never dropped: it stays unmet, so the run is `unconverged`; the outcome's
+could see (its sample read a held-back set), so a reader knows why no
+worker was handed it; once the run has ended the PR shows the probe
+itself, its case, failing assertion and source (§6 *What is still unmet
+when the run ends is shown as tests the reader can run*). It is never
+dropped: it stays unmet, so the run is `unconverged`; the outcome's
 reasons name it; and the next run on the task is handed it in its
 residual. Measured on barnacle a192d275 (leerie 0.44.3): the falsifier
 confirmed an item unmet whose only claimer, feat-001, had settled
@@ -13778,8 +13871,10 @@ outcome was `unconverged` on the unmet item, but nothing recorded that
 the finding reached no worker. Under this rule the item would go to
 feat-001, whose two re-drive rounds were spent before the falsifier ran,
 so it would be recorded `unrouted_item` with reason `budget`; its only
-evidence was a falsifier probe, so under rule 4 it is recorded with
-reason `unreproducible` before any routing.
+evidence was a falsifier probe whose sample read every valid set, so
+under rule 4 it is recorded with reason `unreproducible` before any
+routing. A probe from shown-only leads would be shown, and the item
+routed to feat-001 like any other.
 
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,
@@ -16337,14 +16432,23 @@ relays, each closed where it relayed:
   and of falsifier probes, and, in its `transcripts/`, the transcripts of
   the workers that read a set or run one (`HELD_OUT_LOG_WORKERS`: the
   acceptance writer, the set auditor, the scope judge and the falsifier,
-  whose leads are every valid set). Nothing that builds a worker's input
+  which stays on this side although its leads are now the shown sets
+  only: its transcripts of older runs read every valid set, and its runs
+  of the final commit's harness keep their cache apart all the same). Nothing that builds a worker's input
   reads that directory.
 - *The falsifier's evidence.* A confirmed sample put its probe's case
   title and its own prose into `unmet_final`, which the re-drive's
-  implementers read; both come from a worker that read the held-back
-  sets. The evidence is now the span of the item the probe tests, which
+  implementers read; both came from a worker that read the held-back
+  sets. The evidence became the span of the item the probe tests, which
   code checks is verbatim in the item, and the fact that it fails under
-  B\*.
+  B\*. The relay is now closed at its source instead: the falsifier's
+  leads are the shown sets only (§6 *A falsifier reads only what a fixer
+  may read*), so its probe, case title and prose carry nothing held back,
+  and the re-drive hands them on through the note and the self-check.
+  `unmet_final`'s evidence stays the span (a probe of a sample that read
+  every valid set, recorded before this rule, is still never shown), and
+  what a note adds is read from the sample record only when its
+  `lead_sets` names shown sets alone.
 - *The caches* (review round 21 R2). Every worker's processes wrote one
   cache set per run, `<run-dir>/worktrees/.stores/cache/` (`XDG_CACHE_HOME`,
   `GOCACHE`, `CARGO_HOME`, …), the held-out side's included, so whatever

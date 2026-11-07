@@ -3044,6 +3044,11 @@ BAKE_INSTALL_COMMANDS: dict[str, str] = {
 }
 
 
+# The kinds of contest a re-drive implementer may raise against a shown
+# falsifier probe (DESIGN §8 *Delivery re-drive* rule 4).
+REDRIVE_CONTEST_KINDS = ("input_outside_domain", "contradicts_task")
+
+
 SCHEMAS: dict[str, dict] = {
     "forbidden_command_extractor": {
         "type": "object",
@@ -3507,6 +3512,39 @@ SCHEMAS: dict[str, dict] = {
                     "why_underivable": {"type": "string"},
                 },
                 "required": ["id", "question", "why_underivable"],
+            },
+            # DESIGN §8 *Delivery re-drive* rule 4: a re-drive implementer
+            # handed a shown falsifier probe may contest it, typed. Optional;
+            # `_redrive_check_contests` checks every quote and cite, and an
+            # accepted contest goes to a human — it never settles the item.
+            # Flat, `kind` the only required field (decoder-safety, as
+            # `external_resource_claim`).
+            "contested_probes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["probe_test_file", "kind"],
+                    "properties": {
+                        "probe_test_file": {"type": "string"},
+                        "kind": {"type": "string",
+                                 "enum": list(REDRIVE_CONTEST_KINDS)},
+                        "probe_quote": {"type": "string"},
+                        "cites": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "line_start": {"type": "integer"},
+                                    "line_end": {"type": "integer"},
+                                    "quote": {"type": "string"},
+                                },
+                            },
+                        },
+                        "task_quote": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
             },
             # DESIGN §5 *Artifact passing between subtasks*. Structured
             # deliverables that downstream subtasks (named by the
@@ -42073,6 +42111,33 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                     + ", which fails under B*; the probe is held-out "
                     "content no fixer could see, so no re-drive round was "
                     "spent on it")
+            # A probe its fixer contested, for a human to decide (rule 4):
+            # the item stays unmet, and the contest's checked evidence is
+            # named.
+            seen: set[int] = set()
+            for c in ((st.data.get("delivery_redrive") or {})
+                      .get("contested_probes") or []):
+                i = c.get("item_index") if isinstance(c, dict) else None
+                if (not c.get("accepted") or i not in open_idx
+                        or i in seen):
+                    continue
+                seen.add(i)
+                ok_cites = [x for x, v in zip(c.get("cites") or [],
+                                              c.get("cite_status") or [])
+                            if v in ("ok", "drift") and isinstance(x, dict)]
+                basis = (", citing " + ", ".join(
+                    f"{x.get('path')}:{x.get('line_start')}"
+                    for x in ok_cites[:3]) if ok_cites else
+                    (", quoting the task: \""
+                     + _normalize_risk_text(c.get("task_quote") or "", 120)
+                     + "\"" if c.get("task_quote") else ""))
+                reasons.append(
+                    f"item {i}: a re-drive implementer contested its "
+                    f"falsifier probe {c.get('probe_test_file')} as "
+                    f"{c.get('kind')} (\""
+                    + _normalize_risk_text(c.get("probe_quote") or "", 120)
+                    + "\"" + basis + "); a human decides — the item stays "
+                    "unmet")
     # A regressed bar is work: a run that changed nothing did not do it
     # (DESIGN §8 *Done is a fixed bar per task*).
     regressed = (acc.get("settled_bar") or {}) if isinstance(acc, dict) else {}
@@ -61991,10 +62056,25 @@ def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
     return refused
 
 
+def _falsifier_lead_sets(sets: list[dict]) -> list[dict]:
+    """The held-out sets a falsifier is given as leads (DESIGN §6 *A
+    falsifier reads only what a fixer may read*): the valid shown sets not
+    typed broken — the sets a re-drive group's self-check holds — never a
+    held-back one. Split over every set of the run's record, as the
+    re-drive splits them, so the held-back identity is the run's."""
+    all_sets = [s_ for s_ in sets or [] if isinstance(s_, dict)
+                and "index" in s_]
+    shown = _acceptance_shown_indices(all_sets) if all_sets else set()
+    return [s_ for s_ in all_sets
+            if s_.get("valid") and s_.get("index") in shown
+            and not _acceptance_set_broken(s_)]
+
+
 def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
                            task: str) -> tuple[list[str], list[str]]:
-    """Put the leads into a falsifier checkout: each valid held-out set's
-    files, read-only under `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, and
+    """Put the leads into a falsifier checkout: the files of each set
+    `_falsifier_lead_sets(sets)` keeps — shown sets only, never a held-back
+    one — read-only under `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, and
     every file the task references that the checkout lacks (a report filed
     for the task). Both git-ignored in this checkout only
     (`_checkout_ignore`). Returns (lead files, referenced files present)."""
@@ -62005,8 +62085,8 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     _remove_beneath(wt, leads)
     excludes = [FALSIFIER_LEADS_DIR + "/"]
     ctx: list[str] = []
-    for s_ in sets:
-        if not s_.get("valid") or not s_.get("dir"):
+    for s_ in _falsifier_lead_sets(sets):
+        if not s_.get("dir"):
             continue
         for rel in ((s_.get("defect_files") or [])
                     + (s_.get("control_files") or [])
@@ -62147,7 +62227,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                            label: str, suite: dict | None = None) -> dict:
     """Code decides whether a sample demonstrated anything (bench Q2 F+
     G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
-    held-out content (its writer read every valid set): it is placed in a
+    run as a set file is, whatever its writer read: it is placed in a
     held-out sandbox over the pristine installed checkout of the final
     commit, never copied into it, run there with the runner's serial flags,
     confirmed under B* (`_confirm_still_failing`) and read by the AST facts
@@ -62448,7 +62528,13 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                           effort=efforts.get("falsifier"), db=True)
             st.bump_workers(caps)
             res = await claude_p(user_prompt=user, sid=sid, **common)
-            rec: dict = {"sample": n, "reasked": False}
+            # The sets this sample read: what makes its probe showable to a
+            # fixer (DESIGN §6 *A falsifier reads only what a fixer may
+            # read*, `_falsifier_shown_probe`).
+            rec: dict = {"sample": n, "reasked": False,
+                         "lead_sets": sorted(
+                             s_["index"] for s_ in
+                             _falsifier_lead_sets(sets))}
             activity = _falsifier_probe_activity(
                 _worker_log_path(st.run_dir, sid, "falsifier"), lane,
                 st.repo_root)
@@ -63246,34 +63332,97 @@ def _redrive_unrouted_items(open_items: list[dict], driven: Iterable[int],
 
 
 # The unmet-item evidence sources no re-drive fixer can reproduce or read
-# (DESIGN §8 *Delivery re-drive* rule 4): a confirmed falsifier probe is
-# held-out content (§6 *A falsifier's probe is held-out content*). Every
-# other source of `unmet_final[].by` names code on the fixer's tree — the
-# judge's evidence and verified cites, the changed paths — or is not routed.
+# without more (DESIGN §8 *Delivery re-drive* rule 4): a confirmed falsifier
+# probe is reproducible only as a shown probe (`_falsifier_shown_probe`) the
+# group's self-check holds. Every other source of `unmet_final[].by` names
+# code on the fixer's tree — the judge's evidence and verified cites, the
+# changed paths — or is not routed.
 _REDRIVE_UNREPRODUCIBLE_BY = frozenset({"falsifier"})
 
+# How many characters of a shown probe's case title, assertion and the
+# sample's reason a re-drive note carries.
+_REDRIVE_PROBE_TEXT_MAX = 600
 
-def _redrive_by_reproducible(by: object) -> bool:
-    """True when `by` (an unmet item note's evidence sources) is a non-empty
-    list naming no source in `_REDRIVE_UNREPRODUCIBLE_BY`."""
-    return (isinstance(by, list) and bool(by)
-            and not set(map(str, by)) & _REDRIVE_UNREPRODUCIBLE_BY)
+
+def _falsifier_shown_probe(row: object, shown_idx: Iterable
+                           ) -> dict | None:
+    """The confirmed falsifier probe of a `delivery_gate.items[]` row as a
+    fixer may be shown it (DESIGN §6 *A falsifier reads only what a fixer
+    may read*), or None: `{dir, file, lead_sets, case_name,
+    assertion_quote, reason, item_span_quote}`. None unless the confirmed
+    sample recorded the sets it read (`lead_sets`, a list of indices) and
+    every one is in `shown_idx`, and its saved probe is a regular file —
+    a sample with no `lead_sets` read every valid set, held-back ones
+    included, so its probe is held-out content and is never shown."""
+    fi = row.get("falsifier") if isinstance(row, dict) else None
+    samples = fi.get("samples") if isinstance(fi, dict) else None
+    s_ = next((x for x in samples or [] if isinstance(x, dict)
+               and x.get("confirmed")), None)
+    if s_ is None:
+        return None
+    leads = s_.get("lead_sets")
+    if not isinstance(leads, list) or not all(
+            isinstance(k, int) and not isinstance(k, bool) for k in leads):
+        return None
+    if not set(leads) <= set(shown_idx):
+        return None
+    saved = s_.get("probe_saved")
+    if not isinstance(saved, dict) or not saved.get("dir") or not saved.get(
+            "file"):
+        return None
+    rel = str(saved["file"])
+    if os.path.isabs(rel) or ".." in Path(rel).parts:
+        return None
+    # Leerie's own copy, still read without following a link.
+    if not _regular_file_beneath(Path(str(saved["dir"])),
+                                 Path(str(saved["dir"])) / rel):
+        return None
+    return {"dir": str(saved["dir"]), "file": rel,
+            "lead_sets": sorted(leads),
+            **{k: str(s_.get(k) or "")[:_REDRIVE_PROBE_TEXT_MAX]
+               for k in ("case_name", "assertion_quote", "reason",
+                         "item_span_quote")}}
+
+
+def _redrive_item_note_reproducible(n: dict, shown_idx: Iterable) -> bool:
+    """Whether an `unmet_item` note hands on only evidence its fixer can
+    reproduce or read (rule 4): its `by` is a non-empty list, and when it
+    names a source in `_REDRIVE_UNREPRODUCIBLE_BY` the note carries a
+    `probe` whose sample read only sets in `shown_idx`."""
+    by = n.get("by")
+    if not isinstance(by, list) or not by:
+        return False
+    if not set(map(str, by)) & _REDRIVE_UNREPRODUCIBLE_BY:
+        return True
+    p_ = n.get("probe")
+    leads = p_.get("lead_sets") if isinstance(p_, dict) else None
+    return (isinstance(leads, list) and set(leads) <= set(shown_idx)
+            and bool(p_.get("dir")) and bool(p_.get("file")))
 
 
 def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
-                        n_items: int, rows: list
+                        n_items: int, rows: list, *,
+                        shown_idx: Iterable = (),
+                        contested: Iterable[int] = ()
                         ) -> tuple[list[dict], list[dict]]:
     """(notes, unreproducible) for the open unmet items (DESIGN §8 *Delivery
     re-drive* rules 2 and 4), from typed fields only. An item every claimer
-    types `process` is neither. An item whose sources (`by`; `["judge"]`
-    when absent) less `_REDRIVE_UNREPRODUCIBLE_BY` are none is no note: an
-    `unreproducible` record `{item_index, item, probed}`. Any other is an
-    `unmet_item` note carrying those sources alone and only their evidence
-    (`evidence_by`); an entry without `evidence_by` whose sources are not
-    all reproducible carries no evidence, since its joined prose is never
-    split by code."""
+    types `process` is neither. A falsifier source is reproducible when its
+    row's confirmed probe is shown (`_falsifier_shown_probe(row,
+    shown_idx)`) and no fixer contested it (`contested`, item indices); the
+    other sources of `_REDRIVE_UNREPRODUCIBLE_BY` never are. An item whose
+    sources (`by`; `["judge"]` when absent) less the unreproducible ones are
+    none is no note: an `unreproducible` record `{item_index, item,
+    probed}` — or nothing, when its probe was contested (it was driven).
+    Any other is an `unmet_item` note carrying those sources alone and only
+    their evidence (`evidence_by`), plus the shown `probe` when the
+    falsifier is one of them; an entry without `evidence_by` whose sources
+    are not all reproducible carries no evidence, since its joined prose
+    is never split by code."""
     by_row = {r.get("item_index"): r for r in rows or []
               if isinstance(r, dict)}
+    shown_idx = set(shown_idx)
+    contested = set(contested)
     notes: list[dict] = []
     unrepro: list[dict] = []
     for u in unmet_final or []:
@@ -63285,8 +63434,13 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
             continue   # rule 2: a process constraint is not routed
         by = ([str(b) for b in u["by"]] if isinstance(u.get("by"), list)
               else ["judge"])
-        repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY]
+        probe = (_falsifier_shown_probe(by_row.get(i), shown_idx)
+                 if "falsifier" in by and i not in contested else None)
+        repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY
+                 or (b == "falsifier" and probe is not None)]
         if not repro:
+            if i in contested:
+                continue
             fi = (by_row.get(i) or {}).get("falsifier")
             s_ = next((x for x in (fi.get("samples") or []
                                    if isinstance(fi, dict) else [])
@@ -63302,11 +63456,30 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
             evidence = str(u.get("evidence") or "")
         else:
             evidence = ""
-        notes.append({"kind": "unmet_item", "key": f"item-{i}",
-                      "item_index": i, "item": u.get("item", ""),
-                      "evidence": evidence, "by": repro,
-                      "claimed_by": list(cl.get("claimed_by") or [])})
+        note = {"kind": "unmet_item", "key": f"item-{i}",
+                "item_index": i, "item": u.get("item", ""),
+                "evidence": evidence, "by": repro,
+                "claimed_by": list(cl.get("claimed_by") or [])}
+        if probe is not None and "falsifier" in repro:
+            note["probe"] = probe
+        notes.append(note)
     return notes, unrepro
+
+
+def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
+    """The shown probes a group's notes carry, as self-check sets (DESIGN
+    §8 *Delivery re-drive* rule 4): `{index: "probe-i<k>", item_index, dir,
+    defect_files: [file], control_files: [], support_files: []}`, one per
+    item."""
+    out: dict[int, dict] = {}
+    for n in notes:
+        p_ = n.get("probe") if n.get("kind") == "unmet_item" else None
+        i = n.get("item_index")
+        if isinstance(p_, dict) and isinstance(i, int) and i not in out:
+            out[i] = {"index": f"probe-i{i}", "item_index": i,
+                      "dir": p_["dir"], "defect_files": [p_["file"]],
+                      "control_files": [], "support_files": []}
+    return [out[i] for i in sorted(out)]
 
 
 def _redrive_failing(results: list[dict], sets: list[dict],
@@ -63363,9 +63536,11 @@ def _redrive_unreproducible(notes: list[dict],
     note (`defect`, `control_regression` with a `set_index`) whose set is
     not a shown set not typed broken, or whose file is not one of that
     set's defect or control files — the files `_selfcheck_prepare(shown)`
-    runs; and an `unmet_item` note whose `by` names no source, or a source
-    in `_REDRIVE_UNREPRODUCIBLE_BY` (`_redrive_item_notes` never builds
-    one). Held-back notes are names only and never reach the note's work
+    runs; and an `unmet_item` note `_redrive_item_note_reproducible` does
+    not pass over those shown sets' indices — one naming no source, or a
+    falsifier source without a shown probe, or with a probe whose sample
+    read a set not shown (`_redrive_item_notes` never builds one).
+    Held-back notes are names only and never reach the note's work
     list."""
     files = {s_.get("index"): set(list(s_.get("defect_files") or [])
                                   + list(s_.get("control_files") or []))
@@ -63377,7 +63552,7 @@ def _redrive_unreproducible(notes: list[dict],
                 and n.get("kind") in ("defect", "control_regression")
                 and n.get("file") not in files.get(n["set_index"], ())
                 or n.get("kind") == "unmet_item"
-                and not _redrive_by_reproducible(n.get("by")))]
+                and not _redrive_item_note_reproducible(n, files))]
 
 
 def _redrive_carry(before: dict[str, dict], after: dict[str, dict],
@@ -63531,21 +63706,31 @@ _SELFCHECK_CALLS_MAX = 50
 
 
 def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
-                       shown: list[dict], label: str) -> dict:
+                       shown: list[dict], label: str,
+                       probes: Iterable[dict] = ()) -> dict:
     """The delivery re-drive's out-of-tree self-check for one group (DESIGN
     §8 *A held-out set never enters a tree a worker commits from*):
     `<run>/selfcheck/<label>/` holding a read-only copy of the shown sets
     (`sets/set-<index>/<rel>`, the source the note points at, outside the
-    read-denied `acceptance/`), the call's `config.json` and
-    `bin/leerie-selfcheck`. Returns `{dir, bin, command, src, run_files,
-    name_flag}`. Nothing is written to `staging`. It runs inside the
+    read-denied `acceptance/`) and of each shown falsifier probe the
+    group's notes carry (`probes`, `_redrive_probe_sets`:
+    `sets/probe-i<k>/<rel>`, its file among the self-check's test files —
+    rule 4), the call's `config.json` and `bin/leerie-selfcheck`. Returns
+    `{dir, bin, command, src, run_files, name_flag, probes{item_index:
+    path}}`. Nothing is written to `staging`. It runs inside the
     implementer's own process tree, so a database the implementer has
     (`claude_p(db=True)`) is the self-check's through its environment."""
     root = st.run_dir / "selfcheck" / label
     _rmtree_owned(root)
     sets: list[dict] = []
-    for s_ in shown:
-        dst = root / "sets" / f"set-{s_.get('index')}"
+    probe_paths: dict[int, str] = {}
+    for s_ in [*shown, *probes]:
+        is_probe = "item_index" in s_ and str(s_.get("index") or
+                                              "").startswith("probe-i")
+        dst = root / "sets" / (str(s_["index"]) if is_probe
+                               else f"set-{s_.get('index')}")
+        if is_probe:
+            probe_paths[s_["item_index"]] = str(dst / s_["defect_files"][0])
         for rel in _set_files(s_):
             f = dst / rel
             f.parent.mkdir(parents=True, exist_ok=True)
@@ -63580,7 +63765,8 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     return {"dir": str(root), "bin": str(bin_dir),
             "command": str(wrapper) if cmd else None,
             "src": str(root / "sets"), "run_files": run_files,
-            "name_flag": _SELFCHECK_NAME_FLAGS.get(runner or "")}
+            "name_flag": _SELFCHECK_NAME_FLAGS.get(runner or ""),
+            "probes": probe_paths}
 
 
 def _selfcheck_calls(sc: dict) -> list[dict]:
@@ -65866,9 +66052,18 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
             shown.append({"kind": k, "test": n.get("test"),
                           "detail": n.get("detail")})
         elif k == "unmet_item":
-            shown.append({"kind": k, "item": n.get("item"),
-                          "evidence": str(n.get("evidence") or "")
-                          [:_REDRIVE_EVIDENCE_MAX]})
+            e_ = {"kind": k, "item": n.get("item"),
+                  "evidence": str(n.get("evidence") or "")
+                  [:_REDRIVE_EVIDENCE_MAX]}
+            p_ = n.get("probe")
+            if isinstance(p_, dict):
+                # A shown probe (rule 4): its file is in the self-check.
+                e_["probe"] = {"test_file": p_.get("file"),
+                               "failing_case": p_.get("case_name"),
+                               "failing_assertion": p_.get(
+                                   "assertion_quote"),
+                               "why_it_fails": p_.get("reason")}
+            shown.append(e_)
         elif k == "ci_check":
             shown.append({"kind": k, "check": n.get("id"),
                           "why": n.get("why"), "command": n.get("command"),
@@ -65896,6 +66091,30 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
         "this run's combined diff and found this concrete case unhandled at "
         "`where` — handle it at its root.",
         json.dumps(shown, indent=1)]
+    if any(isinstance(n.get("probe"), dict) for n in notes
+           if n["kind"] == "unmet_item"):
+        parts.append(
+            "PROBES: an unmet_item with `probe` was found unmet by a "
+            "falsifier, a worker that tries to show a required item "
+            "undelivered by execution: it wrote that test from the item's "
+            "words and the test fails on this tree, confirmed by repeated "
+            "runs. The test is among your self-check's test files below; "
+            "name its file to run it alone. Make it pass by fixing the "
+            "item in the production code, never by fitting the test.\n"
+            "If the probe asserts on an input this repository's code never "
+            "gives the entry point it calls, or asserts behaviour the task "
+            "forbids, do not bend the code to it: return it in "
+            "`contested_probes`, each `{probe_test_file` (its test_file "
+            "above), `kind` (`input_outside_domain` or "
+            "`contradicts_task`), `probe_quote` (the probe's line you "
+            "contest, copied exactly), `cites` (for "
+            "`input_outside_domain`: `{path, line_start, line_end, "
+            "quote}` entries quoting code on this tree that shows what the "
+            "entry point is actually given), `task_quote` (for "
+            "`contradicts_task`: the task's or a required item's words, "
+            "copied exactly), `reason}`. Code checks every quote; a "
+            "contest goes to a human and never settles the item — it "
+            "stays unmet unless the probe passes.")
     if merged:
         parts.append(
             "MERGED RE-DRIVE: these subtasks share production files with "
@@ -65983,12 +66202,88 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
                               + os.environ.get("PATH", "")},
                 "selfcheck_dir": str(Path(bin_dir).parent)}
                if bin_dir else {}))
-        return {"status": res.get("status"),
-                "summary": str(res.get("summary") or "")[:500]}
+        out = {"status": res.get("status"),
+               "summary": str(res.get("summary") or "")[:500]}
+        if isinstance(res.get("contested_probes"), list):
+            # Checked by `_redrive_check_contests`, never trusted as is.
+            out["contested_probes"] = res["contested_probes"][:10]
+        return out
     except (WorkerError, subprocess.TimeoutExpired) as e:
         return {"error": _brief_worker_exc(e)}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"[:300]}
+
+
+def _redrive_check_contests(raw: object, probes: list[dict],
+                            tree: str | Path, task: str,
+                            items: list) -> list[dict]:
+    """Each `contested_probes` entry a group's implementer returned,
+    checked in code (DESIGN §8 *Delivery re-drive* rule 4): `{item_index?,
+    probe_test_file, kind, probe_quote, cites[], cite_status[]?,
+    task_quote, reason, accepted, rejected?}`. Accepted only when
+    `probe_test_file` is one of `probes` (`_redrive_probe_sets`, the
+    group's; its path or a path ending in it), `probe_quote` is verbatim in
+    that probe's source, and its kind's evidence verifies: for
+    `input_outside_domain` a cite `_verify_delivery_cite` reads `ok` or
+    `drift` on `tree`'s HEAD; for `contradicts_task` a `task_quote`
+    verbatim in the task or a required item's text or parts. Substring
+    checks after `_scope_norm` — never a reading of the reason."""
+    by_file = {p_["defect_files"][0]: p_ for p_ in probes}
+    texts = [task or ""]
+    for it in items or []:
+        n_ = _delivery_norm_item(it)
+        texts.append(str(n_.get("item") or ""))
+        texts += [str(x) for x in (n_.get("parts") or [])
+                  if isinstance(n_.get("parts"), list)]
+    out: list[dict] = []
+    for c in (raw if isinstance(raw, list) else [])[:10]:
+        if not isinstance(c, dict):
+            continue
+        f = str(c.get("probe_test_file") or "").strip()
+        rel = next((r for r in by_file if f == r or f.endswith("/" + r)),
+                   None)
+        kind = c.get("kind")
+        cites = [x for x in (c.get("cites") or []) if isinstance(x, dict)][:5]
+        rec: dict = {"probe_test_file": f[:400], "kind": kind,
+                     "probe_quote": str(c.get("probe_quote") or "")[:600],
+                     "cites": [{k: x.get(k) for k in ("path", "line_start",
+                                                      "line_end", "quote")}
+                               for x in cites],
+                     "task_quote": str(c.get("task_quote") or "")[:600],
+                     "reason": str(c.get("reason") or "")[:1200]}
+        why = None
+        if rel is None:
+            why = "not a probe this group was handed"
+        else:
+            rec["item_index"] = by_file[rel]["item_index"]
+            rec["probe_test_file"] = rel
+            d_ = Path(by_file[rel]["dir"])
+            try:
+                src = _read_text_beneath(d_, d_ / rel, limit=READ_LIMIT_TEXT)
+            except OSError:
+                src = ""
+            q = _scope_norm(rec["probe_quote"])
+            if kind not in REDRIVE_CONTEST_KINDS:
+                why = "unknown kind"
+            elif len(q) < _DELIVERY_CITE_MIN_QUOTE or q not in _scope_norm(
+                    src):
+                why = "probe_quote is not in the probe"
+            elif kind == "input_outside_domain":
+                memo: dict = {}
+                rec["cite_status"] = [_verify_delivery_cite(x, tree, "", memo)
+                                      for x in cites]
+                if not set(rec["cite_status"]) & {"ok", "drift"}:
+                    why = "no cite verifies on this tree"
+            else:
+                tq = _scope_norm(rec["task_quote"])
+                if len(tq) < _DELIVERY_CITE_MIN_QUOTE or not any(
+                        tq in _scope_norm(t) for t in texts):
+                    why = "task_quote is not in the task or a required item"
+        rec["accepted"] = why is None
+        if why:
+            rec["rejected"] = why
+        out.append(rec)
+    return out
 
 
 def _judge_majority_items(unmet: Iterable[object]) -> list[int]:
@@ -66463,7 +66758,8 @@ def _redrive_rollback_reason(ge: dict) -> str:
     reader never has to re-derive which one voided it."""
     why: list[str] = []
     if ge.get("committed_staged"):
-        why.append("its commits hold a shown held-out set's source or path: "
+        why.append("its commits hold the source or path of a shown held-out "
+                   "set or a shown falsifier probe: "
                    + ", ".join(ge["committed_staged"]))
     if ge.get("zero_progress"):
         why.append("it fixed no failing case it could be measured on")
@@ -66541,6 +66837,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("trade_pairs", [])
     rec.setdefault("contradictions", [])
     rec.setdefault("defects_driven", [])
+    rec.setdefault("contested_probes", [])
     st.data["current_phase"] = "phase 5: delivery re-drive"
     acc = st.data.get("acceptance") or {}
     all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
@@ -66586,8 +66883,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
 
     def item_split() -> tuple[list[dict], list[dict]]:
         dg = st.data.get("delivery_gate") or {}
-        return _redrive_item_notes(dg.get("unmet_final") or [], claims,
-                                   len(normalized), dg.get("items") or [])
+        # A probe is shown only when its sample read the sets every group's
+        # self-check holds (rule 4); one a fixer contested is not handed on
+        # again (`_redrive_check_contests`).
+        return _redrive_item_notes(
+            dg.get("unmet_final") or [], claims, len(normalized),
+            dg.get("items") or [],
+            shown_idx={s_.get("index") for s_ in shown},
+            contested={c["item_index"] for c in rec["contested_probes"]
+                       if c.get("accepted")
+                       and isinstance(c.get("item_index"), int)})
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).
@@ -66820,8 +67125,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             # The shown sets' source, for the anti-cheat history check
             # (DESIGN §8 *A held-out set never enters a tree a worker
             # commits from*); the sets themselves never enter staging.
+            # A shown probe the group holds is a shown file too (rule 4).
+            probe_sets = _redrive_probe_sets(live)
             staged = [{"dir": s_["dir"], "files": _set_files(s_)}
-                      for s_ in shown if s_.get("dir")]
+                      for s_ in [*shown, *probe_sets] if s_.get("dir")]
             prints = await asyncio.to_thread(
                 _heldout_fingerprints, staging, staged, pre_sha)
             sc: dict | None = None
@@ -66829,9 +67136,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             effort = (EFFORT_REDRIVE_ESCALATION if escalate
                       else efforts.get("implementer"))
             try:
-                if shown:
+                if shown or probe_sets:
                     sc = _selfcheck_prepare(st, caps, staging, shown,
-                                            label)
+                                            label, probes=probe_sets)
                 merged = [{"id": m,
                            "title": (specs.get(m) or {}).get("title"),
                            "intent": (specs.get(m) or {}).get("intent")}
@@ -66851,7 +67158,24 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members,
                     note, effort=effort, label=label,
-                    bin_dir=sc["bin"] if sc else None, db=bool(shown))
+                    bin_dir=sc["bin"] if sc else None,
+                    db=bool(shown or probe_sets))
+                raw_contests = ge["implementer"].pop("contested_probes",
+                                                    None)
+                if probe_sets and raw_contests:
+                    checked = _redrive_check_contests(
+                        raw_contests, probe_sets, staging,
+                        st.data.get("task", ""), items)
+                    ge["contested_probes"] = checked
+                    rec["contested_probes"] += [
+                        {**c, "round": rnd, "group": gi} for c in checked]
+                    for c in checked:
+                        log(f"  delivery re-drive r{rnd} g{gi}: probe "
+                            f"{c['probe_test_file']} contested "
+                            f"({c.get('kind')}) — "
+                            + ("accepted: a human decides; the item stays "
+                               "unmet" if c["accepted"]
+                               else f"rejected: {c.get('rejected')}"))
             finally:
                 if sc:
                     calls = _selfcheck_calls(sc)

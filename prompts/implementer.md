@@ -710,5 +710,16 @@ check out is driven again as `other`, with the reason.
   when your subtask produces structured deliverables for downstream
   subtasks — see the "Producing artifacts for downstream subtasks"
   section above for when this applies.
+- `contested_probes` is optional, and only for a delivery re-drive note
+  that hands you a falsifier probe (an `unmet_item` with `probe`). Omit it
+  otherwise. Use it when the probe asserts on an input this repository's
+  code never gives the entry point it calls (`kind`
+  `input_outside_domain`: put in `cites` the code on this tree that shows
+  what the entry point is actually given), or asserts behaviour the task
+  forbids (`kind` `contradicts_task`: put the task's or a required item's
+  words in `task_quote`). Name the probe in `probe_test_file`, copy the
+  line you contest exactly into `probe_quote`, and say why in `reason`.
+  The orchestrator checks every quote and cite; a contest goes to a human
+  and never settles the item. Do not bend the code to a probe you contest.
 
 {{include: _confidence.md}}

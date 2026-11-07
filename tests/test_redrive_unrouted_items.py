@@ -268,7 +268,7 @@ def test_a_forced_falsifier_note_is_raised_never_driven(
     w = _passing_sets_world(leerie, tmp_path, monkeypatch, unmet,
                             [_falsifier_row(0)])
 
-    def forced(unmet_final, claims, n_items, rows):
+    def forced(unmet_final, claims, n_items, rows, **_kw):
         return ([{"kind": "unmet_item", "key": "item-0", "item_index": 0,
                   "item": "a does X", "evidence": PROBE_EVIDENCE,
                   "by": ["falsifier"], "claimed_by": ["s1"]}], [])
