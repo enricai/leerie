@@ -74589,6 +74589,20 @@ def main() -> int | None:
     # invocation's alone and a finished run stays listed as finished.
     if not (args.phase or (args.resume and _run_has_nothing_left(st.data))):
         _own_the_run_death_record(st.run_dir)
+    # The run's end record is this invocation's from here: a resumed run's
+    # `orchestrator.exit_code` is an earlier invocation's, and the launcher
+    # reads that file, for the run the file below names, as this launch's
+    # run having ended (DESIGN §6 *A launch's host-side work starts when its
+    # run has ended*). Cleared before the run is named, so a record the
+    # launcher finds is this invocation's; one that cannot be cleared stops
+    # the run rather than let an earlier end read as this one's.
+    try:
+        os.unlink(st.run_dir / "orchestrator.exit_code")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        die(f"could not clear the run's previous end record "
+            f"{_operator_path(st.run_dir / 'orchestrator.exit_code')}: {e}")
     # The run is this process's from here (its flock is held): tell the
     # launcher which one, for the bring-back after the container exits
     # (DESIGN §6 *Which run the container ran*).

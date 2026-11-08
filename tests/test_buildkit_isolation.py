@@ -1321,7 +1321,8 @@ def _nerdctl_calls(text: str) -> list[str]:
     docstring quotes), and not `info`, the reachability probe."""
     out = []
     for c in _commands(text):
-        if c.lstrip().startswith(("remote_log ", "echo ", "printf ")):
+        if c.lstrip().startswith(("remote_log ", "_launch_note ", "echo ",
+                                  "printf ")):
             continue
         for m in re.finditer(r'(?<![\w"/.-])nerdctl((?:\s+\S+){1,3})', c):
             words = m.group(1).split()
@@ -1355,7 +1356,10 @@ def test_every_nerdctl_command_names_leeries_namespace():
     # starts never outlives that launch*), in leerie's namespace only.
     assert verbs == ["build", "image", "inspect", "kill", "ps", "rm", "run",
                      "save"], verbs
-    assert len(own) == 21, own
+    # 22: `_remove_launch_container`'s bounded `rm -f`, for a runtime that
+    # stopped answering after the run ended (DESIGN §6 *A launch's
+    # host-side work starts when its run has ended*), is a site of its own.
+    assert len(own) == 22, own
     # The run's quoted forms (macOS `script`) name it too.
     assert leerie.count(
         '_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"') == 2
