@@ -7,9 +7,14 @@ cross-category visibility, exactly like the first pass, so it reintroduces
 both the vocabulary drift the reconciler resolved AND the cross-planner
 surface collisions the overlap judge merged.
 
-**Only `phase_adherence_gate` re-plans now.** `phase_planning_coverage_gate`
-became advisory in PR #166 — it invokes its judge once, logs, and returns the
-plan unchanged.
+**The coverage gate re-plans again, and its guards are back.** Its judge
+became advisory in PR #166 and still never re-plans. Its typed item accounting
+does: an item every planner excluded as another domain's and none claimed
+re-plans the domains that excluded it (DESIGN §5 *Required items are claimed
+too, and the plan accounts for every one*). As this file said it would, the
+19a70d96 guard comes back with that path: the coverage gate's re-plan re-runs
+reconcile, the overlap judge and the adherence gate. The history below is
+kept because it is why.
 
 That matters for how this file shrank. The motivating incident, run
 `19a70d96` (2026-08-01), was a COVERAGE-GATE re-plan: the overlap judge merged
@@ -81,6 +86,83 @@ def _duplicated_plan():
                  ["orchestrator/leerie.py", "prompts/provision.md",
                   "docs/DESIGN.md"])]},
     ]
+
+def test_coverage_gate_reruns_every_upstream_phase(leerie):
+    """The 19a70d96 guard, restored with the coverage gate's re-plan path:
+    the re-plan must be followed by every planning phase upstream of it."""
+    calls = _replan_calls(leerie, leerie.phase_planning_coverage_gate)
+    assert calls.index("phase_plan") < calls.index("phase_reconcile") \
+        < calls.index("phase_overlap_judge") \
+        < calls.index("phase_adherence_gate")
+
+
+def test_coverage_gate_replan_reruns_upstream_phases_when_executed(
+        leerie, monkeypatch):
+    """Executed, not read: a cross-domain item gap drives one re-plan, and
+    reconcile, overlap judge and adherence gate each run once after it, in
+    that order, on the re-planned output."""
+    import asyncio
+
+    order: list[str] = []
+    items = [{"item": "first requirement"}, {"item": "second requirement"}]
+
+    def _gap_plans():
+        return [
+            {"domain": "bug-fixing", "status": "ready", "subtasks": [
+                dict(_sub("bugfix-001", [], ["a.py"]),
+                     claims={"sites": [], "items": [
+                         {"item_index": 0, "kind": "deliverable"}]})],
+             "items_not_needed": [{"item_index": 1,
+                                   "reason_kind": "other_domain",
+                                   "reason": "the tests planner owns it"}]},
+            {"domain": "testing", "status": "ready", "subtasks": [],
+             "items_not_needed": [{"item_index": 1,
+                                   "reason_kind": "other_domain",
+                                   "reason": "the bug-fixing planner owns it"}]},
+        ]
+
+    async def fake_plan(task, st, caps, models, efforts, replan_round=0,
+                        domains=None):
+        order.append("plan")
+        assert "item 1" in task and "second requirement" in task
+        return [{"domain": "bug-fixing", "status": "ready", "subtasks": [
+            dict(_sub("bugfix-001", [], ["a.py"]),
+                 claims={"sites": [], "items": [
+                     {"item_index": 0, "kind": "deliverable"},
+                     {"item_index": 1, "kind": "deliverable"}]})]},
+            {"domain": "testing", "status": "ready", "subtasks": []}]
+
+    def _step(name):
+        async def f(plans, *a, **kw):
+            order.append(name)
+            return plans
+        return f
+
+    monkeypatch.setattr(leerie, "phase_plan", fake_plan)
+    monkeypatch.setattr(leerie, "phase_reconcile", _step("reconcile"))
+    monkeypatch.setattr(leerie, "phase_overlap_judge", _step("overlap"))
+    monkeypatch.setattr(leerie, "phase_adherence_gate", _step("adherence"))
+
+    async def fake_claude_p(**kw):
+        return {"task_covered": True, "rationale": "r", "coverage_gaps": []}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    class _St:
+        def __init__(self):
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt",
+                         "required_items": items, "worker_count": 0,
+                         "categories": ["bug-fixing", "testing"]}
+        def save(self): pass
+        def bump_workers(self, caps): pass
+
+    st = _St()
+    out = asyncio.run(leerie.phase_planning_coverage_gate(
+        _gap_plans(), "task", st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert order == ["plan", "reconcile", "overlap", "adherence"]
+    assert st.data["item_coverage"]["uncovered"] == []
+    assert [c["item_index"] for c in
+            out[0]["subtasks"][0]["claims"]["items"]] == [0, 1]
+
 
 def test_adherence_gate_does_not_rerun_the_downstream_coverage_gate(leerie):
     """Not an oversight — the coverage gate sits downstream and has not run

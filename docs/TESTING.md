@@ -5353,10 +5353,40 @@ carries a disposition*).
 top-level schema has no `already_resolved_on_tree` (both pinned as absent,
 with the measured strict-decoding reason in the test); the executed audit
 phase keeps each site's disposition and its `note` evidence;
-`_warn_defect_sites_uncovered` names an uncovered `fix` site and never a
-`ruled_out` one (falsified by removing the filter: 2 red), stays quiet when
-every `fix` site is claimed, and still warns on a legacy site without a
-disposition; both prompts carry their rule.
+`_site_claim_rows` needs a claim only for a `fix` site, never a `ruled_out`
+one, `_check_site_claims` is quiet when every `fix` site is claimed, and a
+legacy site without a disposition still needs a claim; both prompts carry
+their rule. (The file-path floor `_warn_defect_sites_uncovered` these tests
+used to pin was deleted; `tests/test_defect_scope_audit.py` pins its
+absence and the 4134b78c directory site it warned on while three subtasks
+claimed it.)
+
+`tests/test_item_accounting.py` (DESIGN §5 *Required items are claimed too,
+and the plan accounts for every one*): the accounting rows on values (claim,
+`other_domain`, uncovered, and `already_on_tree` read as no exclusion; a
+`verification_only`
+subtask's deliverable claim not counted; an untyped or empty exclusion is
+none; split children and both merge paths keep item claims); the planner
+check's issues (an out-of-range index, the item's words, the uncounted
+claimer, no `other_domain` on a one-category run); the REAL `phase_plan` in a
+real git repository with only `claude_p` stubbed, on 4f9a4b4f's plan shape,
+asserting the planner is re-invoked with exactly the unaccounted items and
+the out-of-range index, that the context carries `item_index`, and that a
+covered plan takes one call; the REAL `phase_planning_coverage_gate`
+recording a residual in `item_coverage`, the log and the PR, re-planning an
+item every domain pointed elsewhere through the real `phase_plan`, stopping
+before any spend when the re-plan is unaffordable, and recording a
+cross-domain residual after its rounds. Falsified live, one mutation at a
+time: counting a verification-only deliverable claim (4 red), dropping the
+planner-loop check (1), handing the planner the bare list (1), finding no
+cross-domain gap (3), skipping reconcile after the gate's re-plan (2, in
+`tests/test_replan_reruns_upstream_phases.py`), dropping item claims on a
+merge (2), accepting `other_domain` on one category (1), omitting the PR
+lines (1), accepting an out-of-range index (2), removing the re-plan
+preflight (1), and making `already_on_tree` an exclusion kind again (2).
+The execution-proof gate for that kind and its test file
+(`tests/test_item_exclusion_proof.py`) were deleted with the kind (DESIGN
+§5 *"Already on the tree" is no exclusion*).
 
 Live strict-mode replays of a recorded v0.36.0 auditor call (CLI 2.1.289)
 chose the shape: dispositions alone came back non-empty 6/6, the prior schema

@@ -301,14 +301,19 @@ subtask it tests). Three mechanisms reconcile that coupling:
   the integrated tree (§8 *The gate judges the finding, not only the
   items*) — which is also
   what operator prompts asking to "fix the root cause at its source"
-  have been requesting all along. Advisory throughout, on the
-  artifact-registry model: the audit can be wrong (it is judgment, and
-  a hallucinated site must not be able to block a run), so nothing
-  gates on it — but a mechanical floor,
-  `_warn_defect_sites_uncovered`, compares the audited sites' *files*
-  (set comparison on paths — never prose) against the plan's
-  `files_likely_touched` union and warns loudly on any audited file no
-  subtask claims. A task that is not a defect fix pays nothing.
+  have been requesting all along. The audit can be wrong (it is
+  judgment, and a hallucinated site must not be able to block a run),
+  so it never stops a run. The plan accounts for each `fix` site
+  through typed site claims (*Every `fix` site is claimed* below),
+  checked in the planner's own loop. A file-path floor that warned on
+  any audited file missing from every subtask's `files_likely_touched`
+  was deleted: by then site claims had a code-assigned `site_id`, and
+  the path match was a second, weaker rule. Measured over the 16
+  barnacle, web and navegando runs with an applicable audit (68 `fix`
+  sites), it warned on 3 sites, and 2 of those were claimed by
+  `site_id`. Navegando 4134b78c's audited site `src/components` is a
+  directory that no file path equals, and three subtasks claimed it.
+  A task that is not a defect fix pays nothing.
 
   **The applicability trigger includes unconfirmed-cause reports.**
   Measured on the audit's first two live runs (one task, 2026-09-28):
@@ -453,7 +458,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
   (replayed against run N's base tree): the later-fixed symbol came back
   disposed `fix` 8/8, 3/3, 7/8 and 5/8, and the mean site count did not
   grow (12.0 with dispositions, 12.8 without). One blind spot stayed (a helper
-  1/8), which is why the planner's coverage warning remains advisory.
+  1/8). An audit blind spot like that is not something a plan-time
+  check can catch.
   The planner must cover every `fix` site; `ruled_out` sites travel with
   their evidence (in `note`) for the record. A per-site judge on the integrated tree
   was tried and dropped: it caught every missed site but at 16%
@@ -507,14 +513,130 @@ subtask it tests). Three mechanisms reconcile that coupling:
   read on a control (4 sites, one run) were all `other` claims — which
   is why `other` is settled at the gate instead of contradicting.
 
-  **Required items are claimed too.** On every run, not only a defect
-  fix, each planner subtask lists in `claims.items` the required items
-  (§8 *The delivery gate*) its work delivers, each typed `deliverable`
-  (a change the tree must carry) or `process` (a constraint on how to
-  work). The claim is not checked at plan time; it is the routing key of
-  the delivery re-drive (§8 *Delivery re-drive*), which hands an unmet
-  deliverable item back to every subtask that claimed it, and never
-  routes a process item. Split children inherit it with the site claims.
+  **Required items are claimed too, and the plan accounts for every
+  one.** On every run, not only a defect fix, each planner subtask lists
+  in `claims.items` the required items (§8 *The delivery gate*) its work
+  delivers, each typed `deliverable` (a change the tree must carry) or
+  `process` (a constraint on how to work). The claim is the routing key
+  of the delivery re-drive (§8 *Delivery re-drive*), which hands an
+  unmet deliverable item back to every subtask that claimed it, and
+  never routes a process item. Split children inherit it with the site
+  claims, and a merge of two subtasks keeps both subtasks' item claims.
+
+  Before execution every required item is claimed by a subtask that can
+  change the tree. The one exclusion is the plan's `items_not_needed`
+  with `reason_kind: other_domain`: another category's planner delivers
+  the item. That is a fact about planner scope, which code checks: it is
+  rejected on a run with one category, and an item every domain excludes
+  is re-planned. Code checks this by set arithmetic over the integer
+  `item_index`, the typed kinds and `verification_only`, never over
+  prose:
+
+  - *The key is copied, not counted.* Each planner gets every required
+    item with the `item_index` code assigned to it. The coverage judge,
+    the delivery gate and the re-drive use the same numbers. Planners
+    used to get a bare list and count positions, and they miscounted:
+    run 2dcb4cce's only fix subtask for item 13 claimed item 11, and
+    4f9a4b4f claimed an item 14 in a 14-item list. A check keyed on a
+    counted index would have re-planned 2dcb4cce for an item it had
+    planned.
+  - *A subtask that writes nothing delivers nothing.* A `deliverable`
+    claim counts only from a subtask that is not typed
+    `verification_only`. In 4f9a4b4f and 879de601, the item that ended
+    unmet (13 and 8) was claimed only by a `verification_only` subtask
+    whose commands tested other items. That subtask was settled by
+    execution, so nothing in the run ever planned the change.
+  - *"Already on the tree" is no exclusion.* An item the planner
+    believes the tree already carries is claimed like any other. If the
+    belief is right, the claiming subtask finds nothing to change and
+    settles as a no-op on its own executed evidence (§8 *A no-op the
+    base already carries*). An `already_on_tree` exclusion was built and
+    removed, because no plan-time check of it is sound:
+    - *Taken on the planner's word* (bench PC, run 1), it was false in
+      9 of 12 target samples once the loop made plans account for every
+      item. That included 4f9a4b4f item 13 in 3 of 3, with evidence
+      citing the optional-step skip. The original run's delivery judge
+      made the same misreading.
+    - *Proven by execution* (run 2, and replay R1 offline on the
+      recorded trees), the rule was that the exclusion's commands pass
+      on the own start and fail on an earlier tree of the task, with
+      their test files as the own start has them. 88 of 100 proofs found
+      the command also passes on the earlier tree.
+    - The proof accepted a test unrelated to the item. 2dcb4cce items
+      10 and 11 were "proven" by a site-name test that changed between
+      the trees.
+    - It accepted a partly delivered item: 879de601 item 8, whose test
+      grew with the part delivered between the trees, while the part the
+      falsifier later found missing stayed missing.
+    - Of the 33 already-delivered items hand-checked, only 1 was
+      provable. 17 were on the tree before the task's first run, 5 have
+      no dedicated test, and 10 are on a first run.
+
+    A proof shows that a command detects some difference between two
+    trees, not that the item is done, so the exclusion was a guess with
+    no sound check.
+  - *Each planner is held to it in its own loop.* The check runs in the
+    planner's mechanical-check loop (`planner_check_rounds`), the same
+    loop the site claims use. An item the planner does not claim
+    (`ITEM_UNACCOUNTED`), or a claim outside the list, is sent back to
+    it by number and wording.
+  - *The merged plan is checked once more.* No single planner can see an
+    item that every planner excluded as `other_domain` and none claimed.
+    The task-coverage gate (§8 *Independent adversarial verification*)
+    finds such items on the merged plan and re-plans the domains that
+    excluded them. The re-plan is scoped by `_replan_domain_closure`,
+    preflighted by `check_replan_affordable`, re-runs reconcile, the
+    overlap judge and the adherence gate (§5 *A re-plan invalidates
+    every phase that already ran*), and is bounded by
+    `judgment_check_rounds`.
+  - *A residual is recorded, not silent and not fatal.* An item still
+    unclaimed after those rounds does not stop the run. State records
+    every item's status in `item_coverage` (`claimed`, `other_domain` or
+    `uncovered`). The log names each uncovered item before any
+    implementation work starts, and the PR lists it under *Not verified
+    by this run*. The delivery gate then reads it on the tree that ships
+    like any other item. If it is met, it is met. If it is unmet, the
+    outcome is the existing `unconverged`, and the re-drive reason is
+    `no_owner`.
+
+  Measured by replaying the rule over every barnacle, web and navegando
+  run still on disk (20 runs with required items, all from after
+  `claims.items` existed; 18 had one category). The rule fires on 6 of
+  the 20 runs, for 76 items plus one out-of-range claim. 6 of those
+  items, in 4 runs, are exactly the items those runs ended with unmet
+  (4f9a4b4f 13, 879de601 8, b24806a1 13, a2a825c2 1, 14 and 29), out of
+  the 17 items the 20 runs ended with unmet. The other 70 ended met.
+  Hand-checked on three of the runs (2dcb4cce, 79c8fbe7 and b24806a1,
+  all repeat runs on one report): 33 of 35 were already on the tree when
+  the run started, one was 2dcb4cce's miscounted claim, and one
+  (b24806a1 13) was a real gap. Per planner, the check also fires on one
+  of the two two-category runs (707bd65a), where each planner left the
+  other's items unaccounted for: that is the case `other_domain` exists
+  for. Neither two-category run had an item that no plan claimed, so the
+  merged-plan re-plan would have fired on none of them.
+
+  What claiming every item costs, measured in bench PC's third run.
+  The `already_on_tree` path was gone, the cases were reused, and the
+  same frozen bar held.
+  - The final plans carried 120 subtasks against main's 96 over the same
+    36 plans.
+  - Subtasks whose every deliverable claim is an item its run had
+    already delivered, so they will settle as no-ops: 14 against main's
+    7 over the 18 repeat-run plans. That is 7 more, about 0.4 per
+    repeat run.
+  - A no-op subtask costs 2 to 4 worker calls (fit judge, satisfied
+    probe and implementer; mean 2.8 over the 6 recorded no-op settles),
+    so about 20 more worker calls over those 18 plans. The planner loop
+    added 12 planner calls over the 36 plans.
+  - #332 ends a finished task's re-run before planning (§8 *A done run's
+    change on the base settles the task*). Of these repeat runs it
+    settles 86f32d44: 6da090bf ended done and both of its non-test hunks
+    reverse-apply on 86f32d44's base. The four repeat runs of the iframe
+    report had no done run before them, so #332 settles none of them,
+    and they pay the no-ops.
+  - In exchange, every item a run ended with unmet was claimed in every
+    final plan (A left 21 such claims missing), and none was excluded.
+    P2 and P3 hold, and the bench passes P1–P7.
 
   A top-level `already_resolved_on_tree` flag was tried alongside and
   dropped: under strict decoding, every schema variant carrying that one
@@ -15140,14 +15262,16 @@ mis-wirings:
   each other). A planner can self-report high `task_understanding` while a
   whole required piece of work never became a subtask, since a decomposition
   self-review is anchored to the decomposition already committed to, not the
-  task independently re-read. Gates on a non-empty array of concretely-named
-  coverage gaps, and **re-drives** `phase_plan` (mirroring
-  `classification_judge`) since the planner can mechanically act on a found
-  gap. A re-plan runs one planner per category with no cross-category
-  visibility, so it can reintroduce cross-domain tag drift `phase_reconcile`
-  already resolved — the re-drive is followed by a second `phase_reconcile`
-  call before the next judge round (§5 *Bridge cross-domain capability-tag
-  mismatches*). This doesn't reopen the earlier falsified attempt at gating
+  task independently re-read. It was first built to gate on a non-empty
+  array of concretely-named coverage gaps and re-drive `phase_plan`. Since
+  2026-08-04 it is advisory (below), and the gate re-plans only on the
+  typed item accounting, never on a judge finding. A re-plan runs one
+  planner per category with no cross-category visibility, so it can
+  reintroduce the cross-domain tag drift `phase_reconcile` already
+  resolved and the surface collisions the overlap judge merged. The gate's
+  re-plan is therefore followed by reconcile, the overlap judge and the
+  adherence gate (§5 *A re-plan invalidates every phase that already
+  ran*). This doesn't reopen the earlier falsified attempt at gating
   `task_understanding` directly (§12 *Instruction adherence is
   code-enforced*): that finding was specific to an *understanding*-framed
   judge, which can't distinguish "understood and disobeyed" from "understood
@@ -15169,17 +15293,24 @@ mis-wirings:
   terminal authority must be proportional to its measured reproducibility,
   and a judgment layer with no mechanical backstop should not be terminal at
   all.** `wiring_judge` keeps its authority (99% of findings verify true,
-  69/70) and `plan_overlap_judge` keeps its (impossible-assertion catches);
-  coverage has neither, since no mechanical check can verify "the plan
-  misses work X" without reading prose.
+  69/70) and `plan_overlap_judge` keeps its (impossible-assertion catches).
 
-  `phase_plan` injects `required_items` verbatim into every planner's
-  context (only when non-empty), mirroring the instruction-adherence gate's
-  `prescribed_procedure` injection, so the planner can echo a required
-  item's wording into a subtask at birth instead of the omission surfacing
-  only after the fact. The coverage judge is handed the same items,
-  numbered, and cites the `item_index` of a required item no subtask
-  addresses; it stays advisory.
+  That demotion was right for what was measured: a token floor and a
+  judge, which both read prose. It was never evidence against a plan-time
+  coverage gate. The mechanical check the gate lacked exists now. Each
+  subtask names the required items it delivers by a code-assigned integer
+  (`claims.items`); the only item a plan may leave unclaimed is one
+  another category's planner delivers (`items_not_needed`,
+  `other_domain`). The gate's authority rests on set
+  arithmetic over those fields, which gives the same answer on the same
+  plan every time (§5 *Required items are claimed too, and the plan
+  accounts for every one*). The judge does not gain authority. It runs as
+  before, and its findings are recorded and logged.
+
+  `phase_plan` hands every planner the `required_items` (only when
+  non-empty), each with its code-assigned `item_index`, mirroring the
+  instruction-adherence gate's `prescribed_procedure` injection. The
+  coverage judge gets the same items with the same numbers.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the

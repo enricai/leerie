@@ -626,6 +626,11 @@ STATE_FIELDS = (
     # blocked plan is recorded*). process_constraints: the classifier's
     # typed forbidden commands (DESIGN §9 *A command the task forbids*).
     "site_claims", "domain_blocked", "process_constraints",
+    # item_coverage: the merged plan's required-item accounting, written by
+    # the coverage gate before execution (DESIGN §5 *Required items are
+    # claimed too, and the plan accounts for every one*), for the log and
+    # the PR.
+    "item_coverage",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -2729,6 +2734,22 @@ def _planner_defs() -> dict:
                 },
             },
         },
+        # DESIGN §5 *Required items are claimed too, and the plan accounts
+        # for every one*: a required item this plan delivers nowhere, with
+        # the typed reason.
+        "items_not_needed": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["item_index", "reason_kind", "reason"],
+                "properties": {
+                    "item_index": {"type": "integer"},
+                    "reason_kind": {"type": "string",
+                                    "enum": list(ITEM_EXCLUSION_KINDS)},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+            },
+        },
         "blocker_kind": {"type": "string",
                          "enum": list(PLANNER_BLOCKER_KINDS)},
     }
@@ -2920,6 +2941,12 @@ CHANGE_KINDS = ("fix", "test", "docs", "other")
 # *Required items are claimed too*): a tree change, or a constraint on how
 # to work — which the delivery re-drive never routes.
 ITEM_CLAIM_KINDS = ("deliverable", "process")
+# Why a plan delivers a required item nowhere (DESIGN §5 *Required items are
+# claimed too, and the plan accounts for every one*): another category's
+# planner delivers it, a fact about planner scope code checks. "The tree
+# already carries it" is no exclusion: no plan-time check of it is sound, so
+# such an item is claimed by a change subtask that settles as a no-op.
+ITEM_EXCLUSION_KINDS = ("other_domain",)
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
@@ -3180,6 +3207,9 @@ SCHEMAS: dict[str, dict] = {
             # DESIGN §5 *Every `fix` site is claimed*: an audited `fix` site
             # the plan deliberately leaves alone, with the reason.
             "sites_not_needed": {"$ref": "#/$defs/sites_not_needed"},
+            # DESIGN §5 *Required items are claimed too, and the plan
+            # accounts for every one*.
+            "items_not_needed": {"$ref": "#/$defs/items_not_needed"},
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
             # clear within confidence_rounds emits status="blocked" with an
             # empty subtasks list and the gap analysis in
@@ -7409,7 +7439,23 @@ def _pr_not_verified(state: dict, in_pr: Callable[[str], bool]
     for line in _untyped_site_lines(state):
         add("Fix sites resting on an untyped change the run did not settle",
             line)
+    for line in _uncovered_item_lines(state):
+        add("Required items no planned subtask claimed", line)
     return groups
+
+
+def _uncovered_item_lines(state: dict) -> list[str]:
+    """The "Not verified by this run" lines for the required items the
+    plan left unaccounted for — no claim, no typed exclusion — as the
+    coverage gate recorded them before execution (DESIGN §5 *Required
+    items are claimed too, and the plan accounts for every one*)."""
+    rec = state.get("item_coverage") if isinstance(state, dict) else None
+    if not isinstance(rec, dict):
+        return []
+    open_idx = {i for i in rec.get("uncovered") or [] if isinstance(i, int)}
+    return [f"- [ ] item {r['item_index']}: {_pr_entry(r.get('item'))}"
+            for r in rec.get("items") or []
+            if isinstance(r, dict) and r.get("item_index") in open_idx]
 
 
 def _untyped_sites(state: dict) -> list[dict]:
@@ -35527,8 +35573,9 @@ async def phase_defect_scope_audit(
     on the base tree implementing it (decision sites, producers,
     consumers, and bypasses — or the candidate mechanisms), and says
     whether a chokepoint exists where one fix covers all of them.
-    `phase_plan` injects the result into every planner's ctx;
-    `_warn_defect_sites_uncovered` is the mechanical floor.
+    `phase_plan` injects the result into every planner's ctx, and the
+    bug-fixing planner's loop holds it to the typed site claims
+    (`_check_site_claims`).
     Best-effort and non-fatal on the artifact-registry model: any
     failure returns `{"applicable": False}` and the run proceeds as
     it did before the audit existed. Never die()s."""
@@ -35701,8 +35748,7 @@ def _site_claim_rows(plan: dict, defect_scope: dict) -> list[dict]:
     """One row per audited `fix` site: who claims it, with which kinds, and
     the verdict (DESIGN §5 *Every `fix` site is claimed*). Set arithmetic on
     typed fields only — `SITE_KIND_CLASS` decides equivalence; no prose is
-    read. A site without a `disposition` counts as `fix` (the legacy rule
-    `_warn_defect_sites_uncovered` also applies)."""
+    read. A site without a `disposition` counts as `fix`."""
     claims: dict[str, list[dict]] = {}
     for s in plan.get("subtasks") or []:
         if not isinstance(s, dict) or s.get("change_kind") != "fix":
@@ -35801,50 +35847,166 @@ def _site_claim_record(plan: object, defect_scope: object) -> dict | None:
             "sites": _site_claim_rows(plan, defect_scope)}
 
 
-def _warn_defect_sites_uncovered(plans: list[dict],
-                                 defect_scope: dict) -> None:
-    """Mechanical floor for the defect-scope audit (DESIGN §5
-    *Defect-scope audit*): warn on every audited site whose FILE appears
-    in no subtask's `files_likely_touched`. Pure set comparison on paths
-    — never on prose (a scope_note naming a deliberate exclusion still
-    warns; that noise is accepted, since parsing the note would be
-    exactly the Language-to-JSON violation the repo forbids). Advisory
-    only: the audit is judgment, and a hallucinated site must not be
-    able to block a run."""
-    if not defect_scope.get("applicable"):
-        return
-    # Only sites the audit disposed `fix` must be claimed; a `ruled_out`
-    # site carries its own evidence (DESIGN §5 *Every site carries a
-    # disposition*). A legacy site without a disposition counts as `fix`.
-    sites = [st_ for st_ in (defect_scope.get("sites") or [])
-             if st_.get("disposition", "fix") == "fix"]
-    if not sites:
-        return
-    def _norm(path: str) -> str:
-        # removeprefix, not lstrip: lstrip("./") strips a CHARACTER SET,
-        # so "/abs/x.py" and "abs/x.py" would conflate (review round 1 —
-        # suppressed a warning). Peel only literal "./" prefixes.
-        while path.startswith("./"):
-            path = path[2:]
-        return path
+def _planner_required_items(items: object) -> list[dict]:
+    """`required_items` as every planner gets them: each with the
+    `item_index` code assigned to it, the numbering the coverage judge, the
+    delivery gate and the re-drive use (DESIGN §5 *Required items are
+    claimed too, and the plan accounts for every one*). Planners handed a
+    bare list counted positions and miscounted (2dcb4cce claimed item 11
+    for its item-13 fix; 4f9a4b4f claimed an item 14 of 14); a copied key
+    cannot be miscounted."""
+    out: list[dict] = []
+    for i, it in enumerate(items if isinstance(items, list) else []):
+        if not isinstance(it, dict):
+            continue
+        row = {"item_index": i}
+        for k in ("item", "span", "parts", "source_ref", "verifiability"):
+            if k in it:
+                row[k] = it[k]
+        out.append(row)
+    return out
 
-    claimed: set[str] = set()
-    for p in plans:
-        for s in (p.get("subtasks") or []):
-            for f in (s.get("files_likely_touched") or []):
-                claimed.add(_norm(str(f)))
-    uncovered = [s for s in sites
-                 if _norm(str(s.get("file", ""))) not in claimed]
-    if not uncovered:
-        return
-    log("  WARNING: defect-scope audit sites not claimed by any subtask's "
-        "files_likely_touched — a plan that leaves a same-shape site "
-        "unfixed is how the same defect ships partially fixed run after "
-        "run (advisory; scope a subtask to each, or name the exclusion "
-        "in a scope_note):")
-    for s in uncovered:
-        log(f"    • {s.get('file')} :: {s.get('symbol')} "
-            f"({s.get('role', '?')})")
+
+def _plan_domain(plan: dict) -> str:
+    """The id prefix a plan's subtasks carry (the key
+    `_replan_domain_closure` and `phase_plan(domains=)` use), else its
+    `domain` field."""
+    for s in plan.get("subtasks") or []:
+        sid = s.get("id") if isinstance(s, dict) else None
+        if isinstance(sid, str) and "-" in sid:
+            return sid.split("-", 1)[0]
+    dom = plan.get("domain")
+    return CATEGORY_ABBREV.get(dom, dom) if isinstance(dom, str) else ""
+
+
+def _item_accounting_rows(plans: list[dict], items: object) -> list[dict]:
+    """One row per required item over `plans`: who claims it, who excludes
+    it and why, and its status (DESIGN §5 *Required items are claimed too,
+    and the plan accounts for every one*). Set arithmetic on typed fields
+    only: `item_index`, `kind`, `reason_kind`, `verification_only`.
+
+    A `deliverable` claim from a subtask typed `verification_only` is not
+    counted: that subtask writes nothing, so the claim is a guess that the
+    tree already carries the item (the 4f9a4b4f and 879de601 shape — the
+    unmet item rested on such a claim). `status`: `claimed`, `other_domain`
+    (only other domains' exclusions), `uncovered`."""
+    n = len(items) if isinstance(items, list) else 0
+    claimed: dict[int, list[str]] = {}
+    not_counted: dict[int, list[str]] = {}
+    excluded: dict[int, list[dict]] = {}
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        for s in plan.get("subtasks") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("claims"),
+                                                         dict):
+                continue
+            sid = str(s.get("id", "?"))
+            for c in s["claims"].get("items") or []:
+                i = c.get("item_index") if isinstance(c, dict) else None
+                if (not isinstance(i, int) or isinstance(i, bool)
+                        or not 0 <= i < n):
+                    continue
+                writes_nothing = s.get("verification_only") is True
+                bucket = (not_counted if c.get("kind") != "process"
+                          and writes_nothing else claimed)
+                if sid not in bucket.setdefault(i, []):
+                    bucket[i].append(sid)
+        for e in plan.get("items_not_needed") or []:
+            if not isinstance(e, dict):
+                continue
+            i, kind, why = (e.get("item_index"), e.get("reason_kind"),
+                            e.get("reason"))
+            if (isinstance(i, int) and not isinstance(i, bool)
+                    and 0 <= i < n and kind in ITEM_EXCLUSION_KINDS
+                    and isinstance(why, str) and why.strip()):
+                excluded.setdefault(i, []).append(
+                    {"domain": _plan_domain(plan), "reason_kind": kind,
+                     "reason": why.strip()})
+    rows: list[dict] = []
+    for i in range(n):
+        status = ("claimed" if claimed.get(i)
+                  else "other_domain" if excluded.get(i)
+                  else "uncovered")
+        it = items[i] if isinstance(items[i], dict) else {}
+        rows.append({"item_index": i, "item": str(it.get("item") or ""),
+                     "claimed_by": claimed.get(i, []),
+                     "not_counted": [x for x in not_counted.get(i, [])
+                                     if x not in claimed.get(i, [])],
+                     "excluded": excluded.get(i, []), "status": status})
+    return rows
+
+
+def _check_item_claims(result: dict, items: object,
+                       n_categories: int) -> list[str]:
+    """The planner-loop item accounting (DESIGN §5 *Required items are
+    claimed too, and the plan accounts for every one*): one gating issue per
+    required item this plan neither claims nor excludes, and per claim or
+    exclusion naming an index the list does not have. `other_domain` is no
+    account on a run with one category. `[]` for a blocked plan (the blocker
+    is its own report) and when there are no required items."""
+    if (not isinstance(items, list) or not items
+            or result.get("status") == "blocked"):
+        return []
+    n = len(items)
+    issues: list[str] = []
+    named = [c.get("item_index") for s in result.get("subtasks") or []
+             if isinstance(s, dict) and isinstance(s.get("claims"), dict)
+             for c in s["claims"].get("items") or [] if isinstance(c, dict)]
+    named += [e.get("item_index") for e in result.get("items_not_needed") or []
+              if isinstance(e, dict)]
+    for i in sorted({i for i in named if isinstance(i, int)
+                     and not isinstance(i, bool) and not 0 <= i < n}):
+        issues.append(
+            f"ITEM_INDEX_UNKNOWN: {i} — `required_items` has items 0 to "
+            f"{n - 1}. Use the `item_index` each item carries.")
+    for r in _item_accounting_rows([result], items):
+        if r["status"] == "claimed":
+            continue
+        if r["status"] == "other_domain" and n_categories > 1:
+            continue
+        words = r["item"][:200]
+        why = ("you excluded it as `other_domain`, but this run has one "
+               "category, so no other planner delivers it. "
+               if r["status"] == "other_domain" else "")
+        if r["not_counted"]:
+            why += ("it is claimed only by "
+                    + ", ".join(r["not_counted"])
+                    + ", which is `verification_only` and writes nothing. ")
+        issues.append(
+            f"ITEM_UNACCOUNTED: item {r['item_index']} — \"{words}\" — "
+            f"{why}Claim it in `claims.items` of a subtask that can change "
+            "the tree for it; if the tree already carries it, that subtask "
+            "settles as a no-op on its own executed evidence"
+            + (", or list it in `items_not_needed` as `other_domain` if "
+               "another category's planner delivers it"
+               if n_categories > 1 else "")
+            + ".")
+    return issues
+
+
+def _item_coverage_record(plans: list[dict], items: object) -> dict | None:
+    """`state.data["item_coverage"]`: the merged plan's accounting rows and
+    the indices still `uncovered` (claimed by no subtask that can change
+    the tree), or None when there are no required items."""
+    if not isinstance(items, list) or not items:
+        return None
+    rows = _item_accounting_rows(plans, items)
+    return {"items": rows,
+            "uncovered": [r["item_index"] for r in rows
+                          if r["status"] != "claimed"]}
+
+
+def _cross_domain_item_gaps(rows: list[dict]) -> list[dict]:
+    """The items every planner that accounted for them excluded as another
+    domain's, and none claimed: the gap no single planner's loop can see."""
+    return [r for r in rows if r["status"] == "other_domain"]
+
+
+def _item_gap_domains(rows: list[dict]) -> set[str]:
+    """The domains whose plans excluded a cross-domain gap — the re-plan's
+    targets, before `_replan_domain_closure` widens them."""
+    return {e["domain"] for r in rows for e in r["excluded"] if e["domain"]}
 
 
 def _replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
@@ -36003,17 +36165,14 @@ async def phase_plan(task: str, st: State, caps: dict,
     prior_residual = _prior_delivery_residual(st)
     if prior_residual:
         ctx_dict["prior_delivery_residual"] = prior_residual
-    # PRIMARY floor for the task-coverage gate (DESIGN §8 sibling to the
-    # instruction-adherence gate above): feed the classifier's
-    # required_items checklist into the planner context so it can echo
-    # each item's wording into a subtask's title/success_criteria_seed at
-    # birth — no mechanical check can verify
-    # coverage of a checklist the planner never saw. Omitted entirely when
-    # the classifier found nothing genuinely enumerable, so the common
-    # case carries no false framing.
+    # The classifier's required items, each with its code-assigned
+    # `item_index` (DESIGN §5 *Required items are claimed too, and the plan
+    # accounts for every one*): the planner claims or excludes every one by
+    # that copied key, and `_check_planner` holds it to that. Omitted when
+    # the classifier found nothing enumerable.
     required_items = st.data.get("required_items") or []
     if required_items:
-        ctx_dict["required_items"] = required_items
+        ctx_dict["required_items"] = _planner_required_items(required_items)
     # Converged-gate dispute residual (DESIGN §8 *A dispute's evidence is
     # planning input, not log noise*): when the no_work_judge disputed an
     # already-satisfied claim, its evidence names exactly what is already
@@ -36122,6 +36281,13 @@ async def phase_plan(task: str, st: State, caps: dict,
                 # recorded below, never fatal.
                 if category == "bug-fixing":
                     issues += _check_site_claims(r, defect_scope)
+                # Every planner accounts for every required item (DESIGN §5
+                # *Required items are claimed too, and the plan accounts for
+                # every one*); `skip_coverage_check` turns all required-items
+                # checking off.
+                if not st.data.get("skip_coverage_check"):
+                    issues += _check_item_claims(
+                        r, required_items, len(st.data["categories"]))
                 return issues
 
             result, gate_warnings = await _run_checked_loop(
@@ -36738,6 +36904,22 @@ def _merge_subtask_core_fields(
         if dep not in merged_deps:
             merged_deps.append(dep)
     into_s["depends_on"] = merged_deps
+
+    # claims.items: union — the merged subtask delivers what both did, and
+    # an item claim lost here would leave the item unaccounted for (DESIGN
+    # §5 *Required items are claimed too, and the plan accounts for every
+    # one*).
+    from_items = ((from_s.get("claims") or {}).get("items")
+                  if isinstance(from_s.get("claims"), dict) else None)
+    if from_items:
+        claims = into_s.get("claims")
+        claims = dict(claims) if isinstance(claims, dict) else {"sites": []}
+        merged_items = list(claims.get("items") or [])
+        for c in from_items:
+            if c not in merged_items:
+                merged_items.append(copy.deepcopy(c))
+        claims["items"] = merged_items
+        into_s["claims"] = claims
 
 
 def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
@@ -40715,51 +40897,121 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
 async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
                                         caps: dict, models: dict[str, str],
                                         efforts: dict[str, str | None]) -> list[dict]:
-    """Advisory whole-plan coverage review (DESIGN §8).
+    """Whole-plan coverage (DESIGN §8 *Independent adversarial
+    verification*; §5 *Required items are claimed too, and the plan
+    accounts for every one*). Two parts, with different authority.
 
-    **This gate does not terminate a run and does not re-plan.** It invokes
-    `task_coverage_judge` once, logs what it finds, and returns `plans`
-    unchanged.
+    **The item accounting gates.** Every required item must be claimed by a
+    subtask that can change the tree (an item another category's planner
+    delivers is excluded as `other_domain`). Each planner's own loop already
+    held its plan to that (`_check_item_claims`); what no single planner can
+    see is an item every planner excluded as `other_domain` and none
+    claimed. Those items re-plan the domains that excluded them, scoped by
+    `_replan_domain_closure`, preflighted by `check_replan_affordable`, and
+    followed by reconcile, the overlap judge and the adherence gate — a
+    re-plan undoes what each of them settled (DESIGN §5 *A re-plan
+    invalidates every phase that already ran*; run 19a70d96 executed 8
+    subtasks the overlap judge had merged to 4 because an earlier re-plan
+    here re-ran nothing). Bounded by `judgment_check_rounds`. Then
+    `state.data["item_coverage"]` records every item's status and the log
+    names each item still uncovered, before any implementation work. A
+    residual never stops the run: the delivery gate reads it on the tree
+    that ships like any other item.
 
-    A deliberate demotion, made on measurement:
+    This is set arithmetic on the typed `item_index`, `kind`, `reason_kind`
+    and `verification_only` fields, so it gives the same answer on the
+    same plan every time. That is what the gate lacked when it was made
+    advisory on 2026-08-04.
 
-    * **Its deterministic floor never worked.** `check_required_items_coverage`
-      required one subtask's `title + success_criteria_seed` tokens to be a
-      SUPERSET of a required item's. Across every run that ever carried
-      `required_items` it passed **0 of 102 items** — a 100% false-positive
-      rate with no true negative in its history. It also violated CLAUDE.md
-      outright: the items are LLM-written sentences, and Python may not
-      "infer meaning from prose… never on an LLM's response". There is no
-      correct threshold, because token-matching prose IS the defect. Deleted,
-      not re-tuned.
-
-    * **Its judge does not reproduce.** Re-invoked on identical input,
-      `task_coverage_judge` returned a DIFFERENT finding set 85% of the time
-      (n=20), and the intersection across repeated samples was **empty** — not
-      one finding survived a re-sample. A finding a judge cannot reproduce on
-      unchanged input is not a stable property of that input, and cannot
-      justify discarding a plan that cost hundreds of worker calls.
-
-    Contrast the gates that keep their authority: the wiring judge's findings
-    are 99% true (69/70, mechanically verified against the plan graph), and
-    the overlap judge has deterministic backstops (`NO_FILE_OVERLAP`,
-    `PHANTOM_ARTIFACT`) catching it assert the impossible. Coverage has
-    neither — no mechanical check can verify "the plan misses work X" without
-    reading prose, which is exactly what the floor got wrong.
-
-    Findings are still surfaced: recorded in `state.data["coverage_gate"]` and
-    logged. That keeps #117's insight (an independent reviewer sees what a
-    self-grader cannot) while removing terminal authority the measurements do
-    not support.
+    **The judge stays advisory.** It is invoked once, its findings are
+    logged and recorded, and it never re-plans. Re-invoked on identical
+    input, `task_coverage_judge` returned a DIFFERENT finding set 85% of
+    the time (n=20), and the intersection across repeated samples was
+    **empty**. A finding a judge cannot reproduce on unchanged input cannot
+    justify discarding a plan. Its deterministic floor,
+    `check_required_items_coverage`, required one subtask's `title +
+    success_criteria_seed` tokens to be a SUPERSET of a required item's and
+    passed **0 of 102 items**; it read prose (CLAUDE.md *Language-to-JSON*)
+    and was deleted, not re-tuned.
 
     Skipped entirely when `st.data["skip_coverage_check"]` is set."""
     if st.data.get("skip_coverage_check"):
         log("phase 2⅞½: task-coverage gate skipped (--skip-coverage-check / "
             "LEERIE_SKIP_COVERAGE_CHECK)")
         return plans
-    log("phase 2⅞½: task-coverage gate (advisory)")
+    log("phase 2⅞½: task-coverage gate")
     st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
     st.save()
+
+    items = st.data.get("required_items") or []
+    cur_plans: list[list[dict]] = [plans]
+    replan_round = [0]
+
+    async def _invoke_accounting() -> dict:
+        return {"rows": _item_accounting_rows(cur_plans[0], items)}
+
+    def _check_accounting(r: dict) -> list[str]:
+        return [
+            f"ITEM_UNCLAIMED_BY_ANY_DOMAIN: item {g['item_index']} — "
+            f"\"{g['item'][:200]}\" — the plan(s) for "
+            + ", ".join(sorted({e["domain"] for e in g["excluded"]}))
+            + " excluded it as `other_domain`, and no plan claims it."
+            for g in _cross_domain_item_gaps(r.get("rows") or [])]
+
+    async def _on_accounting_feedback(fb: str) -> dict:
+        replan_round[0] += 1
+        gaps = _cross_domain_item_gaps(
+            _item_accounting_rows(cur_plans[0], items))
+        scope = _replan_domain_closure(cur_plans[0], _item_gap_domains(gaps))
+        # Preflighted against the live plans before any spend (DESIGN §13).
+        check_replan_affordable(st, caps, "coverage gate", cur_plans[0])
+        log(f"  coverage-gate: {len(gaps)} required item(s) no domain "
+            f"claims — re-planning {len(scope)} domain(s) "
+            f"({', '.join(sorted(scope))}), round {replan_round[0]}")
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — every planner excluded these required items as "
+            f"another domain's, and no plan claims them:\n{fb}\n"
+            "Claim each one in `claims.items` of the subtask that delivers "
+            "it if the work falls in your domain; if the tree already "
+            "carries it, that subtask settles as a no-op.")
+        retained = [p for p in cur_plans[0] if _plan_domain(p) not in scope]
+        fresh = await phase_plan(replan_task, st, caps, models, efforts,
+                                 replan_round=replan_round[0], domains=scope)
+        new = await phase_reconcile(retained + fresh, task, st, caps, models,
+                                    efforts)
+        new = await phase_overlap_judge(new, task, st, caps, models, efforts)
+        cur_plans[0] = await phase_adherence_gate(new, task, st, caps, models,
+                                                  efforts)
+        return {}
+
+    if items:
+        _, acct_warnings = await _run_checked_loop(
+            invoke=_invoke_accounting,
+            check=_check_accounting,
+            name="coverage-gate items",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_accounting_feedback,
+        )
+        for w in acct_warnings:
+            log(f"  coverage-gate: {w}")
+        record = _item_coverage_record(cur_plans[0], items)
+        st.data["item_coverage"] = record
+        st.save()
+        open_rows = [r for r in record["items"]
+                     if r["item_index"] in record["uncovered"]]
+        if open_rows:
+            log(f"  WARNING: coverage-gate: {len(open_rows)} required "
+                "item(s) no planned subtask that can change the tree claims "
+                "— the run proceeds, and the delivery gate reads "
+                "them on the tree that ships:")
+            for r in open_rows:
+                log(f"    • item {r['item_index']} ({r['status']}): "
+                    f"{r['item'][:180]}")
+        else:
+            log(f"  coverage-gate: all {len(record['items'])} required "
+                "item(s) claimed by a subtask that can change the tree")
+    plans = cur_plans[0]
 
     sys_prompt = _load_prompt("task_coverage_judge")
     subtasks = [s for plan in plans for s in plan.get("subtasks", []) or []]
@@ -40824,7 +41076,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         # broken call above for a whole release. OSError is disjoint from
         # every programming-error class, so widening to it re-opens nothing.
         log(f"  coverage-gate: judge failed ({type(exc).__name__}) — "
-            "advisory only, plan unchanged")
+            "the judge is advisory; plan unchanged by it")
         return plans
 
     gaps = [g for g in (judge_result or {}).get("coverage_gaps") or []
@@ -74001,11 +74253,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # audit's PLANNER-side consumer (phase_plan's ctx injection)
         # has run, so spawning the auditor there would spend a worker
         # (and bump worker_count on a re-entry that must be free — CI
-        # caught exactly that) to steer a plan already cut. The
-        # DOWNSTREAM consumer, _warn_defect_sites_uncovered, then reads
-        # {} and degrades to a no-op on that resume shape — an accepted
-        # trade: an advisory warning against a worker spawn, on a
-        # window only pre-feature states can enter (round 5).
+        # caught exactly that) to steer a plan already cut (round 5).
         if ("defect_scope" not in st.data
                 and "plans_after_plan" not in st.data):
             st.data["defect_scope"] = await phase_defect_scope_audit(
@@ -74171,11 +74419,6 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # empty condition cannot see. The wiring gate's constrained repair
             # is what closes that class (DESIGN §5).
             _warn_test_subtask_missing_producer_edge(plans)
-            # Mechanical floor for the defect-scope audit (DESIGN §5
-            # *Defect-scope audit*): file-set comparison of the audited
-            # sites against the plans' files_likely_touched union.
-            _warn_defect_sites_uncovered(
-                plans, st.data.get("defect_scope") or {})
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
             # drop so the surviving subtasks proceed; the drop is

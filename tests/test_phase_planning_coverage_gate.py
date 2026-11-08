@@ -16,9 +16,12 @@ were demoted on measurement:
   finding set 85% of the time (n=20), and the intersection across repeated
   samples was **empty** — not one finding survived a re-sample.
 
-So the gate now invokes the judge once, logs what it finds, and returns
-`plans` unchanged. This file pins that contract, and pins the floor's
-*absence* so it cannot silently return (the `TestRegexPathAbsent` precedent).
+So the gate invokes the judge once, logs what it finds, and never re-plans
+on it. This file pins that contract, and pins the floor's *absence* so it
+cannot silently return (the `TestRegexPathAbsent` precedent). The gate's
+typed item accounting, which does re-plan, is tested in
+`tests/test_item_accounting.py`; these tests carry no `required_items`, so it
+has nothing to account for here.
 """
 from __future__ import annotations
 
