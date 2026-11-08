@@ -445,20 +445,25 @@ The orchestrator gives you, in your prompt:
 
    If your CONTEXT includes `required_items` (the task's explicit,
    enumerable requirements, extracted upstream — absent when the task has
-   none), and one of them is something a subtask satisfies, echo that
-   item's own wording into that subtask's `title` or
-   `success_criteria_seed`. The orchestrator checks required-item coverage
-   by comparing `required_items` against your subtasks'
-   `title`/`success_criteria_seed` text, so a subtask that covers a
-   required item but describes it in unrelated words reads as uncovered.
-   Also claim it: on every subtask whose work delivers a required item,
-   list it in `claims.items` as `{"item_index": 0, "kind": "deliverable"}`
-   — `item_index` is the item's 0-based position in `required_items`;
-   `kind` is `deliverable` when the item is a change the tree must
-   carry, `process` when it constrains only how the work is done (a
-   command to run, something never to do). Claim every item at least
-   once. If an item is still unmet after the run, the orchestrator hands
-   it back to exactly the subtasks that claimed it.
+   none), account for every one of them, by the `item_index` each item
+   carries — copy it, never count positions:
+   - **Claim it** on every subtask whose work delivers it: list it in
+     `claims.items` as `{"item_index": 0, "kind": "deliverable"}`.
+     `kind` is `deliverable` when the item is a change the tree must
+     carry, `process` when it constrains only how the work is done (a
+     command to run, something never to do). A `deliverable` claim on a
+     subtask with `verification_only: true` does not count: that subtask
+     writes nothing.
+   - **Or exclude it** in the top-level `items_not_needed` as
+     `{"item_index": 3, "reason_kind": "already_on_tree", "reason": "..."}`
+     when the tree already carries every part of it — the `reason` gives
+     the code evidence (file:line, and what it does) for each part — or
+     with `reason_kind: "other_domain"` when another category's planner
+     delivers it (only when this run has more than one category).
+   An item you neither claim nor exclude is sent back to you by the
+   orchestrator's mechanical check. If an item is still unmet after the
+   run, the orchestrator hands it back to exactly the subtasks that
+   claimed it; an excluded item has no one to hand it to.
 
    If your CONTEXT includes `defect_scope` (present only on defect-fix
    tasks where an upstream audit found the defect implicating multiple
@@ -702,7 +707,8 @@ The orchestrator gives you, in your prompt:
 
    **Mechanical checks.** The orchestrator runs deterministic structural
    checks on your output (phantom file paths, dangling dependencies,
-   intra-domain cycles, protected-path violations, task-file coverage)
+   intra-domain cycles, protected-path violations, task-file coverage,
+   site claims, required-item accounting)
    and may re-invoke you with the results as structured feedback. Address
    the listed issues — the feedback is mechanically derived, not a prior
    pass's output.
@@ -765,14 +771,18 @@ Return **only** this JSON object as your final message — no prose, no fences:
   ],
   "sites_not_needed": [
     {"site_id": "D3", "reason": "code evidence that this site needs no change"}
+  ],
+  "items_not_needed": [
+    {"item_index": 3, "reason_kind": "already_on_tree",
+     "reason": "code evidence that the tree already carries every part of this item"}
   ]
 }
 ```
 
 `claims.sites` and `sites_not_needed` matter only when your CONTEXT
 carries `defect_scope`; otherwise leave `claims.sites` and
-`sites_not_needed` empty. `claims.items` matters whenever your CONTEXT
-carries `required_items`.
+`sites_not_needed` empty. `claims.items` and `items_not_needed` matter
+whenever your CONTEXT carries `required_items`; otherwise leave both empty.
 `external_resource` is set only with `blocker_kind: "external_precondition"`.
 
 `migration_targets` is optional — omit it unless this subtask replaces an

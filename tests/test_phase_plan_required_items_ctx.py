@@ -18,7 +18,9 @@ which is why these tests outlived it.
 
 Verifies:
 - When st.data["required_items"] is non-empty, the ctx JSON blob carries
-  "required_items" verbatim.
+  "required_items", each item with its code-assigned `item_index` (DESIGN §5
+  *Required items are claimed too, and the plan accounts for every one*):
+  planners handed a bare list counted positions and miscounted.
 - When st.data has no "required_items" key at all, ctx omits it.
 - When st.data["required_items"] is an empty list, ctx omits the key —
   the common case (most tasks have no enumerable requirements) carries
@@ -36,7 +38,7 @@ import json
 
 
 def _build_ctx(task: str, sot: str, answers: dict, confidence_rounds: int,
-               st_data: dict) -> dict:
+               st_data: dict, index=lambda items: items) -> dict:
     """Reproduce the phase_plan ctx-building logic under test (the
     required_items slice), without spawning planners or touching
     repo_map."""
@@ -48,7 +50,7 @@ def _build_ctx(task: str, sot: str, answers: dict, confidence_rounds: int,
     }
     required_items = st_data.get("required_items") or []
     if required_items:
-        ctx_dict["required_items"] = required_items
+        ctx_dict["required_items"] = index(required_items)
     return ctx_dict
 
 
@@ -57,18 +59,22 @@ def _build_ctx(task: str, sot: str, answers: dict, confidence_rounds: int,
 # ---------------------------------------------------------------------------
 
 class TestRequiredItemsPresent:
-    def test_ctx_contains_required_items(self):
+    def test_ctx_contains_required_items(self, leerie):
         items = [{"item": "add rate limiting to the API",
-                  "source_ref": "item 3 of spec"}]
+                  "source_ref": "item 3 of spec"},
+                 {"item": "add pagination", "span": "R2"}]
         ctx = _build_ctx(
             task="build the API per the spec",
             sot="codebase",
             answers={},
             confidence_rounds=8,
             st_data={"required_items": items},
+            index=leerie._planner_required_items,
         )
-        assert "required_items" in ctx
-        assert ctx["required_items"] == items
+        assert ctx["required_items"] == [
+            {"item_index": 0, "item": "add rate limiting to the API",
+             "source_ref": "item 3 of spec"},
+            {"item_index": 1, "item": "add pagination", "span": "R2"}]
 
     def test_baseline_keys_present_when_required_items_set(self):
         ctx = _build_ctx(
@@ -82,7 +88,7 @@ class TestRequiredItemsPresent:
                     "confidence_rounds"):
             assert key in ctx, f"Baseline key '{key}' missing from ctx"
 
-    def test_ctx_serializable_to_json(self):
+    def test_ctx_serializable_to_json(self, leerie):
         items = [{"item": "add rate limiting"}, {"item": "add pagination"}]
         ctx = _build_ctx(
             task="build the API per the spec",
@@ -90,10 +96,11 @@ class TestRequiredItemsPresent:
             answers={},
             confidence_rounds=8,
             st_data={"required_items": items},
+            index=leerie._planner_required_items,
         )
         serialized = json.dumps(ctx, indent=2)
         parsed = json.loads(serialized)
-        assert parsed["required_items"] == items
+        assert [r["item_index"] for r in parsed["required_items"]] == [0, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -150,4 +157,5 @@ class TestWiredIntoRealPhasePlan:
     def test_phase_plan_source_injects_required_items(self, leerie):
         src = inspect.getsource(leerie.phase_plan)
         assert 'st.data.get("required_items")' in src
-        assert 'ctx_dict["required_items"] = required_items' in src
+        assert ('ctx_dict["required_items"] = '
+                '_planner_required_items(required_items)') in src

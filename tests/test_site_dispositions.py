@@ -3,8 +3,8 @@
 The dominant cause of serial narrow fixing (5 of 11 historical repeat pairs)
 was the audit: the later-fixed site was usually LISTED, as a "consumer" left
 to mechanical consequence. Each site now carries a required `disposition`
-(evidence in `note`); the planner must cover every `fix` site, and the coverage
-warning compares only those.
+(evidence in `note`); the planner must claim every `fix` site, and the site
+claims check compares only those.
 """
 from __future__ import annotations
 
@@ -52,33 +52,36 @@ def test_scope_keeps_dispositions(leerie, tmp_path, monkeypatch):
     assert scope["sites"][1]["note"].startswith("other_module.py:40")
 
 
-def _plans_touching(*files):
-    return [{"domain": "bug-fixing", "subtasks": [
-        {"id": "bugfix-001", "files_likely_touched": list(files)}]}]
+def _plan_claiming(*site_ids):
+    return {"subtasks": [{"id": "bugfix-001", "change_kind": "fix",
+                          "claims": {"sites": [
+                              {"site_id": i, "resolution_kinds": ["guard"]}
+                              for i in site_ids]}}]}
 
 
-def test_warning_names_uncovered_fix_sites_only(leerie, capsys):
+def test_only_fix_sites_need_a_claim(leerie):
     scope = {"applicable": True, "sites": _disposed_audit()["sites"]}
-    leerie._warn_defect_sites_uncovered(_plans_touching("src/unrelated.py"),
-                                        scope)
-    out = capsys.readouterr().out
-    assert "merge_candidates" in out
-    assert "render_rows" not in out
+    rows = leerie._site_claim_rows(_plan_claiming(), scope)
+    assert [(r["site_id"], r["symbol"], r["status"]) for r in rows] == [
+        ("D1", "merge_candidates", "unclaimed")]
 
 
-def test_all_fix_sites_covered_means_no_warning(leerie, capsys):
-    scope = {"applicable": True, "sites": _disposed_audit()["sites"]}
-    leerie._warn_defect_sites_uncovered(
-        _plans_touching("src/example_module.py"), scope)
-    assert "WARNING" not in capsys.readouterr().out
+def test_every_fix_site_claimed_means_no_issue(leerie):
+    scope = {"applicable": True, "sites": [
+        dict(s, resolution_kind="guard")
+        for s in _disposed_audit()["sites"]]}
+    assert leerie._check_site_claims(
+        {"status": "ready", **_plan_claiming("D1")}, scope) == []
 
 
-def test_legacy_site_without_disposition_still_counts(leerie, capsys):
-    """A recorded scope from before dispositions existed keeps warning."""
+def test_legacy_site_without_disposition_still_counts(leerie):
+    """A recorded scope from before dispositions existed still needs a
+    claim."""
     scope = {"applicable": True, "sites": [
         {"file": "src/legacy.py", "symbol": "old_site", "role": "bypass"}]}
-    leerie._warn_defect_sites_uncovered(_plans_touching("src/x.py"), scope)
-    assert "old_site" in capsys.readouterr().out
+    rows = leerie._site_claim_rows(_plan_claiming(), scope)
+    assert [(r["symbol"], r["status"]) for r in rows] == [
+        ("old_site", "unclaimed")]
 
 
 def test_prompts_carry_the_rules(leerie):

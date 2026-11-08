@@ -1,6 +1,6 @@
 """Tests for the pre-planning defect-scope audit (DESIGN §5 *Defect-scope
 audit*): `phase_defect_scope_audit`, the planner-ctx injection, and the
-mechanical floor `_warn_defect_sites_uncovered`.
+deleted file-path floor's absence.
 
 Motivation (measured, 2026-09-22..25): a multi-site defect was re-planned
 as "the one remaining gap" run after run — 7 of 11 production commits
@@ -181,41 +181,41 @@ def test_inapplicable_scope_is_omitted(leerie, tmp_path, monkeypatch,
     assert "defect_scope" not in prompt
 
 
-# === the mechanical floor ==================================================
+# === the file-path floor is gone ===========================================
+#
+# `_warn_defect_sites_uncovered` compared each audited site's FILE against
+# the plans' `files_likely_touched` union. Once sites had a code-assigned
+# `site_id` and typed claims (`_check_site_claims`, in the bug-fixing
+# planner's loop), the path match was a second, weaker rule: over the 16
+# barnacle/web/navegando runs with an applicable audit it warned on 3 of 68
+# `fix` sites, and 2 of those were claimed by site_id. Navegando 4134b78c's
+# site `src/components` is a directory no file path equals, claimed by three
+# subtasks. Deleted (DESIGN §5 *Defect-scope audit*).
 
-def _plans_touching(*files):
-    return [{"domain": "bug-fixing", "subtasks": [
-        {"id": "bugfix-001", "files_likely_touched": list(files)}]}]
-
-
-def test_uncovered_site_warns_with_file_and_symbol(leerie, monkeypatch):
-    lines: list[str] = []
-    monkeypatch.setattr(leerie, "log", lines.append)
-    leerie._warn_defect_sites_uncovered(
-        _plans_touching("src/other.py"), AUDIT)
-    joined = "\n".join(lines)
-    assert "src/example_module.py" in joined
-    assert "collect_pending_rows" in joined
-    assert "bypass" in joined
-
-
-def test_covered_sites_are_silent(leerie, monkeypatch):
-    lines: list[str] = []
-    monkeypatch.setattr(leerie, "log", lines.append)
-    leerie._warn_defect_sites_uncovered(
-        _plans_touching("./src/example_module.py"), AUDIT)
-    assert lines == [], "dot-prefixed paths must normalize, not warn"
+def test_the_file_path_floor_is_deleted(leerie):
+    assert not hasattr(leerie, "_warn_defect_sites_uncovered")
+    assert "_warn_defect_sites_uncovered" not in inspect.getsource(
+        leerie._run_phases)
 
 
-@pytest.mark.parametrize("scope", [
-    {}, {"applicable": False, "sites": AUDIT["sites"]},
-    {"applicable": True, "sites": []},
-])
-def test_inapplicable_scope_never_warns(leerie, monkeypatch, scope):
-    lines: list[str] = []
-    monkeypatch.setattr(leerie, "log", lines.append)
-    leerie._warn_defect_sites_uncovered(_plans_touching(), scope)
-    assert lines == []
+def test_a_directory_site_claimed_by_id_reads_claimed(leerie):
+    """The 4134b78c shape: the site the path floor warned on is claimed."""
+    scope = {"applicable": True, "sites": [
+        {"file": "src/components", "symbol": "hardcoded UI literals",
+         "role": "decision_site", "disposition": "fix",
+         "resolution_kind": "relink"}]}
+    plan = {"subtasks": [
+        {"id": f"bugfix-00{n}", "change_kind": "fix",
+         "files_likely_touched": [f"src/components/widget_{n}.tsx"],
+         "claims": {"sites": [{"site_id": "D1",
+                               "resolution_kinds": ["relink"]}]}}
+        for n in (5, 6, 7)]}
+    rows = leerie._site_claim_rows(plan, scope)
+    assert [(r["site_id"], r["status"]) for r in rows] == [("D1", "claimed")]
+    assert [c["sid"] for c in rows[0]["claims"]] == [
+        "bugfix-005", "bugfix-006", "bugfix-007"]
+    assert leerie._check_site_claims(
+        {"status": "ready", **plan}, scope) == []
 
 
 # === wiring pins ===========================================================
@@ -235,10 +235,6 @@ class TestWiring:
         assert (src.index("phase_artifact_registry(")
                 < src.index("phase_defect_scope_audit(")
                 < src.index("phase_plan("))
-
-    def test_schedule_calls_the_floor(self, leerie):
-        src = inspect.getsource(leerie._run_phases)
-        assert "_warn_defect_sites_uncovered(" in src
 
     def test_planner_prompt_documents_the_key(self, leerie):
         text = leerie._load_prompt("planner")

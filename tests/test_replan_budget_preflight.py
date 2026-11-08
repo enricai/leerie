@@ -176,12 +176,13 @@ def test_die_message_names_the_gate_and_the_real_cost_driver(leerie, capsys):
 
 # ----- wiring ---------------------------------------------------------------
 
-# `phase_planning_coverage_gate` was the second entry here until it became
-# advisory (PR #166): it no longer re-plans, so it has no re-plan to preflight.
-# The parametrize is kept rather than inlined because a THIRD re-planning gate
-# would belong here, and the shape should make that obvious.
+# `phase_planning_coverage_gate` left this list when its judge became advisory
+# (PR #166) and is back: its typed item accounting re-plans the domains behind
+# an item every planner excluded as another domain's (DESIGN §5 *Required
+# items are claimed too, and the plan accounts for every one*).
 @pytest.mark.parametrize("phase,gate", [
     ("phase_adherence_gate", "adherence gate"),
+    ("phase_planning_coverage_gate", "coverage gate"),
 ])
 def test_both_replan_paths_preflight_before_spending(leerie, phase, gate):
     """The check is inert unless it runs BEFORE `phase_plan`, and it must be
