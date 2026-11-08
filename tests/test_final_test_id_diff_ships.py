@@ -317,4 +317,8 @@ def test_phase5_refreshes_after_the_acceptance_gate_and_before_finalize(
     i_fin = src.index("await phase_finalize(")
     assert i_acc < i_r1 < i_det < i_red < i_r2 < i_fin
     between = src[i_r2:i_fin]
-    assert "await " not in between
+    # The one step between them, the base-form check of existing tests,
+    # reads the tree that ships and never moves HEAD (it measures in
+    # staging's committed view and a helper checkout).
+    assert between.count("await ") == 1
+    assert "await _check_existing_behaviour(" in between
