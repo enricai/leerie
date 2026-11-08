@@ -2610,7 +2610,10 @@ them. It removes the directory, then collects:
   `case_name`, `line`/`assertion` the probe line the sample's
   `failure_line` names, else the first line holding its normalised
   `assertion_quote` (that quote alone when no line does), `message` its
-  `failure_message`;
+  `failure_message`; plus `conflicts_with[]` (the test ids of the item's
+  first `delivery_redrive.contested_probes` record) and `objections[{kind,
+  reason}]` (its first 3 `delivery_redrive.probe_objections`, `reason` cut
+  to `_UNMET_MESSAGE_MAX`) when there are any;
 - per `acceptance.gate.final` result that is measured, failing and
   `_acceptance_result_has_work` for its set, per failing file with work
   (`_acceptance_file_has_work` when the set is bounded): `{kind:
@@ -2645,8 +2648,13 @@ from `base_failure_messages` (the validation's own runs on that commit,
 defect file. `_pr_unmet_evidence_lines(state)`
 renders it under `## Still failing when the run ended` (in
 `_PR_END_STATE_HEADINGS`, directly after `## Unconverged`): per entry a
-`### <label>: <file>` heading, the item text (quoted), the full copy's
-path, the run command, then per case (at most `_UNMET_CASES_SHOWN`) its
+`### <label>: <file>` heading, the item text (quoted), for a falsifier
+entry with `conflicts_with` the line "The probe conflicts with existing
+tests: a re-drive change that made it pass broke <n> case(s) they pin, so
+the change was rolled back and the probe was not driven again. Decide which
+is right: <first 5 ids>", one line per objection "A fixer's objection, in
+its own words (not verified by leerie; it exempts nothing): <kind>:
+<reason>", the full copy's path, the run command, then per case (at most `_UNMET_CASES_SHOWN`) its
 name, `Failing assertion (line N)`, the B* verdict and the message in a
 fence, then the excerpt in a fence longer than any backtick run in it;
 blocks are added while the section stays under `_UNMET_SECTION_MAX`
@@ -10494,13 +10502,15 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   split by `_redrive_item_notes(unmet_final, claims, n_items, rows, *,
   shown_idx=(), contested=()) -> (notes, unreproducible)` (`rows` is
   `delivery_gate.items`; `shown_idx` the indices of the shown sets not
-  typed broken; `contested` the item indices of accepted
-  `contested_probes`). `_falsifier_shown_probe(row, shown_idx) -> dict |
+  typed broken; `contested` the item indices of
+  `delivery_redrive.contested_probes`, a measured conflict, through
+  `_redrive_contests_by_item`). `_falsifier_shown_probe(row, shown_idx) -> dict |
   None` reads the row's confirmed sample: `{dir, file, lead_sets,
   case_name, assertion_quote, reason, item_span_quote}` (texts cut to
   `_REDRIVE_PROBE_TEXT_MAX = 600`) when its `lead_sets` is a list of
-  integers ⊆ `shown_idx` and `probe_saved.dir/file` is a regular file
-  (not a link, `file` relative without `..`), else None. An entry's
+  integers ⊆ `shown_idx`, `probe_saved.dir/file` is a regular file
+  (not a link, `file` relative without `..`) and the sample has no
+  `via_browser_suite`, else None. An entry's
   `by` (`["judge"]` when absent) less `_REDRIVE_UNREPRODUCIBLE_BY` —
   keeping `falsifier` when the item is not contested and its probe is
   shown — is its reproducible sources. With none, the item is no note:
@@ -10654,28 +10664,32 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
   sid="delivery-redrive-r<round>-g<group>")`, effort the resolved
   implementer effort or `EFFORT_REDRIVE_ESCALATION`, with the self-check's
-  bin first on `PATH`; it returns `{status, summary, contested_probes?}`,
-  the worker's raw `contested_probes`, first 10). `_redrive_note` renders
+  bin first on `PATH`; it returns `{status, summary, probe_objections?}`,
+  the worker's raw `probe_objections`, first 10). `_redrive_note` renders
   an `unmet_item` note's `probe` as `{test_file, failing_case,
   failing_assertion, why_it_fails}` and, when any note has one, a PROBES
-  paragraph naming the self-check and the `contested_probes` fields.
-  With probes and contests, `_redrive_check_contests(raw, probes, staging,
-  task, items) -> list[dict]` checks each: `{item_index?,
-  probe_test_file, kind, probe_quote, cites[], cite_status[]?,
-  task_quote, reason, accepted, rejected?}` — accepted only when
-  `probe_test_file` is a probe of `probes` (its relative path, or a path
-  ending in `/<path>`), `kind` is in `REDRIVE_CONTEST_KINDS =
-  ("input_outside_domain", "contradicts_task")`, `probe_quote` is, after
-  `_scope_norm`, at least `_DELIVERY_CITE_MIN_QUOTE` characters and in the
-  probe's source, and for `input_outside_domain` some cite's
-  `_verify_delivery_cite(cite, staging, "")` is `ok` or `drift`, for
-  `contradicts_task` the normalised `task_quote` (same minimum) is in the
-  task or a required item's `item` or `parts`; `rejected` names the
-  first check that failed. They are recorded on the group
-  (`contested_probes`) and appended, with `round` and `group`, to
-  `delivery_redrive.contested_probes`; then the clean-tree gate runs (a group
+  paragraph naming the self-check, the rollback of a commit that leaves
+  the probe failing or breaks a case an existing test pins, and the
+  `probe_objections` fields. `_redrive_probe_objections(raw, probes) ->
+  list[dict]` keeps each `{item_index, probe_test_file, kind, reason}`
+  (first 10, `reason` cut to 1200) whose `probe_test_file` is a probe of
+  `probes` (its relative path, or a path ending in `/<path>`) and whose
+  `kind` is in `PROBE_OBJECTION_KINDS = ("input_outside_domain",
+  "contradicts_task", "breaks_existing_test")`; nothing in it is checked
+  as true. They are recorded on the group (`probe_objections`) and
+  appended, with `round` and `group`, to
+  `delivery_redrive.probe_objections`; they change no routing and no
+  verdict. Then the clean-tree gate runs (a group
   left dirty past its re-asks is rolled back), and, when HEAD moved, the shown sets (and, in a
-  held-back round, the held-back ones) are re-measured and the repo's test
+  held-back round, the held-back ones) are re-measured, each shown probe
+  the group was handed is re-run on the commit
+  (`_redrive_probe_verdicts(st, caps, staging, probe_sets, label, *, rev)
+  -> {item_index: pass | fail | unmeasured}`: each probe as
+  `_falsifier_probe_set(item_index, dir, rel)` — `{index: 1000000 +
+  item_index, dir, defect_files: [rel], control_files: [], support_files:
+  [], cases: {}}`, the shape `_redrive_recheck_items` re-runs too —
+  through one `_evaluate_acceptance_sets`; recorded as `probes_after
+  {"<i>": verdict}`), and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
   `_ratchet_test_ids` on staging, measured in its committed view, with the re-drive log: a command the task
   forbids is replaced by its `_scoped_test_replacement`, or no verdict when
@@ -10699,13 +10713,27 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   measurement that produced nothing carries the earlier verdict
   (`resource_affected`), and the held-back rules then do not apply. A group
   is `zero_progress` when a set note it drove names a set that produced a
-  verdict after it (a held-back note: the held-back sets did) and it fixed
-  no set case, shown or held-back — `_redrive_fixed_cases(before, after)`:
+  verdict after it (a held-back note: the held-back sets did), or a probe
+  it was handed has a `pass` or `fail` verdict, and it fixed no set case,
+  shown or held-back, and no probe of it passes — `_redrive_fixed_cases(before, after)`:
   every case of a key no longer failing (the key itself when it has no
   per-case record) plus, for a key failing on both sides with per-case
   records, the IDs that left its list; `_redrive_verdict` returns them as
   `fixed_cases` / `held_fixed_cases`, and the held-back "none is fixed" rule
-  reads `held_fixed_cases` too. A group that is none of the below then
+  reads `held_fixed_cases` too. When a probe of the group passes,
+  `_redrive_pinned_breaks(repo, base, post_sha, newv) -> [{id, file}]`
+  (sorted by id) reads the cases an existing test pins that fail on the
+  commit: the `newv["base_form"]["changed"]` rows, and each confirmed
+  `newv["new"]` ID whose `newv["files"]` file exists at the run's
+  `_diff_base` and is not in `git diff --name-only base post_sha`. When
+  any is found the group records `probe_conflict{items, tests}` (tests
+  first `_REDRIVE_CONTEST_TESTS_MAX = 10`) and each passing probe's item
+  is appended to `delivery_redrive.contested_probes` as `{item_index,
+  probe_test_file, tests[], round, group}`. Such a group is already
+  rolled back (each pinned case is in `new_failures`, making it worse, or
+  in `base_form_changed`, voiding it); `_redrive_rollback_reason` names
+  the conflict, and the zero-progress words add "(a shown falsifier probe
+  counts as one)" when the group has `probes_after`. A group that is none of the below then
   runs `_delivery_ratchet` (`ratchet`). A group that is worse, zero-progress,
   committed staged material (`committed_staged`), fails the escalation gate, or whose ratchet
   regressed a previously met item is
@@ -13765,7 +13793,7 @@ command line overrides it.
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
-| `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |
+| `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, conflicts_with?[], objections?[{kind, reason}], artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
 | `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim, reason?}` (`_verify_external_claim`), dropped when a later attempt reports `complete`; one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |
@@ -13855,7 +13883,7 @@ command line overrides it.
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
 | `round_rollbacks` | list[dict] \| absent | every worker round rolled back (`_record_round_rollback`, DESIGN §8 *A rollback says why*): `[{site, worker, label, reason, pre_sha, post_sha, rolled_back}]`; `rolled_back` false when the reset did not land. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), rollback_reason? (why a group was rolled back, in words: `_redrive_rollback_reason`, or the unclean tree), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], items_driven[item indices a group drove], items_budget_skipped[item indices a group held with no member left a re-drive round], unrouted_items?[{item_index, item, reason: no_owner | budget | unreproducible, probed?}] (`_redrive_unrouted_items(open_items, driven, budget_skipped, stopped_on_budget, unreproducible=())` at the end: still-open items no group drove, then each still-open `unreproducible` record with reason `unreproducible` and its `probed`; read by `_decide_outcome`'s reasons — one line naming every unrouted item and reason, then per `unreproducible` one saying a confirmed falsifier probe of the item's words `probed` fails under B\* and the probe is held-out content no fixer could see, so no re-drive round was spent on it — and `_prior_delivery_residual`'s `unrouted_items`), kept_unsettled?[], contested_probes?[] (`_redrive_check_contests`), rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], contested_probes[{item_index?, probe_test_file, kind, probe_quote, cites[], cite_status[]?, task_quote, reason, accepted, rejected?, round, group}] (every checked contest; an accepted one's item is passed to `_redrive_item_notes(contested=)`, so its probe is not handed on again, and `_decide_outcome` adds, per still-unmet item with an accepted contest, one reason: "item <i>: a re-drive implementer contested its falsifier probe <file> as <kind> ("<probe_quote>", citing <path>:<line>… \| quoting the task: "<task_quote>"); a human decides — the item stays unmet"), held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), rollback_reason? (why a group was rolled back, in words: `_redrive_rollback_reason`, or the unclean tree), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], items_driven[item indices a group drove], items_budget_skipped[item indices a group held with no member left a re-drive round], unrouted_items?[{item_index, item, reason: no_owner | budget | unreproducible, probed?}] (`_redrive_unrouted_items(open_items, driven, budget_skipped, stopped_on_budget, unreproducible=())` at the end: still-open items no group drove, then each still-open `unreproducible` record with reason `unreproducible` and its `probed`; read by `_decide_outcome`'s reasons — one line naming every unrouted item and reason, then per `unreproducible` one saying a confirmed falsifier probe of the item's words `probed` fails under B\* and the probe is held-out content no fixer could see, so no re-drive round was spent on it — and `_prior_delivery_residual`'s `unrouted_items`), kept_unsettled?[], probes_after?{"<item>": pass \| fail \| unmeasured} (`_redrive_probe_verdicts`), probe_conflict?{items[], tests[{id, file}]} (`_redrive_pinned_breaks`), probe_objections?[] (`_redrive_probe_objections`), rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], contested_probes[{item_index, probe_test_file, tests[{id, file}], round, group}] (a measured conflict: a group's commit made the probe pass and broke a case an existing test pins; the item is passed to `_redrive_item_notes(contested=)`, so its probe is never handed on again; `_decide_outcome` adds, per still-unmet item, `_redrive_contest_text` of its first record — "item <i>: its falsifier probe <file> conflicts with existing tests — the re-drive change that made it pass (round <r>, group <g>) broke <n> case(s) they pin: <ids> …; the change was rolled back and the probe is not driven again — a person decides; the item stays unmet" — and `_collect_unmet_evidence` its `conflicts_with`), probe_objections[{item_index, probe_test_file, kind, reason, round, group}] (every kept objection, unverified; `_decide_outcome` adds, per still-unmet item, `_redrive_objection_text` of each of its first 3 — "item <i>: a re-drive fixer objected to its falsifier probe <file> (<kind>): "<reason>" — its own words, not verified by leerie; it exempts nothing" — and `_collect_unmet_evidence` its `objections`), held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½), plus `gate` (`skipped` \| `degraded` \| `passed`, `_record_provision_gate`) once `phase_provision_gate` has a result. `_run_phases` runs both after the `plans_after_classify` block, keyed on `recipe` and on `gate` (DESIGN §6 *Resumable planning*). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution`, `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*) or `satisfied_on_base` (`executed?`, `claimed_locations?`). |
@@ -14039,11 +14067,10 @@ Required fields, current shape:
   env_var|network|file|binary|service_credential|human_action, name?,
   host?, port?, path?, description?, quote?}`, the typed resource
   `_verify_external_claim` checks) — routed by `_route_blocker_kind` (§6 *Typed blocker kinds*);
-  and `contested_probes` (array of flat objects, required `probe_test_file`
-  and `kind` — `REDRIVE_CONTEST_KINDS` —, optional `probe_quote`,
-  `cites[{path, line_start, line_end, quote}]`, `task_quote`, `reason`),
-  read only from a delivery re-drive implementer and only through
-  `_redrive_check_contests` (DESIGN §8 *Delivery re-drive* rule 4).
+  and `probe_objections` (array of flat objects, required `probe_test_file`
+  and `kind` — `PROBE_OBJECTION_KINDS` —, optional `reason`), read only
+  from a delivery re-drive implementer and only through
+  `_redrive_probe_objections` (DESIGN §8 *Delivery re-drive* rule 4).
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
   `design-conflict` / `failed`). `confidence`: `_confidence_schema(["resolution"])`.
   Optional: `resolution_summary`, `diagnosis` (fallback on non-`resolved`).

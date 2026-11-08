@@ -3044,9 +3044,13 @@ BAKE_INSTALL_COMMANDS: dict[str, str] = {
 }
 
 
-# The kinds of contest a re-drive implementer may raise against a shown
-# falsifier probe (DESIGN §8 *Delivery re-drive* rule 4).
-REDRIVE_CONTEST_KINDS = ("input_outside_domain", "contradicts_task")
+# The kinds of objection a re-drive implementer may raise against a shown
+# falsifier probe (DESIGN §8 *Delivery re-drive* rule 4): recorded and shown
+# to a person as the fixer's unverified words, never an exemption. Only a
+# measured conflict with an existing test contests a probe
+# (`_redrive_pinned_breaks`).
+PROBE_OBJECTION_KINDS = ("input_outside_domain", "contradicts_task",
+                         "breaks_existing_test")
 
 
 SCHEMAS: dict[str, dict] = {
@@ -3514,12 +3518,11 @@ SCHEMAS: dict[str, dict] = {
                 "required": ["id", "question", "why_underivable"],
             },
             # DESIGN §8 *Delivery re-drive* rule 4: a re-drive implementer
-            # handed a shown falsifier probe may contest it, typed. Optional;
-            # `_redrive_check_contests` checks every quote and cite, and an
-            # accepted contest goes to a human — it never settles the item.
-            # Flat, `kind` the only required field (decoder-safety, as
-            # `external_resource_claim`).
-            "contested_probes": {
+            # handed a shown falsifier probe may object to it, typed.
+            # Optional; `_redrive_probe_objections` keeps one naming a probe
+            # the group was handed and the PR shows it unverified — it never
+            # exempts the probe or settles the item.
+            "probe_objections": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -3527,21 +3530,7 @@ SCHEMAS: dict[str, dict] = {
                     "properties": {
                         "probe_test_file": {"type": "string"},
                         "kind": {"type": "string",
-                                 "enum": list(REDRIVE_CONTEST_KINDS)},
-                        "probe_quote": {"type": "string"},
-                        "cites": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "path": {"type": "string"},
-                                    "line_start": {"type": "integer"},
-                                    "line_end": {"type": "integer"},
-                                    "quote": {"type": "string"},
-                                },
-                            },
-                        },
-                        "task_quote": {"type": "string"},
+                                 "enum": list(PROBE_OBJECTION_KINDS)},
                         "reason": {"type": "string"},
                     },
                 },
@@ -7821,6 +7810,22 @@ def _pr_unmet_evidence_lines(state: dict) -> list[str]:
             b += [f"> {_pr_entry(e.get('item'))}", "",
                   "- Unmet on a confirmed falsifier probe of this required "
                   "item."]
+            conflicts = [str(x) for x in e.get("conflicts_with") or []]
+            if conflicts:
+                b.append("- The probe conflicts with existing tests: a "
+                         "re-drive change that made it pass broke "
+                         f"{len(conflicts)} case(s) they pin, so the change "
+                         "was rolled back and the probe was not driven "
+                         "again. Decide which is right: "
+                         + ", ".join(_pr_code(x) for x in conflicts[:5])
+                         + (f" (+{len(conflicts) - 5} more)"
+                            if len(conflicts) > 5 else ""))
+            for o in e.get("objections") or []:
+                if isinstance(o, dict):
+                    b.append("- A fixer's objection, in its own words "
+                             "(not verified by leerie; it exempts "
+                             f"nothing): {_pr_entry(o.get('kind'))}: "
+                             f"{_pr_entry(o.get('reason'))}")
         if e.get("artifact"):
             b.append(f"- Full file: {_pr_code(e['artifact'])}")
         if e.get("cmd"):
@@ -42111,33 +42116,18 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                     + ", which fails under B*; the probe is held-out "
                     "content no fixer could see, so no re-drive round was "
                     "spent on it")
-            # A probe its fixer contested, for a human to decide (rule 4):
-            # the item stays unmet, and the contest's checked evidence is
-            # named.
-            seen: set[int] = set()
-            for c in ((st.data.get("delivery_redrive") or {})
-                      .get("contested_probes") or []):
-                i = c.get("item_index") if isinstance(c, dict) else None
-                if (not c.get("accepted") or i not in open_idx
-                        or i in seen):
-                    continue
-                seen.add(i)
-                ok_cites = [x for x, v in zip(c.get("cites") or [],
-                                              c.get("cite_status") or [])
-                            if v in ("ok", "drift") and isinstance(x, dict)]
-                basis = (", citing " + ", ".join(
-                    f"{x.get('path')}:{x.get('line_start')}"
-                    for x in ok_cites[:3]) if ok_cites else
-                    (", quoting the task: \""
-                     + _normalize_risk_text(c.get("task_quote") or "", 120)
-                     + "\"" if c.get("task_quote") else ""))
-                reasons.append(
-                    f"item {i}: a re-drive implementer contested its "
-                    f"falsifier probe {c.get('probe_test_file')} as "
-                    f"{c.get('kind')} (\""
-                    + _normalize_risk_text(c.get("probe_quote") or "", 120)
-                    + "\"" + basis + "); a human decides — the item stays "
-                    "unmet")
+            # A probe a measured conflict contested, for a person to decide
+            # (rule 4): the item stays unmet, and the tests it conflicts
+            # with are named. A fixer's objection is named as its words.
+            rd_ = st.data.get("delivery_redrive") or {}
+            for i, c in _redrive_contests_by_item(
+                    rd_.get("contested_probes")).items():
+                if i in open_idx:
+                    reasons.append(_redrive_contest_text(c))
+            for i, objs in _redrive_objections_by_item(
+                    rd_.get("probe_objections")).items():
+                if i in open_idx:
+                    reasons += [_redrive_objection_text(o) for o in objs]
     # A regressed bar is work: a run that changed nothing did not do it
     # (DESIGN §8 *Done is a fixed bar per task*).
     regressed = (acc.get("settled_bar") or {}) if isinstance(acc, dict) else {}
@@ -63351,14 +63341,22 @@ def _falsifier_shown_probe(row: object, shown_idx: Iterable
     may read*), or None: `{dir, file, lead_sets, case_name,
     assertion_quote, reason, item_span_quote}`. None unless the confirmed
     sample recorded the sets it read (`lead_sets`, a list of indices) and
-    every one is in `shown_idx`, and its saved probe is a regular file —
-    a sample with no `lead_sets` read every valid set, held-back ones
-    included, so its probe is held-out content and is never shown."""
+    every one is in `shown_idx`, its saved probe is a regular file, and it
+    was not confirmed through the browser suite (`via_browser_suite`: the
+    self-check cannot run it that way) — a sample with no `lead_sets` read
+    every valid set, held-back ones included, so its probe is held-out
+    content and is never shown."""
     fi = row.get("falsifier") if isinstance(row, dict) else None
     samples = fi.get("samples") if isinstance(fi, dict) else None
     s_ = next((x for x in samples or [] if isinstance(x, dict)
                and x.get("confirmed")), None)
     if s_ is None:
+        return None
+    if s_.get("via_browser_suite"):
+        # Confirmed through the browser suite's runner (DESIGN §8 *A
+        # repository's browser suite is a channel the run provisions*): the
+        # fixer's self-check runs the repository's test command only, so it
+        # could not run this probe as it was confirmed.
         return None
     leads = s_.get("lead_sets")
     if not isinstance(leads, list) or not all(
@@ -63409,10 +63407,11 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
     re-drive* rules 2 and 4), from typed fields only. An item every claimer
     types `process` is neither. A falsifier source is reproducible when its
     row's confirmed probe is shown (`_falsifier_shown_probe(row,
-    shown_idx)`) and no fixer contested it (`contested`, item indices); the
-    other sources of `_REDRIVE_UNREPRODUCIBLE_BY` never are. An item whose
-    sources (`by`; `["judge"]` when absent) less the unreproducible ones are
-    none is no note: an `unreproducible` record `{item_index, item,
+    shown_idx)`) and no measured conflict with an existing test contested
+    it (`contested`, item indices); the other sources of
+    `_REDRIVE_UNREPRODUCIBLE_BY` never are. An item whose sources (`by`;
+    `["judge"]` when absent) less the unreproducible ones are none is no
+    note: an `unreproducible` record `{item_index, item,
     probed}` — or nothing, when its probe was contested (it was driven).
     Any other is an `unmet_item` note carrying those sources alone and only
     their evidence (`evidence_by`), plus the shown `probe` when the
@@ -63480,6 +63479,143 @@ def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
                       "dir": p_["dir"], "defect_files": [p_["file"]],
                       "control_files": [], "support_files": []}
     return [out[i] for i in sorted(out)]
+
+
+# The most conflicting test cases a contested probe's record and words name.
+_REDRIVE_CONTEST_TESTS_MAX = 10
+
+
+def _falsifier_probe_set(item_index: int, dir_: str, rel: str) -> dict:
+    """A saved falsifier probe as a one-file set `_evaluate_acceptance_sets`
+    runs in a held-out sandbox: an integer index of its own, out of the
+    range of a run's sets."""
+    return {"index": 1_000_000 + item_index, "dir": dir_,
+            "defect_files": [rel], "control_files": [],
+            "support_files": [], "cases": {}}
+
+
+async def _redrive_probe_verdicts(st: "State", caps: dict, staging: Path,
+                                  probes: list[dict], label: str, *,
+                                  rev: str) -> dict[int, str]:
+    """item_index -> `pass` | `fail` | `unmeasured`: each shown probe a
+    group was handed (`_redrive_probe_sets`), re-run on `rev` as the
+    re-check runs a saved probe (DESIGN §8 *Delivery re-drive* rule 4). A
+    run that gives no verdict is `unmeasured`: no evidence either way."""
+    if not probes:
+        return {}
+    sets = [_falsifier_probe_set(p_["item_index"], p_["dir"],
+                                 p_["defect_files"][0]) for p_ in probes]
+    res = await _evaluate_acceptance_sets(st, caps, str(staging), sets,
+                                          label, rev=rev)
+    by = {r.get("index"): r for r in res if isinstance(r, dict)}
+    out: dict[int, str] = {}
+    for p_, s_ in zip(probes, sets):
+        r = by.get(s_["index"]) or {"unmeasured": True}
+        out[p_["item_index"]] = ("unmeasured" if r.get("unmeasured")
+                                 else "pass" if r.get("passed") else "fail")
+    return out
+
+
+def _redrive_pinned_breaks(repo: str | Path, base: str, post_sha: str,
+                           newv: dict) -> list[dict]:
+    """`[{id, file}]`: the cases an existing test pins on the run's `base`
+    that fail on `post_sha` (DESIGN §8 *Delivery re-drive* rule 4) — the
+    base-form check's `changed` cases (`newv["base_form"]`: a test file the
+    base had and the run changed, run in its base form) and the confirmed
+    new failures (`newv["new"]`, files from `newv["files"]`) in a test file
+    the base had that `post_sha` leaves as the base had it, whose base form
+    is itself. A new failure in a file the run added or changed is not one:
+    the run wrote what it pins."""
+    out: dict[str, dict] = {}
+    for r in ((newv.get("base_form") or {}).get("changed") or []):
+        if isinstance(r, dict) and r.get("id"):
+            out.setdefault(str(r["id"]), {"id": str(r["id"]),
+                                          "file": str(r.get("file") or "")})
+    new = [str(c) for c in newv.get("new") or []]
+    if new and base and post_sha:
+        files = newv.get("files") or {}
+        changed = set(_redrive_git(repo, "diff", "--name-only",
+                                   "--no-renames", "-z", base,
+                                   post_sha).split("\0"))
+        for c in new:
+            f = str(files.get(c) or "")
+            if (f and f not in changed and c not in out
+                    and _redrive_exists_at(repo, base, f)):
+                out[c] = {"id": c, "file": f}
+    return [out[k] for k in sorted(out)]
+
+
+def _redrive_contests_by_item(raw: object) -> dict[int, dict]:
+    """item_index -> the first recorded contest of its probe
+    (`delivery_redrive.contested_probes`)."""
+    out: dict[int, dict] = {}
+    for c in raw if isinstance(raw, list) else []:
+        i = c.get("item_index") if isinstance(c, dict) else None
+        if isinstance(i, int) and not isinstance(i, bool) and i not in out:
+            out[i] = c
+    return out
+
+
+def _redrive_objections_by_item(raw: object) -> dict[int, list[dict]]:
+    """item_index -> the objections recorded against its probe
+    (`delivery_redrive.probe_objections`), at most 3 each."""
+    out: dict[int, list[dict]] = {}
+    for o in raw if isinstance(raw, list) else []:
+        i = o.get("item_index") if isinstance(o, dict) else None
+        if isinstance(i, int) and not isinstance(i, bool):
+            got = out.setdefault(i, [])
+            if len(got) < 3:
+                got.append(o)
+    return out
+
+
+def _redrive_contest_text(c: dict) -> str:
+    """A contested probe in words, for the outcome's reasons."""
+    tests = [str(x.get("id")) for x in c.get("tests") or []
+             if isinstance(x, dict)]
+    shown = tests[:5]
+    return (f"item {c.get('item_index')}: its falsifier probe "
+            f"{c.get('probe_test_file')} conflicts with existing tests — the "
+            f"re-drive change that made it pass (round {c.get('round')}, "
+            f"group {c.get('group')}) broke {len(tests)} case(s) they pin: "
+            + "; ".join(shown) + (f" (+{len(tests) - len(shown)} more)"
+                                  if len(tests) > len(shown) else "")
+            + "; the change was rolled back and the probe is not driven "
+            "again — a person decides; the item stays unmet")
+
+
+def _redrive_objection_text(o: dict) -> str:
+    """A fixer's objection to a probe in words, marked unverified."""
+    return (f"item {o.get('item_index')}: a re-drive fixer objected to its "
+            f"falsifier probe {o.get('probe_test_file')} ({o.get('kind')}): "
+            f"\"{_normalize_risk_text(o.get('reason') or '', 300)}\" — its "
+            "own words, not verified by leerie; it exempts nothing")
+
+
+def _redrive_probe_objections(raw: object, probes: list[dict]
+                              ) -> list[dict]:
+    """The `probe_objections` a group's implementer returned, kept only
+    when one names a probe the group was handed (`probes`,
+    `_redrive_probe_sets`: its path, or a path ending in `/<path>`):
+    `{item_index, probe_test_file, kind, reason}`, first 10 (DESIGN §8
+    *Delivery re-drive* rule 4). Nothing in it is checked as true: it is
+    the fixer's words for a person, and it changes no routing and no
+    verdict."""
+    by_file = {p_["defect_files"][0]: p_ for p_ in probes}
+    out: list[dict] = []
+    for c in (raw if isinstance(raw, list) else [])[:10]:
+        if not isinstance(c, dict):
+            continue
+        f = str(c.get("probe_test_file") or "").strip()
+        rel = next((r for r in by_file if f == r or f.endswith("/" + r)),
+                   None)
+        kind = c.get("kind")
+        if rel is None or kind not in PROBE_OBJECTION_KINDS:
+            continue
+        out.append({"item_index": by_file[rel]["item_index"],
+                    "probe_test_file": rel, "kind": kind,
+                    "reason": str(c.get("reason") or "")[:1200]})
+    return out
 
 
 def _redrive_failing(results: list[dict], sets: list[dict],
@@ -66100,21 +66236,20 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
             "words and the test fails on this tree, confirmed by repeated "
             "runs. The test is among your self-check's test files below; "
             "name its file to run it alone. Make it pass by fixing the "
-            "item in the production code, never by fitting the test.\n"
-            "If the probe asserts on an input this repository's code never "
-            "gives the entry point it calls, or asserts behaviour the task "
-            "forbids, do not bend the code to it: return it in "
-            "`contested_probes`, each `{probe_test_file` (its test_file "
-            "above), `kind` (`input_outside_domain` or "
-            "`contradicts_task`), `probe_quote` (the probe's line you "
-            "contest, copied exactly), `cites` (for "
-            "`input_outside_domain`: `{path, line_start, line_end, "
-            "quote}` entries quoting code on this tree that shows what the "
-            "entry point is actually given), `task_quote` (for "
-            "`contradicts_task`: the task's or a required item's words, "
-            "copied exactly), `reason}`. Code checks every quote; a "
-            "contest goes to a human and never settles the item — it "
-            "stays unmet unless the probe passes.")
+            "item in the production code, never by fitting the test, and "
+            "never by editing or weakening an existing test to make room "
+            "for it.\n"
+            "After your commit the orchestrator re-runs the probe and the "
+            "repository's tests. A commit that leaves the probe failing is "
+            "rolled back. A commit that makes it pass but breaks a case an "
+            "existing test pins is rolled back too, and the probe is "
+            "recorded as conflicting with that test, for a person to "
+            "decide. If you think the probe is wrong, say so in "
+            "`probe_objections`, each `{probe_test_file` (its test_file "
+            "above), `kind` (`input_outside_domain`, `contradicts_task` or "
+            "`breaks_existing_test`), `reason}`: the person reads it as "
+            "your unverified words; it exempts nothing, and the item stays "
+            "unmet unless the probe passes.")
     if merged:
         parts.append(
             "MERGED RE-DRIVE: these subtasks share production files with "
@@ -66204,86 +66339,14 @@ async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
                if bin_dir else {}))
         out = {"status": res.get("status"),
                "summary": str(res.get("summary") or "")[:500]}
-        if isinstance(res.get("contested_probes"), list):
-            # Checked by `_redrive_check_contests`, never trusted as is.
-            out["contested_probes"] = res["contested_probes"][:10]
+        if isinstance(res.get("probe_objections"), list):
+            # Kept by `_redrive_probe_objections`, never trusted as true.
+            out["probe_objections"] = res["probe_objections"][:10]
         return out
     except (WorkerError, subprocess.TimeoutExpired) as e:
         return {"error": _brief_worker_exc(e)}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"[:300]}
-
-
-def _redrive_check_contests(raw: object, probes: list[dict],
-                            tree: str | Path, task: str,
-                            items: list) -> list[dict]:
-    """Each `contested_probes` entry a group's implementer returned,
-    checked in code (DESIGN §8 *Delivery re-drive* rule 4): `{item_index?,
-    probe_test_file, kind, probe_quote, cites[], cite_status[]?,
-    task_quote, reason, accepted, rejected?}`. Accepted only when
-    `probe_test_file` is one of `probes` (`_redrive_probe_sets`, the
-    group's; its path or a path ending in it), `probe_quote` is verbatim in
-    that probe's source, and its kind's evidence verifies: for
-    `input_outside_domain` a cite `_verify_delivery_cite` reads `ok` or
-    `drift` on `tree`'s HEAD; for `contradicts_task` a `task_quote`
-    verbatim in the task or a required item's text or parts. Substring
-    checks after `_scope_norm` — never a reading of the reason."""
-    by_file = {p_["defect_files"][0]: p_ for p_ in probes}
-    texts = [task or ""]
-    for it in items or []:
-        n_ = _delivery_norm_item(it)
-        texts.append(str(n_.get("item") or ""))
-        texts += [str(x) for x in (n_.get("parts") or [])
-                  if isinstance(n_.get("parts"), list)]
-    out: list[dict] = []
-    for c in (raw if isinstance(raw, list) else [])[:10]:
-        if not isinstance(c, dict):
-            continue
-        f = str(c.get("probe_test_file") or "").strip()
-        rel = next((r for r in by_file if f == r or f.endswith("/" + r)),
-                   None)
-        kind = c.get("kind")
-        cites = [x for x in (c.get("cites") or []) if isinstance(x, dict)][:5]
-        rec: dict = {"probe_test_file": f[:400], "kind": kind,
-                     "probe_quote": str(c.get("probe_quote") or "")[:600],
-                     "cites": [{k: x.get(k) for k in ("path", "line_start",
-                                                      "line_end", "quote")}
-                               for x in cites],
-                     "task_quote": str(c.get("task_quote") or "")[:600],
-                     "reason": str(c.get("reason") or "")[:1200]}
-        why = None
-        if rel is None:
-            why = "not a probe this group was handed"
-        else:
-            rec["item_index"] = by_file[rel]["item_index"]
-            rec["probe_test_file"] = rel
-            d_ = Path(by_file[rel]["dir"])
-            try:
-                src = _read_text_beneath(d_, d_ / rel, limit=READ_LIMIT_TEXT)
-            except OSError:
-                src = ""
-            q = _scope_norm(rec["probe_quote"])
-            if kind not in REDRIVE_CONTEST_KINDS:
-                why = "unknown kind"
-            elif len(q) < _DELIVERY_CITE_MIN_QUOTE or q not in _scope_norm(
-                    src):
-                why = "probe_quote is not in the probe"
-            elif kind == "input_outside_domain":
-                memo: dict = {}
-                rec["cite_status"] = [_verify_delivery_cite(x, tree, "", memo)
-                                      for x in cites]
-                if not set(rec["cite_status"]) & {"ok", "drift"}:
-                    why = "no cite verifies on this tree"
-            else:
-                tq = _scope_norm(rec["task_quote"])
-                if len(tq) < _DELIVERY_CITE_MIN_QUOTE or not any(
-                        tq in _scope_norm(t) for t in texts):
-                    why = "task_quote is not in the task or a required item"
-        rec["accepted"] = why is None
-        if why:
-            rec["rejected"] = why
-        out.append(rec)
-    return out
 
 
 def _judge_majority_items(unmet: Iterable[object]) -> list[int]:
@@ -66376,9 +66439,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                      None)
         still = True
         if isinstance(saved, dict) and saved.get("file"):
-            probe = {"index": 1_000_000 + i, "dir": saved.get("dir"),
-                     "defect_files": [saved["file"]], "control_files": [],
-                     "support_files": [], "cases": {}}
+            probe = _falsifier_probe_set(i, saved.get("dir"),
+                                         saved["file"])
             res = await _evaluate_acceptance_sets(
                 st, caps, str(staging), [probe], f"redrive-probe-i{i}")
             r = res[0] if res else {"unmeasured": True}
@@ -66762,7 +66824,15 @@ def _redrive_rollback_reason(ge: dict) -> str:
                    "set or a shown falsifier probe: "
                    + ", ".join(ge["committed_staged"]))
     if ge.get("zero_progress"):
-        why.append("it fixed no failing case it could be measured on")
+        why.append("it fixed no failing case it could be measured on"
+                   + (" (a shown falsifier probe counts as one)"
+                      if ge.get("probes_after") else ""))
+    pc = ge.get("probe_conflict") or {}
+    if pc.get("tests"):
+        why.append(f"making the falsifier probe(s) of item(s) "
+                   f"{pc.get('items')} pass broke case(s) existing tests "
+                   "pin: " + ", ".join(str(x.get("id"))
+                                       for x in pc["tests"][:5]))
     if ge.get("broke_cases") or ge.get("held_broke_cases"):
         why.append(f"it broke {len(ge.get('broke_cases') or [])} shown and "
                    f"{len(ge.get('held_broke_cases') or [])} held-back "
@@ -66838,6 +66908,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("contradictions", [])
     rec.setdefault("defects_driven", [])
     rec.setdefault("contested_probes", [])
+    rec.setdefault("probe_objections", [])
     st.data["current_phase"] = "phase 5: delivery re-drive"
     acc = st.data.get("acceptance") or {}
     all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
@@ -66884,15 +66955,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     def item_split() -> tuple[list[dict], list[dict]]:
         dg = st.data.get("delivery_gate") or {}
         # A probe is shown only when its sample read the sets every group's
-        # self-check holds (rule 4); one a fixer contested is not handed on
-        # again (`_redrive_check_contests`).
+        # self-check holds (rule 4); one a measured conflict with an
+        # existing test contested is never handed on again.
         return _redrive_item_notes(
             dg.get("unmet_final") or [], claims, len(normalized),
             dg.get("items") or [],
             shown_idx={s_.get("index") for s_ in shown},
-            contested={c["item_index"] for c in rec["contested_probes"]
-                       if c.get("accepted")
-                       and isinstance(c.get("item_index"), int)})
+            contested=set(_redrive_contests_by_item(
+                rec["contested_probes"])))
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).
@@ -67160,22 +67230,20 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     note, effort=effort, label=label,
                     bin_dir=sc["bin"] if sc else None,
                     db=bool(shown or probe_sets))
-                raw_contests = ge["implementer"].pop("contested_probes",
-                                                    None)
-                if probe_sets and raw_contests:
-                    checked = _redrive_check_contests(
-                        raw_contests, probe_sets, staging,
-                        st.data.get("task", ""), items)
-                    ge["contested_probes"] = checked
-                    rec["contested_probes"] += [
-                        {**c, "round": rnd, "group": gi} for c in checked]
-                    for c in checked:
-                        log(f"  delivery re-drive r{rnd} g{gi}: probe "
-                            f"{c['probe_test_file']} contested "
-                            f"({c.get('kind')}) — "
-                            + ("accepted: a human decides; the item stays "
-                               "unmet" if c["accepted"]
-                               else f"rejected: {c.get('rejected')}"))
+                objs = _redrive_probe_objections(
+                    ge["implementer"].pop("probe_objections", None),
+                    probe_sets)
+                if objs:
+                    # The fixer's words for a person, never an exemption
+                    # (rule 4).
+                    ge["probe_objections"] = objs
+                    rec["probe_objections"] += [
+                        {**o, "round": rnd, "group": gi} for o in objs]
+                    for o in objs:
+                        log(f"  delivery re-drive r{rnd} g{gi}: the fixer "
+                            f"objected to probe {o['probe_test_file']} "
+                            f"({o['kind']}) — recorded unverified; it "
+                            "exempts nothing")
             finally:
                 if sc:
                     calls = _selfcheck_calls(sc)
@@ -67249,6 +67317,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["committed_staged"] = committed
                 F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
                 F1 = _redrive_carry(F, F1, unm)
+                # Each shown probe the group was handed, on its commit
+                # (rule 4): a case of its progress, and what a conflict
+                # with an existing test is measured against.
+                probes_after = await _redrive_probe_verdicts(
+                    st, caps, staging, probe_sets,
+                    f"redrive-r{rnd}g{gi}-probes", rev=post_sha)
+                if probes_after:
+                    ge["probes_after"] = {str(i): v for i, v
+                                          in sorted(probes_after.items())}
                 H1 = None
                 if held_mode:
                     H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
@@ -67312,9 +67389,42 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         (n["kind"].startswith("held_") and H1 is not None)
                         or (not n["kind"].startswith("held_")
                             and n["set_index"] not in unm))]
+                # A shown probe is a case too: one that passes now is
+                # progress, one that still fails is not, and one with no
+                # verdict is no evidence either way (rule 4).
+                probe_fixed = sorted(i for i, x in probes_after.items()
+                                     if x == "pass")
+                measured_probes = [i for i, x in probes_after.items()
+                                   if x != "unmeasured"]
                 ge["zero_progress"] = bool(
-                    measured_live and not v["fixed_cases"]
-                    and not v["held_fixed_cases"])
+                    (measured_live or measured_probes)
+                    and not v["fixed_cases"]
+                    and not v["held_fixed_cases"] and not probe_fixed)
+                # A shown probe never forces a change that breaks what an
+                # existing test pins (rule 4): a commit that made a probe
+                # pass and broke such a case contests the probe — measured,
+                # never a worker's say-so.
+                pinned = (_redrive_pinned_breaks(
+                    _run_repo(st), _diff_base(st) or "", post_sha, newv)
+                    if probe_fixed else [])
+                if pinned:
+                    ge["probe_conflict"] = {
+                        "items": probe_fixed,
+                        "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX]}
+                    by_item = {p_["item_index"]: p_ for p_ in probe_sets}
+                    for i in probe_fixed:
+                        rec["contested_probes"].append({
+                            "item_index": i,
+                            "probe_test_file": by_item[i]["defect_files"][0],
+                            "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX],
+                            "round": rnd, "group": gi})
+                        log(f"  delivery re-drive r{rnd} g{gi}: probe of "
+                            f"item {i} contested — making it pass broke "
+                            f"{len(pinned)} case(s) existing tests pin; "
+                            "rolled back, not driven again")
+                # A conflict needs no rule of its own to roll the group
+                # back: each pinned case is a confirmed new failure (worse)
+                # or a base-form change (void).
                 void = (void or ge["zero_progress"]
                         or bool(ge.get("base_form_changed")))
                 if escalate:
@@ -74348,6 +74458,10 @@ def _collect_unmet_evidence(st: "State",
     gate = gate if isinstance(gate, dict) else {}
     rows = {r.get("item_index"): r for r in gate.get("items") or []
             if isinstance(r, dict)}
+    rd_ = st.data.get("delivery_redrive") if results is None else None
+    rd_ = rd_ if isinstance(rd_, dict) else {}
+    contests = _redrive_contests_by_item(rd_.get("contested_probes"))
+    objections = _redrive_objections_by_item(rd_.get("probe_objections"))
     for u in gate.get("unmet_final") or []:
         if not isinstance(u, dict) or "falsifier" not in (u.get("by") or []):
             continue
@@ -74371,6 +74485,17 @@ def _collect_unmet_evidence(st: "State",
                      (text or "").splitlines(), s_.get("case_name"),
                      s_.get("failure_line"), s_.get("failure_message"),
                      str(s_.get("assertion_quote") or ""))]}
+        if i in contests:
+            # Measured (DESIGN §8 *Delivery re-drive* rule 4).
+            entry["conflicts_with"] = [
+                str(x.get("id")) for x in contests[i].get("tests") or []
+                if isinstance(x, dict)]
+        if i in objections:
+            # The fixer's words, never checked as true.
+            entry["objections"] = [
+                {"kind": str(o.get("kind") or ""),
+                 "reason": str(o.get("reason") or "")[:_UNMET_MESSAGE_MAX]}
+                for o in objections[i]]
         _unmet_attach(st, entry, dst, text)
         entries.append(entry)
     acc = st.data.get("acceptance")

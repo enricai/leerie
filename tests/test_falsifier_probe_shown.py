@@ -11,8 +11,8 @@ an item was not driven at all. 4 such items in 4 runs over three days, none
 closed. Now the leads are the shown sets only, a sample records the sets it
 read (`lead_sets`), and a probe whose sample read only shown sets is put in
 the group's self-check and named in its note. A probe of an older sample
-(no `lead_sets`) stays held-out content. A fixer may contest a shown probe,
-typed and checked in code; the contest goes to a human.
+(no `lead_sets`) stays held-out content. What a fixer does with a shown
+probe is checked after its commit (`tests/test_shown_probe_contest.py`).
 """
 from __future__ import annotations
 
@@ -218,7 +218,7 @@ def test_a_shown_probe_item_is_driven_with_its_probe_in_the_selfcheck(
     assert PROBE_REL in cfg["run_files"]
     assert seen[0]["files"][f"sets/probe-i0/{PROBE_REL}"] == PROBE_SRC
     assert "PROBES:" in seen[0]["prompt"]
-    assert "contested_probes" in seen[0]["prompt"]
+    assert "probe_objections" in seen[0]["prompt"]
     assert rec["items_driven"] == [0]
     assert "unrouted_items" not in rec
     # The group's commit is checked for the probe's source like a set's.
@@ -347,107 +347,3 @@ def test_no_held_back_set_reaches_a_fixer_through_a_probe(
             assert f"{SHOWN_MARK}{k}" in probe_copy   # the channel is live
         for k in (4, 5):
             assert f"{HELD_MARK}{k}" not in handed
-
-
-# === a fixer contests a shown probe =========================================
-
-def _contest_world(leerie, tmp_path, monkeypatch, contest: dict):
-    def row(w):
-        return _row(_save_probe(w.st.run_dir), lead_sets=[1, 2])
-    w = _world(leerie, tmp_path, monkeypatch, n_sets=2, row_fn=row)
-    w.caps["subtask_redrive_rounds"] = 3
-
-    async def fake(**kw):
-        w.calls.append({"sid": kw["sid"], "prompt": kw["user_prompt"]})
-        return {"status": "complete", "summary": "contested",
-                "contested_probes": [contest]}
-    monkeypatch.setattr(leerie, "claude_p", fake)
-
-    async def still_unmet(*a, **k):
-        return {0: {"unmet": True, "by": ["falsifier"],
-                    "evidence": PROBE_EVIDENCE,
-                    "evidence_by": {"falsifier": PROBE_EVIDENCE}}}
-    monkeypatch.setattr(leerie, "_redrive_recheck_items", still_unmet)
-    return w
-
-
-CONTEST = {"probe_test_file": PROBE_REL, "kind": "input_outside_domain",
-           "probe_quote": 'const c = "export const XPayloadSchema',
-           "cites": [{"path": "src/a.ts", "line_start": 1, "line_end": 1,
-                      "quote": "export const a = 1; // FIXED"}],
-           "reason": "the emitter never writes `export const`"}
-
-
-def test_an_accepted_contest_goes_to_a_human_and_the_item_stays_unmet(
-        leerie, tmp_path, monkeypatch):
-    w = _contest_world(leerie, tmp_path, monkeypatch, CONTEST)
-    w.run()
-    rec = w.st.data["delivery_redrive"]
-    # Driven once: the contested probe is not handed to another round.
-    assert len(w.calls) == 1
-    [c] = rec["contested_probes"]
-    assert c["accepted"] and c["item_index"] == 0
-    assert c["kind"] == "input_outside_domain"
-    assert c["cite_status"] == ["ok"]
-    assert "unrouted_items" not in rec
-    # Never dropped: unmet, unconverged, named for a human.
-    assert [u["item_index"] for u in
-            w.st.data["delivery_gate"]["unmet_final"]] == [0]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    line = [r for r in w.st.data["outcome_reasons"]
-            if r.startswith("item 0: a re-drive implementer contested")]
-    assert line == [
-        f"item 0: a re-drive implementer contested its falsifier probe "
-        f"{PROBE_REL} as input_outside_domain (\"const c = \"export const "
-        f"XPayloadSchema\", citing src/a.ts:1); a human decides — the item "
-        f"stays unmet"]
-
-
-@pytest.mark.parametrize("bad,why", [
-    ({"probe_quote": "a line the probe does not have"},
-     "probe_quote is not in the probe"),
-    ({"cites": [{"path": "src/a.ts", "line_start": 1, "line_end": 1,
-                 "quote": "nothing like this is in a.ts"}]},
-     "no cite verifies on this tree"),
-    ({"probe_test_file": "src/other.test.ts"},
-     "not a probe this group was handed"),
-    ({"kind": "contradicts_task", "task_quote": "words the task lacks"},
-     "task_quote is not in the task or a required item")])
-def test_a_contest_that_fails_a_check_changes_nothing(
-        leerie, tmp_path, monkeypatch, bad, why):
-    w = _contest_world(leerie, tmp_path, monkeypatch, {**CONTEST, **bad})
-    w.run()
-    rec = w.st.data["delivery_redrive"]
-    assert all(not c["accepted"] and c["rejected"] == why
-               for c in rec["contested_probes"])
-    # Still driven in the next round: a rejected contest is no contest.
-    assert len(w.calls) >= 2
-    leerie._decide_outcome(w.st, any_commits=True)
-    assert not any("contested" in r for r in w.st.data["outcome_reasons"])
-
-
-def test_contradicts_task_is_checked_against_the_task_and_items(
-        leerie, tmp_path):
-    d = _save_probe(tmp_path / "run")
-    probes = [{"index": "probe-i0", "item_index": 0, "dir": str(d),
-               "defect_files": [PROBE_REL], "control_files": [],
-               "support_files": []}]
-    items = [{"item": "x", "parts": ["default behaviour preserved"]}]
-    c = {"probe_test_file": "/abs/selfcheck/sets/probe-i0/" + PROBE_REL,
-         "kind": "contradicts_task", "probe_quote": ASSERTION}
-    got = leerie._redrive_check_contests(
-        [{**c, "task_quote": "default behaviour preserved"},
-         {**c, "task_quote": "never touch the emitter"},
-         {**c, "task_quote": "nowhere at all in this text"}],
-        probes, tmp_path, "Fix it; never touch the emitter.", items)
-    assert [g["accepted"] for g in got] == [True, True, False]
-    assert got[0]["probe_test_file"] == PROBE_REL
-    assert got[0]["item_index"] == 0
-
-
-def test_the_implementer_schema_types_the_contest(leerie):
-    p_ = leerie.SCHEMAS["implementer"]["properties"]["contested_probes"]
-    item = p_["items"]
-    assert item["required"] == ["probe_test_file", "kind"]
-    assert item["properties"]["kind"]["enum"] == list(
-        leerie.REDRIVE_CONTEST_KINDS)

@@ -13167,8 +13167,35 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
      its own bench, frozen before any worker ran: recorded genuine
      falsifier-only items and a few that are not report defects, the probe
      shown against the item words alone, on a bar of closure at least twice
-     the control and at least half. *That bench has not run.* The Q2
-     numbers below describe F+, not this input.
+     the control and at least half. It ran twice. Lane XC (leerie 0.46.0,
+     barnacle items from the RCA) passed closure, 6 of 10 genuine shown
+     samples against 2 of 10 blind, and failed its harm rule: a fixer
+     obeyed a probe that contradicts the report and broke two existing
+     tests (N3), another bent code against pinned tests (G4-shown-2), and
+     the worker-reported contest was used once in 14 shown samples. That
+     led to the measured conflict and to zero progress counting the probe
+     (§8 *Delivery re-drive* rule 4). Lane X2 then ran fresh cases with
+     production's post-commit path simulated (frozen before any worker
+     ran: six falsifier-only items of the week of 2026-11-08 — barnacle
+     4f9a4b4f i13, b24806a1 i13, 79c8fbe7 i8, 879de601 i8, navegando
+     e99c1df1 i0, e0d101e3 i0 — five genuine, one not a defect, hand
+     labelled before running; 2 samples per arm). Closed means kept by
+     that path, the probe passing, and a root fix by reading the diff:
+     shown 7 of 10 genuine, blind 0 of 10, today 0 by construction. On the
+     not-a-defect item both shown samples tried the change the probe asks
+     for, saw an existing test break, reverted and objected
+     (`breaks_existing_test`), so nothing reached the check; nothing
+     harmful survived
+     (a blind sample's change that drops the endorsed fallback for
+     optional selects did). The conflict fired on both shown samples of
+     e0d101e3, a genuine item: each fix was right and still rolled back,
+     because the audit table's existing test pins the hardcoded header,
+     and each also left one Spanish value identical to English, which an
+     existing parity test caught. One shown sample (e99c1df1) fixed only
+     the input the probe names and left three sibling controls with the
+     same defect: kept, and not counted closed. The cases are clustered
+     (two pairs share a report section) and only one is not a defect. The
+     Q2 numbers below describe F+, not this input.
   The first shipped prompt also told the worker what the orchestrator
   checks and offered the executed-commands record as a lead, and its
   input carried that record: none of it was benched, so the Q2 numbers
@@ -13661,9 +13688,16 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    sample with no `lead_sets`, recorded before leads were shown sets
    only, or one whose `lead_sets` names a set the run holds back — is
    held-out content: its fixer can neither run nor read it, and all a
-   note could say is that some input in the item's words fails. An item
-   whose only unmet evidence (`by`) is such a probe is therefore not
-   driven: it is recorded as an `unrouted_item` with reason
+   note could say is that some input in the item's words fails. So is,
+   for this purpose, a probe its sample ran and confirmed through the
+   repository's browser suite (`via_browser_suite`, §8 *A repository's
+   browser suite is a channel the run provisions*): the fixer's
+   self-check runs the repository's test command only, so the fixer could
+   not run it as it was confirmed, and its progress and any conflict with
+   an existing test (below) could not be read through that command either.
+   Running such a probe through the suite in the self-check and in the
+   re-drive's re-runs is a later step. An item whose only unmet evidence
+   (`by`) is such a probe is therefore not driven: it is recorded as an `unrouted_item` with reason
    `unreproducible` (*An unmet item reaches its owner, or is recorded as
    reaching none*, below), stays unmet, and spends no round. An item
    unmet on such a probe and on reproducible evidence too is driven on
@@ -13687,35 +13721,98 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    would have been handed `p.test.ts`, whose `export const
    XPayloadSchema` input the declaration matcher misses.
 
-   *A fixer may contest a shown probe, typed; the contest goes to a human
-   and the item is never dropped.* A probe can be a correct reading of the
-   item's words and still assert on an input the product never gives its
-   entry point — 4b5c564d's emitter writes `const …PayloadSchema`, never
-   `export const`, which the falsifier itself called "an edge case" — or
-   assert a behaviour another requirement of the task forbids. A fixer
-   handed such a probe should neither bend the code to it nor be told it
-   failed. The implementer's output carries `contested_probes[]`
-   (`{probe_test_file, kind: input_outside_domain | contradicts_task,
-   probe_quote, cites[{path, line_start, line_end, quote}], task_quote,
-   reason}`). Code accepts a contest only when its `probe_test_file` is a
-   probe the group was handed, its `probe_quote` is verbatim in that
-   probe's source, and the kind's evidence verifies: for
-   `input_outside_domain`, at least one cite verifies on the group's HEAD
-   (`_verify_delivery_cite`, `ok` or `drift`) — the code that shows what
-   the entry point is actually given; for `contradicts_task`, its
-   `task_quote` is verbatim in the task or in a required item. An accepted
-   contest is recorded (`delivery_redrive.contested_probes[]`); the item's
-   probe is not handed to a later group, so no round is spent chasing it
-   again; the item stays in `unmet_final`, re-checked at the end like any
-   other — the run is `unconverged` unless the probe now passes — and the
-   outcome's reasons and the PR name the probe, the kind and the fixer's
-   quoted evidence for a human to decide. A contest that fails a check is
-   recorded with why and changes nothing. A contest is never resolved in
-   code or by the contesting worker: routing it to a judge instead of a
-   human is a later step, because that is a new judgment over the
-   falsifier's evidence — the contract judge's `conflict` path of *A probe
-   that breaks another part of its own item is a contested reading* —
-   and is benched with that design. After each
+   *A shown probe is contested only by a measured conflict with an
+   existing test; a fixer's objection is a note, never an exemption.* A
+   shown probe never forces a change that breaks what an existing test
+   pins. After a group that was handed a probe commits, the probe is
+   re-run on the commit in a sandbox, as at the re-check
+   (`_redrive_probe_verdicts`), and the commit's test results are read as
+   for any group. A case an existing test pins is one of the base-form
+   check's `changed` cases (a test file the base had and the run changed,
+   run in its base form: §8 *What an existing test pins on the base
+   holds on the tree that ships*), or a confirmed new failure in a test
+   file the run's base had and the commit leaves as the base had it, whose
+   base form is itself (`_redrive_pinned_breaks`). When the probe now
+   passes and any such case fails, satisfying the probe is measured to
+   break what an existing test pins: the group is rolled back, and the
+   probe is recorded as contested (`delivery_redrive.contested_probes[]`,
+   `{item_index, probe_test_file, tests[], round, group}`). The probe is
+   never handed to a later group, so no round is spent against it again;
+   the item stays in `unmet_final`, re-checked at the end like any other,
+   so the run is `unconverged`; and the outcome's reasons and the PR's
+   *Still failing* entry for the item say that the probe conflicts with
+   the existing tests named, for a person to decide. A probe that still
+   fails is no conflict, whatever else broke: that commit is rolled back
+   as worse, or as zero progress (below), and the probe stays shown.
+
+   Nothing else contests a probe. A fixer may still say why it thinks a
+   probe is wrong (an input the product never gives the entry point, a
+   behaviour the task forbids, a test it could not keep) in
+   `probe_objections[]` (`{probe_test_file, kind: input_outside_domain |
+   contradicts_task | breaks_existing_test, reason}`). Code keeps only an
+   objection naming a probe the group was handed, records it
+   (`delivery_redrive.probe_objections[]`) and puts it in the PR as the
+   fixer's unverified words; it changes no routing and no verdict. The
+   first form of this rule (lane XC's branch, never released) accepted a
+   `contradicts_task` contest whose `task_quote` was verbatim in the task
+   or a required item, and an accepted one removed the probe from later
+   groups. A quote check filters how a claim is worded; it is no evidence
+   that the claim is true. Lane TB benched the same check on tracked-test
+   declarations, and 4 of 6 real weakenings passed it with quotes that say
+   nothing about the behaviour, such as "We need to fix the root cost. No
+   band-aids please.", a sentence in every task of that repository. The
+   measured conflict is the evidence: the check runs the tests.
+
+   Neither the conflict nor the objection judges whether the probe is
+   right. A probe can be right and the existing test wrong, a test that
+   pins the very defect the task reports (navegando e0d101e3 item 0: the
+   audit table's existing test finds its column by the hardcoded Spanish
+   header the item says must be translated); the conflict then stops a
+   correct fix and hands it to a person. That is the price of the
+   invariant: no worker decides, from a probe, that an existing test may
+   break.
+
+   Fitting a fix to the probe's wording (lane XC's G1: a generic passive
+   "is …ed" pattern that made the probe sentence a no-op) is not caught
+   by any of this, and no mechanical check is added for it. The candidate
+   was a second, independently written probe of the same item, held back
+   from the fixer, judging its commit. Recorded data cannot measure it —
+   the falsifier stops at its first confirmed sample (any-of-k), so every
+   confirmed item on record has exactly one confirmed probe — so lane X2
+   ran a fresh falsifier with shown-only leads once per bench item. It
+   confirmed a second probe on all six, in 1 to 3 samples, and each shown
+   sample's recorded diff was run against both probes: on two items both
+   passed, and on three the first passed and the second failed in every
+   sample. Those three second probes tested another site or another
+   aspect of a broad item (a note textarea beside the inbox search, the
+   reset-password form beside the audit table, the primitive's own path
+   rather than the step's outcome), so they failed the fix read as root
+   (e99c1df1's first sample, which fixed every input of the list) exactly
+   as they failed the one read as fitted to the probe (its second sample).
+   A held-back second probe measures how much of a broad item a fix
+   covers, not whether it was fitted, and would roll back root fixes; a
+   heuristic on the fix's shape would be a symptom filter. Fitting stays
+   with the held-back sets (rule 6) and the reading of the diff.
+
+   Measured on the recorded diffs that motivated it (lane XC, leerie
+   0.46.0), with the probe shown: N3 (barnacle 80e66fce item 4, a probe
+   contradicting the report's F1) and G4-shown-2 (0d1c4033 item 29) each
+   made the probe pass and broke cases in test files the run's base had
+   and the run never changed (N3: 2 cases in
+   `flow-runner.select-from-list-committed-control.test.ts`; G4-shown-2: 5
+   cases in three files). Replayed on the runs' own final trees (the
+   recorded diff as the group's commit, this rule's post-commit path, no
+   model): the base-form check alone ran the run-changed test files the
+   commit reaches (8 and 2) and found no changed case, because it runs
+   only the test files a run changed, so on its own it stops neither. The
+   near stage confirmed every one of those cases new under B\* (2 and 5),
+   each in a test file the base had and the run left unchanged, and
+   `_redrive_pinned_breaks` returned all of them, so with the probe passing
+   both are contested. A group was already rolled back on those failures;
+   what the conflict adds is the record and the end of the retries:
+   before it, the rolled-back probe went to the next group again.
+
+   After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled
    tests, as at final and in the ratchet, never run raw; a
@@ -13764,7 +13861,13 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing
    report) is `resource_affected`, never on its own a reason to roll back,
-   and a set without a verdict cannot make a group zero-progress. A group
+   and a set without a verdict cannot make a group zero-progress. A shown
+   probe counts as a case here: a group handed one that, on its commit,
+   still fails every probe it was handed and fixed no set case is
+   zero-progress and rolled back, and a probe whose re-run gives no
+   verdict is no evidence either way. Before this, progress read set
+   notes only, so a group handed only a probe could never be
+   zero-progress, and a commit that left its probe failing was kept. A group
    that survives all of that still goes through the delivery ratchet
    (*A repair that regresses met work is rolled back*): when it made an
    item that was met before it unmet, it is rolled back too. The item then
