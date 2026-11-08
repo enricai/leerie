@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = (ROOT / "leerie").read_text()
@@ -60,26 +63,71 @@ def test_operator_ami_without_the_file_keeps_the_session_env(tmp_path):
     assert "MISE_RUBY_COMPILE" not in env
 
 
-def _launch_suffix() -> str:
-    return subprocess.run(
-        ["bash", "-c", f". {ROOT}/scripts/remote/seed-common.sh; _render_launch_suffix"],
-        capture_output=True, text=True, check=True).stdout
+# Replaces the wrapper's process spawn and its root-only calls; the rest of
+# the rendered program runs as written.
+_STUBS = """\
+import json, os, pwd, subprocess, sys, types
+_spawned = []
+class _Child:
+    pid = 4242
+    def poll(self):
+        return 0
+def _spawn(argv, **kw):
+    _spawned.append(list(argv))
+    return _Child()
+subprocess.Popen = _spawn
+os.chown = lambda *a, **k: None
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=1, pw_gid=1)
+"""
 
 
-def test_the_wrapper_forwards_the_orchestrator_argv_unchanged():
-    # The wrapper adds no flag of its own: a leading --no-push once made the
-    # orchestrator miss `resume` (recognized only as argv[0]), and the push
-    # choice is the orchestrator's own record, handed to a fresh run by the
-    # launcher (DESIGN §6 *One push choice per run, on every runtime*).
-    suffix = _launch_suffix()
-    assert '"/opt/leerie-image/orchestrator/leerie.py", *orch_args],' in suffix
-    assert "--no-push" not in suffix
+def _spawned_command(tmp_path: Path, argv: list[str]) -> list[str]:
+    """The command the launcher's whole rendered EC2 wrapper (prefix,
+    child_env block, suffix) would start for `argv` (the run id first, as
+    the launcher passes it): the wrapper is run, with its process spawn
+    recorded instead of made and its run directory under `tmp_path`."""
+    shell = (
+        f". {ROOT}/scripts/remote/seed-common.sh\n"
+        "USER_REPO=/repos/demo; _ec2_host_tz=UTC; _ec2_leerie_commit_json='\"\"'; "
+        "_ec2_oauth_token_json='\"\"'; _ec2_oauth_tokens_json='\"\"'\n"
+        f"_render_launch_prefix ec2 {shlex.quote(json.dumps(argv))}\n"
+        + _child_env_heredoc() + "_render_launch_suffix\n")
+    rendered = subprocess.run(["bash", "-c", shell], capture_output=True,
+                              text=True, check=True).stdout
+    work = tmp_path / "work"
+    rendered = rendered.replace('"/work/.leerie/runs/"', f'"{work}/.leerie/runs/"')
+    program = _STUBS + rendered + "\nprint(json.dumps(_spawned))\n"
+    out = subprocess.run(["python3", "-I", "-c", program], capture_output=True,
+                         text=True, check=True).stdout
+    (spawned,) = json.loads(out)
+    return spawned
 
 
-def test_launch_argv_parses_as_resume_in_the_orchestrator(leerie):
-    # The orchestrator's own verb handling, applied to what the wrapper
-    # forwards for `leerie resume <id> --runtime ec2`.
-    argv = ["resume", "i-0abc", "--runtime", "ec2"]
+ORCHESTRATOR = ["/usr/bin/python3", "/opt/leerie-image/orchestrator/leerie.py"]
+
+
+@pytest.mark.parametrize("orch_args", [
+    ["resume", "i-0abc", "--runtime", "ec2"],
+    ["Fix the login timeout", "--runtime", "ec2"],
+    ["Fix the login timeout", "--no-push", "--runtime", "ec2"],
+    ["resume", "--runtime", "ec2", "--no-push"],
+])
+def test_the_wrapper_forwards_the_orchestrator_argv_unchanged(tmp_path, orch_args):
+    # The wrapper adds no flag of its own, drops none and reorders none: a
+    # leading --no-push once made the orchestrator miss `resume` (recognized
+    # only as argv[0]), and the push choice is the orchestrator's own record,
+    # handed to a fresh run by the launcher (DESIGN §6 *One push choice per
+    # run, on every runtime*). What the user's own argv holds is theirs.
+    assert _spawned_command(tmp_path, ["rid-1", *orch_args]) == ORCHESTRATOR + orch_args
+
+
+def test_launch_argv_parses_as_resume_in_the_orchestrator(tmp_path, leerie):
+    # The orchestrator's own verb handling, applied to the command the
+    # wrapper really starts for `leerie resume <id> --runtime ec2`.
+    command = _spawned_command(
+        tmp_path, ["rid-1", "resume", "i-0abc", "--runtime", "ec2"])
+    argv = command[len(ORCHESTRATOR):]
+    assert argv[0] == "resume"
     run_id, rest = leerie._extract_resume_run_id(argv[1:])
     assert run_id == "i-0abc" and rest == ["--runtime", "ec2"]
 
