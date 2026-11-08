@@ -171,11 +171,11 @@ def test_every_dir_leerie_makes_for_a_command_or_worker_is_0700(leerie, run):
     own = leerie._measure_dir(st, run["wts"]["wt-a"])
     made = [own, *(own / s for s in leerie._MEASURE_SUBDIRS),
             rd / leerie.MEASURE_DIRNAME,
-            rd / leerie.TREE_STORES_DIRNAME / "wt-a"]
+            rd / "worktrees" / ".stores" / leerie.TREE_STORES_DIRNAME / "wt-a"]
     config, tmp = leerie._worker_dirs(rd, "w-0700", None)
     made += [config, tmp, config.parent]
     leerie._worker_cache_env({}, rd)
-    made += [rd / "workers" / "cache" / "xdg"]
+    made += [rd / "worktrees" / ".stores" / "cache" / "xdg"]
     for d in made:
         assert stat.S_IMODE(os.lstat(d).st_mode) == 0o700, (d,
                                                             oct(os.lstat(d)

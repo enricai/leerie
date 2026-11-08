@@ -9768,7 +9768,7 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
   # Package stores and caches are not mounted from the host: the
-  # orchestrator points its own commands at the run's `<run-dir>/stores/`
+  # orchestrator points its own commands at the run's `<run-dir>/worktrees/.stores/stores/`
   # and each worker at `<run-dir>/workers/` (DESIGN §6 *The stores a view
   # installs from are leerie's*). Both are in the state mount, beside the
   # worktrees, so an install can hard-link from its run's store (DESIGN §6

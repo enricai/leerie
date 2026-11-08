@@ -121,7 +121,7 @@ def test_each_pnpm_installs_against_the_runs_store(leerie, tmp_path,
     view = _view(leerie, w)
     assert _installed(view).read_text() == GOOD, _log(w)[-3000:]
     # It wrote the run's own store, which lies in the run directory.
-    assert w["store"].is_relative_to(w["run_dir"] / "stores")
+    assert w["store"].is_relative_to(w["run_dir"] / "worktrees" / ".stores" / "stores")
     assert any(p.is_file() for p in w["store"].rglob("*")), _log(w)[-3000:]
     if version == "10.28.2":
         # The write the shared read-only store refused.
@@ -168,7 +168,7 @@ def test_every_store_variable_is_the_runs_and_its_commands_write_it(
     logs to the read-only store) — while a worker's grant names none."""
     env: dict[str, str] = {}
     leerie._leerie_stores(env, run["run_dir"])
-    stores = run["run_dir"] / leerie.RUN_STORES_DIRNAME
+    stores = run["run_dir"] / "worktrees" / ".stores" / leerie.RUN_STORES_DIRNAME
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     g = leerie._measurement_grants(_St(run["user"], run["run_dir"]), view)
     shared = sorted(set(leerie._STORE_VARS) - leerie._TREE_STORE_VARS)

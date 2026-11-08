@@ -140,7 +140,7 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(
     (v1 / "dist" / "stale.txt").write_text("old")
     (v1 / "node_modules" / ".cache").mkdir()
     (v1 / "node_modules" / ".cache" / "x").write_text("old")
-    poison = v1.parent.parent / "tree-stores" / v1.name / "uv" / "old"
+    poison = v1.parent.parent / "worktrees" / ".stores" / "tree-stores" / v1.name / "uv" / "old"
     poison.parent.mkdir(parents=True, exist_ok=True)
     poison.write_text("old")
     measured = leerie._measure_dir(st, v1)

@@ -43,11 +43,11 @@ def test_a_confined_install_writes_the_runs_stores_and_no_other_runs(
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     env: dict[str, str] = {}
     leerie._leerie_stores(env, run["run_dir"])
-    other = run["state_root"] / "runs" / "another-run" / "stores" / "pnpm-store"
+    other = run["state_root"] / "runs" / "another-run" / "worktrees" / ".stores" / "stores" / "pnpm-store"
     other.mkdir(parents=True)
     (other / "pkg").write_text("stored\n")
     g = leerie._measurement_grants(_state(run), view, leerie.INSTALL_KIND)
-    tree_store = run["run_dir"] / "tree-stores" / view.name / "uv"
+    tree_store = run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / view.name / "uv"
     genv = dict(g.env)
     got = _probe(leerie, g, f"""
 write run store|echo x > {env['npm_config_store_dir']}/planted
@@ -81,7 +81,7 @@ def test_a_measured_pythons_user_base_is_its_trees_and_writable(leerie, run):
     env = dict(os.environ)
     leerie._tree_store_env(env, view)
     env.update(dict(g.env))
-    base = run["run_dir"] / "tree-stores" / view.name / "pyuser"
+    base = run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / view.name / "pyuser"
     assert env["PYTHONUSERBASE"] == str(base)
     got = _probe(leerie, g, f"""
 user base is the trees|test "$(python3 -c 'import site; print(site.getuserbase())')" = {base}
@@ -125,3 +125,40 @@ def test_every_npm_spelled_setting_is_one_npm_or_pnpm_10_reads(leerie, run):
         keys = {k[len("npm_config_"):] for k in env
                 if k.startswith("npm_config_")}
         assert keys <= npm_known | pnpm10, (kind, keys - npm_known - pnpm10)
+
+
+def test_every_store_a_tree_installs_from_is_beneath_the_link_root(
+        leerie, run):
+    """DESIGN §6 *The write grants on one mount are one mount*: the grant's
+    link root holds every store a tree installs from — the run's, the
+    tree's own and both sides' worker caches — and none of the run's own
+    records, so the one writable mount the shim makes there links a tree
+    from its store and leaves `state.json` and the logs read-only."""
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    g = leerie._measurement_grants(_state(run), view, leerie.INSTALL_KIND)
+    link = Path(g.link)
+    assert link == (run["run_dir"] / "worktrees").resolve()
+    env: dict[str, str] = {}
+    leerie._leerie_stores(env, run["run_dir"])
+    leerie._tree_store_env(env, view)
+    wenv = leerie._worker_cache_env({}, run["run_dir"])
+    held = leerie._worker_cache_dir(run["run_dir"], "acceptance_writer")
+    stores = ([env[v] for v in ("npm_config_store_dir", "UV_CACHE_DIR",
+                                "PIP_CACHE_DIR")]
+              + [wenv["npm_config_store_dir"], str(held)])
+    for p in stores:
+        assert Path(os.path.realpath(p)).is_relative_to(link), p
+    for name in ("state.json", "logs", "run.json", "claude-config",
+                 "workers", "acceptance"):
+        assert not (run["run_dir"].resolve() / name).is_relative_to(link)
+    # Every grant beneath the link root is a tree or a store of one.
+    beneath = [p for p in g.rw if Path(p).is_relative_to(link)]
+    assert beneath and all(
+        Path(p) == view.resolve()
+        or Path(p).is_relative_to(link / ".stores") for p in beneath), beneath
+    wg = leerie._worker_grants(
+        run_dir=run["run_dir"], state={}, schema_key="satisfied_probe",
+        cwd=view, allowed_tools="Bash", env={})
+    assert Path(wg.link) == link
+    assert str(leerie._worker_cache_dir(run["run_dir"], "satisfied_probe")
+               .resolve()) in [os.path.realpath(p) for p in wg.rw]

@@ -108,7 +108,7 @@ def world(leerie, tmp_path, monkeypatch):
     # The stub worker is confined (DESIGN §6 *A worker writes only where it
     # is granted*): its log goes where every worker of the run may write,
     # the run's shared cache directory.
-    log = st.run_dir / "workers" / "cache" / "stub.log"
+    log = st.run_dir / "worktrees" / ".stores" / "cache" / "stub.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("STUB_LOG", str(log))
     st.data = {"verbosity": "quiet", "worker_count": 0}

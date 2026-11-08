@@ -37,7 +37,7 @@ def test_a_command_in_a_run_tree_gets_that_trees_own_stores(leerie,
     run, t = _tree(tmp_path)
     env = {"GOCACHE": "/opt/go-cache", "UV_CACHE_DIR": "/shared/uv"}
     leerie._tree_store_env(env, t / "sub")
-    root = run / "tree-stores" / t.name
+    root = run / "worktrees" / ".stores" / "tree-stores" / t.name
     for var in leerie._TREE_STORE_VARS - {"GOCACHE"}:
         assert env[var] == str(root / leerie._STORE_VARS[var]), var
         assert Path(env[var]).is_dir()
@@ -60,7 +60,7 @@ def test_a_trees_own_stores_are_made_private(leerie, tmp_path):
         leerie._tree_store_env(env, t)
     finally:
         os.umask(old)
-    root = run / "tree-stores" / t.name
+    root = run / "worktrees" / ".stores" / "tree-stores" / t.name
     made = [root.parent, root,
             *(Path(env[v]) for v in leerie._TREE_STORE_VARS)]
     for d in made:
@@ -82,7 +82,7 @@ def test_run_streaming_runs_a_repo_command_with_its_trees_stores(
         verbosity="quiet"))
     assert rc == 0
     got = json.loads(out.read_text())
-    assert got["UV_CACHE_DIR"] == str(run / "tree-stores" / t.name / "uv")
+    assert got["UV_CACHE_DIR"] == str(run / "worktrees" / ".stores" / "tree-stores" / t.name / "uv")
 
 
 def _fake(bindir: Path, name: str, rec: Path) -> None:
@@ -137,7 +137,7 @@ def test_a_replaced_view_takes_its_tree_stores_with_it(leerie, tmp_path,
     w = _repo(leerie, tmp_path, monkeypatch)
     staging, st = w["staging"], w["st"]
     view = asyncio.run(leerie._committed_view(st, str(staging)))
-    stores = view.parent.parent / "tree-stores" / view.name
+    stores = view.parent.parent / "worktrees" / ".stores" / "tree-stores" / view.name
     leerie._tree_store_env({}, view)
     assert stores.is_dir()
     (stores / "uv" / "planted").write_text("x")

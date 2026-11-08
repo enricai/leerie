@@ -248,7 +248,7 @@ def test_a_hook_reaches_a_worker_through_local_bin_alone(leerie, run,
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "mise-data"))
     monkeypatch.setenv("PATH", f"{os.environ['PATH']}:{local_bin}")
-    monkeypatch.setenv("PYTHONUSERBASE", str(run_dir / "stores" / "pyuser"))
+    monkeypatch.setenv("PYTHONUSERBASE", str(run_dir / "worktrees" / ".stores" / "stores" / "pyuser"))
     tree = _add(run_dir / "repo", run_dir / "worktrees" / f"{run_dir.name}-p")
     hook = tree / ".leerie-setup.sh"
     hook.write_text(
@@ -265,7 +265,7 @@ def test_a_hook_reaches_a_worker_through_local_bin_alone(leerie, run,
     lib = local_bin / ".tool"
 
     hook_base = (lib / "user-base").read_text().strip()
-    assert hook_base == str(run_dir / "tree-stores" / tree.name / "pyuser")
+    assert hook_base == str(run_dir / "worktrees" / ".stores" / "tree-stores" / tree.name / "pyuser")
     assert Path(hook_base).is_dir()
     assert (lib / "hooks-path").read_text().strip() == str(
         user / ".git" / "hooks")

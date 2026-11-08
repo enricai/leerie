@@ -406,7 +406,7 @@ def _worker_dir(state_dir: Path, run_id: str) -> Path:
     """A worker directory of the run (`<run-dir>/workers/`), the one place
     outside its tree a confined stub may write (DESIGN §6 *A worker writes
     only where it is granted*): the payload's `TMPDIR`."""
-    d = state_dir / "runs" / run_id / "workers" / "cache" / "stub"
+    d = state_dir / "runs" / run_id / "worktrees" / ".stores" / "cache" / "stub"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

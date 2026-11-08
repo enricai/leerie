@@ -237,7 +237,7 @@ def _subtask_with_view(leerie, repo: Path, sid: str):
     assert r.returncode == 0, r.stderr
     (view / "node_modules").mkdir()
     (view / "node_modules" / "dep.js").write_text("module.exports = {};\n")
-    stores = leerie_dir / leerie.TREE_STORES_DIRNAME / view.name
+    stores = leerie_dir / "worktrees" / ".stores" / leerie.TREE_STORES_DIRNAME / view.name
     stores.mkdir(parents=True)
     (stores / "uv").mkdir()
     return leerie_dir, run_repo, wt, view, stores

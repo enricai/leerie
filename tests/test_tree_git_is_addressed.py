@@ -207,11 +207,11 @@ def test_the_rounds_measurement_proof_runs_nothing_of_the_view(leerie, run):
     (rd / "acceptance" / "heldback").mkdir(parents=True)
     secret = rd / "acceptance" / "heldback" / "secret.txt"
     secret.write_text("HELD\n")
-    (rd / "workers" / "cache").mkdir(parents=True)
+    (rd / "worktrees" / ".stores" / "cache").mkdir(parents=True)
     (rd / "state.json").write_text('{"gate": "pending"}')
     run_ref = f"refs/heads/leerie/runs/{RUN_ID}"
     _git(repo, "update-ref", run_ref, "main")
-    leak = rd / "workers" / "cache" / "leaked.txt"
+    leak = rd / "worktrees" / ".stores" / "cache" / "leaked.txt"
     st = _St(run["repo"].parent.parent.parent.parent / "user", rd)
     grants = leerie._measurement_grants(st, view)
     script = f'''

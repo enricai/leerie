@@ -171,14 +171,14 @@ def test_the_runs_shared_caches_and_config_template(leerie, run):
     never written; the run's own stores (leerie's commands') are
     neither."""
     rd = run["run_dir"]
-    (rd / "workers" / "cache").mkdir(parents=True, exist_ok=True)
+    (rd / "worktrees" / ".stores" / "cache").mkdir(parents=True, exist_ok=True)
     (rd / "claude-config").mkdir()
     (rd / "claude-config" / "settings.json").write_text("{}\n")
-    stores = rd / "stores" / "pnpm-store"
+    stores = rd / "worktrees" / ".stores" / "stores" / "pnpm-store"
     stores.mkdir(parents=True)
     g = _grants(leerie, run)
     got = _probe(leerie, g, f"""
-cache write|echo x > {rd}/workers/cache/f
+cache write|echo x > {rd}/worktrees/.stores/cache/f
 template read|cat {rd}/claude-config/settings.json
 template write|echo x > {rd}/claude-config/settings.json
 leerie store|echo x > {stores}/f
@@ -567,7 +567,7 @@ def test_the_writes_notice_says_exactly_what_the_grant_allows(leerie, run):
     writable under the real shim, and every granted path is named."""
     rd, wt = run["run_dir"], run["wts"]["wt-a"]
     # Made by `_worker_cache_env` before the shim opens the grants.
-    (rd / "workers" / "cache").mkdir(parents=True, exist_ok=True)
+    (rd / "worktrees" / ".stores" / "cache").mkdir(parents=True, exist_ok=True)
     g = _grants(leerie, run, notes_id="wt-a")
     notice = leerie._confined_writes_notice(g, cwd=wt, env=run["env"])
     assert notice.startswith("your processes can write only these: "
