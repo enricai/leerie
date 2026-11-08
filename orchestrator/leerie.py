@@ -6672,7 +6672,13 @@ def _drop_view(leerie_dir: Path, tree: Path) -> None:
         _rmtree_owned(view)
     _rmtree_owned(run_dir / TREE_STORES_DIRNAME / view.name)
     _VIEWS.pop(os.path.realpath(tree), None)
-    real = os.path.realpath(view)
+    _forget_installs(view)
+
+
+def _forget_installs(tree: Path) -> None:
+    """Every record this process keeps of an install in `tree`: a tree made
+    again at its path installs afresh."""
+    real = os.path.realpath(tree)
     for memo in (_VIEW_INSTALLS, _DEPS_FAILED, _DEPS_KEPT, _INSTALL_OUTPUTS):
         memo.pop(real, None)
     _DEPS_INSTALLED.discard(real)
@@ -6743,6 +6749,30 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
     await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
+
+
+async def _release_settled_trees(sid: str, leerie_dir: Path,
+                                 result: Mapping) -> None:
+    """Release what a subtask that has just settled no longer needs (DESIGN
+    §6 *A settled subtask's trees go when it settles*): its committed view
+    always — a later measurement of it makes the view again from its branch
+    (`_committed_view`) —, and, once it settled `complete`, its worktree and
+    tree repository too, its branch taken first (`_prune_subtask_worktree`):
+    a re-drive remakes the tree from the run repository's branch
+    (`new-worktree.sh`). A blocked or failed subtask keeps its worktree, the
+    evidence an operator settles it from. Never raises: a failed release is
+    disk the integration prune or the run's cleanup gets back."""
+    tree = _subtask_worktree_path(leerie_dir, sid)
+    try:
+        if result.get("status") == "complete":
+            await _prune_subtask_worktree(sid, leerie_dir)
+            if not tree.exists():
+                _forget_installs(tree)
+        else:
+            await asyncio.to_thread(_drop_view, Path(leerie_dir), tree)
+    except Exception as e:  # disk pressure deferred, never a failed wave
+        log(f"[{sid}] could not release its trees after it settled: "
+            f"{type(e).__name__}: {e}")
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -47414,6 +47444,23 @@ def _move_view(repo: Path, wt: Path, tip: str,
             and not changed.stdout)
 
 
+def _view_repo(st: "State", tree: str | Path) -> Path | None:
+    """The run repository a worker tree's committed view is read from: the
+    one its tree repository borrows from (`_run_repo_for_tree`); for a tree
+    already released (DESIGN §6 *A settled subtask's trees go when it
+    settles*), the run's own repository, where leerie took its branch before
+    releasing it. None when neither is there."""
+    reg = _run_repo_for_tree(tree)
+    if reg is not None:
+        return reg
+    run_dir = getattr(st, "run_dir", None)
+    own = Path(run_dir) / RUN_REPO_NAME if run_dir else None
+    if own is not None and not os.path.lexists(tree) \
+            and (own / "HEAD").is_file():
+        return own
+    return None
+
+
 async def _record_view_install(st: "State", view_key: str) -> None:
     """Record, for the committed view at `view_key`, the install key of its
     tip with the snapshot of the install just made there (`_VIEW_INSTALLS`;
@@ -47424,7 +47471,7 @@ async def _record_view_install(st: "State", view_key: str) -> None:
         if os.path.realpath(path) != view_key:
             continue
         recipe = (st.data.get("provision") or {}).get("recipe") or []
-        reg = await asyncio.to_thread(_run_repo_for_tree, tree_key)
+        reg = await asyncio.to_thread(_view_repo, st, tree_key)
         ikey = (await asyncio.to_thread(
             _install_key, reg, tip, recipe, _copy_inputs_of(st.repo_root))
                 if reg is not None else None)
@@ -47455,7 +47502,7 @@ async def _view_ref(st: "State", tree: str | Path) -> str | None:
     branch = _compute_subtask_branch(run_id, sid)
     # Read in the run repository, where leerie took the branch (DESIGN §6 *A
     # repository per committing tree (I6)*).
-    reg = await asyncio.to_thread(_run_repo_for_tree, t) or t
+    reg = await asyncio.to_thread(_view_repo, st, t) or t
     return branch if sid and await _ref_sha(str(reg), branch) else None
 
 
@@ -47466,7 +47513,7 @@ async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
     ref = await _view_ref(st, tree)
     if ref is None:
         return await _committed_tree_sha(str(tree))
-    reg = await asyncio.to_thread(_run_repo_for_tree, tree) or Path(tree)
+    reg = await asyncio.to_thread(_view_repo, st, tree) or Path(tree)
     got = await run_proc(["git", *_git_at(reg), "rev-parse", "--verify",
                           "-q", f"refs/heads/{ref}^{{tree}}"])
     return got.stdout.strip() if got.returncode == 0 else None
@@ -47492,7 +47539,7 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     # The run repository's record of the branch, and a checkout of the run
     # repository: never the tree's own repository, which its worker can
     # write (DESIGN §6 *A repository per committing tree (I6)*).
-    reg = await asyncio.to_thread(_run_repo_for_tree, tree) or Path(tree)
+    reg = await asyncio.to_thread(_view_repo, st, tree) or Path(tree)
     tip = await _ref_sha(str(reg), ref)
     if not tip:
         die(f"the committed view of {tree} cannot be made: its branch {ref} "
@@ -67360,10 +67407,39 @@ def _coverage_note(rec: dict, round_no: int, cap: int,
     return "\n\n".join(parts)
 
 
+async def _evaluate_subtask_coverage(sid: str, st: "State", caps: dict,
+                                    leerie_dir: Path, *,
+                                    redrive_changed: set[str]) -> dict:
+    """One coverage evaluation of `sid` for `_redrive_uncovered_subtasks`:
+    `_measure_subtask_coverage` with its typed gaps (`_settle_typed_gaps`),
+    measured in its committed view, made from its branch in the run
+    repository — the tree itself may be gone (DESIGN §6 *A settled
+    subtask's trees go when it settles*). The view is this evaluation's
+    alone: dropped when it ends, as nothing reads it again before the tip
+    moves. Never raises: an advisory measurement never kills a wave."""
+    tree = _subtask_worktree_path(leerie_dir, sid)
+    try:
+        if not await _ref_sha(_run_repo(st),
+                              _compute_subtask_branch(st.run_id, sid)):
+            return {"measured": False, "why": "no subtask branch"}
+        rec = await _measure_subtask_coverage(
+            sid, tree, _compute_run_branch(st.run_id), st, caps)
+        rec["gaps"] = await _settle_typed_gaps(
+            sid, tree, st, caps, redrive_changed=redrive_changed)
+        return rec
+    except Exception as e:  # advisory measurement: never kills a wave
+        return {"measured": False,
+                "why": f"measurement error ({type(e).__name__}: {e})"}
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(_drop_view, Path(leerie_dir), tree)
+
+
 async def _redrive_uncovered_subtasks(
         results: dict[str, dict],
         settle: Callable[[str, str], Awaitable[dict]],
-        st: "State", caps: dict, leerie_dir: Path) -> None:
+        st: "State", caps: dict, leerie_dir: Path,
+        evaluated: dict[str, dict] | None = None) -> None:
     """Re-drive this wave's `complete` subtasks whose changed lines no test
     executes, or whose `test_missing` / `test_weak` risks are unsettled
     (DESIGN §9 *Changed lines no test executes are re-driven*), from the
@@ -67375,9 +67451,11 @@ async def _redrive_uncovered_subtasks(
     `{rounds[], final}`; `final` is `covered` (nothing fires),
     `untested` (still firing when the budget is spent — listed in the PR,
     never `unconverged`), `rolled_back`, or `unmeasured`. Mutates
-    `results`."""
+    `results`. `evaluated` holds a first evaluation made as a subtask
+    settled (`_evaluate_subtask_coverage`, while its view stood), used in
+    place of a first round's own."""
     records = st.data.setdefault("coverage_redrive", {})
-    run_branch = _compute_run_branch(st.run_id)
+    evaluated = dict(evaluated or {})
     share_min = float(caps.get("coverage_uncovered_share",
                                DEFAULT_CAPS["coverage_uncovered_share"]))
     cap = int(caps.get("subtask_redrive_rounds",
@@ -67385,19 +67463,11 @@ async def _redrive_uncovered_subtasks(
     redrive_changed: dict[str, set[str]] = {}
 
     async def evaluate(sid: str) -> dict:
-        tree = _subtask_worktree_path(leerie_dir, sid)
-        try:
-            if not tree.is_dir():
-                return {"measured": False, "why": "no worktree"}
-            rec = await _measure_subtask_coverage(sid, tree, run_branch, st,
-                                                  caps)
-            rec["gaps"] = await _settle_typed_gaps(
-                sid, tree, st, caps,
-                redrive_changed=redrive_changed.get(sid, set()))
-            return rec
-        except Exception as e:  # advisory measurement: never kills a wave
-            return {"measured": False,
-                    "why": f"measurement error ({type(e).__name__}: {e})"}
+        if sid in evaluated:
+            return evaluated.pop(sid)
+        return await _evaluate_subtask_coverage(
+            sid, st, caps, leerie_dir,
+            redrive_changed=redrive_changed.get(sid, set()))
 
     def open_gaps(rec: dict) -> list[dict]:
         return [g for g in rec.get("gaps") or []
@@ -67426,6 +67496,7 @@ async def _redrive_uncovered_subtasks(
                 entry["uncovered"] = rec.get("uncovered") or {}
             elif _redrive_allowed(st, caps, s):
                 due.append(s)
+                continue
             else:
                 entry["final"] = "untested"
                 entry["uncovered"] = rec.get("uncovered") or {}
@@ -67441,8 +67512,10 @@ async def _redrive_uncovered_subtasks(
         for s in due:
             n = _consume_redrive(st, s)
             notes[s] = _coverage_note(recs[s], n, cap, previous.get(s))
-            pre[s] = await _branch_head_sha(
-                str(_subtask_worktree_path(leerie_dir, s)))
+            # Read in the run repository, where leerie took the branch: the
+            # tree went when the subtask settled.
+            pre[s] = await _ref_sha(_run_repo(st),
+                                    _compute_subtask_branch(st.run_id, s))
             records[s]["rounds"].append(
                 {"round": n, "share": recs[s].get("share"),
                  "uncovered": recs[s].get("uncovered") or {},
@@ -67464,10 +67537,11 @@ async def _redrive_uncovered_subtasks(
             previous[s] = recs[s]
             if r.get("status") == "complete":
                 results[s] = r
-                tree = _subtask_worktree_path(leerie_dir, s)
                 if pre[s]:
-                    diff = await run_proc(["git", *_tree_git_args(tree), "diff", "--name-only",
-                                           f"{pre[s]}..HEAD"], cwd=str(tree))
+                    diff = await run_proc(
+                        ["git", *_git_at(_run_repo(st)), "diff", "--name-only",
+                         f"{pre[s]}..refs/heads/"
+                         f"{_compute_subtask_branch(st.run_id, s)}"])
                     redrive_changed.setdefault(s, set()).update(
                         diff.stdout.split())
                 nxt.append(s)
@@ -71874,6 +71948,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # clock), charged once per wave as the longest — siblings re-drive in
         # parallel (DESIGN §13 *One re-drive budget per subtask*).
         inner_redrive_sec: dict[str, float] = {}
+        # Coverage evaluations made as subtasks settled, for the coverage
+        # re-drive's first round.
+        evaluated: dict[str, dict] = {}
 
         async def settle_one(sid: str,
                              note: str | None = None) -> tuple[str, dict]:
@@ -71892,6 +71969,16 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                         inner_redrive_sec[sid] = elapsed
                 if r.get("status") == "complete":
                     await _record_settled_head(st, leerie_dir, sid)
+                    # The coverage re-drive's first evaluation, made now in
+                    # the view its settle measured, the last reader of that
+                    # view (DESIGN §6 *A settled subtask's trees go when it
+                    # settles*).
+                    if note is None and not ((st.data.get("coverage_redrive")
+                                              or {}).get(sid) or {}).get(
+                                                  "final"):
+                        evaluated[sid] = await _evaluate_subtask_coverage(
+                            sid, st, caps, leerie_dir, redrive_changed=set())
+                await _release_settled_trees(sid, leerie_dir, r)
                 log(f"  {sid}: {r.get('status')}")
                 return sid, r
 
@@ -72009,7 +72096,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # executes (DESIGN §9), from the same shared budget, still before
         # integrating.
         await _redrive_uncovered_subtasks(results, redrive_one, st, caps,
-                                          leerie_dir)
+                                          leerie_dir, evaluated)
         # Stand-in entries for sids whose implementer completed in a prior
         # invocation but who still have a pending, un-accepted
         # integration_gate finding (see `pending_gate_sids` above) — they

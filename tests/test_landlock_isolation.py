@@ -490,3 +490,125 @@ def test_r20_h1_held_out_content_does_not_reach_a_later_worker(root):
     assert not os.path.exists(f"/dev/shm/r20i-{nonce}")
     assert ctypes.CDLL(None).shmget(key, 0, 0) == -1
     assert not (v / "held.py").exists()
+
+
+# --- the write grants on one mount are one mount ----------------------------
+#
+# DESIGN §6 *The write grants on one mount are one mount*: bound one by one,
+# a tree and the store it installs from were two mounts of one filesystem,
+# a hard link between them was EXDEV, and pnpm copied every file.
+
+
+def _run_layout(root: Path) -> tuple[Path, Path]:
+    store = root / "stores"
+    tree = root / "worktrees" / "tree"
+    store.mkdir()
+    tree.mkdir(parents=True)
+    return store, tree
+
+
+def _isolate_in(tree: Path, code: str, rw: list[Path], *,
+                env: dict | None = None) -> subprocess.CompletedProcess:
+    opts = ["--isolate", "--rw", str(tree), "--rw", "/dev/null", "--ro", "/"]
+    for p in rw:
+        opts += ["--rw", str(p)]
+    return subprocess.run(
+        [sys.executable, "-I", "-S", str(SHIM), *opts, "--",
+         sys.executable, "-I", "-c", textwrap.dedent(code)],
+        cwd=str(tree), capture_output=True, text=True, timeout=120, env=env)
+
+
+def test_isolate_links_a_tree_from_the_store_on_its_mount(root):
+    store, tree = _run_layout(root)
+    (store / "pkg.js").write_text("module.exports = 1;\n")
+    r = _isolate_in(tree, f"""
+        import os
+        try:
+            os.link({str(store / "pkg.js")!r}, "pkg.js"); print("LINKED")
+        except OSError as e:
+            print(e.errno)
+        """, [store])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "LINKED"
+    assert (tree / "pkg.js").stat().st_ino == (store / "pkg.js").stat().st_ino
+    assert (store / "pkg.js").stat().st_nlink == 2
+
+
+def test_isolate_keeps_what_lies_between_grants_read_only(root):
+    store, tree = _run_layout(root)
+    state = root / "state.json"
+    state.write_text("{}\n")
+    other = root / "worktrees" / "other"
+    other.mkdir()
+    (other / "f.txt").write_text("other tree\n")
+    logs = root / "logs"
+    logs.mkdir()
+    (logs / "run.log").write_text("log\n")
+    (tree / "own.txt").write_text("own\n")
+    targets = [state, other, other / "f.txt", logs / "run.log"]
+    before = {p: p.stat().st_mode for p in targets}
+    r = _isolate_in(tree, f"""
+        import os
+        for p in {[str(p) for p in targets]!r}:
+            try:
+                os.chmod(p, 0o777); print("CHANGED")
+            except OSError as e:
+                print(e.errno)
+        os.chmod("own.txt", 0o600); print("OWN")
+        """, [store])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == [str(errno.EROFS)] * len(targets) + ["OWN"]
+    assert {p: p.stat().st_mode for p in targets} == before
+    assert (tree / "own.txt").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_confined_pnpm_install_links_from_its_store(root):
+    import shutil
+    pnpm = shutil.which("pnpm")
+    if pnpm is None:
+        pytest.skip("no pnpm on PATH")
+    store, tree = _run_layout(root)
+    dep = root / "dep"
+    dep.mkdir()
+    (dep / "package.json").write_text(json.dumps(
+        {"name": "dep", "version": "1.0.0", "main": "index.js"}))
+    (dep / "index.js").write_text("module.exports = 'dep';\n")
+    tarball = root / "dep-1.0.0.tgz"
+    env = {**os.environ,
+           "npm_config_store_dir": str(store / "pnpm-store"),
+           "pnpm_config_store_dir": str(store / "pnpm-store"),
+           "npm_config_cache_dir": str(store / "pnpm-cache"),
+           "XDG_CACHE_HOME": "/tmp/cache", "XDG_STATE_HOME": "/tmp/state",
+           "XDG_CONFIG_HOME": "/tmp/config", "XDG_DATA_HOME": "/tmp/data",
+           "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+           "COREPACK_HOME": str(store / "corepack")}
+    # The confined process has no network: pnpm itself (corepack's) is
+    # fetched first, unconfined, as the run's store fetch would.
+    ready = subprocess.run([pnpm, "--version"], env=env, cwd=str(dep),
+                           capture_output=True, text=True, timeout=300)
+    if ready.returncode != 0:
+        pytest.skip(f"pnpm cannot be made ready here: {ready.stderr[-300:]}")
+    # A tarball, which pnpm unpacks into its content-addressed store.
+    packed = subprocess.run([pnpm, "pack", "--pack-destination", str(root)],
+                            env=env, cwd=str(dep), capture_output=True,
+                            text=True, timeout=300)
+    assert packed.returncode == 0 and tarball.is_file(), packed.stderr
+    (tree / "package.json").write_text(json.dumps(
+        {"name": "tree", "version": "1.0.0", "private": True,
+         "dependencies": {"dep": f"file:{tarball}"}}))
+    r = _isolate_in(tree, f"""
+        import subprocess, sys
+        p = subprocess.run([{pnpm!r}, "install", "--offline",
+                            "--ignore-scripts", "--reporter=append-only"],
+                           capture_output=True, text=True)
+        print(p.returncode)
+        sys.stderr.write(p.stdout[-2000:] + p.stderr[-2000:])
+        """, [store], env=env)
+    assert r.returncode == 0 and r.stdout.strip() == "0", r.stderr
+    got = [p for p in (tree / "node_modules" / ".pnpm").rglob("index.js")
+           if p.read_text() == "module.exports = 'dep';\n"]
+    assert got, r.stderr
+    stored = {p.stat().st_ino for p in (store / "pnpm-store").rglob("*")
+              if p.is_file()}
+    assert got[0].stat().st_ino in stored
+    assert got[0].stat().st_nlink >= 2

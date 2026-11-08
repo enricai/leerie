@@ -61,8 +61,9 @@ ABI 6 the abstract-socket and signal scopes.
 and sees every other mount read-only*; *A confined process has its own
 network*): a user namespace mapping the caller onto itself, mount, IPC and
 network namespaces (loopback only), a root the caller owns, private `/tmp`
-and `/dev/shm`, a new `devpts`, the write grants bound onto themselves and
-every other mount read-only. `--egress SOCK` gives the command the outside network
+and `/dev/shm`, a new `devpts`, the write grants bound writable (those on
+one mount as one, so a tree links from its store) and every other mount
+read-only. `--egress SOCK` gives the command the outside network
 through leerie's egress proxy, listening on the unix socket SOCK: a relay
 in the namespace forwards `127.0.0.1:<port>` to it and the proxy variables
 name it; `--forward PORT=SOCK` relays a fixed loopback port to a socket the
@@ -925,16 +926,74 @@ def _bindable(p: str) -> bool:
     return not (_beneath(p, TMP) or _beneath(p, "/dev"))
 
 
-def bind_grants(rw: list[str]) -> list[str]:
-    """Each write grant bound onto itself, so it stays writable when every
-    other mount is made read-only. Returns the mount points."""
-    kept = []
+def _containing_mount(path: str, mounts: list[str]) -> str:
+    """The mount point `path` lies on: the longest of `mounts` it is
+    beneath."""
+    return max((m for m in mounts if _beneath(path, m)), key=len,
+               default="/")
+
+
+def _shield(top: str, grants: list[str]) -> list[str]:
+    """Every entry beneath `top` that is no grant, lies beneath none and
+    leads to none, bound onto itself (`readonly_mounts` then makes it
+    read-only); the directories that lead to a grant are walked. Returns
+    the entries bound. A symbolic link is not bound (a mount follows it);
+    an entry removed while this runs needs nothing."""
+    out = []
+    try:
+        names = sorted(os.listdir(top))
+    except FileNotFoundError:
+        return out
+    except OSError as e:
+        raise IsolationError(f"list {top}", e.errno or 0) from None
+    for name in names:
+        p = os.path.join(top, name)
+        if any(_beneath(p, g) for g in grants):
+            continue
+        if any(_beneath(g, p) for g in grants):
+            out += _shield(p, grants)
+            continue
+        if os.path.islink(p):
+            continue
+        if _mount(p, p, None, MS_BIND | MS_REC) != 0:
+            err = ctypes.get_errno()
+            if err == errno.ENOENT:
+                continue
+            raise IsolationError(f"bind {p}", err)
+        out.append(p)
+    return out
+
+
+def bind_grants(rw: list[str]) -> tuple[list[str], list[str]]:
+    """The write grants bound so they stay writable when every other mount
+    is made read-only, those on one mount bound together (DESIGN §6 *Every
+    confined process ... sees every other mount read-only*): the deepest
+    directory holding them all bound onto itself once, and everything
+    beneath it that no grant covers or leads to bound apart (`_shield`)
+    for `readonly_mounts` to make read-only. One mount, because a hard
+    link cannot cross mounts (`EXDEV`) even on one filesystem: bound one
+    by one, a tree and the store it installs from lie on two, and every
+    package manager that links from its store (pnpm, bun, uv) copies
+    instead. Returns `(grants, roots)`: the grants, and the directories
+    bound that are none of them (each kept writable itself, never what is
+    beneath it)."""
+    mounts = [mp for mp, _ in _mountinfo()]
+    groups: dict[str, list[str]] = {}
     for p in rw:
         if not _bindable(p) or not os.path.exists(p):
             continue
-        _must(f"bind grant {p}", _mount(p, p, None, MS_BIND | MS_REC))
-        kept.append(p)
-    return kept
+        p = os.path.normpath(p)
+        groups.setdefault(_containing_mount(p, mounts), []).append(p)
+    kept: list[str] = []
+    roots: list[str] = []
+    for ps in groups.values():
+        top = os.path.commonpath(ps)
+        _must(f"bind grant {top}", _mount(top, top, None, MS_BIND | MS_REC))
+        if top not in ps:
+            roots.append(top)
+            _shield(top, ps)
+        kept += ps
+    return kept, roots
 
 
 def overlay_grants(rw: list[str], view: str) -> list[str]:
@@ -982,15 +1041,17 @@ def _mountinfo() -> list[tuple[str, set[str]]]:
     return out
 
 
-def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE
-                    ) -> int:
-    """Every mount not already read-only, not a kept grant (or beneath one)
-    and not one of the `private` mounts, remounted read-only with its locked
-    flags. A file outside the grants can then not have its mode, times or
-    extended attributes changed. Returns how many were remounted."""
+def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE,
+                    roots: tuple[str, ...] | list[str] = ()) -> int:
+    """Every mount not already read-only, not a kept grant (or beneath one),
+    not one of the `roots` `bind_grants` made for grants on one mount (that
+    mount itself only) and not one of the `private` mounts, remounted
+    read-only with its locked flags. A file outside the grants can then not
+    have its mode, times or extended attributes changed. Returns how many
+    were remounted."""
     n = 0
     for mp, opts in _mountinfo():
-        if "ro" in opts or mp in private:
+        if "ro" in opts or mp in private or mp in roots:
             continue
         if any(_beneath(mp, k) for k in keep):
             continue
@@ -1369,11 +1430,13 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
                  and os.path.dirname(p) != TMP]
     carry_rw = [p for p in rw if _beneath(p, TMP) and p != TMP]
     kept = pivot_to_owned_root(carry_ro, carry_rw, sandbox=sandbox)
+    roots: list[str] = []
     if sandbox:
         assert view is not None
         kept += overlay_grants(rw, view)
     else:
-        kept += bind_grants(rw)
+        bound, roots = bind_grants(rw)
+        kept += bound
     view_ro: list[str] = []
     private = PRIVATE
     if worker_root is not None:
@@ -1381,8 +1444,9 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         # carry them, and stay writable where they are writable.
         view_ro = build_worker_view(worker_root)
         kept += [WORKER_VIEW + k for k in kept]
+        roots += [WORKER_VIEW + r for r in roots]
         private = PRIVATE + tuple(WORKER_VIEW + p for p in PRIVATE)
-    n = readonly_mounts(kept, private)
+    n = readonly_mounts(kept, private, roots)
     if sandbox:
         assert view is not None
         # After the read-only remount: the view's overlay is the one

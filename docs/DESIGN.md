@@ -4996,7 +4996,8 @@ and runs anything (`--isolate`):
    open the operator's terminal*); a grant beneath `/tmp` (the
    command's private temp directory `/tmp/l/<id>/`, a host's state root)
    is carried into the new `/tmp` at its own path;
-4. every write grant bound onto itself, then every other mount remounted
+4. the write grants bound so they stay writable, those that lie on one
+   mount bound together (below), then every other mount remounted
    read-only, its locked flags kept. A file outside the grants can then
    not have its mode, times or extended attributes changed (EROFS), and a
    device node on a read-only mount still writes;
@@ -5006,6 +5007,55 @@ and runs anything (`--isolate`):
    from Landlock ABI 6 the abstract-socket and signal scopes;
 6. the command, run and ended as before (*A confined command's processes
    end with it*).
+
+**The write grants on one mount are one mount** (*designed 2026-11-08,
+the navegando run a70fb4a6*). The invariant: *a confined install can
+hard-link from its store wherever the filesystem can.* Until 0.48.0 step 4
+bound each write grant onto itself, so a tree and the store it installs
+from — `<run-dir>/worktrees/<tree>` and `<run-dir>/stores/` (or
+`<run-dir>/workers/cache/`, or `<run-dir>/tree-stores/<tree>/`) — were two
+mounts of one filesystem, and Linux refuses a hard link between two mounts
+whatever lies beneath them (`do_linkat`'s `EXDEV`). Landlock was not the
+cause: it handles `REFER` and grants it beneath every write grant, and a
+link from the store into the tree under Landlock alone succeeded. Measured
+in the barnacle repository image (rootless, `seccomp=unconfined`, the
+`leerie-container` profile), as the leerie user, inside the confined
+process: `stat -c %d` gave one device (2049) for the store and the view,
+`/proc/self/mountinfo` gave them two mount ids, and `ln <store file>
+<view>/` answered `Invalid cross-device link`; unconfined and under
+Landlock alone it linked. pnpm's import tries a hard link and copies on
+any error, silently: a confined `pnpm install --offline --frozen-lockfile`
+of barnacle's lockfile (pnpm 10.4.1) left 0 of its 36,623 files sharing an
+inode with the store, every one of link count 1; in each of the 23 trees
+of the navegando run that held a `node_modules` (views and worker trees,
+pnpm 10.28.2) the file sampled had link count 1 too. Every manager that links
+from its store copies the same way: pnpm, bun (hard links by default on
+Linux) and uv (`link-mode` hard link by default on Linux, a copy with a
+warning when the link fails); yarn berry links only when a repository opts
+into `nmMode: hardlinks-*`; npm, pip, poetry, bundler and composer copy
+by design, and go and cargo read their stores in place.
+
+So the grants that lie on one mount are bound together: the deepest
+directory holding them all — for every grant leerie makes in a run, the
+run directory — is bound onto itself once, and everything beneath it that
+no grant covers or leads to is bound onto itself apart, then made
+read-only with every other mount (`bind_grants`, `_shield`). The same
+install, confined so, linked 30,054 of its 31,818 files from the store,
+and a view's `node_modules` cost 58 MB beside the store's 578 MB instead of
+616 MB (barnacle); navegando's lockfile (pnpm 10.28.2, scripts off) 74 MB
+beside a 1,134 MB store instead of 1,189 MB. Nothing about the store
+changes: each is still its run's (*The stores a view installs from are
+leerie's*), and a link joins only a run's own store to a run's own tree.
+
+What this gives up, deliberately: the bound directory and those between
+it and a grant are on a writable mount, so their own mode, times and
+extended attributes (`chmod` on `<run-dir>` or `<run-dir>/worktrees`) are
+not refused, nor are those of an entry that appears or is replaced in one
+of them after the process started (a tree made later, a `state.json`
+saved again). Landlock still refuses every read, write, create, remove,
+rename and link there; only the metadata Landlock does not handle is
+open, and only on those paths. The alternative — a mount per grant — is
+a copy of every store for every tree, which filled the host.
 
 So `/tmp` and `/dev/shm` are a confined process's own: every worker and
 every repository command reads and writes them as it would outside leerie,
@@ -8227,6 +8277,56 @@ operator inspects by hand before settling it with `accept-blocked` or
 `accept-integration` — pruning the whole wave instead would destroy that
 evidence.
 
+**A settled subtask's trees go when it settles** (*designed 2026-11-08,
+the navegando run a70fb4a6*). The invariant: *a tree lives only while
+something can still read it; what a later step needs is made again from
+committed refs.* The per-wave prune bounded coexistence to one wave, and a
+wave is as wide as the plan makes it: a70fb4a6's first wave held 14
+subtasks, and every one that had settled `complete` kept its worktree and
+its committed view until the last of the 14 had settled and the wave was
+integrated — 14 views of 1,549 MB, seven worker trees of 1.2 GB, staging's
+view and the planning tree: 33.8 GB of the run's 36 GB, and the host at
+1.5% free. What reads a subtask's trees once it has settled:
+
+- its *view* (`_committed_view`): the coverage re-drive's evaluation
+  (`_measure_subtask_coverage`, `_settle_typed_gaps`) and nothing else
+  before its tip moves — the integration gate's conflicted-area tests run
+  in their own trees at each parent (`_integration_tree`); B\*, the
+  intermittent-discovery repeats, the falsifier, the base-form check, the
+  ratchet, the acceptance gate and final conformance all measure staging;
+- its *worktree*: a re-drive's worker (blocked or coverage), which
+  `new-worktree.sh` already makes from the subtask's branch in the run
+  repository when the tree is absent, and the rollback of a re-drive that
+  did not end `complete`, which runs while that re-drive's tree stands;
+- its *branch*: integration (`integrate.sh` merges it from the run
+  repository, where leerie took it as each worker exited), the settled
+  head, the undo of an interrupted re-drive (which resets the branch in
+  the run repository when the tree is gone).
+
+So when a subtask settles: the coverage re-drive's first evaluation runs
+then, in the view the settle measured (`_evaluate_subtask_coverage`, inside
+the wave's `max_parallel` slot), instead of after the whole wave in a view
+made again; the view is dropped when any evaluation ends; and a `complete`
+subtask's worktree and tree repository go too, its branch taken first
+(`_release_settled_trees` → `_prune_subtask_worktree`). A `blocked` or
+`failed` subtask keeps its worktree, as above; its view goes. A later
+reader makes what it needs from refs: the view from the branch tip in the
+run repository (`_view_repo`), the tree by `new-worktree.sh`, each
+installing afresh (`_forget_installs`) from the run's own store, which —
+now that a tree links from its store (§6 *The write grants on one mount
+are one mount*) — costs a link pass, not a copy. A resumed run finds the
+same: its trees gone, its branches in the run repository.
+
+Peak on a70fb4a6's shape (14 subtasks in one wave, `max_parallel` 5), from
+per-tree sizes measured on that run and on its lockfile in scratch: a
+view's private bytes 1,549 MB before, about 392 MB after (74 MB of pnpm's
+`node_modules`, 298 MB of `infra/node_modules` that npm copies by design,
+the checkout); a worker tree 1,229–1,251 MB before, about 89 MB after.
+The run's worktrees measured 33.8 GB. With links alone they come to about
+7.2 GB; with links and the release, at most five settling subtasks hold a
+tree and a view at once beside staging's view and the planning tree:
+about 3.4 GB, the run directory about 6 GB with its stores.
+
 **Why a worktree costs what it does.** Package managers like pnpm are
 content-addressed and normally *hardlink* from a shared store into each
 `node_modules`, so a second checkout of the same dependency set costs
@@ -8243,7 +8343,11 @@ worth of trees.
 
 **The pnpm store shares the worktrees' mount.** Every package store lives
 in the state mount, beside the worktrees, so an install can hard-link from
-its run's store (a hard link cannot cross mounts). There are three sets, all
+its run's store (a hard link cannot cross mounts). Inside a confined
+process they must stay one mount too: from the isolation of 2026-11-01
+through 0.48.0 the shim bound each grant onto itself, which split them
+again and made every confined install a copy (§6 *The write grants on one
+mount are one mount*). There are three sets, all
 set by the orchestrator through environment variables, with no mount or
 `-e` of their own (*The stores a view installs from are leerie's*, *Which
 stores an install may share*, below), and every one is inside its run's
@@ -13418,7 +13522,11 @@ view stores, are removed wherever the tree is: when a subtask's tree is
 pruned after integration (only once its branch is taken, as the tree
 itself) and when it is reset for a retry (`_drop_view`). The view's path is
 derived from the tree's name, never from the process's record, so a view a
-process before a resume made goes the same way.
+process before a resume made goes the same way. A view goes sooner still
+when nothing measures it again: as its subtask settles, and when a
+coverage evaluation of it ends (§6 *A settled subtask's trees go when it
+settles*); a later measurement makes it again from the branch tip, read
+in the run repository when the tree itself is gone (`_view_repo`).
 
 Measured with the confined install, copy import, the store fetch and the
 stores emptied on a move (review round 19), a new tip with unchanged install
