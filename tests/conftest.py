@@ -1106,6 +1106,10 @@ def _emulated_heldout_sandbox(request, monkeypatch):
                "--view", sandbox.view]
         for src, rel in sandbox.place:
             out += ["--place", f"{src}={rel}"]
+        for src, rel in sandbox.replace:
+            out += ["--replace", f"{src}={rel}"]
+        for rel in sandbox.remove:
+            out += ["--remove", rel]
         if taken_fd is not None:
             out += ["--taken-fd", str(taken_fd)]
         if sandbox.report is not None and report_fd is not None:

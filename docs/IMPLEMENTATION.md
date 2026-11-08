@@ -5318,6 +5318,7 @@ landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                   [--worker-root DIR [--cli]]]
                  [--rw PATH]... [--ro PATH]... -- CMD
 landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
+                 [--replace SRC=REL]... [--remove REL]...
                  [--report PATH --report-fd N] [--worker-root DIR]
                  [--rw PATH]... [--ro PATH]... -- CMD
 ```
@@ -5417,6 +5418,16 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   39, isolation R1: reported as a refusal, the same link stopped the run
   with exit 78 on every `resume`).
   `tests/heldout_sandbox_emulator.py` refuses the same paths.
+  `over` (`--replace` pairs) and `remove` (`--remove` paths), keyword
+  arguments of `place`, after the pairs and validated the same way: an
+  existing test's base form (DESIGN §8). `_place_one(…, over=True)`
+  writes over a regular file at `REL` with `O_WRONLY | O_TRUNC |
+  O_NOFOLLOW` (creating it as above when absent); `_place_one(view_fd,
+  None, rel)` deletes the regular file at `REL` with `unlinkat`, and is a
+  no-op when it or a directory on its way is absent (none is made).
+  `_regular_at` reads `REL` with `fstatat(AT_SYMLINK_NOFOLLOW)`: anything
+  but a regular file there fails `EEXIST`, so a link, a directory or a
+  device at `REL` is `PlacementTaken` too.
 - `loopback_up() -> None` (both) — `SIOCGIFFLAGS` and `SIOCSIFFLAGS`
   (`IFF_UP`) on `lo`; a failure is step `bring up lo`.
 - `join_session_keyring() -> None` — `keyctl(KEYCTL_JOIN_SESSION_KEYRING,
@@ -5503,8 +5514,8 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   watched signals still blocked (a stop forwarded before PID 1 has its
   handlers waits, pending), and the outer wait. `_parse(argv)` — the
   options, or a usage error (exit 2): `--isolate` and `--sandbox`
-  exclusive, `--sandbox` needs `--view`, `--view`/`--place`/`--report`
-  need `--sandbox`, `--report` and `--report-fd` together, `--egress
+  exclusive, `--sandbox` needs `--view`, `--view`/`--place`/`--replace`/
+  `--remove`/`--report` need `--sandbox`, `--report` and `--report-fd` together, `--egress
   SOCK` (absolute) and `--forward PORT=SOCK` (1–65535, absolute) need
   `--isolate`, `--worker-root DIR` (absolute, not `/`; normalized) needs
   `--isolate` or `--sandbox`, `--cli` needs `--isolate` and
@@ -5539,12 +5550,15 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   confined spawn in this process and its children (`worker-guard.py`)
   isolates; `_isolated() -> bool` reads it.
 - `HeldOutSandbox(view: str, place: tuple[tuple[str, str], ...] = (),
-  report: str | None = None)` (NamedTuple; `place` pairs are `(absolute
-  source, path relative to view)`).
+  report: str | None = None, replace: tuple[tuple[str, str], ...] = (),
+  remove: tuple[str, ...] = ())` (NamedTuple; `place` and `replace` pairs
+  are `(absolute source, path relative to view)`; `replace` and `remove`
+  carry an existing test's base form, DESIGN §8).
 - `_confined_argv(grants, cmd, *, sandbox: HeldOutSandbox | None = None,
   report_fd: int | None = None) -> list[str]` — `[sys.executable, "-I",
   "-S", LANDLOCK_SCRIPT]`, then `--sandbox --view <view>`, one `--place
-  SRC=REL` per pair and `--report <report> --report-fd <report_fd>` (both
+  SRC=REL` per pair, one `--replace SRC=REL` per `replace` pair, one
+  `--remove REL` per `remove` path, and `--report <report> --report-fd <report_fd>` (both
   or neither) when `sandbox` is given, else `--isolate` when `_isolated()`
   — followed, when `grants.egress`, by `--egress
   <_egress_server().socket_path>` and, while `_STRICT_PROXY` is live,
@@ -7295,14 +7309,15 @@ ships*. Measured, never read: no prompt, judge or text rule.
 
 | Name | Contract |
 |---|---|
-| `_base_form_path(rel)` | Where a test-case file's base form is placed, beside it: `a.test.ts` -> `a.leerie-base.test.ts` (`_BASE_FORM_JS_RE`: `.test.`/`.spec.` + `[cm]?[jt]sx?`), `test_a.py` -> `test_a__leerie_base.py`, `a_test.py` -> `a__leerie_base_test.py`; None for anything else (a helper, `conftest.py`, a fixture, `_test.go`). |
-| `_base_form_files(repo, base, head, globs)` | `(files, unsupported)` from `git diff --name-status --no-renames base head`: each `_is_test_file` path present at `base` (status not `A`) that `head` modified or deleted, with a `_base_form_path`; `unsupported` the test files whose extension is in `_BASE_FORM_UNSUPPORTED_EXT` (`.go .rb .rs .java .kt .cs .ex .exs .php .swift`: a runner that cannot hold a second copy beside the first). |
-| `_base_form_place(st, repo, base, files, trees)` | `(pairs, original, taken)`: each file's `base` blob written to `<run-dir>/base-form/<base[:12]>/<placed path>` and paired with its placed path, with a JS file's base `__snapshots__/<name>.snap` placed as `__snapshots__/<placed name>.snap`; `original` maps placed -> original path; a file whose placed path exists at any of `trees` is `taken` and never placed. |
-| `_base_form_id(cid, sib, rel)` | A case ID in its file's own name: the placed path and its dotted module (a JUnit class) replaced by the original's. |
-| `_base_form_regressions(st, caps, staging, before, *, label, log_path, reach_of=None)` | Base `_diff_base(st)`, after staging's branch head. `reach_of` (a round's start): files narrowed to those `reach_of..after` touched or `_change_reach` reaches, all of them when its reach is unknown. One `_capture_failing_test_ids(staging, test cmd, files=<placed paths>, place=<pairs>, serial=True)` on staging's committed view, in a held-out sandbox (the base form is never on disk). No failing ID: done. Else a `base-form-base` helper worktree at `before` with `_ensure_worktree_deps`, and B\* over the failing IDs, base side the same base forms placed on it (`_confirm_sized` when every ID has a file, else `_confirm_new_failures` over all of them; a failed checkout or install gives every candidate `no_verdict`). Returns `{base, before, after, files, unsupported, changed: [{id, file, placed_id, message}], unmeasured: [file], unsettled: [id], verdict, unmeasured_reason?}`: `changed` is B\*'s `new`, `unmeasured` the taken files, every file when no test or scoped command resolves or the first run gave no report, and the files of `no_verdict` IDs; `unsettled` the `budget_short_unsettled` IDs. A load failure (`<file> :: (file failed to load)`) is a case like any other. |
+| `_base_form_case(rel, globs)` | Whether an `_is_test_file` path is a test-case file the check runs: its basename matches one of `_BASE_FORM_CASE_RES` (`_BASE_FORM_JS_RE`: `<stem>.test.`/`.spec.` + `[cm]?[jt]sx?`; `test_*.py`/`*_test.py`; `*_test.go`; `*_test.rb`/`*_spec.rb`/`test_*.rb`) or it is a cargo integration test (`_is_cargo_integration_test`). Not a helper, `conftest.py`, fixture or snapshot. |
+| `_base_form_snapshot(rel)` | A JS test-case file's `__snapshots__/<name>.snap` beside it; None for any other file. |
+| `_base_form_files(repo, base, head, globs)` | `(files, unsupported)` from `git diff --name-status --no-renames base head`: each `_is_test_file` path present at `base` (status not `A`) that `head` modified or deleted; `unsupported` those whose extension is in `_BASE_FORM_NO_REPORT_EXT` (`.java .kt .kts .scala .groovy .cs .fs .ex .exs .php .swift`: no runner leerie reads a report from, `_RUNNER_REPORTS`), `files` the rest that `_base_form_case` accepts. |
+| `_base_form_writable(repo, rev, rel)` | Whether `rel` at `rev` may be written or removed without following a link, read with one `git ls-tree -z rev -- <each directory on the way> rel`: no directory on the way is a row of its own (a directory pathspec lists its contents; anything else is a row), and `rel` is absent or mode `100644`/`100755`. |
+| `_base_form_place(st, repo, base, files, trees)` | `(pairs, taken, removed)`: each file's `base` blob written to `<run-dir>/base-form/<base[:12]>/<path>` and paired with its own path, which it replaces; a JS file's base `__snapshots__/<name>.snap` paired the same way when the base had it. A file is `taken`, and never placed, when it or its snapshot is not `_base_form_writable` at one of `trees`. `removed` maps each tree to the paths removed there: every `_base_form_case` file `git diff --name-status base <tree>` shows added (`A`) and writable, and a non-taken JS file's snapshot the tree has and the base did not. |
+| `_base_form_regressions(st, caps, staging, before, *, label, log_path, reach_of=None)` | Base `_diff_base(st)`, after staging's branch head. `reach_of` (a round's start): files narrowed to those `reach_of..after` touched or `_change_reach` reaches, all of them when its reach is unknown. One `_capture_failing_test_ids(staging, test cmd, files=<the files not taken>, replace=<pairs>, remove=removed[after], serial=True)` on staging's committed view, in a held-out sandbox (the base form is never on disk). No failing ID: done. Else a `base-form-base` helper worktree at `before` with `_ensure_worktree_deps`, and B\* over the failing IDs, every run of either side with all the pairs and that side's `removed`, whichever files it runs (`_confirm_sized` when every ID has a file, else `_confirm_new_failures` over all of them; a failed checkout or install gives every candidate `no_verdict`). Returns `{base, before, after, files, unsupported, changed: [{id, file, message}], unmeasured: [file], unsettled: [id], verdict, unmeasured_reason?}`: `changed` is B\*'s `new`, IDs as the report names them (the file runs at its own path), `unmeasured` the taken files (`unmeasured_reason` "the base form's path is a link or not a file"), every file when no test or scoped command resolves or the first run gave no report, and the files of `no_verdict` IDs; `unsettled` the `budget_short_unsettled` IDs. A load failure (`<file> :: (file failed to load)`) is a case like any other. |
 | `_base_form_reason(changed)` | `"N case(s) an existing test pinned on the base fail when the base's own test file is run against this tree (existing_behaviour_changed): …"`, at most `_BASE_FORM_SHOWN` (5) IDs, each prefixed by its file when the ID does not name it, and `(+k more)`. |
 | `_check_existing_behaviour(leerie_dir, st, caps)` | Phase 5's last step before `phase_finalize`, after the final `_refresh_shipping_test_id_diff`: `_base_form_regressions(staging, before=_diff_base(st))` stored as `existing_behaviour` with `tree_sha` (`_view_tree_sha`); reused when that tree is recorded without `error`; a raise is stored as `{error, changed: [], …}`. Then `_set_base_form_gap`. |
-| `_set_base_form_gap(st, rec)` | One `needs_human_verification` entry, source `BASE_FORM_GAP_SOURCE` (`"base_form"`, group "Regression checks the run could not settle"), naming the `unmeasured`, `unsupported` and `unsettled` entries and an `error`; cleared when there are none. |
+| `_set_base_form_gap(st, rec)` | One `needs_human_verification` entry, source `BASE_FORM_GAP_SOURCE` (`"base_form"`, group "Regression checks the run could not settle"), naming the `unmeasured` ("gave no verdict"), `unsupported` ("has no runner leerie reads a report from") and `unsettled` entries and an `error`; cleared when there are none. |
 
 Where it runs:
 
@@ -8659,9 +8674,12 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   is `"<file> :: (file failed to load)"`. None when no report is readable
   or it executed no test and recorded no load failure.
 - `async _capture_failing_test_ids(tree, cmd, st, caps, *, label, log_path,
-  timeout, serial=False, files=None, db=False, place=()) -> dict | None`
-  (with `place`, each attempt runs in `_held_out_section` in a
-  `HeldOutSandbox`, § *Isolation and the held-out sandbox (I3)*) — runs `cmd` (or its
+  timeout, serial=False, files=None, db=False, place=(), replace=(),
+  remove=()) -> dict | None`
+  (with any of `place`, `replace` or `remove`, each attempt runs in
+  `_held_out_section` in a `HeldOutSandbox` carrying them, § *Isolation and
+  the held-out sandbox (I3)*; `place` and `replace` sources are read in place
+  of the tree's copies by `_acceptance_cmd`) — runs `cmd` (or its
   scoped form over `files`) once with a report requested via
   `_acceptance_report_spec`, appending `_SERIAL_RUNNER_FLAGS[runner]`
   (`--runInBand`, `--no-file-parallelism --maxWorkers=1`, `-p no:xdist`)
@@ -13522,7 +13540,7 @@ command line overrides it.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier, typed `unverified_external` with its `resource` only when it names `unexercisable_resource`, else `test_missing`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` with a non-empty `resource` (or `simulated_interleaving`) to the PR's "Needs human verification", grouped by that resource (an `unverified_external` entry stored with none, by an older leerie, is not rendered); `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
-| `existing_behaviour` | dict | the existing tests the run changed, run in their base form on the tree that ships (`_check_existing_behaviour`, DESIGN §8 *What an existing test pins on the base holds on the tree that ships*): `{tree_sha, base, before, after, files[], unsupported[], changed: [{id, file, placed_id, message}], unmeasured[], unsettled[], verdict, unmeasured_reason?, error?}`. `changed` makes the run `unconverged` (`_decide_outcome`); `error`, `unmeasured` or another tree is a reason of `_unmeasured_on_shipping_tree`. |
+| `existing_behaviour` | dict | the existing tests the run changed, run in their base form on the tree that ships (`_check_existing_behaviour`, DESIGN §8 *What an existing test pins on the base holds on the tree that ships*): `{tree_sha, base, before, after, files[], unsupported[], changed: [{id, file, message}], unmeasured[], unsettled[], verdict, unmeasured_reason?, error?}`. `changed` makes the run `unconverged` (`_decide_outcome`); `error`, `unmeasured` or another tree is a reason of `_unmeasured_on_shipping_tree`. |
 | `tracked_test_report` | dict | existing tests the run changed (`_tracked_test_report`, DESIGN §8 *Existing tests the run changed are listed in the PR*): `{files: [{file, deleted?, removed[], cases_removed[], added[], cases_added[], skips_added?, lines_removed?, lines_added?, omitted?}], files_omitted}`, stored once at `phase_finalize` (base to final tree), report-only; rendered by `_pr_tracked_test_lines` under `## Existing tests changed by this run`. Lists are source-ordered and bounded by `_TRACKED_TEST_ITEMS_MAX` / `_TRACKED_TEST_FILES_MAX`; the PR shows at most `_PR_TRACKED_TEST_SHOWN` entries and counts the rest. |
 | `settled_heads` | dict[str, str] | per-sid subtask branch tip at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |

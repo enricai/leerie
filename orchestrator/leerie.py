@@ -10958,7 +10958,8 @@ async def _run_streaming(
     # of its own: a fact about the tree, never a refusal.
     refusals = _ShimRefusals(label or " ".join(cmd))
     taken = (_ShimTaken(label or " ".join(cmd))
-             if sandbox is not None and sandbox.place else None)
+             if sandbox is not None and (sandbox.place or sandbox.replace
+                                         or sandbox.remove) else None)
     try:
         async with _exec_lock().shared():
             spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,
@@ -24852,10 +24853,16 @@ class HeldOutSandbox(NamedTuple):
     alone*): `view` is overlaid, each `place` pair (absolute source, path
     relative to `view`) copied into the overlay, and `report` — the path
     the runner writes its report to, inside the sandbox — copied out to the
-    descriptor `_confined_argv` is given."""
+    descriptor `_confined_argv` is given. `replace` pairs are written over
+    the view's own regular file and `remove` paths deleted from the overlay:
+    an existing test run in its base form, in place of its final form
+    (DESIGN §8 *What an existing test pins on the base holds on the tree
+    that ships*)."""
     view: str
     place: tuple[tuple[str, str], ...] = ()
     report: str | None = None
+    replace: tuple[tuple[str, str], ...] = ()
+    remove: tuple[str, ...] = ()
 
 
 class WorkerGrants(NamedTuple):
@@ -25512,6 +25519,10 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
             argv += ["--place", f"{src}={rel}"]
+        for src, rel in sandbox.replace:
+            argv += ["--replace", f"{src}={rel}"]
+        for rel in sandbox.remove:
+            argv += ["--remove", rel]
         if taken_fd is not None:
             argv += ["--taken-fd", str(taken_fd)]
         if sandbox.report is not None and report_fd is not None:
@@ -48787,7 +48798,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     serial: bool = False,
                                     files: list[str] | None = None,
                                     db: bool = False,
-                                    place: tuple[tuple[str, str], ...] = ()
+                                    place: tuple[tuple[str, str], ...] = (),
+                                    replace: tuple[tuple[str, str], ...] = (),
+                                    remove: tuple[str, ...] = ()
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
@@ -48805,13 +48818,17 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     content: DESIGN §6 *A held-out evaluation runs alone*), each run is in a
     held-out sandbox over `tree`, alone, the `(source, relative path)`
     pairs placed in it and never on disk, its report back through the
-    sandbox's descriptor. A worker tree is run in its committed view,
-    installed there (`_measured_tree`; DESIGN §8 *Every measurement reads the
-    committed view*)."""
+    sandbox's descriptor. `replace` and `remove` (an existing test's base
+    form, DESIGN §8 *What an existing test pins on the base holds on the
+    tree that ships*): in the same sandbox, the pairs written over the
+    tree's own files and the paths removed, never on disk either. A worker
+    tree is run in its committed view, installed there (`_measured_tree`;
+    DESIGN §8 *Every measurement reads the committed view*)."""
     tree = await _measured_tree(st, tree, caps, log_path=log_path,
                                 label=label)
     run_files = list(files or [])
-    placed = {rel: src for src, rel in place}
+    sandboxed = bool(place or replace or remove)
+    placed = {rel: src for src, rel in (*place, *replace)}
     if run_files:
         scoped = _acceptance_cmd(st, run_files, tree, placed)
         if scoped:
@@ -48838,7 +48855,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     # The report is the command's output: beside its tree, in the tree's own
     # measurement directory (DESIGN §6 *Leerie's runs of the repository's
     # commands are confined too*).
-    grants = (_heldout_grants(st, tree) if place
+    grants = (_heldout_grants(st, tree) if sandboxed
               else _measurement_grants(st, tree))
     own = _measure_dir(st, tree)
     reports = own / "reports"
@@ -48891,7 +48908,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                     _leaves_tree_as_found(tree, "test run", label):
                 t_run = time.monotonic()
                 try:
-                    if place:
+                    if sandboxed:
                         async with _held_out_section(st):
                             await _run_streaming(
                                 argv, grants=grants, cwd=str(tree), env=env,
@@ -48900,7 +48917,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                 verbosity="quiet",
                                 sandbox=HeldOutSandbox(
                                     view=str(tree), place=tuple(place),
-                                    report=str(report)),
+                                    report=str(report),
+                                    replace=tuple(replace),
+                                    remove=tuple(remove)),
                                 report_into=got)
                     else:
                         async with _build_class_slot(st,
@@ -48929,8 +48948,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             with contextlib.suppress(OSError):
                 _unlink_beneath(own, report)
             return None
-        data: bytes | None = bytes(got) if place else None
-        if not place:
+        data: bytes | None = bytes(got) if sandboxed else None
+        if not sandboxed:
             with contextlib.suppress(OSError):
                 data = _read_beneath(own, report, limit=READ_LIMIT_LARGE)
             with contextlib.suppress(OSError):
@@ -63754,49 +63773,60 @@ async def _store_tracked_test_report(st: "State", base: str) -> None:
 # DESIGN §8 *What an existing test pins on the base holds on the tree that
 # ships*. Every pattern here reads paths — mechanical strings (§12).
 
-# A JS/TS test-case file: `<stem>.test.<ext>` / `<stem>.spec.<ext>`.
+# A JS/TS test-case file: `<stem>.test.<ext>` / `<stem>.spec.<ext>`, whose
+# snapshot (`__snapshots__/<name>.snap`) goes with its base form.
 _BASE_FORM_JS_RE = re.compile(
     r"^(?P<stem>.+?)(?P<tail>\.(?:test|spec)\.[cm]?[jt]sx?)$")
-# What a base form's file name carries, beside the final form's.
-_BASE_FORM_TAG = "leerie-base"
-# Test files of languages whose runner cannot hold a second copy of a test
-# file beside the first (a Go package declares each test function once):
-# never run in base form, listed as unchecked instead.
-_BASE_FORM_UNSUPPORTED_EXT = frozenset({
-    ".go", ".rb", ".rs", ".java", ".kt", ".cs", ".ex", ".exs", ".php",
-    ".swift"})
+# The other test-case file names by convention, each a runner leerie reads a
+# report from: pytest (`test_a.py`, `a_test.py`), go (`a_test.go`), rspec
+# and minitest (`a_spec.rb`, `a_test.rb`, `test_a.rb`); a cargo integration
+# test is `_is_cargo_integration_test`'s. A helper, a fixture or a
+# `conftest.py` is none of these.
+_BASE_FORM_CASE_RES = (
+    _BASE_FORM_JS_RE,
+    re.compile(r"^(?:test_.+|.+_test)\.py$"),
+    re.compile(r"^.+_test\.go$"),
+    re.compile(r"^(?:.+_(?:test|spec)|test_.+)\.rb$"))
+# Test files of languages whose runner gives no report leerie reads
+# (`_RUNNER_REPORTS`): never run in base form, listed as unchecked instead,
+# as their failing-test-ID diff is (DESIGN §9 *Which failures are new*).
+_BASE_FORM_NO_REPORT_EXT = frozenset({
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".cs", ".fs", ".ex", ".exs",
+    ".php", ".swift"})
 # The most changed cases an outcome reason names; the rest are counted.
 _BASE_FORM_SHOWN = 5
 BASE_FORM_GAP_SOURCE = "base_form"
 
 
-def _base_form_path(rel: str) -> str | None:
-    """Where the base form of the test-case file `rel` is placed: beside it,
-    its name tagged (`a.test.ts` -> `a.leerie-base.test.ts`, `test_a.py` ->
-    `test_a__leerie_base.py`, `a_test.py` -> `a__leerie_base_test.py`), so
-    its relative imports resolve as the file's own and the runner's file
-    shapes still select it. None for any other path."""
-    d, b = posixpath.split(rel)
-    m = _BASE_FORM_JS_RE.match(b)
-    if m:
-        nb = f"{m['stem']}.{_BASE_FORM_TAG}{m['tail']}"
-    elif b.startswith("test_") and b.endswith(".py"):
-        nb = b[:-3] + "__leerie_base.py"
-    elif b.endswith("_test.py") and len(b) > len("_test.py"):
-        nb = b[:-len("_test.py")] + "__leerie_base_test.py"
-    else:
+def _base_form_case(rel: str, globs: list[str] | None = None) -> bool:
+    """Whether the test file `rel` is a test-case file the base-form check
+    runs: one of `_BASE_FORM_CASE_RES`' names or a cargo integration
+    test."""
+    if not _is_test_file(rel, globs):
+        return False
+    b = posixpath.basename(rel)
+    return (any(r.match(b) for r in _BASE_FORM_CASE_RES)
+            or _is_cargo_integration_test(rel))
+
+
+def _base_form_snapshot(rel: str) -> str | None:
+    """A JS test-case file's snapshot path (`__snapshots__/<name>.snap`
+    beside it); None for any other file."""
+    if not _BASE_FORM_JS_RE.match(posixpath.basename(rel)):
         return None
-    return posixpath.join(d, nb) if d else nb
+    d = posixpath.dirname(rel)
+    return posixpath.join(d, "__snapshots__", posixpath.basename(rel) + ".snap")
 
 
 def _base_form_files(repo: str | Path, base: str, head: str,
                      globs: list[str] | None = None
                      ) -> tuple[list[str], list[str]]:
     """`(files, unsupported)`: every test-case file present at `base` that
-    `head` modified or deleted and that runs in base form, and every test
-    file of a language that cannot (`_BASE_FORM_UNSUPPORTED_EXT`). A test
-    helper, a fixture or a `conftest.py` is neither: it is not a case, and
-    it is reached through the cases that use it."""
+    `head` modified or deleted (`_base_form_case`), and every test file of
+    a language whose runner gives no report leerie reads
+    (`_BASE_FORM_NO_REPORT_EXT`). A test helper, a fixture or a
+    `conftest.py` is neither: it is not a case, and it is reached through
+    the cases that use it."""
     rows = _redrive_git(repo, "diff", "--name-status", "--no-renames", "-z",
                         base, head).split("\0")
     files: list[str] = []
@@ -63804,70 +63834,91 @@ def _base_form_files(repo: str | Path, base: str, head: str,
     for status, f in zip(rows[0::2], rows[1::2]):
         if not f or status.startswith("A") or not _is_test_file(f, globs):
             continue
-        if _base_form_path(f) is not None:
-            files.append(f)
-        elif posixpath.splitext(f)[1] in _BASE_FORM_UNSUPPORTED_EXT:
+        if posixpath.splitext(f)[1] in _BASE_FORM_NO_REPORT_EXT:
             unsupported.append(f)
+        elif _base_form_case(f, globs):
+            files.append(f)
     return sorted(files), sorted(unsupported)
 
 
-def _base_form_id(cid: str, sib: str, rel: str) -> str:
-    """A base-form case's ID in its file's own name: the placed path, and a
-    JUnit class's dotted module, read as the original's."""
-    out = cid.replace(sib, rel)
-    s_mod = posixpath.splitext(sib)[0].replace("/", ".")
-    return out.replace(s_mod, posixpath.splitext(rel)[0].replace("/", "."))
+def _base_form_writable(repo: str | Path, rev: str, rel: str) -> bool:
+    """Whether `rel` at `rev` is a path the base form may be written to or
+    removed from without following a link: every directory on its way absent
+    or a directory, and `rel` itself absent or a regular file (the shim's
+    own rule, read from git)."""
+    parts = rel.split("/")
+    ways = {"/".join(parts[:i]) for i in range(1, len(parts))}
+    # A pathspec naming a directory lists what is in it, so a directory on
+    # the way is never a row of its own; one that is not a directory is.
+    out = _redrive_git(repo, "ls-tree", "-z", rev, "--", *sorted(ways), rel)
+    for row in out.split("\0"):
+        meta, _tab, path = row.partition("\t")
+        if path == rel and meta.split(" ", 1)[0] not in ("100644", "100755"):
+            return False
+        if path in ways:
+            return False
+    return True
 
 
 def _base_form_place(st: "State", repo: str | Path, base: str,
                      files: list[str], trees: list[str]
-                     ) -> tuple[list[tuple[str, str]], dict[str, str],
-                                list[str]]:
-    """`(pairs, original, taken)`: the base forms of `files` written under
-    the run directory and paired with where each is placed
-    (`_base_form_path`), the original path of each placed one, and the files
-    whose placed path one of `trees` already has (never placed over). A
-    JS file's base snapshot (`__snapshots__/<name>.snap`) goes with it, so a
-    snapshot assertion compares against the base's, not a new one."""
+                     ) -> tuple[list[tuple[str, str]], list[str],
+                                dict[str, tuple[str, ...]]]:
+    """`(pairs, taken, removed)`: the base forms of `files` written under
+    the run directory and paired with the file's own path, which they
+    replace in a sandbox over each of `trees`; the files whose path, or a
+    snapshot's, is no plain file in one of `trees` (never written through);
+    and per tree, the paths removed there: every test-case file the base did
+    not have (`_base_form_case`), so a runner that builds a package together
+    sees the base's test-case files only, and a JS file's final snapshot
+    the base did not have. A JS file's base snapshot replaces its final one,
+    so a snapshot assertion compares against the base's."""
     root = Path(st.run_dir) / "base-form" / base[:12]
+    globs = resolve_test_file_globs(st.repo_root)
     pairs: list[tuple[str, str]] = []
-    original: dict[str, str] = {}
     taken: list[str] = []
+    gone_snaps: list[str] = []
     for rel in files:
-        sib = _base_form_path(rel)
-        extra: list[tuple[str, str]] = []
-        d = posixpath.dirname(rel)
-        snap = posixpath.join(d, "__snapshots__",
-                              posixpath.basename(rel) + ".snap")
-        if (_BASE_FORM_JS_RE.match(posixpath.basename(rel))
-                and _redrive_exists_at(repo, base, snap)):
-            extra.append((snap, posixpath.join(
-                d, "__snapshots__", posixpath.basename(sib) + ".snap")))
-        want = [(rel, sib), *extra]
-        if any(_redrive_exists_at(repo, t, to) for t in trees
-               for _, to in want):
+        snap = _base_form_snapshot(rel)
+        want = [rel]
+        has_snap = bool(snap) and _redrive_exists_at(repo, base, snap)
+        if snap:
+            want.append(snap)
+        if not all(_base_form_writable(repo, t, w) for t in trees
+                   for w in want):
             taken.append(rel)
             continue
-        for frm, to in want:
+        for frm in (want if has_snap else [rel]):
             blob = subprocess.run(
                 ["git", *_tree_git_args(repo), "show", f"{base}:{frm}"],
                 capture_output=True, check=False).stdout
-            src = root / to
+            src = root / frm
             src.parent.mkdir(parents=True, exist_ok=True)
             src.write_bytes(blob)
-            pairs.append((str(src), to))
-        original[sib] = rel
-    return pairs, original, taken
+            pairs.append((str(src), frm))
+        if snap and not has_snap:
+            gone_snaps.append(snap)
+    removed: dict[str, tuple[str, ...]] = {}
+    for t in trees:
+        rows = _redrive_git(repo, "diff", "--name-status", "--no-renames",
+                            "-z", base, t).split("\0")
+        added = [f for status, f in zip(rows[0::2], rows[1::2])
+                 if f and status.startswith("A") and _base_form_case(f, globs)
+                 and _base_form_writable(repo, t, f)]
+        removed[t] = tuple(sorted(set(added) | {
+            g for g in gone_snaps if _redrive_exists_at(repo, t, g)}))
+    return pairs, taken, removed
 
 
 async def _base_form_regressions(st: "State", caps: dict, staging: Path,
                                  before: str, *, label: str, log_path: Path,
                                  reach_of: str | None = None) -> dict:
     """Run every test-case file the run's base had and staging's commit
-    modified or deleted IN ITS BASE FORM — the base's own content, placed
-    beside the final form in a held-out sandbox, never on disk — on staging's
+    modified or deleted IN ITS BASE FORM — the base's own content, in place
+    of the final form in a held-out sandbox, never on disk, with every
+    test-case file the base did not have removed there — on staging's
     committed view, and confirm each failing case under B* against the same
-    base form placed on `before` (`_confirm_sized`). A case that fails there
+    base forms on `before` (`_confirm_sized`). A case that fails there
     and passed on `before` is behaviour the run's base pinned and the commit
     no longer has (`changed`), the same as any new failure: a deleted case,
     a loosened assertion and a deleted file all still run, and a file that
@@ -63907,27 +63958,25 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
         out["unmeasured"] = list(files)
         out["unmeasured_reason"] = "no scoped test command resolves"
         return out
-    pairs, original, taken = await asyncio.to_thread(
+    pairs, taken, removed = await asyncio.to_thread(
         _base_form_place, st, repo, base, files, [before, after])
     if taken:
         out["unmeasured"] = list(taken)
-        out["unmeasured_reason"] = "the base form's path is in use"
-    sibs = sorted(original)
-    if not sibs:
+        out["unmeasured_reason"] = ("the base form's path is a link or "
+                                    "not a file")
+    run = [f for f in files if f not in set(taken)]
+    if not run:
         return out
-
-    def _placed(units: Iterable[str] | None) -> tuple[tuple[str, str], ...]:
-        names = set(units or sibs)
-        snaps = {posixpath.join(posixpath.dirname(u), "__snapshots__",
-                                posixpath.basename(u) + ".snap")
-                 for u in names}
-        return tuple(p for p in pairs if p[1] in names or p[1] in snaps)
+    # Every base form is in place on every run, whichever files it runs: a
+    # runner that builds a package together must never see a final form
+    # beside a base form it was changed with.
+    over = tuple(pairs)
     timeout = float(caps.get("worker_timeout_sec",
                              DEFAULT_CAPS["worker_timeout_sec"]))
     first = await _capture_failing_test_ids(
         str(staging), cmd, st, caps, label=f"{label}-base-form",
-        log_path=log_path, timeout=timeout, serial=True, files=sibs,
-        place=_placed(None))
+        log_path=log_path, timeout=timeout, serial=True, files=run,
+        replace=over, remove=removed[after])
     if first is None:
         out["unmeasured"] = sorted(set(out["unmeasured"]) | set(files))
         out["unmeasured_reason"] = "the base-form run gave no report"
@@ -63936,7 +63985,7 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
     id_files = {c: first["files"].get(c) for c in cand}
     messages = dict(first.get("messages") or {})
     if not cand:
-        log(f"  {label}: {len(sibs)} existing test file(s) run in their "
+        log(f"  {label}: {len(run)} existing test file(s) run in their "
             "base form — every case the base pinned holds")
         return out
     wt = _helper_worktree_path(st, "base-form-base")
@@ -63962,14 +64011,15 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
         else:
             n = {"i": 0}
 
-            def _runner(tree: str, side: str, units: list[str] | None):
+            def _runner(tree: str, side: str, units: list[str] | None,
+                        gone: tuple[str, ...]):
                 async def _run(left: float) -> set[str] | None:
                     n["i"] += 1
                     got = await _capture_failing_test_ids(
                         tree, cmd, st, caps,
                         label=f"{label}-base-form-{side}{n['i']}",
                         log_path=log_path, timeout=left, serial=True,
-                        files=list(units or sibs), place=_placed(units))
+                        files=list(units or run), replace=over, remove=gone)
                     return None if got is None else set(got["ids"])
                 return _run
 
@@ -63977,8 +64027,9 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
                             pcaps: dict, gate: dict | None,
                             **more: object) -> dict:
                 return await _confirm_new_failures(
-                    cands, _runner(str(wt), "base", units),
-                    _runner(str(staging), "final", units), pcaps,
+                    cands, _runner(str(wt), "base", units, removed[before]),
+                    _runner(str(staging), "final", units, removed[after]),
+                    pcaps,
                     label=f"{label} base form", seen_failing=True,
                     prior_gate=gate, **more)
             if all(id_files.get(c) for c in cand):
@@ -63999,14 +64050,11 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
         "pairs_required", "pairs_run", "budget_exhausted")}
 
     def _row(cid: str) -> dict:
-        # A JUnit report names a placed file only by its dotted module: the
-        # file is in the sandbox, never on disk, so it has no path there.
-        sib = id_files.get(cid) or next(
-            (s for s in sibs if cid.startswith(s)
+        # A JUnit report may name a file only by its dotted module.
+        rel = id_files.get(cid) or next(
+            (s for s in run if cid.startswith(s)
              or posixpath.splitext(s)[0].replace("/", ".") in cid), "")
-        rel = original.get(sib, sib)
-        return {"id": _base_form_id(cid, sib, rel) if sib else cid,
-                "file": rel, "placed_id": cid,
+        return {"id": cid, "file": rel,
                 "message": str(messages.get(cid) or "")[:400]}
     out["changed"] = [_row(c) for c in verdict.get("new") or []]
     out["unmeasured"] = sorted(set(out["unmeasured"]) | {
@@ -64083,7 +64131,8 @@ def _set_base_form_gap(st: "State", rec: dict) -> None:
                        and e.get("source") == BASE_FORM_GAP_SOURCE)]
     parts: list[str] = []
     for key, what in (("unmeasured", "gave no verdict"),
-                      ("unsupported", "cannot be run beside its new form"),
+                      ("unsupported", "has no runner leerie reads a report "
+                                      "from"),
                       ("unsettled", "could not be confirmed within the "
                                     "budget")):
         xs = [str(x) for x in rec.get(key) or []]

@@ -8389,3 +8389,41 @@ pins the converse: a red run behind the script has no report, so the group's
 ID diff is unmeasured, never empty. Falsified by putting back the 0.45 report-run
 read (every case but the premise goes red, the red one because nothing ran) and by making a red run with no
 report read as zero IDs (the red case goes red).
+
+## An existing test's base form runs in place
+
+`tests/test_base_form_in_place.py` (DESIGN §8 *What an existing test pins on
+the base holds on the tree that ships*, *Where the base form runs*), beside
+`tests/test_existing_behaviour_base_form.py`, whose cases now run in place.
+No Go, Rust, Ruby or JVM toolchain was on the host it was written on, so none
+is imitated. The property a package-compiling runner rests on is pinned with
+a real pytest instead: during the base-form run the tree's test-case files are
+exactly the base's, so a registry case listing its directory's `test_*.py`
+holds when the run added a file and listed it. The shim's `--replace` and
+`--remove` are driven on a real directory (over a regular file, a deleted file
+restored, nothing absent removed, never through a file link, a directory link
+or a directory). The real overlay cannot be built on such a host, so the
+suite's emulator stands in for it there.
+
+`tests/test_base_form_in_place_real_overlay.py` is the real one, opt-in: it
+runs `tests/real_overlay_base_form_probe.sh` in a leerie repository image
+already present (`LEERIE_TEST_OVERLAY_IMAGE`; nothing built or pulled), started
+as the launcher starts one (seccomp unconfined, the `leerie-container`
+AppArmor profile, `--network none`) and dropped to `leerie` by the rootless
+entry's `unshare --user --map-user`, with the image's worker root. The state
+root must be `/leerie-state`: the profile allows an overlay mount nowhere
+else, and a probe with its tree elsewhere failed `overlay …: EACCES` before
+any placement. The device grants a confined command gets
+(`_WORKER_DEVICES`) are passed too, or `git status` inside fails opening
+`/dev/null`. On `leerie-repo/enricai-barnacle-1d7b79549fd6:0.47.0` all 14
+checks pass. Falsified three ways: the image's own 0.47.0 shim (`bad option
+'--replace'`), the file-link check removed from a copy of the shim (a replace
+through the link becomes a refusal, a remove runs the command), and
+`--replace` made create-only (every replacement refused as taken). A real vitest runs a JS case with its base
+snapshot when `LEERIE_TEST_VITEST_DIR` names a directory holding
+`node_modules/.bin/vitest`; vitest 5 writes an API token beneath the tree's
+own `node_modules`, so the fixture links the package into a real
+`node_modules` directory rather than linking the directory itself.
+Falsified, one at a time: the shim writing a replacement as a `--place`, no
+removal, no replacement on the first run, the base snapshot left out, and the
+writability check made always true. Each turns its tests red.
