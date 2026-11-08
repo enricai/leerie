@@ -523,14 +523,14 @@ subtask it tests). Three mechanisms reconcile that coupling:
   never routes a process item. Split children inherit it with the site
   claims, and a merge of two subtasks keeps both subtasks' item claims.
 
-  Before execution every required item is either claimed or excluded:
-  the plan's `items_not_needed` lists an item with a typed `reason_kind`
-  and its `reason`. `already_on_tree` means the tree the run starts from
-  already carries the item, with the code evidence in `reason`.
-  `other_domain` means another category's planner delivers it, and it is
-  not valid on a run with one category. Code checks this by set
-  arithmetic over the integer `item_index`, the typed kinds and
-  `verification_only`, never over prose:
+  Before execution every required item is claimed by a subtask that can
+  change the tree. The one exclusion is the plan's `items_not_needed`
+  with `reason_kind: other_domain`: another category's planner delivers
+  the item. That is a fact about planner scope, which code checks: it is
+  rejected on a run with one category, and an item every domain excludes
+  is re-planned. Code checks this by set arithmetic over the integer
+  `item_index`, the typed kinds and `verification_only`, never over
+  prose:
 
   - *The key is copied, not counted.* Each planner gets every required
     item with the `item_index` code assigned to it. The coverage judge,
@@ -542,103 +542,44 @@ subtask it tests). Three mechanisms reconcile that coupling:
     planned.
   - *A subtask that writes nothing delivers nothing.* A `deliverable`
     claim counts only from a subtask that is not typed
-    `verification_only`. Such a claim says the tree already carries the
-    item, so the planner has to say that in the typed form
-    (`already_on_tree`, with its evidence). In 4f9a4b4f and 879de601,
-    the item that ended unmet (13 and 8) was claimed only by a
-    `verification_only` subtask whose commands tested other items. That
-    subtask was settled by execution, so nothing in the run ever planned
-    the change.
-  - *An `already_on_tree` exclusion is a claim about the code, so it is
-    proven by execution.* The planner's word is not evidence: bench PC
-    (below) measured planners excluding, as already on the tree, items
-    their runs ended with unmet, in 9 of 12 target samples once the
-    loop pushed them to account for every item. So the exclusion
-    carries a typed `verify: [{argv}]`, the same argv form the planner
-    already writes for settle-by-execution (§8 *Settled by execution*).
-    Code runs it, confined, in a committed view, under B\*
-    (`_settle_by_execution`), on two trees:
-    - it must **pass on the run's own start**; and
-    - it must **fail on a tree where the item is not done**. That tree
-      is the task's earliest same-task base, the same lookup the
-      acceptance sets' `report_reproduced` uses, or the own start of a
-      matching prior `done` run's change (§8 *A done run's change on the
-      base settles the task*). The command's test files are written onto
-      that tree as the own start has them, the form the settled bar runs
-      a change's tests in, so only the code differs between the two
-      runs. A test file that is missing on the older tree therefore
-      cannot fail there by its absence alone.
+    `verification_only`. In 4f9a4b4f and 879de601, the item that ended
+    unmet (13 and 8) was claimed only by a `verification_only` subtask
+    whose commands tested other items. That subtask was settled by
+    execution, so nothing in the run ever planned the change.
+  - *"Already on the tree" is no exclusion.* An item the planner
+    believes the tree already carries is claimed like any other. If the
+    belief is right, the claiming subtask finds nothing to change and
+    settles as a no-op on its own executed evidence (§8 *A no-op the
+    base already carries*). An `already_on_tree` exclusion was built and
+    removed, because no plan-time check of it is sound:
+    - *Taken on the planner's word* (bench PC, run 1), it was false in
+      9 of 12 target samples once the loop made plans account for every
+      item. That included 4f9a4b4f item 13 in 3 of 3, with evidence
+      citing the optional-step skip. The original run's delivery judge
+      made the same misreading.
+    - *Proven by execution* (run 2, and replay R1 offline on the
+      recorded trees), the rule was that the exclusion's commands pass
+      on the own start and fail on an earlier tree of the task, with
+      their test files as the own start has them. 88 of 100 proofs found
+      the command also passes on the earlier tree.
+    - The proof accepted a test unrelated to the item. 2dcb4cce items
+      10 and 11 were "proven" by a site-name test that changed between
+      the trees.
+    - It accepted a partly delivered item: 879de601 item 8, whose test
+      grew with the part delivered between the trees, while the part the
+      falsifier later found missing stayed missing.
+    - Of the 33 already-delivered items hand-checked, only 1 was
+      provable. 17 were on the tree before the task's first run, 5 have
+      no dedicated test, and 10 are on a first run.
 
-    A command that passes on both trees does not detect the item, and
-    its exclusion is not proven. When no such earlier tree exists (the
-    task's first run), no exclusion can be proven, and the planner is
-    told so in its context (`already_on_tree_provable: false`). The item
-    must then be claimed by a subtask that changes the tree for it. If
-    there really is nothing to change, that subtask settles as a no-op on
-    its own evidence (§8 *A no-op the base already carries*). An unproven
-    exclusion goes back into the planner's loop by number, with the
-    reason (`ITEM_EXCLUSION_UNPROVEN`). If it is still unproven after the
-    loop, the item stays `uncovered`. The PR then lists it under *Not
-    verified by this run* together with the exclusion's reason. It is
-    never dropped silently.
-
-    The proof catches what the command catches, no more. A command that
-    tests a part of the item that changed between the two trees proves
-    the exclusion even if another part is still missing. Replay R1
-    measured this offline on the recorded trees, with the commands
-    confined. Arm C's false exclusions break down as follows:
-    - 9 of the 15 were on their task's first run (b24806a1, a2a825c2),
-      where nothing is provable.
-    - 4f9a4b4f item 13's three were rejected. Two tests both also pass
-      on the earlier tree 09d83ba6: the test of the item's first part,
-      and the optional-step test the planners cited. The item's own
-      falsifier probe fails on the own start.
-    - 879de601 item 8's three would be accepted. Its layered-widget
-      test, as the own start has it, passes there and fails on
-      09d83ba6. A commit between the two trees delivered part of the
-      item and extended that test. The part the falsifier later found
-      missing stayed missing. (Run as-is on 09d83ba6, that test passes
-      and the exclusion is rejected. The as-is form instead lets a test
-      file missing on the older tree prove anything, so neither form
-      closes this.)
-
-    Of the 33 already-delivered items hand-checked below, one would be
-    proven (2dcb4cce item 8, by the same test). The other 32 cannot be:
-    - 17 were on the tree before the task's first run, and their tests
-      pass on 09d83ba6 too;
-    - 5 have no dedicated test (items 10, 11 and 12 of the report);
-    - b24806a1's 10 are on a first run.
-
-    Those must be claimed by a change subtask that settles as a no-op.
-    So the gate turns 12 of the 15 false exclusions into claims or
-    listed residuals. It does not catch an item that was partly
-    delivered with a test that grew alongside the delivered part.
-
-    Bench PC was re-run with the gate in code, on the same cases (reused,
-    and disclosed as such) and against the same frozen bar. It still
-    FAILS, on P2 and P3:
-    - In the final plans (the loop arm), no item the run ended unmet was
-      excluded, proven or not. 4f9a4b4f item 13 and 879de601 item 8 were
-      each claimed in 3 of 3 samples, where the ungated loop had
-      excluded them in 3 of 3. Known-absent items with a claim that
-      counts: 36, against 15 on main and 21 ungated. Claims an annotator
-      said do not deliver their item: 10.3%, against 32.5% on main.
-    - P3 fails on the first round alone: one 879de601 sample's
-      `already_on_tree` exclusion of item 8 was proven by the
-      layered-widget test, the hole R1 predicted. Only other open items
-      in that plan sent it back into the loop.
-    - P2 fails on one 2dcb4cce sample, which ended its three rounds with
-      9 unproven exclusions. Those are listed in the PR, not dropped.
-    - The proof also accepted a command unrelated to the item it
-      excluded: 2dcb4cce items 10 and 11 by a site-name test that changed
-      between the two trees. A proof shows that the command detects a
-      difference, not that the item is done.
-    - 100 proofs ran; 88 found the commands also pass on the earlier tree.
+    A proof shows that a command detects some difference between two
+    trees, not that the item is done, so the exclusion was a guess with
+    no sound check.
   - *Each planner is held to it in its own loop.* The check runs in the
     planner's mechanical-check loop (`planner_check_rounds`), the same
-    loop the site claims use. An item the planner neither claims nor
-    excludes (`ITEM_UNACCOUNTED`), or a claim outside the list, is sent
-    back to it by number and wording.
+    loop the site claims use. An item the planner does not claim
+    (`ITEM_UNACCOUNTED`), or a claim outside the list, is sent back to
+    it by number and wording.
   - *The merged plan is checked once more.* No single planner can see an
     item that every planner excluded as `other_domain` and none claimed.
     The task-coverage gate (§8 *Independent adversarial verification*)
@@ -649,33 +590,53 @@ subtask it tests). Three mechanisms reconcile that coupling:
     every phase that already ran*), and is bounded by
     `judgment_check_rounds`.
   - *A residual is recorded, not silent and not fatal.* An item still
-    unaccounted for after those rounds does not stop the run. State
-    records every item's status in `item_coverage` (`claimed`, `excluded`
-    with its kind and reason, or `uncovered`). The log names each
-    uncovered item before any implementation work starts, and the PR
-    lists it under *Not verified by this run*. The delivery gate then
-    reads it on the tree that ships like any other item. If it is met,
-    it is met. If it is unmet, the outcome is the existing `unconverged`,
-    and the re-drive reason is `no_owner`.
+    unclaimed after those rounds does not stop the run. State records
+    every item's status in `item_coverage` (`claimed`, `other_domain` or
+    `uncovered`). The log names each uncovered item before any
+    implementation work starts, and the PR lists it under *Not verified
+    by this run*. The delivery gate then reads it on the tree that ships
+    like any other item. If it is met, it is met. If it is unmet, the
+    outcome is the existing `unconverged`, and the re-drive reason is
+    `no_owner`.
 
   Measured by replaying the rule over every barnacle, web and navegando
   run still on disk (20 runs with required items, all from after
-  `claims.items` existed; 18 had one category). Without exclusions the
-  rule fires on 6 of the 20 runs, for 76 items plus one out-of-range
-  claim. 6 of those items, in 4 runs, are exactly the items those runs
-  ended with unmet (4f9a4b4f 13, 879de601 8, b24806a1 13, a2a825c2 1,
-  14, 29), out of the 17 items the 20 runs ended with unmet. The other
-  70 ended met. Hand-checked on three of the runs (2dcb4cce, 79c8fbe7,
-  b24806a1, all repeat runs on one report): 33 of 35 were already on the
-  tree when the run started, one was 2dcb4cce's miscounted claim, and one
-  (b24806a1 13) was a real gap. That is the case for a typed
-  `already_on_tree` exclusion, and also why it has to be proven (above):
-  most of those 33 were on the tree before the task's first run, so no
-  recorded tree shows them undone. Per planner, the check also fires on one of the two
-  two-category runs (707bd65a), where each planner left the other's
-  items unaccounted for: that is the case `other_domain` exists for.
-  Neither two-category run had an item that no plan claimed, so the
+  `claims.items` existed; 18 had one category). The rule fires on 6 of
+  the 20 runs, for 76 items plus one out-of-range claim. 6 of those
+  items, in 4 runs, are exactly the items those runs ended with unmet
+  (4f9a4b4f 13, 879de601 8, b24806a1 13, a2a825c2 1, 14 and 29), out of
+  the 17 items the 20 runs ended with unmet. The other 70 ended met.
+  Hand-checked on three of the runs (2dcb4cce, 79c8fbe7 and b24806a1,
+  all repeat runs on one report): 33 of 35 were already on the tree when
+  the run started, one was 2dcb4cce's miscounted claim, and one
+  (b24806a1 13) was a real gap. Per planner, the check also fires on one
+  of the two two-category runs (707bd65a), where each planner left the
+  other's items unaccounted for: that is the case `other_domain` exists
+  for. Neither two-category run had an item that no plan claimed, so the
   merged-plan re-plan would have fired on none of them.
+
+  What claiming every item costs, measured in bench PC's third run.
+  The `already_on_tree` path was gone, the cases were reused, and the
+  same frozen bar held.
+  - The final plans carried 120 subtasks against main's 96 over the same
+    36 plans.
+  - Subtasks whose every deliverable claim is an item its run had
+    already delivered, so they will settle as no-ops: 14 against main's
+    7 over the 18 repeat-run plans. That is 7 more, about 0.4 per
+    repeat run.
+  - A no-op subtask costs 2 to 4 worker calls (fit judge, satisfied
+    probe and implementer; mean 2.8 over the 6 recorded no-op settles),
+    so about 20 more worker calls over those 18 plans. The planner loop
+    added 12 planner calls over the 36 plans.
+  - #332 ends a finished task's re-run before planning (§8 *A done run's
+    change on the base settles the task*). Of these repeat runs it
+    settles 86f32d44: 6da090bf ended done and both of its non-test hunks
+    reverse-apply on 86f32d44's base. The four repeat runs of the iframe
+    report had no done run before them, so #332 settles none of them,
+    and they pay the no-ops.
+  - In exchange, every item a run ended with unmet was claimed in every
+    final plan (A left 21 such claims missing), and none was excluded.
+    P2 and P3 hold, and the bench passes P1–P7.
 
   A top-level `already_resolved_on_tree` flag was tried alongside and
   dropped: under strict decoding, every schema variant carrying that one
@@ -15205,8 +15166,9 @@ mis-wirings:
   judge, which both read prose. It was never evidence against a plan-time
   coverage gate. The mechanical check the gate lacked exists now. Each
   subtask names the required items it delivers by a code-assigned integer
-  (`claims.items`), and an item it does not deliver is excluded with a
-  typed reason (`items_not_needed`). The gate's authority rests on set
+  (`claims.items`); the only item a plan may leave unclaimed is one
+  another category's planner delivers (`items_not_needed`,
+  `other_domain`). The gate's authority rests on set
   arithmetic over those fields, which gives the same answer on the same
   plan every time (§5 *Required items are claimed too, and the plan
   accounts for every one*). The judge does not gain authority. It runs as

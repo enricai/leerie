@@ -1,4 +1,4 @@
-"""Every required item is claimed or excluded before execution (DESIGN §5
+"""Every required item is claimed before execution (DESIGN §5
 *Required items are claimed too, and the plan accounts for every one*).
 
 Motive, proven from barnacle run 4f9a4b4f's state and calls.ndjson: its
@@ -67,33 +67,31 @@ def _verify_only(sid, *items):
                          "argv": ["pytest", "tests/test_flow_runner.py"]}])
 
 
-def _status(leerie, plans, items, proofs=None):
+def _status(leerie, plans, items):
     return {r["item_index"]: r["status"]
-            for r in leerie._item_accounting_rows(plans, items, proofs)}
-
-
-def _proven(leerie, *indices):
-    """Recorded proofs of exclusions that name no verify command — the rows
-    read only the record (the proof itself is tests/test_item_exclusion_
-    proof.py's)."""
-    return {leerie._exclusion_proof_key(i, []): {"proven": True, "why": "w"}
-            for i in indices}
+            for r in leerie._item_accounting_rows(plans, items)}
 
 
 # === the rows: set arithmetic on typed fields ==============================
 
-def test_claimed_excluded_other_domain_and_uncovered(leerie):
-    items = [{"item": f"i{n}"} for n in range(5)]
+def test_claimed_other_domain_and_uncovered(leerie):
+    items = [{"item": f"i{n}"} for n in range(4)]
     plans = [
         _plan(_sub("bugfix-001", (0, "deliverable"), (1, "process")),
-              not_needed=[(2, "already_on_tree", "x.py:4 does it"),
-                          (3, "other_domain", "tests own it")]),
+              not_needed=[(2, "other_domain", "tests own it")]),
     ]
-    assert _status(leerie, plans, items, _proven(leerie, 2)) == {
-        0: "claimed", 1: "claimed", 2: "excluded", 3: "other_domain",
-        4: "uncovered"}
-    assert _status(leerie, plans, items)[2] == "uncovered", \
-        "an already_on_tree exclusion with no proof excludes nothing"
+    assert _status(leerie, plans, items) == {
+        0: "claimed", 1: "claimed", 2: "other_domain", 3: "uncovered"}
+
+
+def test_already_on_tree_is_no_exclusion(leerie):
+    """The exclusion path is gone (DESIGN §5): no plan-time check of "the
+    tree already carries it" is sound, so the item must be claimed."""
+    assert leerie.ITEM_EXCLUSION_KINDS == ("other_domain",)
+    plans = [_plan(not_needed=[(0, "already_on_tree", "x.py:4 does it")])]
+    assert _status(leerie, plans, [{"item": "a"}]) == {0: "uncovered"}
+    issues = leerie._check_item_claims(plans[0], [{"item": "a"}], 1)
+    assert issues[0].startswith("ITEM_UNACCOUNTED: item 0 — ")
 
 
 def test_a_verification_only_deliverable_claim_does_not_count(leerie):
@@ -110,27 +108,23 @@ def test_a_verification_only_deliverable_claim_does_not_count(leerie):
             ("claimed", ["bugfix-003"], [])]
 
 
-def test_a_claim_wins_over_an_exclusion_and_already_on_tree_over_other(
-        leerie):
+def test_a_claim_wins_over_an_exclusion(leerie):
     items = [{"item": "a"}, {"item": "b"}]
-    plans = [_plan(_sub("bugfix-001", (0, "deliverable")),
-                   not_needed=[(0, "already_on_tree", "a.py:1")]),
+    plans = [_plan(_sub("bugfix-001", (0, "deliverable"))),
              _plan(_sub("test-001", change_kind="test"), domain="testing",
-                   not_needed=[(1, "other_domain", "bug-fixing has it"),
-                               (1, "already_on_tree", "b.py:9")])]
-    rows = leerie._item_accounting_rows(plans, items, _proven(leerie, 0, 1))
-    assert [r["status"] for r in rows] == ["claimed", "excluded"]
+                   not_needed=[(0, "other_domain", "bug-fixing has it"),
+                               (1, "other_domain", "bug-fixing has it")])]
+    rows = leerie._item_accounting_rows(plans, items)
+    assert [r["status"] for r in rows] == ["claimed", "other_domain"]
     assert rows[1]["excluded"] == [
         {"domain": "test", "reason_kind": "other_domain",
-         "reason": "bug-fixing has it"},
-        {"domain": "test", "reason_kind": "already_on_tree",
-         "reason": "b.py:9", "verify": [], "proven": True, "proof_why": "w"}]
+         "reason": "bug-fixing has it"}]
 
 
 @pytest.mark.parametrize("entry", [
-    {"item_index": 0, "reason_kind": "already_on_tree", "reason": "  "},
+    {"item_index": 0, "reason_kind": "other_domain", "reason": "  "},
     {"item_index": 0, "reason_kind": "out_of_scope", "reason": "r"},
-    {"item_index": True, "reason_kind": "already_on_tree", "reason": "r"},
+    {"item_index": True, "reason_kind": "other_domain", "reason": "r"},
 ])
 def test_an_untyped_or_empty_exclusion_is_no_exclusion(leerie, entry):
     plan = _plan()
@@ -178,7 +172,8 @@ def test_check_names_the_item_its_words_and_the_uncounted_claimer(leerie):
     assert "treating as present" in issues[1]
     assert "claimed only by bugfix-003, which is `verification_only`" \
         in issues[1]
-    assert "`already_on_tree`" in issues[1]
+    assert "settles as a no-op" in issues[1]
+    assert "already_on_tree" not in issues[1]
     assert "other_domain" not in issues[1], \
         "a one-category run must not be offered other_domain"
 
@@ -215,13 +210,14 @@ def test_planner_schema_carries_typed_exclusions(leerie):
     entry = sch["$defs"]["items_not_needed"]["items"]
     assert sorted(entry["required"]) == ["item_index", "reason", "reason_kind"]
     assert entry["properties"]["reason_kind"]["enum"] == [
-        "already_on_tree", "other_domain"]
+        "other_domain"]
     assert "items_not_needed" not in sch["required"]
 
 
 def test_planner_prompt_documents_the_accounting(leerie):
     text = leerie._load_prompt("planner")
-    for name in ("items_not_needed", "already_on_tree", "other_domain",
+    assert "already_on_tree" not in text, "the exclusion path is gone"
+    for name in ("items_not_needed", "other_domain",
                  "reason_kind", "item_index"):
         assert f"`{name}`" in text or f'"{name}"' in text, name
     assert "position in `required_items`" not in text, \
@@ -285,12 +281,12 @@ def _4f9a_first_plan():
 def test_an_unaccounted_item_sends_the_plan_back_with_that_item(
         leerie, tmp_path, monkeypatch, repo):
     st = _state(leerie, tmp_path, required_items=ITEMS_4F9A)
-    # This state has no earlier tree of the task (a first run), so no
-    # exclusion can be proven: the second plan claims every item.
     second = _plan(
         _sub("bugfix-001", (0, "deliverable"), (1, "deliverable"),
              (2, "deliverable"), (4, "deliverable"), (8, "deliverable"),
              (13, "deliverable")),
+        # Items the planner believes already done are claimed too, by a
+        # subtask that can change code; it settles as a no-op if so.
         _sub("bugfix-002", *[(i, "deliverable") for i in
                              (3, 5, 6, 7, 9, 10, 11, 12)]))
     plans, calls = _drive_plan(leerie, monkeypatch, st,
@@ -369,7 +365,8 @@ def test_a_residual_is_recorded_logged_and_listed_in_the_pr(
     assert rec["uncovered"] == [3, 5, 6, 7, 9, 10, 11, 12, 13]
     assert rec["items"][13]["not_counted"] == ["bugfix-003"]
     out = capsys.readouterr().out
-    assert "9 required item(s) no planned subtask claims" in out
+    assert ("9 required item(s) no planned subtask that can change the "
+            "tree claims") in out
     assert "item 13 (uncovered): Other observations" in out
 
     groups = leerie._pr_not_verified(st.data, lambda sid: True)
@@ -386,7 +383,7 @@ def test_a_fully_accounted_plan_is_recorded_clean(
                                         for i in range(14)]))]
     _gate(leerie, st, plans)
     assert st.data["item_coverage"]["uncovered"] == []
-    assert "all 14 required item(s) claimed or excluded" in \
+    assert "all 14 required item(s) claimed by a subtask that can change" in \
         capsys.readouterr().out
     assert "Required items no planned subtask claimed" not in \
         leerie._pr_not_verified(st.data, lambda sid: True)

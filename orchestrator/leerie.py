@@ -631,10 +631,6 @@ STATE_FIELDS = (
     # claimed too, and the plan accounts for every one*), for the log and
     # the PR.
     "item_coverage",
-    # item_exclusion_proofs: each `already_on_tree` exclusion's execution
-    # proof, keyed by item and commands (DESIGN §5 *An `already_on_tree`
-    # exclusion ... is proven by execution*).
-    "item_exclusion_proofs",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -2751,21 +2747,6 @@ def _planner_defs() -> dict:
                     "reason_kind": {"type": "string",
                                     "enum": list(ITEM_EXCLUSION_KINDS)},
                     "reason": {"type": "string", "minLength": 1},
-                    # `already_on_tree` only: the commands that prove it —
-                    # pass on the own start, fail where the item is not
-                    # done (`_prove_item_exclusion`). Code, not the schema,
-                    # requires them: an `other_domain` entry has none.
-                    "verify": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["argv"],
-                            "properties": {
-                                "argv": {"type": "array",
-                                         "items": {"type": "string"}},
-                            },
-                        },
-                    },
                 },
             },
         },
@@ -2961,9 +2942,11 @@ CHANGE_KINDS = ("fix", "test", "docs", "other")
 # to work — which the delivery re-drive never routes.
 ITEM_CLAIM_KINDS = ("deliverable", "process")
 # Why a plan delivers a required item nowhere (DESIGN §5 *Required items are
-# claimed too, and the plan accounts for every one*): the tree the run starts
-# from already carries it, or another category's planner delivers it.
-ITEM_EXCLUSION_KINDS = ("already_on_tree", "other_domain")
+# claimed too, and the plan accounts for every one*): another category's
+# planner delivers it, a fact about planner scope code checks. "The tree
+# already carries it" is no exclusion: no plan-time check of it is sound, so
+# such an item is claimed by a change subtask that settles as a no-op.
+ITEM_EXCLUSION_KINDS = ("other_domain",)
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
@@ -7437,17 +7420,9 @@ def _uncovered_item_lines(state: dict) -> list[str]:
     if not isinstance(rec, dict):
         return []
     open_idx = {i for i in rec.get("uncovered") or [] if isinstance(i, int)}
-    out: list[str] = []
-    for r in rec.get("items") or []:
-        if not isinstance(r, dict) or r.get("item_index") not in open_idx:
-            continue
-        unproven = [e for e in r.get("excluded") or [] if isinstance(e, dict)
-                    and e.get("reason_kind") == "already_on_tree"]
-        out.append(f"- [ ] item {r['item_index']}: {_pr_entry(r.get('item'))}"
-                   + (" — the plan excluded it as already on the tree, not "
-                      f"proven: {_pr_entry(unproven[-1].get('proof_why'))}"
-                      if unproven else ""))
-    return out
+    return [f"- [ ] item {r['item_index']}: {_pr_entry(r.get('item'))}"
+            for r in rec.get("items") or []
+            if isinstance(r, dict) and r.get("item_index") in open_idx]
 
 
 def _untyped_sites(state: dict) -> list[dict]:
@@ -35845,44 +35820,18 @@ def _plan_domain(plan: dict) -> str:
     return CATEGORY_ABBREV.get(dom, dom) if isinstance(dom, str) else ""
 
 
-def _exclusion_verify_argvs(entry: dict) -> list[list[str]]:
-    """The executable argvs an `items_not_needed` entry types in `verify`,
-    in order and de-duplicated (the `_subtask_verify_argvs` rule)."""
-    out: list[list[str]] = []
-    for v in entry.get("verify") or [] if isinstance(entry, dict) else []:
-        argv = v.get("argv") if isinstance(v, dict) else None
-        if (isinstance(argv, list) and argv
-                and all(isinstance(a, str) and a for a in argv)
-                and argv not in out):
-            out.append(list(argv))
-    return out
-
-
-def _exclusion_proof_key(item_index: int, argvs: list[list[str]]) -> str:
-    """The key an exclusion's proof is kept under: the item and the exact
-    commands. A different command for the same item is a different proof."""
-    return f"{item_index}|{json.dumps(argvs, separators=(',', ':'))}"
-
-
-def _item_accounting_rows(plans: list[dict], items: object,
-                          proofs: object = None) -> list[dict]:
+def _item_accounting_rows(plans: list[dict], items: object) -> list[dict]:
     """One row per required item over `plans`: who claims it, who excludes
     it and why, and its status (DESIGN §5 *Required items are claimed too,
     and the plan accounts for every one*). Set arithmetic on typed fields
-    only: `item_index`, `kind`, `reason_kind`, `verification_only`, and the
-    recorded `proven` of each `already_on_tree` exclusion's proof.
+    only: `item_index`, `kind`, `reason_kind`, `verification_only`.
 
     A `deliverable` claim from a subtask typed `verification_only` is not
-    counted: that subtask writes nothing, so the claim says the tree
-    already carries the item, which is `already_on_tree`'s to say (the
-    4f9a4b4f and 879de601 shape — the unmet item rested on such a claim).
-    An `already_on_tree` exclusion counts only when `proofs` (keyed by
-    `_exclusion_proof_key`) holds a proof of it with `proven: true`; each
-    such entry carries `proven` and `proof_why`. `status`: `claimed`,
-    `excluded` (a proven `already_on_tree`), `other_domain` (only other
-    domains' exclusions), `uncovered`."""
+    counted: that subtask writes nothing, so the claim is a guess that the
+    tree already carries the item (the 4f9a4b4f and 879de601 shape — the
+    unmet item rested on such a claim). `status`: `claimed`, `other_domain`
+    (only other domains' exclusions), `uncovered`."""
     n = len(items) if isinstance(items, list) else 0
-    proofs = proofs if isinstance(proofs, dict) else {}
     claimed: dict[int, list[str]] = {}
     not_counted: dict[int, list[str]] = {}
     excluded: dict[int, list[dict]] = {}
@@ -35912,48 +35861,31 @@ def _item_accounting_rows(plans: list[dict], items: object,
             if (isinstance(i, int) and not isinstance(i, bool)
                     and 0 <= i < n and kind in ITEM_EXCLUSION_KINDS
                     and isinstance(why, str) and why.strip()):
-                row = {"domain": _plan_domain(plan), "reason_kind": kind,
-                       "reason": why.strip()}
-                if kind == "already_on_tree":
-                    argvs = _exclusion_verify_argvs(e)
-                    proof = proofs.get(_exclusion_proof_key(i, argvs))
-                    proof = proof if isinstance(proof, dict) else {}
-                    row["verify"] = argvs
-                    row["proven"] = proof.get("proven") is True
-                    row["proof_why"] = str(
-                        proof.get("why")
-                        or ("it names no verify command" if not argvs
-                            else "it was not run"))
-                excluded.setdefault(i, []).append(row)
+                excluded.setdefault(i, []).append(
+                    {"domain": _plan_domain(plan), "reason_kind": kind,
+                     "reason": why.strip()})
     rows: list[dict] = []
     for i in range(n):
-        ex = excluded.get(i, [])
         status = ("claimed" if claimed.get(i)
-                  else "excluded" if any(
-                      e["reason_kind"] == "already_on_tree" and e["proven"]
-                      for e in ex)
-                  else "other_domain" if any(
-                      e["reason_kind"] == "other_domain" for e in ex)
+                  else "other_domain" if excluded.get(i)
                   else "uncovered")
         it = items[i] if isinstance(items[i], dict) else {}
         rows.append({"item_index": i, "item": str(it.get("item") or ""),
                      "claimed_by": claimed.get(i, []),
                      "not_counted": [x for x in not_counted.get(i, [])
                                      if x not in claimed.get(i, [])],
-                     "excluded": ex, "status": status})
+                     "excluded": excluded.get(i, []), "status": status})
     return rows
 
 
-def _check_item_claims(result: dict, items: object, n_categories: int,
-                       proofs: object = None) -> list[str]:
+def _check_item_claims(result: dict, items: object,
+                       n_categories: int) -> list[str]:
     """The planner-loop item accounting (DESIGN §5 *Required items are
     claimed too, and the plan accounts for every one*): one gating issue per
-    required item this plan neither claims nor validly excludes, and per
-    claim or exclusion naming an index the list does not have. `other_domain`
-    is no account on a run with one category; an `already_on_tree` exclusion
-    is one only when its proof (`proofs`) holds (`ITEM_EXCLUSION_UNPROVEN`,
-    with the proof's reason). `[]` for a blocked plan (the blocker is its own
-    report) and when there are no required items."""
+    required item this plan neither claims nor excludes, and per claim or
+    exclusion naming an index the list does not have. `other_domain` is no
+    account on a run with one category. `[]` for a blocked plan (the blocker
+    is its own report) and when there are no required items."""
     if (not isinstance(items, list) or not items
             or result.get("status") == "blocked"):
         return []
@@ -35969,27 +35901,12 @@ def _check_item_claims(result: dict, items: object, n_categories: int,
         issues.append(
             f"ITEM_INDEX_UNKNOWN: {i} — `required_items` has items 0 to "
             f"{n - 1}. Use the `item_index` each item carries.")
-    claim_it = ("Claim it in `claims.items` of the subtask that changes the "
-                "tree for it; if the tree needs no change for it, that "
-                "subtask settles as a no-op on its own evidence.")
-    for r in _item_accounting_rows([result], items, proofs):
-        if r["status"] in ("claimed", "excluded"):
+    for r in _item_accounting_rows([result], items):
+        if r["status"] == "claimed":
             continue
         if r["status"] == "other_domain" and n_categories > 1:
             continue
         words = r["item"][:200]
-        unproven = [e for e in r["excluded"]
-                    if e["reason_kind"] == "already_on_tree"]
-        if unproven:
-            issues.append(
-                f"ITEM_EXCLUSION_UNPROVEN: item {r['item_index']} — "
-                f"\"{words}\" — your `already_on_tree` exclusion is not "
-                f"proven: {unproven[-1]['proof_why']}. An exclusion's "
-                "`verify` commands must pass on this tree and fail on an "
-                "earlier tree of this task where the item was not done, "
-                "with the commands' test files as this tree has them. "
-                + claim_it)
-            continue
         why = ("you excluded it as `other_domain`, but this run has one "
                "category, so no other planner delivers it. "
                if r["status"] == "other_domain" else "")
@@ -35999,210 +35916,26 @@ def _check_item_claims(result: dict, items: object, n_categories: int,
                     + ", which is `verification_only` and writes nothing. ")
         issues.append(
             f"ITEM_UNACCOUNTED: item {r['item_index']} — \"{words}\" — "
-            f"{why}{claim_it} Or list it in `items_not_needed` with "
-            "`reason_kind` `already_on_tree` and the `verify` commands that "
-            "prove the tree already carries every part of it"
-            + (", or `other_domain` if another category's planner delivers "
-               "it" if n_categories > 1 else "")
+            f"{why}Claim it in `claims.items` of a subtask that can change "
+            "the tree for it; if the tree already carries it, that subtask "
+            "settles as a no-op on its own executed evidence"
+            + (", or list it in `items_not_needed` as `other_domain` if "
+               "another category's planner delivers it"
+               if n_categories > 1 else "")
             + ".")
     return issues
 
 
-def _item_coverage_record(plans: list[dict], items: object,
-                          proofs: object = None) -> dict | None:
+def _item_coverage_record(plans: list[dict], items: object) -> dict | None:
     """`state.data["item_coverage"]`: the merged plan's accounting rows and
-    the indices still `uncovered` (neither claimed nor validly excluded),
-    or None when there are no required items."""
+    the indices still `uncovered` (claimed by no subtask that can change
+    the tree), or None when there are no required items."""
     if not isinstance(items, list) or not items:
         return None
-    rows = _item_accounting_rows(plans, items, proofs)
+    rows = _item_accounting_rows(plans, items)
     return {"items": rows,
             "uncovered": [r["item_index"] for r in rows
-                          if r["status"] not in ("claimed", "excluded")]}
-
-
-def _item_exclusion_trees(st: "State") -> list[str]:
-    """The trees on which an `already_on_tree` exclusion must fail (DESIGN
-    §5 *An `already_on_tree` exclusion ... is proven by execution*): the
-    task's earliest same-task base (`_acceptance_report_base`, the
-    `report_reproduced` lookup) and the own start of a matching prior
-    `done` run's change (the settled bar's `change.own_start`), each only
-    when it differs from this run's own start and is in the run's
-    repository. `[]` on a task's first run: nothing can be proven."""
-    own = _acceptance_own_start(st)
-    out: list[str] = []
-    cands: list[str | None] = [_acceptance_report_base(st)]
-    try:
-        key = _settled_bar_key(st.data.get("task") or "", st.repo_root)
-        change = (_load_settled_bar(Path(st.leerie_root), key).get("change")
-                  if key else None)
-        cands.append(change.get("own_start") if isinstance(change, dict)
-                     else None)
-    except Exception as e:
-        log(f"  item exclusions: the settled bar could not be read "
-            f"({type(e).__name__})")
-    for c in cands:
-        if (isinstance(c, str) and c and c != own and c not in out
-                and _run_repo_commit(st, c, "refs/leerie/exclusion-base")):
-            out.append(c)
-    return out
-
-
-def _exclusion_proof_commit(st: "State", base: str, own: str,
-                            argvs: list[list[str]]) -> str | None:
-    """`base` with each test file the commands name written as `own` has it
-    (the settled bar's form of running a change's tests on an older tree):
-    a commit in the run's repository, made with git plumbing through a
-    scratch index. `base` itself when the commands name no test file. None
-    when git cannot make it."""
-    repo = _run_repo(st)
-    globs = resolve_test_file_globs(st.repo_root)
-    tests: list[str] = []
-    for argv in argvs:
-        for a in argv[1:]:
-            rel = a[2:] if a.startswith("./") else a
-            if (rel not in tests and not rel.startswith("-")
-                    and _is_test_file(rel, globs)
-                    and _git_bytes(repo, "cat-file", "-e",
-                                   f"{own}:{rel}").returncode == 0):
-                tests.append(rel)
-    if not tests:
-        return base
-    idx = Path(st.run_dir) / ".exclusion-proof-index"
-    env = {**os.environ, "GIT_INDEX_FILE": str(idx),
-           "GIT_AUTHOR_NAME": "leerie", "GIT_AUTHOR_EMAIL": "leerie@localhost",
-           "GIT_COMMITTER_NAME": "leerie",
-           "GIT_COMMITTER_EMAIL": "leerie@localhost"}
-    try:
-        if _git_bytes(repo, "read-tree", base, env=env).returncode != 0:
-            return None
-        for rel in tests:
-            ls = _git_bytes(repo, "ls-tree", own, "--", f":(literal){rel}")
-            parts = ls.stdout.split(None, 3)
-            if ls.returncode != 0 or len(parts) < 3:
-                return None
-            mode, _kind, blob = (x.decode() for x in parts[:3])
-            if _git_bytes(repo, "update-index", "--add", "--cacheinfo",
-                          f"{mode},{blob},{rel}", env=env).returncode != 0:
-                return None
-        tree = _git_bytes(repo, "write-tree", env=env)
-        if tree.returncode != 0:
-            return None
-        commit = _git_bytes(repo, "commit-tree", tree.stdout.decode().strip(),
-                            "-p", base, "-m",
-                            "leerie: exclusion proof tree", env=env)
-        return commit.stdout.decode().strip() if commit.returncode == 0 \
-            else None
-    except subprocess.SubprocessError:
-        return None
-    finally:
-        with contextlib.suppress(OSError):
-            idx.unlink()
-
-
-async def _prove_item_exclusion(st: "State", caps: dict, item_index: int,
-                                argvs: list[list[str]],
-                                trees: list[str]) -> dict:
-    """Prove one `already_on_tree` exclusion by execution (DESIGN §5 *An
-    `already_on_tree` exclusion ... is proven by execution*): its commands
-    must pass on the own start and fail on one of `trees` (written with the
-    own start's test files, `_exclusion_proof_commit`), each run by
-    `_settle_by_execution` — confined, in a committed view, a failure
-    re-checked under B*. Returns `{proven, why, own, earlier[]}`; never
-    raises."""
-    rec: dict = {"proven": False, "why": "", "own": None, "earlier": []}
-    own = _acceptance_own_start(st)
-    if not argvs:
-        rec["why"] = "it names no verify command"
-        return rec
-    if not trees:
-        rec["why"] = ("this is the task's first run, so there is no earlier "
-                      "tree where the item was not done to show the "
-                      "commands detect it")
-        return rec
-    if not own:
-        rec["why"] = "the run's own start is not recorded"
-        return rec
-    spec = {"verify": [{"criterion": f"item {item_index} is on the tree",
-                        "argv": a} for a in argvs]}
-    tag = hashlib.sha256(_exclusion_proof_key(item_index, argvs)
-                         .encode()).hexdigest()[:10]
-
-    async def _run_at(rev: str, label: str) -> dict:
-        wt = _helper_worktree_path(st, f"exclusion-{tag}-{label}")
-        _rmtree_owned(wt)
-        add = await _worktree_add_detached_async(st, wt, rev)
-        if add.returncode != 0:
-            return {"verdict": "none", "why": "the proof tree could not be "
-                    "checked out"}
-        try:
-            return await _settle_by_execution(
-                spec, str(wt), st, caps,
-                sid=f"item-exclusion-{item_index}-{tag}-{label}")
-        finally:
-            subprocess.run(["git", "--git-dir", str(_run_repo(st)),
-                            "worktree", "remove", "--force", str(wt)],
-                           capture_output=True, check=False)
-            _rmtree_owned(wt)
-    try:
-        at_own = await _run_at(own, "own")
-        rec["own"] = at_own.get("verdict")
-        if at_own.get("verdict") != "pass":
-            rec["why"] = ("its commands do not pass on this run's own start "
-                          f"({at_own.get('verdict')}: {at_own.get('why')})")
-            return rec
-        for n, base in enumerate(trees):
-            rev = _exclusion_proof_commit(st, base, own, argvs)
-            if rev is None:
-                rec["earlier"].append({"base": base, "verdict": "none"})
-                continue
-            got = await _run_at(rev, f"e{n}")
-            rec["earlier"].append({"base": base, "verdict": got.get("verdict")})
-            if got.get("verdict") == "fail":
-                rec["proven"] = True
-                rec["why"] = (f"its commands pass on the own start and fail on "
-                              f"{base[:12]}, where the item was not done")
-                return rec
-        verdicts = {e["verdict"] for e in rec["earlier"]}
-        rec["why"] = ("its commands also pass on "
-                      + ", ".join(e["base"][:12] for e in rec["earlier"])
-                      + ", an earlier tree of this task, so they do not "
-                      "detect the item" if verdicts == {"pass"} else
-                      "its commands could not be run on an earlier tree of "
-                      "this task (" + ", ".join(sorted(map(str, verdicts)))
-                      + ")")
-        return rec
-    except Exception as e:
-        rec["why"] = f"the proof could not run ({type(e).__name__})"
-        return rec
-
-
-async def _prove_item_exclusions(result: dict, st: "State", caps: dict,
-                                 items: object, trees: list[str]) -> None:
-    """Prove every `already_on_tree` exclusion `result` makes that has no
-    proof yet, recording each in `state.data["item_exclusion_proofs"]` under
-    `_exclusion_proof_key`. One at a time within a plan; each proof checks
-    out trees of its own, named by its key, so two planners' proofs never
-    share one."""
-    n = len(items) if isinstance(items, list) else 0
-    if not isinstance(result, dict) or not n:
-        return
-    proofs = st.data.setdefault("item_exclusion_proofs", {})
-    for e in result.get("items_not_needed") or []:
-        if not isinstance(e, dict) or e.get("reason_kind") != "already_on_tree":
-            continue
-        i = e.get("item_index")
-        if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < n:
-            continue
-        argvs = _exclusion_verify_argvs(e)
-        key = _exclusion_proof_key(i, argvs)
-        if key in proofs:
-            continue
-        rec = await _prove_item_exclusion(st, caps, i, argvs, trees)
-        proofs[key] = rec
-        st.save()
-        log(f"  item {i}: already_on_tree exclusion "
-            + ("proven" if rec["proven"] else "NOT proven") + f" — {rec['why']}")
+                          if r["status"] != "claimed"]}
 
 
 def _cross_domain_item_gaps(rows: list[dict]) -> list[dict]:
@@ -36381,14 +36114,6 @@ async def phase_plan(task: str, st: State, caps: dict,
     required_items = st.data.get("required_items") or []
     if required_items:
         ctx_dict["required_items"] = _planner_required_items(required_items)
-    # The trees an `already_on_tree` exclusion must fail on (DESIGN §5 *An
-    # `already_on_tree` exclusion ... is proven by execution*). Told to the
-    # planner, so a first run claims instead of excluding what it cannot
-    # prove.
-    exclusion_trees: list[str] = []
-    if required_items and not st.data.get("skip_coverage_check"):
-        exclusion_trees = _item_exclusion_trees(st)
-        ctx_dict["already_on_tree_provable"] = bool(exclusion_trees)
     # Converged-gate dispute residual (DESIGN §8 *A dispute's evidence is
     # planning input, not log noise*): when the no_work_judge disputed an
     # already-satisfied claim, its evidence names exactly what is already
@@ -36473,7 +36198,7 @@ async def phase_plan(task: str, st: State, caps: dict,
 
             async def _invoke() -> dict:
                 st.bump_workers(caps)
-                r = await claude_p(
+                return await claude_p(
                     user_prompt="\n\n".join(up_parts + feedback_slot),
                     system_prompt=sys_prompt,
                     schema_key="planner", cwd=_judgment_cwd(st),
@@ -36483,12 +36208,6 @@ async def phase_plan(task: str, st: State, caps: dict,
                     effort=efforts["planner"],
                     sid=sid,
                     add_dirs=st.data.get("inspect_dirs") or None)
-                # Before the check reads them: each `already_on_tree`
-                # exclusion is proven by execution, or it is no account.
-                if required_items and not st.data.get("skip_coverage_check"):
-                    await _prove_item_exclusions(r, st, caps, required_items,
-                                                 exclusion_trees)
-                return r
 
             async def _on_feedback(fb: str) -> dict:
                 feedback_slot.clear()
@@ -36509,8 +36228,7 @@ async def phase_plan(task: str, st: State, caps: dict,
                 # checking off.
                 if not st.data.get("skip_coverage_check"):
                     issues += _check_item_claims(
-                        r, required_items, len(st.data["categories"]),
-                        st.data.get("item_exclusion_proofs"))
+                        r, required_items, len(st.data["categories"]))
                 return issues
 
             result, gate_warnings = await _run_checked_loop(
@@ -41125,7 +40843,8 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     accounts for every one*). Two parts, with different authority.
 
     **The item accounting gates.** Every required item must be claimed by a
-    subtask or excluded with a typed reason. Each planner's own loop already
+    subtask that can change the tree (an item another category's planner
+    delivers is excluded as `other_domain`). Each planner's own loop already
     held its plan to that (`_check_item_claims`); what no single planner can
     see is an item every planner excluded as `other_domain` and none
     claimed. Those items re-plan the domains that excluded them, scoped by
@@ -41170,8 +40889,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
     replan_round = [0]
 
     async def _invoke_accounting() -> dict:
-        return {"rows": _item_accounting_rows(
-            cur_plans[0], items, st.data.get("item_exclusion_proofs"))}
+        return {"rows": _item_accounting_rows(cur_plans[0], items)}
 
     def _check_accounting(r: dict) -> list[str]:
         return [
@@ -41183,8 +40901,8 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
 
     async def _on_accounting_feedback(fb: str) -> dict:
         replan_round[0] += 1
-        gaps = _cross_domain_item_gaps(_item_accounting_rows(
-            cur_plans[0], items, st.data.get("item_exclusion_proofs")))
+        gaps = _cross_domain_item_gaps(
+            _item_accounting_rows(cur_plans[0], items))
         scope = _replan_domain_closure(cur_plans[0], _item_gap_domains(gaps))
         # Preflighted against the live plans before any spend (DESIGN §13).
         check_replan_affordable(st, caps, "coverage gate", cur_plans[0])
@@ -41196,9 +40914,8 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             "IMPORTANT — every planner excluded these required items as "
             f"another domain's, and no plan claims them:\n{fb}\n"
             "Claim each one in `claims.items` of the subtask that delivers "
-            "it if the work falls in your domain, or list it in "
-            "`items_not_needed` as `already_on_tree` with the code evidence "
-            "that the tree already carries it.")
+            "it if the work falls in your domain; if the tree already "
+            "carries it, that subtask settles as a no-op.")
         retained = [p for p in cur_plans[0] if _plan_domain(p) not in scope]
         fresh = await phase_plan(replan_task, st, caps, models, efforts,
                                  replan_round=replan_round[0], domains=scope)
@@ -41219,23 +40936,22 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
         )
         for w in acct_warnings:
             log(f"  coverage-gate: {w}")
-        record = _item_coverage_record(cur_plans[0], items,
-                                       st.data.get("item_exclusion_proofs"))
+        record = _item_coverage_record(cur_plans[0], items)
         st.data["item_coverage"] = record
         st.save()
         open_rows = [r for r in record["items"]
                      if r["item_index"] in record["uncovered"]]
         if open_rows:
             log(f"  WARNING: coverage-gate: {len(open_rows)} required "
-                "item(s) no planned subtask claims and no typed reason "
-                "excludes — the run proceeds, and the delivery gate reads "
+                "item(s) no planned subtask that can change the tree claims "
+                "— the run proceeds, and the delivery gate reads "
                 "them on the tree that ships:")
             for r in open_rows:
                 log(f"    • item {r['item_index']} ({r['status']}): "
                     f"{r['item'][:180]}")
         else:
             log(f"  coverage-gate: all {len(record['items'])} required "
-                "item(s) claimed or excluded with a typed reason")
+                "item(s) claimed by a subtask that can change the tree")
     plans = cur_plans[0]
 
     sys_prompt = _load_prompt("task_coverage_judge")

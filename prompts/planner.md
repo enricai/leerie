@@ -445,35 +445,24 @@ The orchestrator gives you, in your prompt:
 
    If your CONTEXT includes `required_items` (the task's explicit,
    enumerable requirements, extracted upstream — absent when the task has
-   none), account for every one of them, by the `item_index` each item
-   carries — copy it, never count positions:
-   - **Claim it** on every subtask whose work delivers it: list it in
-     `claims.items` as `{"item_index": 0, "kind": "deliverable"}`.
-     `kind` is `deliverable` when the item is a change the tree must
-     carry, `process` when it constrains only how the work is done (a
-     command to run, something never to do). A `deliverable` claim on a
-     subtask with `verification_only: true` does not count: that subtask
-     writes nothing.
-   - **Or exclude it** in the top-level `items_not_needed`. With
-     `reason_kind: "already_on_tree"` when the tree already carries every
-     part of it: the `reason` gives the code evidence (file:line, and what
-     it does) for each part, and `verify` lists the commands that prove it
-     (`{"argv": [...]}`, the same form as a subtask's `verify`, usually a
-     test that asserts the item). The orchestrator runs them: they must
-     pass on this tree **and fail on an earlier tree of this task where
-     the item was not done**, with their test files as this tree has them.
-     A command that would pass on both trees proves nothing, and the item
-     comes back to you. When CONTEXT's `already_on_tree_provable` is
-     `false` there is no earlier tree (this is the task's first run): do
-     not exclude as `already_on_tree`; claim the item on the subtask that
-     would change the tree for it, and if nothing needs changing the
-     orchestrator settles that subtask as a no-op on its own evidence.
-     With `reason_kind: "other_domain"` when another category's planner
-     delivers it (only when this run has more than one category).
-   An item you neither claim nor exclude is sent back to you by the
-   orchestrator's mechanical check. If an item is still unmet after the
-   run, the orchestrator hands it back to exactly the subtasks that
-   claimed it; an excluded item has no one to hand it to.
+   none), claim every one of them, by the `item_index` each item
+   carries — copy it, never count positions. List it in `claims.items`
+   of every subtask whose work delivers it, as
+   `{"item_index": 0, "kind": "deliverable"}`. `kind` is `deliverable`
+   when the item is a change the tree must carry, `process` when it
+   constrains only how the work is done (a command to run, something
+   never to do). The claimer must be a subtask that can change the tree:
+   a `deliverable` claim on a subtask with `verification_only: true` does
+   not count, because that subtask writes nothing. Claim an item even if
+   you believe the tree already carries it. If it does, the subtask finds
+   nothing to change and the orchestrator settles it as a no-op on its
+   own executed evidence, so give that subtask `verify` commands that test
+   the item. The only exclusion is `items_not_needed` with `reason_kind:
+   "other_domain"`, for an item another category's planner delivers, and
+   only when this run has more than one category. An item you neither
+   claim nor exclude is sent back to you by the orchestrator's mechanical
+   check. If an item is still unmet after the run, the orchestrator hands
+   it back to exactly the subtasks that claimed it.
 
    If your CONTEXT includes `defect_scope` (present only on defect-fix
    tasks where an upstream audit found the defect implicating multiple
@@ -783,9 +772,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
     {"site_id": "D3", "reason": "code evidence that this site needs no change"}
   ],
   "items_not_needed": [
-    {"item_index": 3, "reason_kind": "already_on_tree",
-     "reason": "code evidence that the tree already carries every part of this item",
-     "verify": [{"argv": ["pytest", "tests/test_timeout.py"]}]}
+    {"item_index": 3, "reason_kind": "other_domain",
+     "reason": "which other category's planner delivers this item"}
   ]
 }
 ```
