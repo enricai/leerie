@@ -15057,18 +15057,41 @@ failing case of its own (`(file failed to load)`), as it is in every report
 leerie reads. No prompt, judge or text rule takes part: nothing here asks a
 worker or reads an assertion.
 
-*Where the base form runs.* Beside the final form, its name tagged
-(`a.test.ts` -> `a.leerie-base.test.ts`, `test_a.py` -> `test_a__leerie_base.py`),
-so its relative imports resolve as the file's own and the runner's file shapes
-still select it; a JS file's base snapshot goes with it. It is placed in a
-held-out sandbox over the committed view and never written to a tree (§6 *A
-held-out evaluation runs alone*), so what is measured is still exactly the
-commit plus that one file. A placed path the tree already has is never placed
-over: the file is unmeasured. A test helper, fixture or `conftest.py` is not
-run in base form; it is reached through the cases that use it. Languages whose
-runner cannot hold a second copy beside the first (a Go package declares each
-test function once; Ruby, Rust, the JVM and others alike) are listed under
-"Regression checks the run could not settle", not run.
+*Where the base form runs.* In place of the final form, at its own path, in
+a disposable copy of the tree: the held-out sandbox over the committed view
+(§6 *A held-out evaluation runs alone*), an overlay whose writes vanish with
+it. Every test-case file the check runs is replaced there by its base blob (a
+deleted one is restored), and every test-case file the base did not have is
+removed, so the runner sees the base's test-case files and the tree's code,
+and nothing is written to a tree. A JS file's base snapshot replaces its final
+one, and a final snapshot the base did not have is removed with it. A test
+helper, fixture or `conftest.py` keeps its final form; it is reached through
+the cases that use it.
+
+It was first placed beside the final form under a tagged name
+(`a.test.ts` -> `a.leerie-base.test.ts`). That cannot work wherever a runner
+builds a package or a directory together. A Go package declares each test
+function once. A Ruby class reopened by a second copy merges its methods. A
+JVM or .NET test source set compiles every copy. Those files were listed as
+unchecked. A tagged name is also not the file's own name, and a test that
+reads a fixture or a snapshot named after its own file then finds none.
+Replacing the file works for every runner, so it is the one mechanism. The
+removal is what a runner that compiles a package together needs. Without it,
+a helper the run added to a changed file and used from a new one, or moved
+from a changed file into a new one, no longer compiles beside the base form,
+and every case of the package would fail as if the run had changed it.
+
+The check costs what it cost when the copy sat beside the final form. The
+sandbox lies over the view the measurement already installed. A fresh git
+checkout of the tree with the file replaced would need an install of its own
+for every check, on top of the one B\*'s base side already pays when a case
+fails (at most 38 s for a `web` view in 6f147a0c's re-drive, the log's whole gap
+around it, pnpm from the run's store). A path that is a
+link or a directory, or has a link or a non-directory on its way, in either
+tree, is never written through: the file is unmeasured. A test file whose
+runner gives no report leerie reads (a JVM, .NET, PHP, Swift or Elixir test;
+§9 *Which failures are new*) is listed under "Regression checks the run could
+not settle", not run, as its failing-test-ID diff is.
 
 *Where it runs.* After every acceptance repair round and every delivery re-drive
 group that commits, inside the ratchet's execution route: the files the round
@@ -15158,8 +15181,7 @@ has three such cases, among them the tracked-test replay's weakened
 `tsc --noEmit` e2e file. The final conformer's own rounds are not checked one by
 one: the tree that ships is (a2a825c2's `aea6d06` was a final-conformer
 commit). Integration and subtask rounds are not checked one by one either; the
-shipping tree is. A JUnit report names a placed Python file by its dotted module
-only, so its cases are confirmed as a whole set. A removed export: pytest
+shipping tree is. A removed export: pytest
 fails to load the file (pinned by a test); for vitest and jest it was not
 measured here: a runner that binds a missing named export to `undefined` fails
 the cases that use it rather than the load, and either way they fail.

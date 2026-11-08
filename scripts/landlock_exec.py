@@ -7,6 +7,7 @@ Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                          [--worker-root DIR [--cli]]] [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
+                        [--replace SRC=REL]... [--remove REL]...
                         [--report PATH --report-fd N] [--worker-root DIR]
                         [--refusal-fd N] [--taken-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
@@ -24,6 +25,14 @@ the tree already has its path — a file there, or a link or a non-directory
 on its way — is a fact about the tree, not a refusal. The shim writes that
 reason to N (never to the refusal descriptor), exits 126 and does not run
 CMD.
+
+`--replace SRC=REL` and `--remove REL` (`--sandbox`): an existing test file's
+base form is run in place of its final form (DESIGN §8 *What an existing test
+pins on the base holds on the tree that ships*). `--replace` writes SRC over
+the regular file at REL (or creates it), `--remove` deletes the regular file
+at REL (nothing when there is none); both in the overlay, following no link,
+and a link, a directory or anything but a regular file at REL is a taken path
+like `--place`'s.
 
 Every write-class right (write, truncate, create, remove, rename and link)
 and every read right (read a file, list a directory) is handled: allowed
@@ -994,29 +1003,60 @@ def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE
     return n
 
 
-def _place_one(view_fd: int, src: str, rel: str) -> None:
+def _regular_at(dir_fd: int, name: str) -> bool:
+    """Whether `name` beneath `dir_fd` is a regular file (False: nothing
+    there), not following a link; anything else there is a taken path."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EEXIST, f"{name} is not a regular file")
+    return True
+
+
+def _place_one(view_fd: int, src: str | None, rel: str, *,
+               over: bool = False) -> None:
     """Write `src` at `rel` beneath the directory `view_fd`, resolving every
     component from that descriptor and following no link: each directory
     opened `O_NOFOLLOW | O_DIRECTORY` (made with `mkdirat` when absent), the
     file created `O_EXCL | O_NOFOLLOW`. A link anywhere on the path — the
     tree's own code, which a worker wrote — refuses the placement instead of
-    sending the file through it."""
+    sending the file through it. `over` (`--replace`): a regular file at
+    `rel` is overwritten in place (`O_TRUNC | O_NOFOLLOW`); anything else
+    there is still taken. `src` None (`--remove`): the regular file at `rel`
+    is deleted, and a directory on the way that does not exist means there
+    is nothing to delete."""
     parts = rel.split("/")
     fds: list[int] = []
     cur = view_fd
     try:
         for name in parts[:-1]:
+            if src is not None:
+                try:
+                    os.mkdir(name, 0o755, dir_fd=cur)
+                except FileExistsError:
+                    pass
             try:
-                os.mkdir(name, 0o755, dir_fd=cur)
-            except FileExistsError:
-                pass
-            cur = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                          | os.O_CLOEXEC, dir_fd=cur)
+                cur = os.open(name, os.O_RDONLY | os.O_DIRECTORY
+                              | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cur)
+            except FileNotFoundError:
+                if src is None:
+                    return
+                raise
             fds.append(cur)
+        if src is None:
+            if _regular_at(cur, parts[-1]):
+                os.unlink(parts[-1], dir_fd=cur)
+            return
         with open(src, "rb") as f:
             data = f.read()
-        fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                     | os.O_NOFOLLOW | os.O_CLOEXEC, 0o444, dir_fd=cur)
+        flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        if over and _regular_at(cur, parts[-1]):
+            flags |= os.O_TRUNC
+        else:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(parts[-1], flags, 0o444, dir_fd=cur)
         try:
             os.write(fd, data)
         finally:
@@ -1026,15 +1066,22 @@ def _place_one(view_fd: int, src: str, rel: str) -> None:
             os.close(d)
 
 
-def place(pairs: list[tuple[str, str]], view: str) -> None:
+def place(pairs: list[tuple[str, str]], view: str, *,
+          over: list[tuple[str, str]] = (),
+          remove: list[str] = ()) -> None:
     """Copy each held-out file into the overlaid view, read-only. Refused
     when a destination is not a plain relative path; `PlacementTaken` when
     the view already has a file there, or a link or a non-directory is on
     its path (`_place_one`): a set is never placed over the tree's own
-    file, nor anywhere but beneath the overlay. Runs after every other
-    mount is read-only."""
+    file, nor anywhere but beneath the overlay. `over` pairs replace a
+    regular file of the tree's (an existing test's base form), `remove`
+    paths delete one; anything but a regular file there is taken. Runs
+    after every other mount is read-only."""
+    todo = ([(src, rel, False) for src, rel in pairs]
+            + [(src, rel, True) for src, rel in over]
+            + [(None, rel, False) for rel in remove])
     bad = []
-    for src, rel in pairs:
+    for _src, rel, _over in todo:
         parts = rel.split("/")
         if (not rel or rel.startswith("/") or ".." in parts or "." in parts
                 or "" in parts):
@@ -1048,9 +1095,9 @@ def place(pairs: list[tuple[str, str]], view: str) -> None:
         raise IsolationError(f"place: open {view}: {e}", e.errno or 0) \
             from None
     try:
-        for src, rel in pairs:
+        for src, rel, over_it in todo:
             try:
-                _place_one(view_fd, src, rel)
+                _place_one(view_fd, src, rel, over=over_it)
             except OSError as e:
                 if e.errno in _TAKEN_ERRNOS:
                     raise PlacementTaken(
@@ -1303,6 +1350,8 @@ def keep_chroot_across_exec() -> None:
 def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             view: str | None = None,
             place_pairs: list[tuple[str, str]] = (),
+            over_pairs: list[tuple[str, str]] = (),
+            remove_paths: list[str] = (),
             sockets: list[str] = (),
             worker_root: str | None = None) -> tuple[int, list[str]]:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
@@ -1338,7 +1387,8 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         assert view is not None
         # After the read-only remount: the view's overlay is the one
         # writable place left on the path the placement resolves.
-        place(list(place_pairs), view)
+        place(list(place_pairs), view, over=list(over_pairs),
+              remove=list(remove_paths))
     # The working directory was resolved before the binds and overlays: it
     # still names the directory beneath them (read-only now, or the
     # overlay's lower layer), so it is resolved again.
@@ -1653,13 +1703,17 @@ def _isolation_failed(e: BaseException) -> int:
 
 def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                 place_pairs: list[tuple[str, str]], report: str | None,
-                report_fd: int | None, worker_root: str | None = None) -> int:
+                report_fd: int | None, worker_root: str | None = None, *,
+                over_pairs: list[tuple[str, str]] = (),
+                remove_paths: list[str] = ()) -> int:
     """`--sandbox`: build it, fork PID 1 of the new PID namespace, forward
     a stop signal to it, and exit as `cmd` did."""
     enter = None
     try:
         _n, view_ro = isolate(rw, ro, sandbox=True, view=view,
                               place_pairs=place_pairs,
+                              over_pairs=over_pairs,
+                              remove_paths=remove_paths,
                               worker_root=worker_root)
         if worker_root is not None:
             ro = ro + view_ro
@@ -1773,11 +1827,13 @@ def _parse(argv: list[str]) -> dict | str:
     if "--" not in argv:
         return ("usage: landlock_exec.py [--isolate [--egress SOCK] "
                 "[--forward PORT=SOCK]... | --sandbox --view TREE "
-                "[--place SRC=REL]... [--report PATH --report-fd N]] "
+                "[--place SRC=REL]... [--replace SRC=REL]... [--remove REL]... "
+                "[--report PATH --report-fd N]] "
                 "[--rw PATH]... [--ro PATH]... -- CMD")
     sep = argv.index("--")
     o: dict = {"rw": [], "ro": [], "isolate": False, "sandbox": False,
-               "view": None, "place": [], "report": None,
+               "view": None, "place": [], "replace": [], "remove": [],
+               "report": None,
                "report_fd": None, "egress": None, "forward": [],
                "worker_root": None, "cli": False, "refusal_fd": None,
                "taken_fd": None,
@@ -1790,7 +1846,8 @@ def _parse(argv: list[str]) -> dict | str:
             o[k[2:]] = True
             i += 1
             continue
-        if k not in ("--rw", "--ro", "--view", "--place", "--report",
+        if k not in ("--rw", "--ro", "--view", "--place", "--replace",
+                     "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd") \
                 or i + 1 >= len(opts):
@@ -1798,11 +1855,15 @@ def _parse(argv: list[str]) -> dict | str:
         v = opts[i + 1]
         if k in ("--rw", "--ro"):
             o[k[2:]].append(v)
-        elif k == "--place":
+        elif k in ("--place", "--replace"):
             src, eq, rel = v.partition("=")
             if not eq or not src or not rel:
-                return f"landlock_exec.py: bad --place {v!r}"
-            o["place"].append((src, rel))
+                return f"landlock_exec.py: bad {k} {v!r}"
+            o[k[2:]].append((src, rel))
+        elif k == "--remove":
+            if not v:
+                return f"landlock_exec.py: bad --remove {v!r}"
+            o["remove"].append(v)
         elif k == "--egress":
             if not os.path.isabs(v):
                 return f"landlock_exec.py: bad --egress {v!r}"
@@ -1834,11 +1895,12 @@ def _parse(argv: list[str]) -> dict | str:
         return "landlock_exec.py: --isolate and --sandbox are exclusive"
     if o["sandbox"] and not o["view"]:
         return "landlock_exec.py: --sandbox needs --view"
-    if not o["sandbox"] and (o["view"] or o["place"] or o["report"]
+    if not o["sandbox"] and (o["view"] or o["place"] or o["replace"]
+                             or o["remove"] or o["report"]
                              or o["report_fd"] is not None
                              or o["taken_fd"] is not None):
-        return ("landlock_exec.py: --view, --place, --report and --taken-fd "
-                "need --sandbox")
+        return ("landlock_exec.py: --view, --place, --replace, --remove, "
+                "--report and --taken-fd need --sandbox")
     if not o["isolate"] and (o["egress"] or o["forward"]):
         return "landlock_exec.py: --egress and --forward need --isolate"
     if (o["report"] is None) != (o["report_fd"] is None):
@@ -1877,7 +1939,8 @@ def main(argv: list[str]) -> int:
     wr = o["worker_root"]
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
-                           o["report_fd"], wr)
+                           o["report_fd"], wr, over_pairs=o["replace"],
+                           remove_paths=o["remove"])
     relays: list[tuple[socket.socket, str]] = []
     enter = None
     if o["isolate"]:

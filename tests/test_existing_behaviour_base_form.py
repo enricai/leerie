@@ -6,7 +6,9 @@ Run a79384a4 ended `done` with a PR that undid an earlier merged fix: its
 acceptance repair round 2 changed the code and deleted the two existing cases
 that pinned the fix. The test-ID diff and B* look for tests that newly fail,
 and a deleted case never runs. So every test-case file the base had and a
-tree modified or deleted is run in its BASE form against that tree.
+tree modified or deleted is run in its BASE form against that tree, in place
+of its final form (`tests/test_base_form_in_place.py` has what the
+replacement itself must do).
 
 Every test here runs the real check over a real git repository and a real
 pytest, confined as a measurement is (the held-out sandbox through the
@@ -132,8 +134,9 @@ def test_a_deleted_case_is_run_from_the_base_and_fails(leerie, tmp_path):
     (row,) = rec["changed"]
     assert row["file"] == "tests/test_cases.py"
     assert "test_spends_the_whole_budget" in row["id"]
-    # Named in the file's own name, not the placed one.
-    assert "leerie_base" not in row["id"]
+    # Run under its own name: the ID is the file's own.
+    assert row["id"].startswith("tests/test_cases.py") or (
+        "tests.test_cases" in row["id"])
     assert "test_kept" not in str(rec["changed"])
 
 
@@ -250,16 +253,19 @@ def test_an_unchanged_behaviour_leaves_the_run_done(leerie, tmp_path):
 
 def test_a_check_that_could_not_run_is_unmeasured_never_a_pass(
         leerie, tmp_path):
-    """The base form's place is taken by a file the tree has: it is never
-    placed over it, and the file is unmeasured, not passing."""
+    """The file's path is a link in the tree: the base form is never written
+    through it, and the file is unmeasured, not passing."""
     w = World(leerie, tmp_path)
     w.commit({"lib.py": LIB.replace("return 5", "return 2"),
-              "tests/test_gone.py": None,
-              "tests/test_gone__leerie_base.py": "X = 1\n"})
+              "tests/test_gone.py": None})
+    (w.staging / "tests" / "test_gone.py").symlink_to("test_append.py")
+    _git(w.staging, "add", "-A")
+    _git(w.staging, "commit", "-qm", "a link where the test was")
     asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps))
     rec = w.st.data["existing_behaviour"]
     assert rec["unmeasured"] == ["tests/test_gone.py"]
-    assert rec["unmeasured_reason"] == "the base form's path is in use"
+    assert rec["unmeasured_reason"] == ("the base form's path is a link or "
+                                        "not a file")
     reasons = leerie._unmeasured_on_shipping_tree(w.st)
     assert any("gave no verdict in their base form" in r
                and "tests/test_gone.py" in r for r in reasons)
@@ -340,46 +346,37 @@ def test_a_repair_that_deletes_the_tests_it_disagrees_with_is_rolled_back(
 
 # --- paths -----------------------------------------------------------------------
 
-@pytest.mark.parametrize("rel,placed", [
-    ("src/a.test.ts", "src/a.leerie-base.test.ts"),
-    ("src/flow-runner.post-click-settle.test.ts",
-     "src/flow-runner.post-click-settle.leerie-base.test.ts"),
-    ("a.spec.tsx", "a.leerie-base.spec.tsx"),
-    ("tests/test_a.py", "tests/test_a__leerie_base.py"),
-    ("pkg/a_test.py", "pkg/a__leerie_base_test.py"),
-    ("src/a.test-helper.ts", None),
-    ("tests/conftest.py", None),
-    ("pkg/a_test.go", None),
+@pytest.mark.parametrize("rel,case", [
+    ("src/a.test.ts", True), ("a.spec.tsx", True),
+    ("tests/test_a.py", True), ("pkg/a_test.py", True),
+    ("pkg/a_test.go", True), ("spec/models/a_spec.rb", True),
+    ("test/a_test.rb", True), ("tests/api.rs", True),
+    ("src/a.test-helper.ts", False), ("tests/conftest.py", False),
+    ("tests/helpers.py", False), ("src/__snapshots__/a.test.ts.snap", False),
+    ("tests/fixtures/x.json", False), ("tests/common/mod.rs", False),
 ])
-def test_where_a_base_form_is_placed(leerie, rel, placed):
-    assert leerie._base_form_path(rel) == placed
+def test_what_is_a_test_case_file(leerie, rel, case):
+    assert leerie._base_form_case(rel) is case
 
 
-def test_a_junit_id_reads_as_the_original_file(leerie):
-    sib, rel = "tests/test_a__leerie_base.py", "tests/test_a.py"
-    assert leerie._base_form_id(
-        "tests.test_a__leerie_base :: tests.test_a__leerie_base.test_x",
-        sib, rel) == "tests.test_a :: tests.test_a.test_x"
-    assert leerie._base_form_id(
-        "src/a.leerie-base.test.ts :: d c", "src/a.leerie-base.test.ts",
-        "src/a.test.ts") == "src/a.test.ts :: d c"
-
-
-def test_a_language_that_cannot_hold_two_copies_is_listed_not_run(
-        leerie, tmp_path):
+def test_a_runner_with_no_report_is_listed_not_run(leerie, tmp_path):
+    """Go, Ruby and Rust cases run in base form; a JVM test, whose runner
+    gives no report leerie reads, is listed."""
     repo = tmp_path / "r"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "t@x")
     _git(repo, "config", "user.name", "t")
     for rel in ("pkg/a_test.go", "src/a.test.ts", "tests/fixtures/x.json",
-                "src/b.test.ts"):
+                "src/b.test.ts", "spec/a_spec.rb",
+                "src/test/java/x/ATest.java"):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text("1\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "b")
     base = _git(repo, "rev-parse", "HEAD")
-    for rel in ("pkg/a_test.go", "src/a.test.ts", "tests/fixtures/x.json"):
+    for rel in ("pkg/a_test.go", "src/a.test.ts", "tests/fixtures/x.json",
+                "spec/a_spec.rb", "src/test/java/x/ATest.java"):
         (repo / rel).write_text("2\n")
     (repo / "src" / "b.test.ts").unlink()
     (repo / "src" / "new.test.ts").write_text("1\n")
@@ -387,8 +384,9 @@ def test_a_language_that_cannot_hold_two_copies_is_listed_not_run(
     _git(repo, "commit", "-qm", "h")
     files, unsupported = leerie._base_form_files(repo, base, "HEAD")
     # Added files have no base; a fixture is no case.
-    assert files == ["src/a.test.ts", "src/b.test.ts"]
-    assert unsupported == ["pkg/a_test.go"]
+    assert files == ["pkg/a_test.go", "spec/a_spec.rb", "src/a.test.ts",
+                     "src/b.test.ts"]
+    assert unsupported == ["src/test/java/x/ATest.java"]
 
 
 # --- the delivery re-drive's group ------------------------------------------------

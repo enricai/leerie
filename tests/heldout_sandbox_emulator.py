@@ -3,13 +3,16 @@ build one (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
 with it (I3)*; `tests/conftest.py::_emulated_heldout_sandbox`).
 
     heldout_sandbox_emulator.py --view V [--place SRC=REL]...
+        [--replace SRC=REL]... [--remove REL]...
         [--report PATH --report-fd N] [--taken-fd N] -- INNER...
 
 It keeps the sandbox's contract with leerie, not its isolation: each placed
 file is copied to `V/REL` for the run (not placed, exit 126, the reason on
 the taken descriptor, when the view already has one or a link or a
 non-directory is on its path; refused, exit 126, for a path that is not
-plain), INNER (the real
+plain), each `--replace` file written over the view's regular file there
+and each `--remove` file taken away (both kept aside and put back after; a
+link or anything but a regular file there is taken), INNER (the real
 shim, without `--sandbox`) runs, the report is copied to descriptor N from
 offset 0 and the copy truncated, and then the placed files, the directories
 made for them and the report are removed — so what leerie reads comes back
@@ -29,6 +32,8 @@ def main(argv: list[str]) -> int:
     opts, inner = argv[:sep], argv[sep + 1:]
     view = None
     place: list[tuple[str, str]] = []
+    over: list[tuple[str, str]] = []
+    remove: list[str] = []
     report = None
     report_fd = None
     taken_fd = None
@@ -40,6 +45,11 @@ def main(argv: list[str]) -> int:
         elif k == "--place":
             src, rel = v.split("=", 1)
             place.append((src, rel))
+        elif k == "--replace":
+            src, rel = v.split("=", 1)
+            over.append((src, rel))
+        elif k == "--remove":
+            remove.append(v)
         elif k == "--report":
             report = Path(v)
         elif k == "--report-fd":
@@ -61,15 +71,22 @@ def main(argv: list[str]) -> int:
                 return True
         return False
 
-    bad = [rel for _src, rel in place
+    every = [rel for _src, rel in place + over] + remove
+    bad = [rel for rel in every
            if rel.startswith("/") or ".." in Path(rel).parts]
     if bad:
         print("leerie: cannot isolate the command, so it does not run: "
               f"place: the view cannot hold {', '.join(bad)}",
               file=sys.stderr)
         return 126
-    taken = [rel for _src, rel in place
-             if _blocked(rel) or os.path.lexists(view / rel)]
+    def _not_regular(rel: str) -> bool:
+        p = view / rel
+        return p.is_symlink() or (os.path.lexists(p) and not p.is_file())
+
+    taken = ([rel for _src, rel in place
+              if _blocked(rel) or os.path.lexists(view / rel)]
+             + [rel for rel in [r for _s, r in over] + remove
+                if _blocked(rel) or _not_regular(rel)])
     if taken:
         msg = ("leerie: the held-out file is not placed, so the command "
                f"does not run: place: a set path is taken: "
@@ -80,8 +97,16 @@ def main(argv: list[str]) -> int:
         return 126
     made_files: list[Path] = []
     made_dirs: list[Path] = []
+    # The view's own files a replacement or removal took away, put back
+    # after the run: (path, its bytes, its mode).
+    kept: list[tuple[Path, bytes, int]] = []
     try:
-        for src, rel in place:
+        for rel in [r for _s, r in over] + remove:
+            p = view / rel
+            if p.is_file():
+                kept.append((p, p.read_bytes(), p.stat().st_mode))
+                p.unlink()
+        for src, rel in place + over:
             dst = view / rel
             missing = []
             d = dst.parent
@@ -113,6 +138,10 @@ def main(argv: list[str]) -> int:
                 pass
         for d in reversed(made_dirs):
             shutil.rmtree(d, ignore_errors=True)
+        for p, data, mode in kept:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            os.chmod(p, mode)
 
 
 if __name__ == "__main__":

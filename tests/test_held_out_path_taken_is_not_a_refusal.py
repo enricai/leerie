@@ -108,7 +108,7 @@ def test_an_environment_failure_while_placing_is_still_a_refusal(
     m = _shim()
     view = _tree(tmp_path, "dir")
 
-    def _full(view_fd, src, rel):
+    def _full(view_fd, src, rel, **_kw):
         raise OSError(errno.ENOSPC, "No space left on device")
     monkeypatch.setattr(m, "_place_one", _full)
     with pytest.raises(m.IsolationError):
@@ -126,7 +126,7 @@ def test_the_sandbox_reports_a_taken_path_on_its_own_descriptor(
     held = tmp_path / "acc.test.js"
     held.write_text("x\n")
 
-    def _isolate(rw, ro, *, sandbox, view, place_pairs, worker_root):
+    def _isolate(rw, ro, *, sandbox, view, place_pairs, worker_root, **_kw):
         m.place(list(place_pairs), view)
         return 0, []
     monkeypatch.setattr(m, "isolate", _isolate)
