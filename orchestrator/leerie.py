@@ -63850,7 +63850,8 @@ def _base_form_writable(repo: str | Path, rev: str, rel: str) -> bool:
     ways = {"/".join(parts[:i]) for i in range(1, len(parts))}
     # A pathspec naming a directory lists what is in it, so a directory on
     # the way is never a row of its own; one that is not a directory is.
-    out = _redrive_git(repo, "ls-tree", "-z", rev, "--", *sorted(ways), rel)
+    out = _redrive_git(repo, "--literal-pathspecs", "ls-tree", "-z", rev,
+                       "--", *sorted(ways), rel)
     for row in out.split("\0"):
         meta, _tab, path = row.partition("\t")
         if path == rel and meta.split(" ", 1)[0] not in ("100644", "100755"):
