@@ -5489,7 +5489,10 @@ B\* — never the probe's text, its case title, or the sample's prose — and
 no fixer's grant reaches `acceptance/`, where saved probes are kept. That
 evidence names no failure a fixer can run, so it is never handed to one:
 an item unmet on it alone is not re-driven, and the span goes to the
-outcome and the PR instead (§8 *Delivery re-drive* rule 4).
+outcome and the PR instead (§8 *Delivery re-drive* rule 4). Once the run
+has ended, and only then, the probe itself goes to the PR and the run's
+report as well (§6 *What is still unmet when the run ends is shown as
+tests the reader can run*): no worker is steered by anything after that.
 
 **Residual.** The verdict itself (which files of which set failed), which
 is the evaluation's purpose; and its duration, which a later worker can
@@ -7463,12 +7466,16 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most seven short lists, each under its own heading, each
+recorded into at most nine short lists, each under its own heading, each
 present only when it has an entry:
 
 - `## Unconverged` — why the PR is a draft: the outcome decider's reasons
   (§6 *The run outcome is decided once*) and every `unconverged` subtask
   with its own reason.
+- `## Still failing when the run ended` — every required item unmet on a
+  confirmed falsifier probe and every held-out case still failing on the
+  tree that ships, each as a test the reader can run (below, *What is
+  still unmet when the run ends is shown as tests the reader can run*).
 - `## Needs human verification` — one checkbox list, grouped by the
   resource a human must supply, and only entries that carry a typed
   external resource: the task's required items the classifier typed
@@ -7505,6 +7512,77 @@ present only when it has an entry:
 - `## Advisory (not verified by this run)` — the whole-PR review's verified
   findings, the contract-literal flags and the site-token hits (§8, §9),
   labelled advisory because nothing waited on them.
+
+*What is still unmet when the run ends is shown as tests the reader can
+run.* The invariant: a run that ends with something unmet shows the person
+exactly what is unmet, in a form they can run. Barnacle 79c8fbe7 (PR #708)
+ended `unconverged` with item 8 "unmet on a confirmed falsifier probe …
+which fails under B\*", and the PR showed nothing more: the probe, which
+asserted that the step `completed` and that the right anchor showed the
+option, stayed in the run directory, while the PR's own new test ran the
+same step with `.catch(() => "failed")` and read as a fix. 879de601
+(item 8) and b24806a1 (item 13) did the same. The probe was the clearest
+statement of what was still wrong, and the held-out cases still failing at
+the end were never shown either, only counted.
+
+During the run both are held out (I3): no fixer may see them, and nothing a
+held-out evaluation produces reaches one (§8 *Nothing a held-out
+evaluation produces reaches a fixer*). That reason ends with the run. After
+the outcome is decided nothing of the run is steered by a verdict any more:
+the `pr_writer` composes from a payload that does not carry this (the
+section is appended to its body), and the rebaser resolves conflicts, not
+verdicts. And no later run is weakened, checked consumer by consumer: sets
+are written fresh at each run's own start and never carried forward (§8
+*Held-out acceptance tests*); the settled bar is recorded only by a `done`
+run, which has nothing unmet to show; the prior residual and the dispute
+bound read named fields of the earlier run's state (the shown sets' case
+names, counts, the dispute record), never the PR, `pr_end_state`, this
+record or its files.
+
+So `phase_finalize`, after `_decide_outcome` and never earlier, records
+`unmet_evidence` in code, with no worker summarising:
+
+- for each item in `delivery_gate.unmet_final` that the falsifier made
+  unmet, from its confirmed sample: the item's text, the probe's path and
+  case, its failing assertion (the line the runner's failure names in the
+  probe, else the sample's `assertion_quote`, which code already found in
+  the case), the B\* verdict, and the runner's failure message from the
+  confirm runs;
+- for each held-out set in `acceptance.gate.final` that `_decide_outcome`
+  counts as work, each failing file with work: its failing case IDs (the
+  counted ones when the scope judge bounded the set), each with the
+  runner's message and the line its stack names in the file, both recorded
+  by the evaluation itself, and the B\* basis of the file's verdict (a held
+  case failing again, every B\* rerun failing, failing on every rerun the
+  budget allowed, or failing only with resource signatures).
+
+Every file — the probe, and each such set's defect, control and support
+files — is copied whole, under its repository path, to
+`<run-dir>/unmet-evidence/` (`item-<i>/`, `set-<k>/`), so a file can be
+dropped into a checkout of the branch and run with the repository's own
+scoped command, which the section names when it can render one. The
+section shows each file's source bounded mechanically: a window of lines
+around the failing line, a number of cases per file, and a character
+budget for the whole section, past which files and cases are counted, not
+shown, with the directory's operator path (`_operator_path`). The same
+text goes to the run's final log and to `run.json` (`unmet_evidence`,
+the text and the directory). It renders on every composition path,
+since the record is state and `pr_end_state` carries it to the launcher's
+fallback, and its heading is code-owned, so a `pr_writer` copy is
+stripped and cannot stand in for it.
+
+A run with no PR can end with something unmet too: at the dispute bound
+(§8 *No work is declared on executed evidence, and a dispute is
+bounded*) a run ends `no_work` while held-out sets still fail on HEAD
+(barnacle 4777d790: five of five). The person still has to see what was
+left failing to decide whether the tests or the code are wrong, so that
+exit records the same evidence from the same mechanical record, with the
+same bounds, from the verdict it ended on, once it has decided to end and
+before `_finish_no_work_run` writes `finished_at`: in the final log and
+`run.json`, with the directory. When that verdict was known without a run
+(HEAD is the commit the sets were validated on, the run's own start), its
+messages and lines are the validation's own (`base_failure_messages`),
+taken on that same commit.
 
 *Only a typed external resource reaches "Needs human verification".* The
 section answers one question — what must a human bring that the run could
@@ -12067,7 +12145,9 @@ would be a new infinite loop. So a dispute is raised once per task (twice
 when the first goes unacted, below): when the previous same-task run
 already disputed on acceptance evidence, a
 still-failing set ends the run as no work with a loud warning and the
-residual recorded. The cost of a wrong dispute is bounded to one extra run
+residual recorded, and the failing cases are shown, as tests the reader
+can run, in the run's final log and `run.json` (§6 *What is still unmet
+when the run ends is shown as tests the reader can run*). The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
 With no valid sets the judge's confirmation stands, as before — except
 when every set written was discarded because its defect cases all pass on
@@ -13140,8 +13220,10 @@ unreproducible}`). So is an item rule 4 does not drive, with reason
 `unreproducible` and the item words its probe tested (`probed`); the
 outcome's reasons say for it that a confirmed falsifier probe of those
 words fails under B\* and that the probe is held-out content no fixer
-could see, so a reader knows why no worker was handed it. It is
-never dropped: it stays unmet, so the run is `unconverged`; the outcome's
+could see, so a reader knows why no worker was handed it; once the
+run has ended the PR shows the probe itself, its case, failing assertion
+and source (§6 *What is still unmet when the run ends is shown as tests
+the reader can run*). It is never dropped: it stays unmet, so the run is `unconverged`; the outcome's
 reasons name it; and the next run on the task is handed it in its
 residual. Measured on barnacle a192d275 (leerie 0.44.3): the falsifier
 confirmed an item unmet whose only claimer, feat-001, had settled

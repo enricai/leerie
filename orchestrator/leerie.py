@@ -921,6 +921,11 @@ STATE_FIELDS = (
     # outcome / outcome_reasons: the run's single verdict, written only by
     # _decide_outcome (DESIGN §6 *The run outcome is decided once*).
     "outcome", "outcome_reasons",
+    # unmet_evidence: what was still unmet when the run ended, as the tests
+    # that show it — written only once the run has ended
+    # (`_record_unmet_evidence`; DESIGN §6 *What is still unmet when the run
+    # ends is shown as tests the reader can run*).
+    "unmet_evidence",
     # Shared re-drive budget (DESIGN §13): the persisted per-subtask counter,
     # the run-level wall time charged against `redrive_budget_sec`, and the
     # record of every subtask settled `unconverged`.
@@ -7098,9 +7103,11 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
 # dump's heading: still stripped, because a pr_writer echoing an old PR body
 # or template may emit it.
 _RISK_SECTION_HEADING = "## ⚠ Residual risks"
+_UNMET_HEADING = "## Still failing when the run ended"
 _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
+    _UNMET_HEADING,
     "## Needs human verification",
     "## Not verified by this run",
     "## Untested after re-drive",
@@ -7118,6 +7125,20 @@ _PR_LINES_SHOWN = 20
 # Changed-test entries (one removed or added assertion or case, a deleted
 # file, a skip count) listed under "Existing tests changed by this run".
 _PR_TRACKED_TEST_SHOWN = 60
+# What is still unmet when the run ends (DESIGN §6 *What is still unmet when
+# the run ends is shown as tests the reader can run*): the run-dir directory
+# every file is copied to whole, and the bounds of what the PR shows of them.
+UNMET_EVIDENCE_DIRNAME = "unmet-evidence"
+# Source lines shown per file, around its first failing line.
+_UNMET_SOURCE_LINES = 60
+# Characters shown of one source line.
+_UNMET_LINE_MAX = 240
+# Cases shown per file; the rest are counted.
+_UNMET_CASES_SHOWN = 10
+# Characters kept of one runner failure message.
+_UNMET_MESSAGE_MAX = 600
+# The whole section's text; past it, files and cases are counted, not shown.
+_UNMET_SECTION_MAX = 30000
 
 
 def _strip_worker_risk_sections(body: str) -> tuple[str, bool]:
@@ -7529,12 +7550,136 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
     return out
 
 
+def _evidence_line(message: object, rel: str) -> int | None:
+    """The line of `rel` a runner's failure message names — the first
+    `<rel>:<N>` in it, a stack frame or a `file:line:` prefix, fixed runner
+    output (DESIGN §12) — or None when it names none."""
+    text = str(message or "")
+    if not rel or not text:
+        return None
+    m = re.search(r"(?:^|[\s/(\"'])" + re.escape(rel) + r":(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+_UNMET_BSTAR = {
+    "falsifier": "fails under B* on the final tree: every confirm rerun "
+                 "failed",
+    "held_case": "fails: a case that failed at the run's own start failed "
+                 "again on the final tree",
+    "bstar": "fails under B* on the final tree: every confirm rerun failed",
+    "budget_short": "fails on every rerun the confirm budget allowed",
+    "intermittent": "fails, but only with resource signatures "
+                    "(intermittent)",
+    "unconfirmed": "failed once on the final tree (not confirmed)",
+    "residual": "failed on the last tree the gate measured (the tree that "
+                "ships left it unmeasured)",
+    "validated": "fails: it failed when the set was validated on this very "
+                 "commit, the run's own start",
+}
+
+
+def _unmet_fence(text: str) -> str:
+    """A code fence longer than any backtick run in `text`, so the text can
+    never close it."""
+    runs = re.findall(r"`+", text)
+    return "`" * max(3, 1 + max((len(r) for r in runs), default=0))
+
+
+def _pr_unmet_evidence_lines(state: dict) -> list[str]:
+    """The `## Still failing when the run ended` lines of a finished run's
+    `unmet_evidence` record (`_record_unmet_evidence`; DESIGN §6 *What is
+    still unmet when the run ends is shown as tests the reader can run*),
+    or [] when there is none. Mechanical: every line comes from the record,
+    and the section stops at `_UNMET_SECTION_MAX` characters, counting what
+    it did not show."""
+    rec = state.get("unmet_evidence") if isinstance(state, dict) else None
+    if not isinstance(rec, dict):
+        return []
+    entries = [e for e in rec.get("entries") or []
+               if isinstance(e, dict) and isinstance(e.get("file"), str)]
+    if not entries:
+        return []
+    where = str(rec.get("dir") or "")
+    head = ["What the run left unmet, as the tests that show it. Each file "
+            "is copied whole"
+            + (f" under {_pr_code(where)}" if where else "")
+            + ", under its path in the repository: put it at that path in a "
+            "checkout of this branch and run it.", ""]
+    blocks: list[list[str]] = []
+    for e in entries:
+        b: list[str] = [f"### {_pr_entry(e.get('label'))}: "
+                        f"{_pr_code(e['file'])}", ""]
+        if e.get("kind") == "falsifier":
+            b += [f"> {_pr_entry(e.get('item'))}", "",
+                  "- Unmet on a confirmed falsifier probe of this required "
+                  "item."]
+        if e.get("artifact"):
+            b.append(f"- Full file: {_pr_code(e['artifact'])}")
+        if e.get("cmd"):
+            b.append(f"- Run: {_pr_code(e['cmd'])}")
+        b.append(f"- B* verdict: "
+                 f"{_UNMET_BSTAR.get(str(e.get('bstar')), _pr_entry(e.get('bstar')) or 'failing')}")
+        cases = [c for c in e.get("cases") or [] if isinstance(c, dict)]
+        for c in cases[:_UNMET_CASES_SHOWN]:
+            b += ["", f"- Case: {_pr_code(c.get('case') or '(the whole file)')}"]
+            if c.get("assertion"):
+                ln = c.get("line")
+                b.append("- Failing assertion"
+                         + (f" (line {ln})" if isinstance(ln, int) else "")
+                         + f": {_pr_code(c['assertion'])}")
+            elif isinstance(c.get("line"), int):
+                b.append(f"- Failing line: {c['line']}")
+            msg = str(c.get("message") or "").strip()
+            if msg:
+                f_ = _unmet_fence(msg)
+                b += ["", "Failure message:", "", f_, msg, f_]
+        if len(cases) > _UNMET_CASES_SHOWN:
+            b += ["", f"({len(cases) - _UNMET_CASES_SHOWN} more failing "
+                  "case(s) of this file not listed here.)"]
+        excerpt = e.get("excerpt")
+        if isinstance(excerpt, list) and excerpt:
+            start = int(e.get("excerpt_start") or 1)
+            marks = {c.get("line") for c in cases}
+            body = "\n".join(
+                f"{'>' if start + k in marks else ' '}{start + k:5} | "
+                f"{str(t)[:_UNMET_LINE_MAX]}"
+                for k, t in enumerate(excerpt))
+            f_ = _unmet_fence(body)
+            total = e.get("lines_total")
+            span = (f"lines {start}–{start + len(excerpt) - 1}"
+                    + (f" of {total}" if isinstance(total, int) else ""))
+            b += ["", f"Source ({span}):", "", f_, body, f_]
+        blocks.append(b)
+    out = list(head)
+    size = sum(len(x) + 1 for x in out)
+    shown = 0
+    for b in blocks:
+        n = sum(len(x) + 1 for x in b) + 1
+        if shown and size + n > _UNMET_SECTION_MAX:
+            break
+        out += [*b, ""]
+        size += n
+        shown += 1
+    rest = entries[shown:]
+    if rest:
+        n_cases = sum(max(1, len(e.get("cases") or [])) for e in rest)
+        out.append(f"({len(rest)} more file(s) with {n_cases} failing "
+                   "case(s) not shown here"
+                   + (f"; every file is in full under {_pr_code(where)}"
+                      if where else "") + ".)")
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to eight headed lists, each
+    rendered by code, from typed state*). Up to nine headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
-    draft), `## Needs human verification` (typed external resources only),
+    draft), `## Still failing when the run ended` (what is unmet, as the
+    tests that show it: `_pr_unmet_evidence_lines`),
+    `## Needs human verification` (typed external resources only),
     `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
     `## Existing tests changed by this run`,
@@ -7584,6 +7729,10 @@ def _format_pr_end_state_section(state: dict) -> str:
         lines.pop()
     if lines:
         sections.append(("## Unconverged", lines))
+
+    lines = _pr_unmet_evidence_lines(state)
+    if lines:
+        sections.append((_UNMET_HEADING, lines))
 
     groups = _pr_needs_human(state, in_pr)
     if groups:
@@ -55922,9 +56071,16 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         asserted_ids: dict[str, list[str]] = {}
         intermittent: dict[str, list[str]] = {}
         discovery: dict | None = None
+        # The runner's last message per failing case of each file, for what
+        # the finished run shows (`_record_unmet_evidence`) and nothing else.
+        case_msgs: dict[str, dict[str, str]] = {}
 
         def _note(rel: str, obs: dict, _s=s_, _seen=seen,
-                  _asserted=asserted, _ids=asserted_ids) -> bool:
+                  _asserted=asserted, _ids=asserted_ids,
+                  _msgs=case_msgs) -> bool:
+            for cid, m in (obs.get("failing_messages") or {}).items():
+                if str(m or "").strip():
+                    _msgs.setdefault(rel, {})[str(cid)] = str(m)
             hit, saw = _acceptance_held_signals(_s, rel, obs)
             if saw:
                 _seen.setdefault(rel, set()).update(saw)
@@ -56095,6 +56251,29 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         if any(rel in case_ids for rel in failing):
             res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
                                      if rel in case_ids}
+        if failing:
+            # What a finished run shows of each failing file (DESIGN §6
+            # *What is still unmet when the run ends is shown as tests the
+            # reader can run*); read by `_record_unmet_evidence` alone.
+            ev: dict[str, dict[str, dict]] = {}
+            for rel in failing:
+                for cid in case_ids.get(rel) or []:
+                    m = (case_msgs.get(rel) or {}).get(cid)
+                    if not m:
+                        continue
+                    one: dict = {"message": m[:_UNMET_MESSAGE_MAX]}
+                    ln = _evidence_line(m, rel)
+                    if ln is not None:
+                        one["line"] = ln
+                    ev.setdefault(rel, {})[cid] = one
+            if ev:
+                res_["failing_case_evidence"] = ev
+            res_["failing_basis"] = {
+                rel: ("intermittent" if rel in intermittent
+                      else "held_case" if rel in asserted
+                      else "budget_short" if rel in budget_short
+                      else "bstar" if confirm else "unconfirmed")
+                for rel in failing}
         if intermittent:
             res_["intermittent_cases"] = intermittent
             log(f"  acceptance {label} set {s_['index']}: held case(s) "
@@ -59266,6 +59445,28 @@ async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,
 _HEAD_ACCEPTANCE_RESULTS: dict[tuple[str, str], list[dict]] = {}
 
 
+def _validated_case_evidence(set_: dict) -> dict:
+    """What a finished run shows of a set's defect files when its verdict on
+    HEAD is the validation's own, taken on that same commit:
+    `failing_case_evidence` from `base_failure_messages` and
+    `failing_basis` `validated` (read by `_record_unmet_evidence` alone)."""
+    msgs = set_.get("base_failure_messages")
+    msgs = msgs if isinstance(msgs, dict) else {}
+    ev: dict[str, dict[str, dict]] = {}
+    for rel, per in msgs.items():
+        for cid, m in (per.items() if isinstance(per, dict) else ()):
+            if not str(m or "").strip():
+                continue
+            one: dict = {"message": str(m)[:_UNMET_MESSAGE_MAX]}
+            ln = _evidence_line(m, str(rel))
+            if ln is not None:
+                one["line"] = ln
+            ev.setdefault(str(rel), {})[str(cid)] = one
+    return {"failing_basis": {rel: "validated" for rel in
+                              set_.get("defect_files") or []},
+            **({"failing_case_evidence": ev} if ev else {})}
+
+
 async def _acceptance_results_on_head(st: "State", caps: dict
                                       ) -> list[dict] | None:
     """Run the valid acceptance sets on HEAD (the planning worktree), or
@@ -59294,7 +59495,8 @@ async def _acceptance_results_on_head(st: "State", caps: dict
                  "failing_files": list(s_.get("defect_files") or []),
                  **({"failing_cases": dict(s_["base_failing_cases"])}
                     if isinstance(s_.get("base_failing_cases"), dict)
-                    else {})}
+                    else {}),
+                 **_validated_case_evidence(s_)}
                 for s_ in sets]
     res = await _evaluate_acceptance_sets(st, caps, tree, sets, "head",
                                           rev=sha or "HEAD")
@@ -59551,6 +59753,10 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
             "no work (the dispute bound). "
             + (f"Failing cases: {'; '.join(cases[:5])}" if cases
                else no_names))
+        # The run ends here: what was left failing, as the tests that show
+        # it (DESIGN §6 *What is still unmet when the run ends is shown as
+        # tests the reader can run*).
+        _record_unmet_evidence(st, res)
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence + " — accepted at the "
                                  "acceptance-dispute bound; residual "
@@ -61191,6 +61397,9 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         fd, src = tempfile.mkstemp(prefix="leerie-probe-",
                                    suffix=Path(rel).suffix)
         os.close(fd)
+        # The runner's last message per failing case, for what the finished
+        # run shows (`_record_unmet_evidence`) and nothing else.
+        msgs: dict[str, str] = {}
         try:
             # Read from the lane, which its falsifier wrote, without
             # following a link it left there.
@@ -61203,6 +61412,10 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                     label=f"falsifier-{label}", log_path=log_path,
                     timeout=min(left, timeout), serial=True, files=[rel],
                     db=True, place=place)
+                if got is not None:
+                    msgs.update({str(k): str(v) for k, v in
+                                 (got.get("messages") or {}).items()
+                                 if str(v or "").strip()})
                 return set(got["ids"]) if got is not None else None
             first = await _run(timeout)
             cid = _falsifier_case_id(first or (),
@@ -61217,6 +61430,11 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             g["fails_under_bstar"] = cid in verdict["confirmed"]
             if not g["fails_under_bstar"]:
                 return out
+            if msgs.get(cid):
+                out["failure_message"] = msgs[cid][:_UNMET_MESSAGE_MAX]
+                ln = _evidence_line(msgs[cid], rel)
+                if ln is not None:
+                    out["failure_line"] = ln
             title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
             facts = await _probe_case_facts_placed(st, confirm_tree, src,
                                                    rel, title)
@@ -72523,6 +72741,217 @@ async def _compose_pr_for_a_push_chosen_after_finalize(
     )
 
 
+def _unmet_copy(st: "State", dst: Path, src_dir: object,
+                rel: str) -> str | None:
+    """Copy `rel` from the saved directory `src_dir` (a held-out set's, a
+    saved probe's) to `dst / rel` beneath the run directory, neither side
+    through a link, and return its text — or None when it cannot be read or
+    written."""
+    if (not rel or not isinstance(src_dir, str) or not src_dir
+            or os.path.isabs(rel) or ".." in Path(rel).parts):
+        return None
+    try:
+        data = _read_beneath(Path(src_dir), Path(src_dir) / rel,
+                             limit=READ_LIMIT_TEXT)
+        _write_beneath(st.run_dir, dst / rel, data)
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _unmet_attach(st: "State", entry: dict, dst: Path,
+                  text: str | None) -> None:
+    """Add to one `unmet_evidence` entry where its file's full copy is, a
+    bounded excerpt of its source around its first failing line, and the
+    repository's own command for it, when one renders."""
+    rel = entry["file"]
+    if text is None:
+        return
+    lines = text.splitlines()
+    entry["artifact"] = _operator_path(dst / rel)
+    entry["lines_total"] = len(lines)
+    marks = [c["line"] for c in entry["cases"]
+             if isinstance(c.get("line"), int) and 1 <= c["line"] <= len(lines)]
+    start = 1
+    if len(lines) > _UNMET_SOURCE_LINES and marks:
+        start = max(1, min(min(marks) - _UNMET_SOURCE_LINES // 3,
+                           len(lines) - _UNMET_SOURCE_LINES + 1))
+    entry["excerpt_start"] = start
+    entry["excerpt"] = [t[:_UNMET_LINE_MAX] for t in
+                        lines[start - 1:start - 1 + _UNMET_SOURCE_LINES]]
+    try:
+        cmd = _acceptance_cmd(st, [rel], None, {rel: str(dst / rel)})
+    except Exception:
+        cmd = None
+    if cmd:
+        entry["cmd"] = cmd
+
+
+def _unmet_case(lines: list[str], case: str | None, line: object,
+                message: object, quote: str = "") -> dict:
+    """One failing case of an `unmet_evidence` entry: its failing assertion
+    is the line the runner's message named, else the first line holding
+    `quote` (a falsifier's `assertion_quote`), else `quote` itself."""
+    ln = line if isinstance(line, int) and 1 <= line <= len(lines) else None
+    q = _scope_norm(quote)
+    if ln is None and q:
+        ln = next((k + 1 for k, t in enumerate(lines)
+                   if q in _scope_norm(t)), None)
+    out: dict = {"case": case}
+    if ln is not None:
+        out["line"] = ln
+        out["assertion"] = lines[ln - 1].strip()[:_UNMET_LINE_MAX]
+    elif q:
+        out["assertion"] = q[:_UNMET_LINE_MAX]
+    msg = str(message or "").strip()
+    if msg:
+        out["message"] = msg[:_UNMET_MESSAGE_MAX]
+    return out
+
+
+def _collect_unmet_evidence(st: "State",
+                            results: list[dict] | None = None
+                            ) -> dict | None:
+    """The `unmet_evidence` record (`_record_unmet_evidence`): every item
+    the falsifier left unmet, with its confirmed probe, and every held-out
+    file still failing with work on the tree that ships, each file copied
+    whole under `<run_dir>/unmet-evidence/`. With `results` (the verdict a
+    no-work exit ended on), only those held-out results: there is no
+    delivery verdict. None when there is nothing."""
+    root = st.run_dir / UNMET_EVIDENCE_DIRNAME
+    _rmtree_owned(root)
+    entries: list[dict] = []
+    gate = st.data.get("delivery_gate") if results is None else None
+    gate = gate if isinstance(gate, dict) else {}
+    rows = {r.get("item_index"): r for r in gate.get("items") or []
+            if isinstance(r, dict)}
+    for u in gate.get("unmet_final") or []:
+        if not isinstance(u, dict) or "falsifier" not in (u.get("by") or []):
+            continue
+        i = u.get("item_index")
+        fi = (rows.get(i) or {}).get("falsifier")
+        samples = [x for x in (fi.get("samples") or [] if isinstance(
+            fi, dict) else []) if isinstance(x, dict) and x.get("confirmed")]
+        s_ = next((x for x in samples
+                   if isinstance(x.get("probe_saved"), dict)),
+                  samples[0] if samples else None)
+        if s_ is None:
+            continue
+        saved = s_.get("probe_saved") or {}
+        rel = str(saved.get("file") or s_.get("probe_path") or "")
+        dst = root / f"item-{i}"
+        text = _unmet_copy(st, dst, saved.get("dir"), rel)
+        entry = {"kind": "falsifier", "item_index": i,
+                 "item": str(u.get("item") or ""), "label": f"Item {i}",
+                 "file": rel, "bstar": "falsifier",
+                 "cases": [_unmet_case(
+                     (text or "").splitlines(), s_.get("case_name"),
+                     s_.get("failure_line"), s_.get("failure_message"),
+                     str(s_.get("assertion_quote") or ""))]}
+        _unmet_attach(st, entry, dst, text)
+        entries.append(entry)
+    acc = st.data.get("acceptance")
+    acc = acc if isinstance(acc, dict) else {}
+    agate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
+    sets = [x for x in acc.get("sets") or [] if isinstance(x, dict)]
+    by_index = {x.get("index"): x for x in sets}
+    ended_on = results is not None
+    results = [r for r in (results if ended_on
+                           else agate.get("final") or []
+                           if isinstance(agate.get("final"), list) else [])
+               if isinstance(r, dict) and r.get("passed") is False
+               and not r.get("unmeasured")]
+    residual = ({} if ended_on else _acceptance_residual_unbroken(
+        agate.get("residual") or {}, sets) or {})
+    if not results and residual.get("sets"):
+        # The tree that ships left every set unmeasured: the residual is the
+        # last measured verdict, as `_decide_outcome` reads it.
+        results = [{"index": k, "passed": False, "residual": True,
+                    "failing_files": list((residual.get("files_by_set")
+                                           or {}).get(str(k)) or []),
+                    "failing_cases": dict((residual.get(
+                        "failing_cases_by_set") or {}).get(str(k)) or {})}
+                   for k in residual["sets"]]
+    for r in results:
+        set_ = by_index.get(r.get("index"))
+        fc = r.get("failing_cases")
+        fc = fc if isinstance(fc, dict) else None
+        if (not isinstance(set_, dict) or not _acceptance_result_has_work(
+                set_, r.get("failing_files") or [], fc)):
+            continue
+        k = r["index"]
+        dst = root / f"set-{k}"
+        texts = {rel: _unmet_copy(st, dst, set_.get("dir"), rel)
+                 for rel in ((set_.get("support_files") or [])
+                             + (set_.get("defect_files") or [])
+                             + (set_.get("control_files") or []))}
+        bounded = _acceptance_counted_files(set_) is not None
+        counted = ((set_.get("scope") or {}).get("counted_cases") or {}
+                   if bounded else {})
+        basis = r.get("failing_basis") or {}
+        for rel in r.get("failing_files") or []:
+            if bounded and not _acceptance_file_has_work(set_, rel, fc):
+                continue
+            ids = [str(c) for c in (fc or {}).get(rel) or []]
+            if bounded and ids:
+                ids = [c for c in ids if c in set(counted.get(rel) or [])]
+            ev = (r.get("failing_case_evidence") or {}).get(rel) or {}
+            text = texts.get(rel)
+            if text is None and rel not in texts:
+                text = _unmet_copy(st, dst, set_.get("dir"), rel)
+            lines = (text or "").splitlines()
+            cases = [_unmet_case(lines,
+                                 c.split(" :: ", 1)[1] if " :: " in c else c,
+                                 (ev.get(c) or {}).get("line"),
+                                 (ev.get(c) or {}).get("message"))
+                     for c in ids] or [_unmet_case(lines, None, None, None)]
+            entry = {"kind": "held_out", "set_index": k,
+                     "label": f"Held-out set {k}", "file": rel,
+                     "cases": cases,
+                     "bstar": ("residual" if r.get("residual")
+                               else basis.get(rel)
+                               or ("intermittent" if rel in (
+                                   r.get("intermittent_cases") or {})
+                                   else "budget_short" if rel in (
+                                       r.get("budget_short_files") or [])
+                                   else "bstar"))}
+            _unmet_attach(st, entry, dst, text)
+            entries.append(entry)
+    if not entries:
+        _rmtree_owned(root)
+        return None
+    return {"dir": _operator_path(root), "entries": entries}
+
+
+def _record_unmet_evidence(st: "State",
+                           results: list[dict] | None = None) -> None:
+    """Record what is still unmet now that the run has ended, as the tests
+    that show it (DESIGN §6 *What is still unmet when the run ends is shown
+    as tests the reader can run*): `state.data["unmet_evidence"]`, rendered
+    by `_pr_unmet_evidence_lines` into the PR and logged here. Called by
+    `phase_finalize` after `_decide_outcome` and nowhere else: during the
+    run the probe and the sets are held out (I3). Mechanical, no worker;
+    fail-open — an error leaves no record and is logged. With `results`,
+    called by the dispute-bound no-work exit as it ends (there is no PR):
+    the held-out verdict it ended on, to the final log and `run.json`."""
+    try:
+        rec = _collect_unmet_evidence(st, results)
+    except Exception as e:
+        log(f"unmet evidence: not recorded ({type(e).__name__}: {e})")
+        rec = None
+    if rec:
+        st.data["unmet_evidence"] = rec
+    else:
+        st.data.pop("unmet_evidence", None)
+    st.save()
+    lines = _pr_unmet_evidence_lines(st.data)
+    if lines and rec:
+        _write_run_json(st.run_dir, unmet_evidence={
+            "dir": rec["dir"], "text": "\n".join(lines)})
+        log(f"still failing when the run ended — every file in full under "
+            f"{rec['dir']}:\n" + "\n".join(lines))
+
+
 async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
                          no_verify: bool,
                          caps: dict | None = None,
@@ -72664,6 +73093,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # decided and read by nothing that decides. Fail-open.
     if base:
         await _store_tracked_test_report(st, base)
+    # Only now, the outcome decided: what is still unmet, as the held-out
+    # tests that show it (DESIGN §6 *What is still unmet when the run ends
+    # is shown as tests the reader can run*).
+    _record_unmet_evidence(st)
     st.data["finished_at"] = now()
     st.save()
     will_push = not no_push

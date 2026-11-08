@@ -2579,9 +2579,12 @@ def _passing(n):
 
 
 def _no_cases(results):
-    """A measured verdict without the runner's per-case IDs (which only
-    the evaluation knows), for comparing with `_failing`/`_passing`."""
-    return [{k: v for k, v in r.items() if k != "failing_cases"}
+    """A measured verdict without the runner's per-case IDs, messages and
+    the basis of each failing file's verdict (which only the evaluation
+    knows), for comparing with `_failing`/`_passing`."""
+    return [{k: v for k, v in r.items()
+             if k not in ("failing_cases", "failing_case_evidence",
+                          "failing_basis")}
             for r in results]
 
 
