@@ -8374,3 +8374,18 @@ later round runs the file. The re-drive case stubs `_ratchet_test_ids` and
 `_redrive_new_failures`, since `RD.World` has no runner: it pins the wiring
 (the controls named, the rollback, the control added), the rest being pinned on
 real runs by the others.
+
+`tests/test_ratchet_ids_behind_a_wrapper_script.py` (DESIGN §9 *Which failures
+are new*) extends the same `Run` with a test command leerie cannot see a runner
+in: a shell script that runs pytest, as `web`'s `pnpm run test` runs
+`./bin/test-with-dedicated-ports.sh` and that runs jest. Five `web` re-drive
+groups on 0.44.3 to 0.45.0 recorded `unmeasured: ["test ids"]` with no
+`redrive-ids0` command in their logs: the ratchet measured IDs only through a
+report run, which returns before running anything when it knows no runner, on
+trees whose whole suite passed every time it ran. Since #329 the ratchet reads
+the axis's own measurement, where a pass is zero failing IDs whatever the
+runner; the file pins that, real wrapper and real pytest, nothing stubbed, and
+pins the converse: a red run behind the script has no report, so the group's
+ID diff is unmeasured, never empty. Falsified by putting back the 0.45 report-run
+read (every case but the premise goes red, the red one because nothing ran) and by making a red run with no
+report read as zero IDs (the red case goes red).
