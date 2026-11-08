@@ -151,15 +151,15 @@ def test_every_store_variable_is_split(leerie, tmp_path):
     lenv: dict[str, str] = {"GOCACHE": "/opt/go-cache"}
     leerie._leerie_stores(lenv, run_dir)
     wenv = leerie._worker_cache_env(lenv, run_dir)
-    leerie_side = run_dir / "stores"
+    leerie_side = run_dir / "worktrees" / ".stores" / "stores"
     for var in leerie._STORE_VARS:
         if var == "GOCACHE":                    # baked into the image
             assert lenv[var] == wenv[var] == "/opt/go-cache"
             continue
         assert Path(lenv[var]).is_relative_to(leerie_side), var
-        assert Path(wenv[var]).is_relative_to(run_dir / "workers"), var
+        assert Path(wenv[var]).is_relative_to(run_dir / "worktrees" / ".stores" / "cache"), var
     # One set per run, every worker's: the grant is that one directory.
-    cache = run_dir / "workers" / "cache"
+    cache = run_dir / "worktrees" / ".stores" / "cache"
     assert Path(wenv["XDG_CACHE_HOME"]).is_relative_to(cache)
     for var in leerie._STORE_VARS:
         if var != "GOCACHE":
@@ -189,7 +189,8 @@ def test_invoke_gives_the_worker_its_own_stores(leerie, tmp_path,
     wenv = captured[0]
     for var in leerie._STORE_VARS:
         assert wenv[var] != env[var], var
-        assert Path(wenv[var]).is_relative_to(tmp_path / "run" / "workers")
+        assert Path(wenv[var]).is_relative_to(
+            tmp_path / "run" / "worktrees" / ".stores" / "cache")
 
 
 _PNPM_VERSIONS = ("10.4.1", "11.21.0")

@@ -241,7 +241,7 @@ def world(leerie, tmp_path, monkeypatch):
     # orchestrator: it must not reach a CLI.
     monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(run_tmp))
     # The stub's log goes where every worker of the run may write.
-    log = st.run_dir / "workers" / "cache" / "stub-env.json"
+    log = st.run_dir / "worktrees" / ".stores" / "cache" / "stub-env.json"
     log.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("STUB_LOG", str(log))
     grants: list = []

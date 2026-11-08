@@ -358,8 +358,8 @@ def test_each_worker_kind_writes_its_sides_cache_set_only(leerie, tmp_path):
     environment `_invoke` gives it follows its grant."""
     run_dir = tmp_path / "state" / "runs" / "r1"
     run_dir.mkdir(parents=True)
-    shared = run_dir / "workers" / leerie.WORKER_CACHE_DIR
-    held = run_dir / "workers" / leerie.HELD_OUT_CACHE_DIR
+    shared = run_dir / "worktrees" / ".stores" / leerie.WORKER_CACHE_DIR
+    held = run_dir / "worktrees" / ".stores" / leerie.HELD_OUT_CACHE_DIR
     assert leerie.HELD_OUT_LOG_WORKERS <= set(leerie.WORKER_TYPES)
     for kind in leerie.WORKER_TYPES:
         g = leerie._worker_grants(

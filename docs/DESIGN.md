@@ -1818,8 +1818,8 @@ and nothing else:
   private*), `<id>` derived from `<run-dir>/workers/<wid>/`;
 - not its caches: those are one set per side of the run, shared by every
   worker of that side and never by leerie's measurements (§6 *The stores a
-  view installs from are leerie's*): `<run-dir>/workers/cache/` for the
-  fixers' side, `<run-dir>/workers/cache-held-out/` for the held-out side
+  view installs from are leerie's*): `<run-dir>/worktrees/.stores/cache/` for the
+  fixers' side, `<run-dir>/worktrees/.stores/cache-held-out/` for the held-out side
   (§8 *Nothing a held-out evaluation produces reaches a fixer*).
 
 `<wid>` is the `sid` of the worker's first call. A call that resumes a
@@ -1869,8 +1869,9 @@ return that was neither: each no-work exit of planning, the template
 dep-capture makes again after finalize removed it, and the rebaser's on
 the host (review round 19 claims H1, exec M1). The same exit removes the
 run's other per-process scratch: the measurement directories
-(`measure/`), the trees' own stores (`tree-stores/`), the run's stores
-(`stores/`) and the ref-less clones' git directories
+(`measure/`), every store the trees install from (`worktrees/.stores/`:
+the trees' own, the run's and the workers' caches) and the ref-less clones'
+git directories
 (`clone-gits/`), which nothing reads once the process is gone (review
 round 19 exec L2). The auto-resume after a rate limit
 replaces the process image (`os.execv`), which runs no exit handlers, so
@@ -2540,8 +2541,8 @@ worker gets the first block, then its kind's.
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
 | leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
-| its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/workers/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/workers/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
-| its tree's own stores | `<run-dir>/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
+| its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/worktrees/.stores/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/worktrees/.stores/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
+| its tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
 | outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
@@ -2553,7 +2554,7 @@ directory is granted only when it lies beneath `<run-dir>/workers/`
 grants nothing. The caches are granted as the one directory its side
 shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
 `MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
-`/opt/go-cache` and the run's stores `<run-dir>/stores/` are never
+`/opt/go-cache` and the run's stores `<run-dir>/worktrees/.stores/stores/` are never
 granted, so no store leerie's own commands install from can be written by
 a worker. The grants are computed after `claude_p` has named
 the worker's own directories, and follow them.
@@ -4112,8 +4113,8 @@ confinement failure stops the run; it is never a result*).
 | `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
 | leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
-| the run's stores | `<run-dir>/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
-| the tree's own stores | `<run-dir>/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
+| the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
+| the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
@@ -4164,7 +4165,7 @@ path they name outside the grant is refused, which is a finding, not a
 grant to widen. A fixed `/tmp/<name>` path is not: every command writes
 its own `/tmp` as it would outside leerie.
 
-**The run's stores and the tree's.** The run's stores (`<run-dir>/stores/`)
+**The run's stores and the tree's.** The run's stores (`<run-dir>/worktrees/.stores/stores/`)
 are written by every command leerie runs in the run and read by no other
 run (*The stores a view installs from are leerie's*). The tree's own stores
 are written by that tree's commands and read by no other tree; they follow
@@ -5010,52 +5011,73 @@ and runs anything (`--isolate`):
 
 **The write grants on one mount are one mount** (*designed 2026-11-08,
 the navegando run a70fb4a6*). The invariant: *a confined install can
-hard-link from its store wherever the filesystem can.* Until 0.48.0 step 4
+hard-link from its store wherever the filesystem can, and nothing of
+leerie's own record is writable to get there.* Through layout 3 step 4
 bound each write grant onto itself, so a tree and the store it installs
-from — `<run-dir>/worktrees/<tree>` and `<run-dir>/stores/` (or
-`<run-dir>/workers/cache/`, or `<run-dir>/tree-stores/<tree>/`) — were two
-mounts of one filesystem, and Linux refuses a hard link between two mounts
-whatever lies beneath them (`do_linkat`'s `EXDEV`). Landlock was not the
-cause: it handles `REFER` and grants it beneath every write grant, and a
-link from the store into the tree under Landlock alone succeeded. Measured
-in the barnacle repository image (rootless, `seccomp=unconfined`, the
-`leerie-container` profile), as the leerie user, inside the confined
-process: `stat -c %d` gave one device (2049) for the store and the view,
-`/proc/self/mountinfo` gave them two mount ids, and `ln <store file>
-<view>/` answered `Invalid cross-device link`; unconfined and under
-Landlock alone it linked. pnpm's import tries a hard link and copies on
-any error, silently: a confined `pnpm install --offline --frozen-lockfile`
-of barnacle's lockfile (pnpm 10.4.1) left 0 of its 36,623 files sharing an
-inode with the store, every one of link count 1; in each of the 23 trees
-of the navegando run that held a `node_modules` (views and worker trees,
-pnpm 10.28.2) the file sampled had link count 1 too. Every manager that links
-from its store copies the same way: pnpm, bun (hard links by default on
-Linux) and uv (`link-mode` hard link by default on Linux, a copy with a
-warning when the link fails); yarn berry links only when a repository opts
-into `nmMode: hardlinks-*`; npm, pip, poetry, bundler and composer copy
-by design, and go and cargo read their stores in place.
+from — `<run-dir>/worktrees/<tree>` and the run's `<run-dir>/stores/` (or
+the workers' `<run-dir>/workers/cache/`, or the tree's own
+`<run-dir>/tree-stores/<tree>/`) — were two mounts of one filesystem, and
+Linux refuses a hard link between two mounts whatever lies beneath them
+(`do_linkat`'s `EXDEV`). Landlock was not the cause: it handles `REFER`
+and grants it beneath every write grant, and a link from the store into
+the tree under Landlock alone succeeded. Measured in the barnacle
+repository image (rootless, `seccomp=unconfined`, the `leerie-container`
+profile), as the leerie user, inside the confined process: `stat -c %d`
+gave one device (2049) for the store and the view, `/proc/self/mountinfo`
+gave them two mount ids, and `ln <store file> <view>/` answered `Invalid
+cross-device link`; unconfined and under Landlock alone it linked. pnpm's
+import tries a hard link and copies on any error, silently: a confined
+`pnpm install --offline --frozen-lockfile` of barnacle's lockfile (pnpm
+10.4.1) left 0 of its 36,623 files sharing an inode with the store, every
+one of link count 1; in each of the 23 trees of the navegando run that
+held a `node_modules` (views and worker trees, pnpm 10.28.2) the file
+sampled had link count 1 too. Every manager that links from its store
+copies the same way: pnpm, bun (hard links by default on Linux) and uv
+(`link-mode` hard link by default on Linux, a copy with a warning when the
+link fails); yarn berry links only when a repository opts into `nmMode:
+hardlinks-*`; npm, pip, poetry, bundler and composer copy by design, and
+go and cargo read their stores in place.
 
-So the grants that lie on one mount are bound together: the deepest
-directory holding them all — for every grant leerie makes in a run, the
-run directory — is bound onto itself once, and everything beneath it that
-no grant covers or leads to is bound onto itself apart, then made
-read-only with every other mount (`bind_grants`, `_shield`). The same
-install, confined so, linked 30,054 of its 31,818 files from the store,
-and a view's `node_modules` cost 58 MB beside the store's 578 MB instead of
-616 MB (barnacle); navegando's lockfile (pnpm 10.28.2, scripts off) 74 MB
-beside a 1,134 MB store instead of 1,189 MB. Nothing about the store
-changes: each is still its run's (*The stores a view installs from are
-leerie's*), and a link joins only a run's own store to a run's own tree.
+One mount for the tree and its store means one writable mount holding
+both, and Landlock cannot refuse `chmod`, `utime` or `setxattr`: whatever
+else lies on that mount has its metadata open to the process. Rooted at
+the run directory, that was `state.json`, the logs and `run.json` — a
+`chmod 000 state.json` would stop the run. So the layout gives the trees
+and their stores a directory that holds nothing else (layout 4): every
+store a tree installs from lives beside the trees, in
+`<run-dir>/worktrees/.stores/` — the run's (`stores/`), each tree's own
+(`tree-stores/<tree>/`) and each side's worker caches (`cache/`,
+`cache-held-out/`) (`_stores_home`). Every grant leerie makes names that
+directory as its link root (`WorkerGrants.link`, the shim's `--link-root`):
+the grants beneath it are bound as one mount rooted there, everything else
+beneath it that no grant covers or leads to — the other trees, the other
+trees' stores — is bound apart and made read-only (`_shield`), and every
+grant outside it (a measurement directory, a worker's own directories, a
+tree repository, notes) is its own mount as before. `state.json`, the
+logs, `run.json`, `claude-config` and every other record of the run stay
+on the read-only mount: a confined process's `chmod`, `touch` and
+`setfattr` on them answer `EROFS`. The same install, confined so, linked
+30,054 of its 31,818 files from the store, and a view's `node_modules` cost
+58 MB beside the store's 578 MB instead of 616 MB (barnacle); navegando's
+lockfile (pnpm 10.28.2, scripts off) 74 MB beside a 1,134 MB store
+instead of 1,189 MB. Nothing about the stores' isolation changes: each is
+still its run's (*The stores a view installs from are leerie's*), and a
+link joins only a run's own store to a run's own tree.
 
-What this gives up, deliberately: the bound directory and those between
-it and a grant are on a writable mount, so their own mode, times and
-extended attributes (`chmod` on `<run-dir>` or `<run-dir>/worktrees`) are
-not refused, nor are those of an entry that appears or is replaced in one
-of them after the process started (a tree made later, a `state.json`
-saved again). Landlock still refuses every read, write, create, remove,
-rename and link there; only the metadata Landlock does not handle is
-open, and only on those paths. The alternative — a mount per grant — is
-a copy of every store for every tree, which filled the host.
+What this still gives up, deliberately: `<run-dir>/worktrees` and
+`<run-dir>/worktrees/.stores` themselves, and a tree or tree's store made
+in them after the process started, are on the writable mount, so their
+mode, times and extended attributes can change; a tree or store that
+existed when the process started is read-only to it. Landlock still
+refuses every read, write, create, remove, rename and link there. A layout
+cannot remove this: a store that every tree links from shares a mount with
+every tree, and a tree made later appears in that mount. What it reaches is
+the metadata of another subtask's tree, never its content and never
+leerie's records. Measured in the barnacle repository image, from a
+confined process with `--link-root <run>/worktrees`: `chmod`, `touch -d`
+and `setxattr` on `state.json`, a log and a tree that existed at its start
+all answered read-only; on a file of a tree made after it started, and on
+`worktrees` itself, all three succeeded.
 
 So `/tmp` and `/dev/shm` are a confined process's own: every worker and
 every repository command reads and writes them as it would outside leerie,
@@ -6682,7 +6704,10 @@ The mechanism:
   `RUN_LAYOUT_VERSION` and never rewritten by a resume. A directory with no
   `run_layout` is an older layout: every directory made before the field
   existed. Any change to what a run directory holds that a later process of
-  the run reads back bumps `RUN_LAYOUT_VERSION`.
+  the run reads back bumps `RUN_LAYOUT_VERSION`. Layout 4 (2026-11-08)
+  moved every store a tree installs from into `worktrees/.stores/` (*The
+  write grants on one mount are one mount*): a layout-3 run directory is
+  finished by the leerie that made it, 0.48.0 or earlier.
 - `resume` and `--phase judge|heal`, the two verbs that spawn workers in an
   existing run directory, compare it as soon as `State` holds the
   directory's lock and its `state.json` is read — before anything else
@@ -8351,10 +8376,10 @@ mount are one mount*). There are three sets, all
 set by the orchestrator through environment variables, with no mount or
 `-e` of their own (*The stores a view installs from are leerie's*, *Which
 stores an install may share*, below), and every one is inside its run's
-directory: the run's own, `<run-dir>/stores/<name>`, for every command
-leerie runs; each run's workers', `<run-dir>/workers/cache/<name>` (the
-held-out side's at `<run-dir>/workers/cache-held-out/<name>`); and each run
-tree's own, `<run-dir>/tree-stores/<tree>/<name>`. The state root is
+directory: the run's own, `<run-dir>/worktrees/.stores/stores/<name>`, for every command
+leerie runs; each run's workers', `<run-dir>/worktrees/.stores/cache/<name>` (the
+held-out side's at `<run-dir>/worktrees/.stores/cache-held-out/<name>`); and each run
+tree's own, `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`. The state root is
 `/leerie-state` locally and `/work/.leerie` on Fly. The host cache mounts
 that used to hold them (pnpm, pip, Go, Cargo, corepack) are gone. Copying
 was not only a disk cost: concurrent installs copying whole trees ran past
@@ -8375,7 +8400,7 @@ cargo, bundler, composer, NuGet (`_STORE_VARS`) — is the run's own, and
 writable by every command leerie runs in that run; one mechanism covers
 every manager, and no manager is configured differently because of it:
 
-- *The run's*, `<run-dir>/stores/<name>`, set on the orchestrator's own
+- *The run's*, `<run-dir>/worktrees/.stores/stores/<name>`, set on the orchestrator's own
   environment once the run directory exists, before anything installs
   (`_leerie_stores`). Every install, build, test and measurement leerie
   runs in the run reads and writes it (the measurement grant names it,
@@ -8385,11 +8410,11 @@ every manager, and no manager is configured differently because of it:
   exit with the trees' stores (*No copy of the credentials outlives its
   run's process*), so a resumed process installs cold again, and a
   finished run keeps no store until it is pruned.
-- *The run's workers'*, `<run-dir>/workers/cache/<name>` with
-  `XDG_CACHE_HOME` at `<run-dir>/workers/cache/xdg`
+- *The run's workers'*, `<run-dir>/worktrees/.stores/cache/<name>` with
+  `XDG_CACHE_HOME` at `<run-dir>/worktrees/.stores/cache/xdg`
   (`_worker_cache_env`, in the worker's spawn), one set per side of the
   run, shared by that side's workers: the held-out side's workers
-  (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/workers/cache-held-out/`,
+  (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/worktrees/.stores/cache-held-out/`,
   which no fixer's grant names (§8 *Nothing a held-out evaluation produces
   reaches a fixer*). Per side rather than per worker, because what a worker
   leaves in a cache can mislead only another worker of its side, while
@@ -8400,7 +8425,7 @@ every manager, and no manager is configured differently because of it:
   engines 22 MB). A worker's configuration and temporary directory stay its
   own: they carry hooks and sessions, a cache carries neither. The set goes
   with the run directory.
-- *Each run tree's own*, `<run-dir>/tree-stores/<tree>/<name>`
+- *Each run tree's own*, `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`
   (`_tree_store_env`): the stores that hold one tree's environment or build
   (*Which stores an install may share*, below).
 
@@ -8467,7 +8492,7 @@ download store and cache is the run's (above). One class is narrower:
 *per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
 environments, pnpm's metadata cache, pip's user base, the .NET CLI home and
 bundler's home (`_TREE_STORE_VARS`) — one set per tree, at
-`<run-dir>/tree-stores/<tree>/<name>`, set for every command leerie runs in
+`<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`, set for every command leerie runs in
 a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
 `_run_streaming`), and emptied whenever a view's tip moves: a replaced
 view's go with it, and a moved view is a new tree to every measurement
@@ -8518,7 +8543,7 @@ manager installs inside the tree (`node_modules`, a `.venv`) the worker
 saw the install; where it installs into a per-tree store it did not.
 Review round 23 exec M1 measured it on a pip repository: leerie's install
 of each falsifier lane put pytest in that lane's user base
-(`<run-dir>/tree-stores/<lane>/pyuser`), the falsifier ran with
+(`<run-dir>/worktrees/.stores/tree-stores/<lane>/pyuser`), the falsifier ran with
 `PYTHONUSERBASE` at its side's cache, and all 6 first samples answered
 "pytest isn't installed" (`could_not_demonstrate`); each re-ask
 improvised a `pip install --target /tmp/…` through egress. The root
@@ -10938,7 +10963,7 @@ classification and planning, layered top-to-bottom by determinism:
    every worker reads it and has it on `PATH`. The rest of the hook's
    environment belongs to its checkout:
    - *pip's user base.* `pip install --user` installs into the checkout's
-     user base (`<run-dir>/tree-stores/<tree>/pyuser`, §6 *Which stores an
+     user base (`<run-dir>/worktrees/.stores/tree-stores/<tree>/pyuser`, §6 *Which stores an
      install may share*), which no worker reads; a worker has its own
      (`_worker_cache_env`). A Python tool goes in with
      `pip install --target ~/.local/bin/.<tool> <tool>` and a launcher
@@ -15896,7 +15921,7 @@ relays, each closed where it relayed:
   code checks is verbatim in the item, and the fact that it fails under
   B\*.
 - *The caches* (review round 21 R2). Every worker's processes wrote one
-  cache set per run, `<run-dir>/workers/cache/` (`XDG_CACHE_HOME`,
+  cache set per run, `<run-dir>/worktrees/.stores/cache/` (`XDG_CACHE_HOME`,
   `GOCACHE`, `CARGO_HOME`, …), the held-out side's included, so whatever
   a held-out-side worker's processes left there a later fixer read: `go
   test` alone keeps a run's compiled test package, string constants
@@ -15904,7 +15929,7 @@ relays, each closed where it relayed:
   harness — a fixer's code — with the probe on disk. The rule is over
   every store a held-out-side worker can write, not only what it returns:
   that side (`HELD_OUT_LOG_WORKERS`) has a cache set of its own,
-  `<run-dir>/workers/cache-held-out/`, granted to it in place of the
+  `<run-dir>/worktrees/.stores/cache-held-out/`, granted to it in place of the
   fixers' and named by no fixer's grant (`_worker_cache_dir`; the
   environment follows the grant, `_granted_cache_dir`). Its cost is one
   cold set per run for that side.

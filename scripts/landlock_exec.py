@@ -4,6 +4,7 @@
 command's processes end with it*).
 
 Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
+                         [--link-root DIR]
                          [--worker-root DIR [--cli]]] [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
@@ -11,6 +12,12 @@ Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                         [--report PATH --report-fd N] [--worker-root DIR]
                         [--refusal-fd N] [--taken-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
+
+`--link-root DIR` (`--isolate`): the write grants beneath DIR are one
+mount rooted at DIR, everything else beneath it read-only, so a hard link
+between two of them works (`bind_grants`). DIR holds only trees and the
+stores they install from (DESIGN §6 *The write grants on one mount are one
+mount*); every other grant is its own mount.
 
 `--refusal-fd N`: every refusal (each exit 126 the shim makes itself, never
 CMD's) also writes its reason to descriptor N, which the shim makes
@@ -61,9 +68,9 @@ ABI 6 the abstract-socket and signal scopes.
 and sees every other mount read-only*; *A confined process has its own
 network*): a user namespace mapping the caller onto itself, mount, IPC and
 network namespaces (loopback only), a root the caller owns, private `/tmp`
-and `/dev/shm`, a new `devpts`, the write grants bound writable (those on
-one mount as one, so a tree links from its store) and every other mount
-read-only. `--egress SOCK` gives the command the outside network
+and `/dev/shm`, a new `devpts`, the write grants bound writable (those
+beneath `--link-root DIR` as one mount, so a tree links from its store) and
+every other mount read-only. `--egress SOCK` gives the command the outside network
 through leerie's egress proxy, listening on the unix socket SOCK: a relay
 in the namespace forwards `127.0.0.1:<port>` to it and the proxy variables
 name it; `--forward PORT=SOCK` relays a fixed loopback port to a socket the
@@ -926,13 +933,6 @@ def _bindable(p: str) -> bool:
     return not (_beneath(p, TMP) or _beneath(p, "/dev"))
 
 
-def _containing_mount(path: str, mounts: list[str]) -> str:
-    """The mount point `path` lies on: the longest of `mounts` it is
-    beneath."""
-    return max((m for m in mounts if _beneath(path, m)), key=len,
-               default="/")
-
-
 def _shield(top: str, grants: list[str]) -> list[str]:
     """Every entry beneath `top` that is no grant, lies beneath none and
     leads to none, bound onto itself (`readonly_mounts` then makes it
@@ -964,35 +964,41 @@ def _shield(top: str, grants: list[str]) -> list[str]:
     return out
 
 
-def bind_grants(rw: list[str]) -> tuple[list[str], list[str]]:
+def bind_grants(rw: list[str], link_root: str | None = None
+                ) -> tuple[list[str], list[str]]:
     """The write grants bound so they stay writable when every other mount
-    is made read-only, those on one mount bound together (DESIGN §6 *Every
-    confined process ... sees every other mount read-only*): the deepest
-    directory holding them all bound onto itself once, and everything
-    beneath it that no grant covers or leads to bound apart (`_shield`)
-    for `readonly_mounts` to make read-only. One mount, because a hard
-    link cannot cross mounts (`EXDEV`) even on one filesystem: bound one
-    by one, a tree and the store it installs from lie on two, and every
-    package manager that links from its store (pnpm, bun, uv) copies
-    instead. Returns `(grants, roots)`: the grants, and the directories
-    bound that are none of them (each kept writable itself, never what is
-    beneath it)."""
-    mounts = [mp for mp, _ in _mountinfo()]
-    groups: dict[str, list[str]] = {}
+    is made read-only (DESIGN §6 *The write grants on one mount are one
+    mount*). Those beneath `link_root` are bound together: `link_root`
+    bound onto itself once, and everything beneath it that no grant covers
+    or leads to bound apart (`_shield`) for `readonly_mounts` to make
+    read-only. One mount, because a hard link cannot cross mounts (`EXDEV`)
+    even on one filesystem: bound one by one, a tree and the store it
+    installs from lie on two, and every package manager that links from its
+    store (pnpm, bun, uv) copies instead. `link_root` is the caller's
+    directory of trees and stores and nothing else; every other grant is
+    bound onto itself apart, as before. Returns `(grants, roots)`: the
+    grants, and `link_root` when it was bound (kept writable itself, never
+    what is beneath it)."""
+    kept: list[str] = []
+    linked: list[str] = []
+    root = os.path.normpath(link_root) if link_root else None
     for p in rw:
         if not _bindable(p) or not os.path.exists(p):
             continue
         p = os.path.normpath(p)
-        groups.setdefault(_containing_mount(p, mounts), []).append(p)
-    kept: list[str] = []
+        if root is not None and p != root and _beneath(p, root):
+            linked.append(p)
+            continue
+        _must(f"bind grant {p}", _mount(p, p, None, MS_BIND | MS_REC))
+        kept.append(p)
     roots: list[str] = []
-    for ps in groups.values():
-        top = os.path.commonpath(ps)
-        _must(f"bind grant {top}", _mount(top, top, None, MS_BIND | MS_REC))
-        if top not in ps:
-            roots.append(top)
-            _shield(top, ps)
-        kept += ps
+    if linked:
+        assert root is not None
+        _must(f"bind grant {root}", _mount(root, root, None,
+                                           MS_BIND | MS_REC))
+        _shield(root, linked)
+        roots.append(root)
+        kept += linked
     return kept, roots
 
 
@@ -1409,6 +1415,7 @@ def keep_chroot_across_exec() -> None:
 
 
 def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
+            link_root: str | None = None,
             view: str | None = None,
             place_pairs: list[tuple[str, str]] = (),
             over_pairs: list[tuple[str, str]] = (),
@@ -1435,7 +1442,7 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         assert view is not None
         kept += overlay_grants(rw, view)
     else:
-        bound, roots = bind_grants(rw)
+        bound, roots = bind_grants(rw, link_root)
         kept += bound
     view_ro: list[str] = []
     private = PRIVATE
@@ -1890,7 +1897,7 @@ def _parse(argv: list[str]) -> dict | str:
     """The shim's options, or a usage error."""
     if "--" not in argv:
         return ("usage: landlock_exec.py [--isolate [--egress SOCK] "
-                "[--forward PORT=SOCK]... | --sandbox --view TREE "
+                "[--forward PORT=SOCK]... [--link-root DIR] | --sandbox --view TREE "
                 "[--place SRC=REL]... [--replace SRC=REL]... [--remove REL]... "
                 "[--report PATH --report-fd N]] "
                 "[--rw PATH]... [--ro PATH]... -- CMD")
@@ -1900,7 +1907,7 @@ def _parse(argv: list[str]) -> dict | str:
                "report": None,
                "report_fd": None, "egress": None, "forward": [],
                "worker_root": None, "cli": False, "refusal_fd": None,
-               "taken_fd": None,
+               "taken_fd": None, "link_root": None,
                "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
@@ -1913,7 +1920,8 @@ def _parse(argv: list[str]) -> dict | str:
         if k not in ("--rw", "--ro", "--view", "--place", "--replace",
                      "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
-                     "--worker-root", "--refusal-fd", "--taken-fd") \
+                     "--worker-root", "--refusal-fd", "--taken-fd",
+                     "--link-root") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
@@ -1938,6 +1946,10 @@ def _parse(argv: list[str]) -> dict | str:
                     or not os.path.isabs(sock)):
                 return f"landlock_exec.py: bad --forward {v!r}"
             o["forward"].append((int(port), sock))
+        elif k == "--link-root":
+            if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
+                return f"landlock_exec.py: bad --link-root {v!r}"
+            o["link_root"] = os.path.normpath(v)
         elif k == "--worker-root":
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --worker-root {v!r}"
@@ -1971,6 +1983,8 @@ def _parse(argv: list[str]) -> dict | str:
         return "landlock_exec.py: --report and --report-fd go together"
     if o["worker_root"] and not (o["isolate"] or o["sandbox"]):
         return "landlock_exec.py: --worker-root needs --isolate or --sandbox"
+    if o["link_root"] and not o["isolate"]:
+        return "landlock_exec.py: --link-root needs --isolate"
     if o["cli"] and not (o["worker_root"] and o["isolate"]):
         return "landlock_exec.py: --cli needs --isolate and --worker-root"
     return o
@@ -2012,7 +2026,8 @@ def main(argv: list[str]) -> int:
                                         else [])
         try:
             _n, view_ro = isolate(rw, ro, sockets=[t for _p, t in targets],
-                                  worker_root=wr)
+                                  worker_root=wr,
+                                  link_root=o["link_root"])
             if wr is not None:
                 ro = ro + view_ro
                 enter = (("cli", WORKER_VIEW, wr) if o["cli"] else

@@ -78,7 +78,7 @@ def test_every_caller_that_moves_the_base_moves_its_scripts(leerie, run,
     tree = leerie._tree_stores_for(stores, _view(run))
     t = tree["PYTHONUSERBASE"]
     assert t not in (mine, w) and Path(t).is_relative_to(
-        run["run_dir"] / "tree-stores")
+        run["run_dir"] / "worktrees" / ".stores" / "tree-stores")
     assert tree["PATH"].split(":") == ["/usr/bin", "/home/leerie/.local/bin",
                                        f"{t}/bin"]
 

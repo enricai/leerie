@@ -6204,10 +6204,10 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
 
 # The package stores and caches an install reads (DESIGN §6 *The stores a
 # view installs from are leerie's*): variable -> directory name. Every one is
-# the run's own: leerie's commands get `<run-dir>/stores/<name>`
+# the run's own: leerie's commands get `<run-dir>/worktrees/.stores/stores/<name>`
 # (`_leerie_stores`, set on the orchestrator's environment in `main()` once
 # the run directory exists), written by every command leerie runs in the
-# run; the run's workers share `<run-dir>/workers/cache/<name>`
+# run; the run's workers share `<run-dir>/worktrees/.stores/cache/<name>`
 # (`_worker_cache_env`). No store is shared across runs or repositories.
 # Every installer the provision recipe can name is covered: pnpm, npm, yarn
 # (classic and berry), bun, corepack, pip, uv, poetry, pipenv, go, cargo,
@@ -6274,7 +6274,7 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
 # metadata cache). Two trees at two commits never share an environment, and
 # a view whose tip moves starts them empty. Set, for every command leerie
 # runs in a tree under `<run-dir>/worktrees/`, to
-# `<run-dir>/tree-stores/<tree>/<name>` (`_tree_store_env`).
+# `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>` (`_tree_store_env`).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
     "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
     "GOCACHE", "WORKON_HOME", "npm_config_cache_dir", "PYTHONUSERBASE",
@@ -6290,7 +6290,8 @@ def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
     p = Path(os.path.abspath(cwd))
     for d in (p, *p.parents):
         if d.parent.name == "worktrees" and (d / ".git").exists():
-            return d, d.parent.parent / "tree-stores" / d.name
+            return d, _stores_home(d.parent.parent) / TREE_STORES_DIRNAME \
+                / d.name
     return None
 
 
@@ -6315,7 +6316,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
             continue
         dst = root / _STORE_VARS[var]
         with contextlib.suppress(OSError):
-            _mkdir_private(dst, root.parent.parent)
+            _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
     _with_pnpm_spellings(env)
     _with_user_scripts(env, user_base)
@@ -6392,14 +6393,15 @@ def _with_user_scripts(env: MutableMapping[str, str],
 
 def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at the run's own store,
-    `<run-dir>/stores/<name>` (`RUN_STORES_DIRNAME`), made here (a value
+    `<run-dir>/worktrees/.stores/stores/<name>` (`_stores_home`,
+    `RUN_STORES_DIRNAME`), made here (a value
     beneath the image's bake root `_BAKED_ROOT` is kept). Every command
     leerie runs in the run reads and writes them, and nothing outside the
     run does: no store is shared across runs or repositories (DESIGN §6
     *The stores a view installs from are leerie's*). A worker's environment
     replaces every one (`_worker_cache_env`), and no worker's grant names
     them."""
-    root = Path(run_dir) / RUN_STORES_DIRNAME
+    root = _stores_home(run_dir) / RUN_STORES_DIRNAME
     for var, name in _STORE_VARS.items():
         if (env.get(var) or "").startswith(_BAKED_ROOT):
             continue
@@ -6418,7 +6420,8 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
                       cache: Path | None = None) -> dict[str, str]:
     """A copy of `env` whose every store and cache is in the worker's
     cache set `cache` (default the fixers' side's,
-    `<run-dir>/workers/cache/`): `<cache>/<name>` (a baked value is kept, as
+    `<run-dir>/worktrees/.stores/cache/`): `<cache>/<name>` (a baked value
+    is kept, as
     `_leerie_stores` keeps it) and `XDG_CACHE_HOME` at `<cache>/xdg`. One
     set per side of the run, not per worker (`_worker_cache_dir`): what a
     worker leaves in a cache can mislead only another worker of its side,
@@ -6429,7 +6432,7 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
     the run's store leerie's commands use (DESIGN §6 *The stores a view
     installs from are leerie's*)."""
     if cache is None:
-        cache = Path(run_dir) / "workers" / "cache"
+        cache = _stores_home(run_dir) / WORKER_CACHE_DIR
     out = {**env, **_cache_vars(env, cache)}
     _with_pnpm_spellings(out)
     _with_user_scripts(out, env.get("PYTHONUSERBASE"))
@@ -6658,7 +6661,7 @@ def _drop_view(leerie_dir: Path, tree: Path) -> None:
     """Remove the committed view of the worker tree `tree` and its own
     stores (DESIGN §8 *A view lives no longer than its tree*): the view at
     `<run-dir>/worktrees/<prefix>-view-<tree name>` — a checkout of the run
-    repository — and `<run-dir>/tree-stores/<view name>`, with every record
+    repository — and `<run-dir>/worktrees/.stores/tree-stores/<view name>`, with every record
     this process keeps of it. Derived from the tree's name alone, so a view
     a process before a resume made goes too. Absent ones are the idempotent
     case."""
@@ -6670,7 +6673,7 @@ def _drop_view(leerie_dir: Path, tree: Path) -> None:
                    capture_output=True, check=False)
     if view.exists() or view.is_symlink():
         _rmtree_owned(view)
-    _rmtree_owned(run_dir / TREE_STORES_DIRNAME / view.name)
+    _rmtree_owned(_stores_home(run_dir) / TREE_STORES_DIRNAME / view.name)
     _VIEWS.pop(os.path.realpath(tree), None)
     _forget_installs(view)
 
@@ -12176,7 +12179,10 @@ def _record_run_id_for_launcher(run_id: str) -> None:
 # directory is continued only by a leerie of its layout*). Bump it with any
 # change to what a run directory holds that a later process of the run reads
 # back. The layout before the field, which recorded nothing, counts as 1.
-RUN_LAYOUT_VERSION = 3
+# 4: every store a tree installs from moved beside the trees, into
+# `<run-dir>/worktrees/.stores/` (DESIGN §6 *The write grants on one mount
+# are one mount*).
+RUN_LAYOUT_VERSION = 4
 
 
 def _refuse_other_run_layout(st: "State", verb: str) -> None:
@@ -12999,7 +13005,7 @@ def _run_scratch_names() -> tuple[str, ...]:
     # The run's stores too: a resumed process installs again, cold, rather
     # than every finished run keeping a store until it is pruned (DESIGN §6
     # *The stores a view installs from are leerie's*).
-    return (MEASURE_DIRNAME, TREE_STORES_DIRNAME, RUN_STORES_DIRNAME,
+    return (MEASURE_DIRNAME, f"worktrees/{STORES_HOME_NAME}",
             CLONE_GITS_NAME)
 
 
@@ -25055,11 +25061,15 @@ class WorkerGrants(NamedTuple):
     `/dev/shm` and IPC*). `egress`: the process reaches the outside network,
     through leerie's egress proxy only (a worker, an install kind); without
     it an isolated process has its own loopback and nothing else (DESIGN §6
-    *A confined process has its own network*)."""
+    *A confined process has its own network*). `link`: the run's trees
+    directory (`<run-dir>/worktrees`), whose write grants the shim binds as
+    one mount so a tree links from its store; empty, every grant is bound
+    apart (DESIGN §6 *The write grants on one mount are one mount*)."""
     rw: tuple[str, ...]
     ro: tuple[str, ...]
     env: tuple[tuple[str, str], ...] = ()
     egress: bool = False
+    link: str = ""
 
 
 # The caps key that marks the host-side seam, set only by
@@ -25145,8 +25155,9 @@ HELD_OUT_LOG_WORKERS = frozenset({"acceptance_writer", "set_auditor",
 def _worker_cache_dir(run_dir: str | Path, schema_key: str) -> Path:
     """The cache set of a worker of kind `schema_key`: the held-out side's
     own for a worker that reads a set or runs one (`HELD_OUT_LOG_WORKERS`),
-    else the fixers' side's, both under `<run-dir>/workers/`."""
-    return (Path(run_dir) / WORKERS_DIR
+    else the fixers' side's, both in the stores' home beside the trees
+    (`_stores_home`), so a tree links from them."""
+    return (_stores_home(run_dir)
             / (HELD_OUT_CACHE_DIR if schema_key in HELD_OUT_LOG_WORKERS
                else WORKER_CACHE_DIR))
 
@@ -25156,12 +25167,12 @@ def _granted_cache_dir(grants: "WorkerGrants | None",
     """The cache set `grants` writes: the held-out side's when the grant
     names it, else the fixers' side's. The worker's environment is pointed
     at this one (`_invoke`), so the variables follow the grant."""
-    held = Path(run_dir) / WORKERS_DIR / HELD_OUT_CACHE_DIR
+    held = _stores_home(run_dir) / HELD_OUT_CACHE_DIR
     if grants is not None and any(
             os.path.realpath(p) == os.path.realpath(held)
             for p in grants.rw):
         return held
-    return Path(run_dir) / WORKERS_DIR / WORKER_CACHE_DIR
+    return _stores_home(run_dir) / WORKER_CACHE_DIR
 
 
 def _held_out_logs(run_dir: str | Path) -> Path:
@@ -25582,7 +25593,7 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
-        egress=True)
+        egress=True, link=str(run_dir / TREES_DIRNAME))
 
 
 # DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
@@ -25730,6 +25741,8 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                          f"{proxy.forward(_STRICT_PROXY.port)}"]
         if wr is not None:
             argv += ["--worker-root", wr] + (["--cli"] if cli else [])
+        if grants.link:
+            argv += ["--link-root", grants.link]
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -25766,6 +25779,21 @@ TREE_STORES_DIRNAME = "tree-stores"
 # in the run reads and writes them (DESIGN §6 *The stores a view installs
 # from are leerie's*).
 RUN_STORES_DIRNAME = "stores"
+# Every store a run's tree installs from lives beside the trees, in
+# `<run-dir>/worktrees/.stores/` (DESIGN §6 *The write grants on one mount
+# are one mount*): the run's (`stores/`), each tree's own (`tree-stores/`)
+# and each side's worker caches (`cache/`, `cache-held-out/`). A confined
+# process's grants beneath `<run-dir>/worktrees` are one mount rooted
+# there, so a tree hard-links from its store, and nothing of leerie's own
+# record (`state.json`, the logs) is on that mount.
+TREES_DIRNAME = "worktrees"
+STORES_HOME_NAME = ".stores"
+
+
+def _stores_home(run_dir: str | Path) -> Path:
+    """`<run-dir>/worktrees/.stores`: where every store a tree installs
+    from lives."""
+    return Path(run_dir) / TREES_DIRNAME / STORES_HOME_NAME
 _MEASURE_ID_FILE = "leerie-measure-id"
 _MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _MEASURE_SUBDIRS = ("mise-state", "reports", "coverage")
@@ -25781,7 +25809,7 @@ _PRIVATE_TMPS: dict[str, int] = {}
 # The run directory's entries no measured tree may hold or lie beneath:
 # granting such a tree would grant them.
 _MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
-                    TREE_STORES_DIRNAME, RUN_STORES_DIRNAME, "tmp",
+                    f"{TREES_DIRNAME}/{STORES_HOME_NAME}", "tmp",
                     RUN_REPO_SETTINGS_NAME, TREE_REPOS_DIRNAME,
                     RUN_REPO_NAME, MEASURE_DIRNAME)
 
@@ -26251,7 +26279,7 @@ def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
     _with_pnpm_spellings(out)
     for d in (cache / "xdg", cache / "pnpm-store"):
         with contextlib.suppress(OSError):
-            # `cache` is `<run-dir>/workers/cache`: everything below the run
+            # `cache` is `<run-dir>/worktrees/.stores/cache`: everything below the run
             # directory is the workers'.
             _mkdir_private(d, cache.parent.parent)
     return out
@@ -26375,7 +26403,7 @@ def _measure_dir_at(run_dir: Path, tree: Path,
             # A new tree at this path: its own stores (`_tree_store_env`)
             # start empty too, never with what an earlier tree's commands
             # left there.
-            stale = run_dir / TREE_STORES_DIRNAME / tree.name
+            stale = _stores_home(run_dir) / TREE_STORES_DIRNAME / tree.name
             if stale.exists():
                 gone = root / ".gone"
                 _mkdir_private(gone, run_dir)
@@ -26452,8 +26480,8 @@ def _measurement_grants(st: "State", tree: str | Path,
     """THE grant of a command leerie runs on a repository's code (DESIGN §6
     *Leerie's runs of the repository's commands are confined too*): write
     the tree, its measurement directory (`_measure_dir`), the run's own
-    stores (`<run-dir>/stores/`, `_leerie_stores`) and the tree's own
-    (`<run-dir>/tree-stores/<tree>/`, `_tree_store_env`; DESIGN §6 *The
+    stores (`<run-dir>/worktrees/.stores/stores/`, `_leerie_stores`) and the tree's own
+    (`<run-dir>/worktrees/.stores/tree-stores/<tree>/`, `_tree_store_env`; DESIGN §6 *The
     stores a view installs from are leerie's*, *Which stores an install may
     share*); read its git metadata (`_measured_git_reads`), the run's mise
     overrides and everything outside the state root.
@@ -26487,13 +26515,13 @@ def _measurement_grants(st: "State", tree: str | Path,
     own = _measure_dir_at(run_dir, t, dirs)
     # The run's own stores, which every command leerie runs in the run
     # writes and no other run reads.
-    stores = run_dir / RUN_STORES_DIRNAME
+    stores = _stores_home(run_dir) / RUN_STORES_DIRNAME
     _mkdir_private(stores, run_dir)
     rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own), str(stores)]
     if t.parent == (run_dir / "worktrees").resolve():
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
-        tree_stores = run_dir / TREE_STORES_DIRNAME / t.name
+        tree_stores = _stores_home(run_dir) / TREE_STORES_DIRNAME / t.name
         _mkdir_private(tree_stores, run_dir)
         rw.append(str(tree_stores))
     # Leerie's install (the AST scripts) and the home, named as a worker's
@@ -26558,7 +26586,8 @@ def _measurement_grants(st: "State", tree: str | Path,
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
-        tuple(env.items()), egress=kind != MEASURE_KIND)
+        tuple(env.items()), egress=kind != MEASURE_KIND,
+        link=str(run_dir.resolve() / TREES_DIRNAME))
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
@@ -47577,7 +47606,8 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
             _rmtree_owned(wt)
         # Its own stores go with it: what one commit's code left there must
         # not reach the next commit's measurement (`_TREE_STORE_VARS`).
-        _rmtree_owned(wt.parent.parent / "tree-stores" / wt.name)
+        _rmtree_owned(_stores_home(wt.parent.parent) / TREE_STORES_DIRNAME
+                      / wt.name)
     await asyncio.to_thread(_remove)
     _VIEWS.pop(key, None)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))

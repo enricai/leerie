@@ -28,7 +28,7 @@ def test_a_measured_command_works_in_its_own_tree(leerie, run):
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     g = _measure(leerie, run, view)
     own = leerie._measure_dir(_state(run), view)
-    stores = run["run_dir"] / "stores"
+    stores = run["run_dir"] / "worktrees" / ".stores" / "stores"
     stores.mkdir(parents=True, exist_ok=True)
     (stores / "pkg.txt").write_text("stored\n")
     got = _probe(leerie, g, f"""
@@ -46,9 +46,9 @@ def test_a_measured_command_is_refused_the_runs_state(leerie, run):
     rd, w = run["run_dir"], run["wts"]
     view = w[f"{rd.name}-view-staging"]
     g = _measure(leerie, run, view)
-    stores = run["state_root"] / "runs" / "another-run" / "stores"
+    stores = run["state_root"] / "runs" / "another-run" / "worktrees" / ".stores" / "stores"
     stores.mkdir(parents=True, exist_ok=True)
-    cache = rd / "workers" / "cache"
+    cache = rd / "worktrees" / ".stores" / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     got = _probe(leerie, g, f"""
 read held-out set|cat {rd}/acceptance/set-1/test_held.py

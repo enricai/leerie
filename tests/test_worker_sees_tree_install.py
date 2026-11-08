@@ -111,7 +111,7 @@ def test_worker_and_install_name_the_same_tree_stores(
         access):
     lane = _lane(run)
     installed(lane)
-    stores = run["run_dir"] / "tree-stores" / lane.name
+    stores = run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / lane.name
     g = _grants(leerie, run, lane, schema_key, getattr(leerie, tools))
     real = os.path.realpath(stores)
     assert real in {os.path.realpath(p) for p in getattr(g, access)}
@@ -145,7 +145,7 @@ def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
     lane = _lane(run)
     assert os.path.realpath(lane) not in leerie._DEPS_INSTALLED
     g = _grants(leerie, run, lane, "implementer", leerie.ACT_TOOLS)
-    stores = os.path.realpath(run["run_dir"] / "tree-stores" / lane.name)
+    stores = os.path.realpath(run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / lane.name)
     assert stores not in {os.path.realpath(p) for p in (*g.rw, *g.ro)}
     wenv = _worker_env(leerie, run, lane, g)
     cache = leerie._granted_cache_dir(g, run["run_dir"])
@@ -237,6 +237,6 @@ def test_a_falsifier_runs_the_pytest_leeries_pip_install_put_in_its_lane(
                                env=wenv, capture_output=True, text=True,
                                timeout=120)
             assert r.returncode == 0, (cmd, r.stdout, r.stderr)
-        assert str(run["run_dir"] / "tree-stores" / lane.name) in r.stdout
+        assert str(run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / lane.name) in r.stdout
     finally:
         leerie._DEPS_INSTALLED.discard(os.path.realpath(lane))

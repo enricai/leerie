@@ -70,7 +70,7 @@ def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
         me, ie = dict(m.env), dict(i.env)
         assert me.pop("GNUPGHOME") != ie.pop("GNUPGHOME")
         assert (i.rw, i.ro, ie) == (m.rw, m.ro, me)
-        stores = str(run["run_dir"] / "stores")
+        stores = str(run["run_dir"] / "worktrees" / ".stores" / "stores")
         assert stores in i.rw and stores not in i.ro
 
 

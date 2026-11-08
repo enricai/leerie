@@ -496,20 +496,29 @@ def test_r20_h1_held_out_content_does_not_reach_a_later_worker(root):
 #
 # DESIGN §6 *The write grants on one mount are one mount*: bound one by one,
 # a tree and the store it installs from were two mounts of one filesystem,
-# a hard link between them was EXDEV, and pnpm copied every file.
+# a hard link between them was EXDEV, and pnpm copied every file. Now the
+# grants beneath `--link-root` (the run's `worktrees/`, which holds only the
+# trees and their stores) are one mount, and the run's own records outside
+# it stay read-only.
 
 
-def _run_layout(root: Path) -> tuple[Path, Path]:
-    store = root / "stores"
-    tree = root / "worktrees" / "tree"
-    store.mkdir()
+def _run_layout(root: Path) -> tuple[Path, Path, Path]:
+    """`(link root, store, tree)` laid out as a run's: the trees and their
+    stores in `worktrees/`, leerie's records beside it."""
+    trees = root / "worktrees"
+    store = trees / ".stores" / "stores"
+    tree = trees / "tree"
+    store.mkdir(parents=True)
     tree.mkdir(parents=True)
-    return store, tree
+    return trees, store, tree
 
 
 def _isolate_in(tree: Path, code: str, rw: list[Path], *,
-                env: dict | None = None) -> subprocess.CompletedProcess:
+                link: Path | None, env: dict | None = None
+                ) -> subprocess.CompletedProcess:
     opts = ["--isolate", "--rw", str(tree), "--rw", "/dev/null", "--ro", "/"]
+    if link is not None:
+        opts += ["--link-root", str(link)]
     for p in rw:
         opts += ["--rw", str(p)]
     return subprocess.run(
@@ -518,8 +527,8 @@ def _isolate_in(tree: Path, code: str, rw: list[Path], *,
         cwd=str(tree), capture_output=True, text=True, timeout=120, env=env)
 
 
-def test_isolate_links_a_tree_from_the_store_on_its_mount(root):
-    store, tree = _run_layout(root)
+def test_isolate_links_a_tree_from_the_store_beneath_its_link_root(root):
+    trees, store, tree = _run_layout(root)
     (store / "pkg.js").write_text("module.exports = 1;\n")
     r = _isolate_in(tree, f"""
         import os
@@ -527,38 +536,66 @@ def test_isolate_links_a_tree_from_the_store_on_its_mount(root):
             os.link({str(store / "pkg.js")!r}, "pkg.js"); print("LINKED")
         except OSError as e:
             print(e.errno)
-        """, [store])
+        """, [store], link=trees)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "LINKED"
     assert (tree / "pkg.js").stat().st_ino == (store / "pkg.js").stat().st_ino
     assert (store / "pkg.js").stat().st_nlink == 2
 
 
-def test_isolate_keeps_what_lies_between_grants_read_only(root):
-    store, tree = _run_layout(root)
+def test_without_a_link_root_the_grants_stay_apart(root):
+    """The shape that copied: each grant its own mount."""
+    trees, store, tree = _run_layout(root)
+    (store / "pkg.js").write_text("module.exports = 1;\n")
+    r = _isolate_in(tree, f"""
+        import os
+        try:
+            os.link({str(store / "pkg.js")!r}, "pkg.js"); print("LINKED")
+        except OSError as e:
+            print(e.errno)
+        """, [store], link=None)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == str(errno.EXDEV)
+
+
+def test_the_runs_records_stay_read_only_beside_the_link_root(root):
+    """`state.json` and a log lie outside the link root: a confined
+    process's chmod, utime and setxattr on them are refused (EROFS), as is
+    every one on a tree that was there when it started."""
+    trees, store, tree = _run_layout(root)
     state = root / "state.json"
     state.write_text("{}\n")
-    other = root / "worktrees" / "other"
+    log = root / "logs" / "orchestrator.log"
+    log.parent.mkdir()
+    log.write_text("log\n")
+    other = trees / "other"
     other.mkdir()
     (other / "f.txt").write_text("other tree\n")
-    logs = root / "logs"
-    logs.mkdir()
-    (logs / "run.log").write_text("log\n")
     (tree / "own.txt").write_text("own\n")
-    targets = [state, other, other / "f.txt", logs / "run.log"]
-    before = {p: p.stat().st_mode for p in targets}
+    targets = [state, log, root, other, other / "f.txt"]
+    before = {p: (p.stat().st_mode, p.stat().st_mtime_ns) for p in targets}
     r = _isolate_in(tree, f"""
         import os
         for p in {[str(p) for p in targets]!r}:
-            try:
-                os.chmod(p, 0o777); print("CHANGED")
-            except OSError as e:
-                print(e.errno)
+            out = []
+            for name, op in (("chmod", lambda: os.chmod(p, 0o777)),
+                             ("utime", lambda: os.utime(p, (0, 0))),
+                             ("setxattr", lambda: os.setxattr(
+                                 p, "user.leerie", b"x"))):
+                try:
+                    op(); out.append(name + ":CHANGED")
+                except OSError as e:
+                    out.append(f"{{name}}:{{e.errno}}")
+            print(" ".join(out))
         os.chmod("own.txt", 0o600); print("OWN")
-        """, [store])
+        """, [store], link=trees)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == [str(errno.EROFS)] * len(targets) + ["OWN"]
-    assert {p: p.stat().st_mode for p in targets} == before
+    lines = r.stdout.splitlines()
+    want = " ".join(f"{n}:{errno.EROFS}" for n in ("chmod", "utime",
+                                                    "setxattr"))
+    assert lines == [want] * len(targets) + ["OWN"], r.stdout
+    assert {p: (p.stat().st_mode, p.stat().st_mtime_ns)
+            for p in targets} == before
     assert (tree / "own.txt").stat().st_mode & 0o777 == 0o600
 
 
@@ -567,7 +604,7 @@ def test_a_confined_pnpm_install_links_from_its_store(root):
     pnpm = shutil.which("pnpm")
     if pnpm is None:
         pytest.skip("no pnpm on PATH")
-    store, tree = _run_layout(root)
+    trees, store, tree = _run_layout(root)
     dep = root / "dep"
     dep.mkdir()
     (dep / "package.json").write_text(json.dumps(
@@ -603,7 +640,7 @@ def test_a_confined_pnpm_install_links_from_its_store(root):
                            capture_output=True, text=True)
         print(p.returncode)
         sys.stderr.write(p.stdout[-2000:] + p.stderr[-2000:])
-        """, [store], env=env)
+        """, [store], link=trees, env=env)
     assert r.returncode == 0 and r.stdout.strip() == "0", r.stderr
     got = [p for p in (tree / "node_modules" / ".pnpm").rglob("index.js")
            if p.read_text() == "module.exports = 'dep';\n"]
