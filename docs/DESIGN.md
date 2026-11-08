@@ -15726,8 +15726,8 @@ confirmed no-work on counted failures with none genuine (8 of 8 and 9 of 9
 over-reach or test error), and 43bd4671's change introduced a real regression
 that the next run, 673a0cc6, spent itself fixing.
 
-The invariant: **a report-pointer task that ended `done` stays done as long as
-the tests that passed when it finished still pass. A later run's new failures
+The invariant: **a task that ended `done` stays done as long as the tests that
+passed when it finished still pass. A later run's new failures
 are reported as advisory and create no work; a failure of those recorded tests
 reopens the task. No LLM takes part in this decision.** It is deliberately not
 a judgement of which fresh failures are real. Three benched attempts to have a
@@ -15735,14 +15735,17 @@ worker make that judgement failed: the `set_auditor` dropped 2 of 17 bad cases,
 and `scope_judge` v4 and a structural version of it each lost genuine recall on
 held-out cases. So the judgement is removed, and what it costs is stated below.
 
-*The bar.* When a report-pointer run ends `done`, its counted cases that pass
+*The bar.* When a run ends `done`, its counted cases that pass
 on the tree it ships, with the control files of their sets, are recorded as the
 task's **settled bar**: copies of the passed test files and the IDs of the
 cases, under the state root (`settled-bars/`), never inside one run's
-directory.
+directory. So is the run's **change** (below): its diff from its own start to
+the tree it ships, and the test files that diff added or changed, in the form
+it shipped them.
 
 The key is the stripped task text and the path and content hash of each report
-the task points at, as the run read them at its start. "The task" for this rule
+the task points at, as the run read them at its start. A task that points at no
+report is keyed by its text alone: it asks exactly what it says. "The task" for this rule
 means what was asked, and a task that points at a report asks what the report
 says, so a new finding in the same report is a new question, not a fresh failure
 to withhold. So a run whose task text or report changed has no bar and is
@@ -15820,10 +15823,80 @@ carry the same list in its advisory section; no run that withholds a case makes
 one today, since a held bar ends with no commits. They never reach the next
 run's residual: the run has no gate, so nothing is handed on.
 
-*Tasks with no bar.* A run that ended `done` before this shipped left no bar,
-so the first later run of that task behaves as before; its own `done`, if any,
-records one. Nothing is backfilled. A task that has never ended `done` has no
-bar, however many of its runs have merged a PR.
+*A done run's change on the base settles the task.* The held-out half of the
+bar is narrow (one counted case in REST-GET's) and exists only for runs that
+ended `done` with sets. The user's statement of the rule is wider: when the
+change a `done` run shipped is on a later run's base, the task is finished, and
+a run that reverses it is the opposite of what leerie is for. Barnacle 73751002
+ended `done`, its PR (#696) was squash-merged, and the next run of the same task,
+a79384a4, started on a base holding it, found the symptom no longer reproduced,
+was overturned by two fresh held-out sets demanding the opposite, deleted #696's
+tests and opened a PR (#702, closed) that reversed it. So at each later run's own
+start, beside the held-out entries:
+
+- *Is the change on this base?* Decided by git alone: every hunk the `done` run's
+  diff made to a non-test file, each taken on its own, reverse-applies to the own
+  start (`git apply --cached --check -R`; a diff touching only tests uses its test
+  hunks). A squash merge leaves no ancestry, so ancestry cannot answer, and a
+  later commit to another part of the same file must not hide it. A hunk a later
+  commit rewrote does not reverse-apply, so the answer is then "not on the base",
+  and the run goes on as the held-out entries alone decide — today's behaviour.
+  An unsure answer never settles.
+- *Has it regressed?* When it is on the base, the test files the change added or
+  changed are run, in the form it shipped them, at the own start in the held-out
+  sandbox, per case. They are the repository's own committed tests, not held-out
+  ones, and the base usually has them, so they are written onto the bar's
+  disposable tree, after its held-out entries ran, rather than placed in the
+  sandbox, which never places a file over a path the tree has (I3); a failing file run once more as for the held-out entries.
+  A case that already failed on the tree the `done` run shipped (its recorded
+  final failing IDs) is not a regression. A file that no longer loads or holds no
+  test is dropped for good. With the change on the base, a failure of every case
+  reads as the regression it is, not as unlanded: the git answer has told the
+  two apart.
+- Then the bar holds, regresses or is not measured exactly as for the held-out
+  entries, and a holding bar ends the run `no_work` before planning with every
+  fresh counted case listed as advisory. A change on the base whose test files
+  have all been dropped, or that changed no test, holds on the git answer alone.
+  A regressed change test's names reach the planners as a regressed bar case's
+  do, through the no-work dispute, and a run that then changes nothing is
+  `unconverged`; no held-out set carries them, since they are not held out and
+  their paths are the tree's. A change that is not on the base is
+  `unlanded`, and the next `done` run replaces the bar.
+
+The three signals measured over every recorded lineage, for each `done` run with
+its PR and every later recorded base (167 pairs; truth: the PR's merge commit is
+an ancestor of the base), on barnacle and web:
+
+| signal | on base, said so | on base, missed | not on base, said on base |
+|---|---|---|---|
+| each file's content equals the run's shipped tree | 5 | 135 | 0 |
+| the whole diff reverse-applies | 32 | 108 | 0 |
+| every non-test hunk reverse-applies on its own (chosen) | 61 | 79 | 0 |
+
+The misses are bases where later commits rewrote the change's own lines, or
+where the PR that merged was not the run's tip (43bd4671's #685 was edited before
+merge: 2 of its 8 non-test hunks differ). On the twelve pairs of a `done` run and
+the next run of its task, the chosen signal says "on base" on ten, among them
+73751002 → a79384a4 (15 of 15 non-test hunks; the whole diff does not
+reverse-apply, for #694's and #695's hunks in the same file and an import reorder
+in a test).
+
+*Prior runs, backfilled at run time.* A task with no change in its bar takes it,
+at the own start, from the latest run of the same task that ended `done` and
+whose directory is still under the state root: its task text equal; its key equal
+when it recorded one, or, for a run from before keys, every report the task
+points at unmodified since that run started (the file's mtime earlier than the
+run's start); its own start, and its branch in its own repository. A bar that
+already has held-out entries takes the change of the run that recorded them. A
+`done` run whose directory was pruned, whose repository is gone, or that recorded
+no own start cannot be backfilled, and its task behaves as before. Nothing outside
+leerie's own run writes it.
+
+*Rewording starts fresh.* A task that legitimately has more to do after a `done`
+run whose change is on the base is not reopened by its fresh sets. The user's
+rule is that a re-run finding work means something is wrong; the way to ask for
+more is to reword the task or edit the report, which is a new key. This is an
+accepted cost, and the replay below shows it is not zero.
 
 **What was measured.** A mechanical replay of the recorded barnacle runs through
 `_record_settled_bar` and `_settled_bar_withdraw`, with no worker and no
@@ -15858,6 +15931,8 @@ leaves these decisions as they are.
 - *A regression of every report case reads as unlanded.* Squash merges leave no
   ancestry to tell the two apart, so a one-case bar's regression, or a total one,
   is ignored and left to the fresh sets. REST-GET's bar has one counted case.
+  A bar that holds a `done` run's change on the base is the exception: there git
+  tells the two apart, and a total failure is a regression.
 - *A reopened task's fresh sets count.* On a regressed bar nothing is withheld, so
   over-reach can come back into a reopened run: on their recorded trees,
   396c84e3's 9 bad cases stay work. Withholding them too would also withhold
@@ -15866,6 +15941,41 @@ leaves these decisions as they are.
   their sets' control files, not every case passing at the finish: 1 of the 24
   cases in 107cd8a3's sets is counted. REST-GET's bar sees #685's regression only
   through its control file, so a set with a less specific control sees less.
+
+**The change half, replayed.** Every run after a `done` run of the same task in
+the recorded barnacle, web and navegando runs (17), with the latest earlier
+`done` run as the prior one, mechanically and with no worker or repository code
+run: the git answer computed on the recorded commits; the test half read from
+the record, every prior change test unchanged on the base or the base suite
+green apart from unrelated scale tests. "Hunks" is non-test hunks that
+reverse-apply.
+
+| prior `done` → run | hunks | the rule | what happened |
+|---|---|---|---|
+| 73751002 → a79384a4 | 15/15 | settles | reversed #696; #702 closed. Right |
+| 107cd8a3 → 43bd4671 | 4/4 | settles | 8 over-reach cases; #685 brought a regression (above). Right |
+| 6da090bf → 86f32d44 | 2/2 | settles | the classifier found #701 already did it; 3 fresh cases overturned that; #703 is open under #701's own title. Right |
+| 7cff429a → bdcd110e | 2/2 | settles | `no_work` anyway |
+| 48c48629 → a192d275 | 22/22 | settles | `unconverged` with no commit and no PR; nothing delivered either way |
+| ebe36d49 → 7cff429a | 8/8 | settles | **needed work**: #674 (merged) fixed the report's issue 5, a rate-limit probe aimed at the wrong request, which #670 left |
+| 7cff429a → da2e5520 | 2/2 | settles | **needed work**: #677 (merged) gave the manifest and the audit one predicate, the report's issue 1 ("Expected: one consistent definition"), which #670 left |
+| 7c1f0bfe → 120a8cd5 | 17/17 | settles | **needed work, by every sign**: #666 (merged) extended #662's leniency from scalar leaves to nested objects and arrays, for the report's own symptom |
+| 2e382c2f → b009c575 | 5/5 | settles | **needed work, by every sign**: #676 (merged) made one leniency decision for the four emission paths that disagreed after #672 |
+| web f7d839df → 984a352a | 22/22 | settles | an open-ended "improve the home page" task, re-run by choice; #617 merged |
+| web 984a352a → deb96d3e | 11/11 | settles | the same; #618 merged |
+| ef425976 → ddd383ea, → 107cd8a3 | 9/10, 5/10 | not on base | as today |
+| 43bd4671 → 673a0cc6, → 396c84e3, → a41a09fd | 6/8, 6/8, 1/8 | not on base | as today (#685 merged edited) |
+| 7c1f0bfe → 2e382c2f | 11/17 | not on base | as today |
+
+So of the eleven runs it settles, three are the reopenings this rule exists to
+stop, two change nothing, two are a task the user re-ran for more, and four did
+work the user merged after a `done` that was premature: on leerie 0.43.0–0.44.3
+the earlier run ended `done` with part of a multi-issue report, or one emission
+path of one symptom, still open. The rule cannot tell those apart from a done
+task without a judgement, and it trusts `done`. That is the accepted cost above,
+and its measured size: on these lineages, 4 of 11 settles hid real work, all
+behind a `done` leerie should not have reached. Each is recovered by editing the
+report or rewording the task.
 
 **Not measured:** the bar's re-run at the own start in a real run, which runs
 repository code and so stays inside leerie's confinement; the statuses above are

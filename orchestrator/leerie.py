@@ -55399,15 +55399,17 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
             return skipped
         sets: list[dict] = []
         key = _settled_bar_key(task, st.repo_root)
+        # Kept even with no bar yet: a `done` run records under it.
+        keyed = {**skipped, **({"settled_bar_key": key} if key else {})}
         bar = await _settled_bar_at_own_start(key, st, caps, sets, base)
         if not bar:
-            return skipped
+            return keyed
         if sets:
             return {"validity_base": base,
                     "report_base": _acceptance_report_base(st), "sets": sets,
                     "written": 0, "discarded": [], "settled_bar_key": key,
                     "settled_bar": bar}
-        return {**skipped, "settled_bar": bar}
+        return {**keyed, "settled_bar": bar}
     if not resolve_test_files_scoped(st.repo_root):
         canonical = _canonical_test_command(st.repo_root)
         _template, why = _infer_scoped_test_template(canonical)
@@ -57157,10 +57159,13 @@ SETTLED_BAR_ADVISORY_NOTE = (
 def _settled_bar_key(task: str, repo_root: Path) -> str | None:
     """What a bar is keyed by: the stripped task text and the path and
     content hash of each report it points at (`_d1_report_paths`), so a new
-    finding in the same report starts a new bar. Not the same-task match of
+    finding in the same report starts a new bar; a task pointing at no report
+    is keyed by its text alone. Not the same-task match of
     `_prior_delivery_residual` and `_prior_acceptance_dispute_record`, which
-    keep the task text alone. None on a task pointing at no report, and,
-    logged, when a report cannot be read: no bar applies."""
+    keep the task text alone. None on an empty task, and, logged, when a
+    report cannot be read: no bar applies."""
+    if not (task or "").strip():
+        return None
     reports: list[list[str]] = []
     for rel, f in _d1_report_paths(task, repo_root):
         try:
@@ -57172,8 +57177,6 @@ def _settled_bar_key(task: str, repo_root: Path) -> str | None:
                 "bar applies to this run")
             return None
         reports.append([rel, hashlib.sha256(body).hexdigest()])
-    if not reports:
-        return None
     text = json.dumps({"task": (task or "").strip(),
                        "reports": sorted(reports)}, sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
@@ -57198,6 +57201,11 @@ def _load_settled_bar(leerie_root: Path, key: str) -> dict:
     data["entries"] = [e for e in data["entries"] if isinstance(e, dict)
                        and isinstance(e.get("run"), str)
                        and isinstance(e.get("defect"), dict)]
+    ch = data.get("change")
+    if not (isinstance(ch, dict) and isinstance(ch.get("run"), str)
+            and isinstance(ch.get("patches"), list)
+            and isinstance(ch.get("tests"), list)):
+        data.pop("change", None)
     return data
 
 
@@ -57219,11 +57227,236 @@ def _settled_bar_entry_files(entry: dict) -> list[str]:
                       + list(entry.get("support") or [])))
 
 
+SETTLED_CHANGE_DIRNAME = "change"
+
+
+def _settled_change_dir(leerie_root: Path, key: str, run: str) -> Path:
+    return _settled_bar_dir(leerie_root, key) / run / SETTLED_CHANGE_DIRNAME
+
+
+def _git_bytes(git_dir: Path, *args: str, env: Mapping[str, str] | None = None,
+               data: bytes | None = None) -> subprocess.CompletedProcess:
+    """One git call on `git_dir`, bytes in and out: a diff or a file is the
+    repository's bytes, not text in any encoding."""
+    return subprocess.run(["git", *_git_at(git_dir), *args],
+                          capture_output=True, check=False, timeout=300,
+                          input=data, env=None if env is None else dict(env))
+
+
+def _settled_change_capture(git_dir: Path, own_start: str, tree: str,
+                            leerie_root: Path, dest: Path,
+                            globs: list[str], failing_ids: list) -> dict | None:
+    """The change a `done` run shipped, kept under the state root at `dest`
+    (DESIGN §8 *A done run's change on the base settles the task*): its diff
+    from `own_start` to `tree`, one patch per file, and each test file the
+    diff added or changed as `tree` has it. `known_failing` is `failing_ids`
+    (`<file> :: <name>`, the run's final failing IDs) of those test files.
+    None, writing nothing, when the diff is empty or cannot be read whole."""
+    root = Path(leerie_root)
+    names = _git_bytes(git_dir, "diff", "--no-renames", "--name-only", "-z",
+                       own_start, tree, "--")
+    paths = [os.fsdecode(n) for n in names.stdout.split(b"\0") if n]
+    if names.returncode != 0 or not paths:
+        return None
+    _remove_beneath(root, dest)
+    patches: list[dict] = []
+    tests: list[str] = []
+    try:
+        for i, rel in enumerate(paths):
+            got = _git_bytes(git_dir, "diff", "--no-renames", "--binary",
+                             own_start, tree, "--", f":(literal){rel}")
+            if got.returncode != 0 or len(got.stdout) > READ_LIMIT_TEXT:
+                raise OSError(f"the diff of {rel} cannot be kept")
+            test = _is_test_file(rel, globs)
+            _write_beneath(root, dest / "patches" / f"{i}.patch", got.stdout)
+            patches.append({"path": rel, "test": test,
+                            "patch": f"patches/{i}.patch"})
+            if not test:
+                continue
+            blob = _git_bytes(git_dir, "cat-file", "blob", f"{tree}:{rel}")
+            if blob.returncode != 0:
+                continue                    # the change deleted it
+            if len(blob.stdout) > READ_LIMIT_TEXT:
+                raise OSError(f"{rel} is over {READ_LIMIT_TEXT} bytes")
+            _write_beneath(root, dest / "files" / rel, blob.stdout)
+            tests.append(rel)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"  settled bar: the change of {tree[:12]} not kept ({e})")
+        _remove_beneath(root, dest)
+        return None
+    # A case ID's file part is the path (`vitest`, `jest`) or, from pytest's
+    # report, the dotted module: both are the runner's fixed output.
+    by_name = {n: rel for rel in tests
+               for n in (rel, rel.rsplit(".", 1)[0].replace("/", "."))}
+    known: dict[str, list[str]] = {}
+    for cid in failing_ids or []:
+        rel = by_name.get(str(cid).split(" :: ", 1)[0])
+        if rel:
+            known.setdefault(rel, []).append(str(cid))
+    return {"own_start": own_start, "tree": tree, "recorded_at": now(),
+            "patches": patches, "tests": tests, "run_tests": list(tests),
+            "known_failing": known}
+
+
+def _settled_change_hunks(patch: bytes) -> list[bytes]:
+    """One file's patch as units each `git apply` can check alone: its header
+    with each `@@` hunk. A binary patch, or one with no hunk, is one unit."""
+    lines = patch.splitlines(keepends=True)
+    first = next((i for i, ln in enumerate(lines) if ln.startswith(b"@@ ")),
+                 None)
+    if first is None or b"GIT binary patch" in patch:
+        return [patch] if patch else []
+    head = b"".join(lines[:first])
+    hunks: list[list[bytes]] = []
+    for ln in lines[first:]:
+        if ln.startswith(b"@@ "):
+            hunks.append([])
+        hunks[-1].append(ln)
+    return [head + b"".join(h) for h in hunks]
+
+
+def _settled_change_landed(st: "State", leerie_root: Path, key: str,
+                           change: dict, base: str) -> bool:
+    """Is the `done` run's change on `base`? Every hunk it made to a non-test
+    file (every hunk, when it touched only tests), each alone, reverse-
+    applies to `base` (DESIGN §8 *A done run's change on the base settles the
+    task*): robust to a squash merge, which leaves no ancestry, and to a
+    later commit elsewhere in the same file. False whenever it cannot be
+    told: an unsure answer never settles."""
+    root = Path(leerie_root)
+    cdir = _settled_change_dir(root, key, change["run"])
+    src: list[bytes] = []
+    tst: list[bytes] = []
+    for p in change.get("patches") or []:
+        try:
+            data = _read_beneath(root, cdir / str(p["patch"]),
+                                 limit=READ_LIMIT_TEXT)
+        except (OSError, KeyError, TypeError):
+            return False
+        (tst if p.get("test") else src).extend(_settled_change_hunks(data))
+    units = src or tst
+    if not units:
+        return False
+    _run_repo_commit(st, base, "refs/leerie/own-start")
+    repo = _run_repo(st)
+    idx = Path(st.run_dir) / ".settled-change-index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+    try:
+        if _git_bytes(repo, "read-tree", base, env=env).returncode != 0:
+            return False
+        return all(_git_bytes(repo, "apply", "--cached", "--check", "-R",
+                              env=env, data=u).returncode == 0
+                   for u in units)
+    except subprocess.SubprocessError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            idx.unlink()
+
+
+def _settled_change_backfill(st: "State", key: str, task: str,
+                             bar: dict) -> dict | None:
+    """The change of the newest earlier run of this task that ended `done`,
+    read from its run directory while that is still under the state root
+    (DESIGN §8 *Prior runs, backfilled at run time*): limited to the runs of
+    the bar's entries when it has any. Same key when the run recorded one;
+    for a run from before keys, every report the task points at unmodified
+    since that run started. None, logged, when that run's repository, own
+    start or branch is gone: it cannot be backfilled."""
+    task = (task or "").strip()
+    runs_dir = Path(st.run_dir).parent
+    want = {e["run"] for e in bar.get("entries") or []}
+    found: list[tuple[str, Path, dict]] = []
+    try:
+        dirs = [d for d in runs_dir.iterdir()
+                if d.is_dir() and d.name != Path(st.run_dir).name
+                and (not want or d.name in want)]
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            rj = json.loads(_read_text_beneath(runs_dir, d / "run.json",
+                                               limit=READ_LIMIT_TEXT))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(rj, dict) and rj.get("outcome") == "done"
+                and (rj.get("task") or "").strip() == task):
+            found.append((str(rj.get("finished_at") or ""), d, rj))
+    reports = _d1_report_paths(task, st.repo_root)
+    for _fin, d, _rj in sorted(found, key=lambda x: x[0], reverse=True):
+        try:
+            data = json.loads(_read_text_beneath(runs_dir, d / "state.json",
+                                                 limit=READ_LIMIT_TEXT))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("outcome") != "done":
+            continue
+        acc = data.get("acceptance") if isinstance(data.get("acceptance"),
+                                                   dict) else {}
+        if acc.get("settled_bar_key"):
+            if acc["settled_bar_key"] != key:
+                continue
+        elif reports:
+            try:
+                started = datetime.fromisoformat(
+                    str(data.get("started_at"))).timestamp()
+                if any(f.stat().st_mtime >= started for _r, f in reports):
+                    continue
+            except (OSError, ValueError, TypeError):
+                continue
+        own = ((data.get("repo_state_before_planning") or {}).get("head")
+               or data.get("base_sha"))
+        repo = d / RUN_REPO_NAME
+        tip = (_git_bytes(repo, "rev-parse", "-q", "--verify",
+                          f"refs/heads/{_compute_run_branch(d.name)}")
+               if _is_git_dir(repo) else None)
+        if not own or tip is None or tip.returncode != 0:
+            log(f"  settled bar: run {d.name[:12]} ended done on this task, "
+                "but its own start or branch is gone — its change cannot be "
+                "backfilled")
+            return None
+        got = _settled_change_capture(
+            repo, str(own), tip.stdout.decode().strip(), st.leerie_root,
+            _settled_change_dir(st.leerie_root, key, d.name),
+            resolve_test_file_globs(st.repo_root),
+            data.get("final_failing_ids") or [])
+        if got is None:
+            return None
+        log(f"  settled bar: backfilled the change of run {d.name[:12]}, "
+            f"which ended done on this task ({len(got['patches'])} file(s), "
+            f"{len(got['tests'])} test file(s))")
+        return {"run": d.name, **got, "backfilled": True}
+    return None
+
+
+def _record_settled_change(st: "State", leerie_root: Path,
+                           key: str) -> dict | None:
+    """This `done` run's change, from its own repository: its own start to
+    its run branch (the gate's final tree when it has no branch)."""
+    acc = st.data.get("acceptance") or {}
+    own = (acc.get("validity_base")
+           or (st.data.get("repo_state_before_planning") or {}).get("head"))
+    repo = _run_repo(st)
+    got = _git_bytes(repo, "rev-parse", "-q", "--verify",
+                     f"refs/heads/{_compute_run_branch(st.run_id)}")
+    tree = (got.stdout.decode().strip() if got.returncode == 0
+            else ((acc.get("gate") or {}).get("final_sha") or ""))
+    if not own or not tree or own == tree:
+        return None
+    rec = _settled_change_capture(
+        repo, str(own), str(tree), leerie_root,
+        _settled_change_dir(leerie_root, key, st.run_id),
+        resolve_test_file_globs(st.repo_root),
+        st.data.get("final_failing_ids") or [])
+    return {"run": st.run_id, **rec} if rec else None
+
+
 def _record_settled_bar(st: "State") -> dict | None:
-    """When a report-pointer run ends `done`: record its counted cases that
-    pass on the tree it ships, with their sets' control files, as the task's
-    settled bar (DESIGN §8 *Done is a fixed bar per task*). Copies of the
-    passed test files go under the state root, never a fix. The bar is fixed
+    """When a run ends `done`: record its counted cases that pass on the
+    tree it ships, with their sets' control files, and its change (its diff
+    and the test files it added or changed), as the task's settled bar
+    (DESIGN §8 *Done is a fixed bar per task*). Copies go under the state
+    root, never a fix outside the change's own patches. The bar is fixed
     once recorded: a later done run replaces it only when this run found it
     `unlanded`, and adds nothing to it otherwise. Idempotent per run. Returns
     what was recorded, or None."""
@@ -57234,17 +57467,22 @@ def _record_settled_bar(st: "State") -> dict | None:
     gate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
     final = gate.get("final")
     key = acc.get("settled_bar_key")
-    if not isinstance(final, list) or not key:
+    if not key:
         return None
     root = Path(st.leerie_root)
     bar = _load_settled_bar(root, key)
     others = [e for e in bar["entries"] if e.get("run") != st.run_id]
+    old_change = bar.get("change") if isinstance(bar.get("change"),
+                                                 dict) else None
+    if old_change and old_change.get("run") != st.run_id:
+        others.append(old_change)
     status = (acc.get("settled_bar") or {}).get("status")
     if others and status != "unlanded":
         return None
-    results = {r.get("index"): r for r in final if isinstance(r, dict)}
+    results = {r.get("index"): r for r in final
+               if isinstance(r, dict)} if isinstance(final, list) else {}
     entries: list[dict] = []
-    for s_ in acc.get("sets") or []:
+    for s_ in (acc.get("sets") or []) if results else []:
         if not isinstance(s_, dict) or _acceptance_set_broken(s_) \
                 or s_.get("settled_bar"):
             continue
@@ -57288,19 +57526,28 @@ def _record_settled_bar(st: "State") -> dict | None:
             _copy_beneath(Path(s_["dir"]) / rel, root, dest / rel,
                           src_anchor=st.run_dir, limit=READ_LIMIT_TEXT)
         entries.append(entry)
-    if not entries:
+    change = _record_settled_change(st, root, key)
+    if not entries and not change:
         return None
     # An unlanded bar's files go with it: only this run's are the bar now.
-    for run in {e["run"] for e in others}:
+    for run in {e["run"] for e in others} - {st.run_id}:
         _remove_beneath(root, _settled_bar_dir(root, key) / run)
     bar["entries"] = entries
+    if change:
+        bar["change"] = change
+    else:
+        bar.pop("change", None)
     bar["task_sha256"] = _task_fingerprint(task)
     _save_settled_bar(root, key, bar)
     n = sum(len(ids) for e in entries for ids in e["defect"].values())
     log(f"  settled bar: recorded {n} passing counted case(s) from "
-        f"{len(entries)} set(s) as this task's bar (DESIGN §8 *Done is a "
-        "fixed bar per task*)")
-    return {"entries": len(entries), "cases": n}
+        f"{len(entries)} set(s)"
+        + (f" and this run's change ({len(change['patches'])} file(s), "
+           f"{len(change['tests'])} test file(s))" if change else "")
+        + " as this task's bar (DESIGN §8 *Done is a fixed bar per task*)")
+    return {"entries": len(entries), "cases": n,
+            **({"change": {"files": len(change["patches"]),
+                           "tests": len(change["tests"])}} if change else {})}
 
 
 def _record_settled_bar_safely(st: "State") -> None:
@@ -57410,19 +57657,46 @@ async def _settled_bar_check(key: str | None, st: "State", caps: dict,
     """Re-run the task's settled bar at the own start and act on it (DESIGN
     §8 *Done is a fixed bar per task, not re-sampled each run*): drop a bar
     case that can no longer run, for good; ignore a bar whose report cases
-    all fail again (`unlanded`); add the failing cases of a regressed bar as
-    a counted set of their own (`regressed`); and, when the bar `holds`,
-    withdraw every fresh counted failing case as advisory. No worker takes
-    part. None with no key (`_settled_bar_key`) or no bar under it."""
+    all fail again, or whose change is not on this tree (`unlanded`); add
+    the failing cases of a regressed bar as a counted set of their own
+    (`regressed`); and, when the bar `holds`, withdraw every fresh counted
+    failing case as advisory. A change on this tree (`_settled_change_landed`)
+    has its test files run in the form it shipped them, and with it a
+    failure of every case is a regression. No worker takes part. None with
+    no key (`_settled_bar_key`) or no bar under it, after a backfill
+    (`_settled_change_backfill`)."""
     if not key:
         return None
     root = Path(st.leerie_root)
     bar = _load_settled_bar(root, key)
-    if not bar["entries"]:
+    change = bar.get("change")
+    if not change:
+        change = _settled_change_backfill(st, key, st.data.get("task") or "",
+                                          bar)
+        if change:
+            bar["change"] = change
+            if not bar.get("task_sha256"):
+                bar["task_sha256"] = _task_fingerprint(
+                    (st.data.get("task") or "").strip())
+            _save_settled_bar(root, key, bar)
+    if not bar["entries"] and not change:
         return None
     rec: dict = {"status": "empty", "entries": len(bar["entries"]),
                  "passed": 0, "failed": 0, "dropped": [], "skipped": [],
-                 "unmeasured": [], "advisory": [], "injected": []}
+                 "unmeasured": [], "advisory": [], "injected": [],
+                 "change_failed": []}
+    landed = False
+    if change:
+        landed = _settled_change_landed(st, root, key, change, base)
+        rec["change"] = {"run": change["run"], "landed": landed,
+                         "backfilled": bool(change.get("backfilled"))}
+        log(f"  settled bar: the change of run {change['run'][:12]}, which "
+            "ended done on this task, is "
+            + ("on this tree" if landed else "not on this tree (some hunk "
+               "of it does not reverse-apply) — it is not applied"))
+        if not landed and not bar["entries"]:
+            rec["status"] = "unlanded"
+            return rec
     async with _acceptance_tree(st, caps, base, "acceptance-bar",
                                 "settled-bar") as wt:
         if wt is None:
@@ -57479,12 +57753,23 @@ async def _settled_bar_check(key: str | None, st: "State", caps: dict,
                         entry["defect"].pop(rel)
                 per[rel] = got
             runs.append((entry, edir, per))
+        change_out: list[bool] = []
+        change_fail: dict[str, list[str]] = {}
+        change_per: dict[str, dict] = {}
+        if landed:
+            changed |= await _settled_change_tests(
+                st, caps, wt, root, key, change, rec, change_out,
+                change_fail, change_per)
         if changed:
             bar["entries"] = [e for e in bar["entries"] if e["defect"]]
             _save_settled_bar(root, key, bar)
         # Every bar case's outcome here.
-        defect_out: list[bool] = []
+        defect_out: list[bool] = list(change_out)
         failures: list[tuple[dict, Path, dict, dict[str, list[str]]]] = []
+        # The change's own tests are not held out: their failures reach the
+        # planners by name, never as a set (`_settled_bar_settles_run`).
+        rec["change_failed"] = [c for ids in change_fail.values()
+                                for c in ids]
         for entry, edir, per in runs:
             if not entry["defect"]:
                 continue
@@ -57505,20 +57790,21 @@ async def _settled_bar_check(key: str | None, st: "State", caps: dict,
             if fails:
                 failures.append((entry, edir, per, fails))
         rec["passed"] = sum(1 for x in defect_out if x)
-        rec["failed"] = sum(len(v) for _e, _d, _p, f in failures
-                            for v in f.values())
-        if not defect_out:
+        rec["failed"] = (sum(len(v) for _e, _d, _p, f in failures
+                             for v in f.values())
+                         + len(rec["change_failed"]))
+        if not defect_out and not (landed and not rec["unmeasured"]):
             if rec["unmeasured"]:
                 rec["status"] = "unmeasured"
             log("  settled bar: no case of it ran here — not applied")
             return rec
-        if not any(defect_out):
+        if not landed and not any(defect_out):
             rec["status"] = "unlanded"
             log(f"  settled bar: every one of its {len(defect_out)} report "
                 "case(s) fails again here, as before the run that settled "
                 "it — that fix is not on this tree; the bar is not applied")
             return rec
-        if failures:
+        if failures or rec["change_failed"]:
             rec["status"] = "regressed"
             rec["injected"] = _inject_settled_bar_sets(st, sets, failures,
                                                        written)
@@ -57538,6 +57824,70 @@ async def _settled_bar_check(key: str | None, st: "State", caps: dict,
             f"here; {len(rec['advisory'])} fresh failing case(s) withheld as "
             "advisory")
     return rec
+
+
+async def _settled_change_tests(st: "State", caps: dict, wt: Path,
+                                root: Path, key: str, change: dict,
+                                rec: dict, out: list[bool],
+                                fails: dict[str, list[str]],
+                                per: dict[str, dict]) -> bool:
+    """Run a landed change's test files at the own start, in the form the
+    `done` run shipped them (DESIGN §8 *A done run's change on the base
+    settles the task*). They are the repository's own tests and the tree
+    usually has them, which the held-out sandbox never places over, so they
+    are written onto the bar's disposable tree, after its held-out entries
+    ran, and run unplaced. Appends each
+    case's outcome to `out`, a regression's IDs to `fails`, each file's run
+    to `per`. A case that already failed on the tree that run shipped
+    (`known_failing`) is no regression. A file that ran nothing or did not
+    load leaves `run_tests` for good. True when `change` was changed."""
+    cdir = _settled_change_dir(root, key, change["run"]) / "files"
+    for rel in change["tests"]:
+        try:
+            _write_beneath(wt, wt / rel,
+                           _read_beneath(root, cdir / rel,
+                                         limit=READ_LIMIT_TEXT))
+        except OSError as e:
+            rec["unmeasured"].append(f"{change['run'][:12]}/change/{rel}")
+            log(f"  settled bar: {rel} of the change could not be written "
+                f"onto the tree ({e}) — not measured")
+            return False
+    place = {"run": change["run"], "set": "change", "defect": {},
+             "modes": {}}
+    tag = f"{change['run'][:12]}/change"
+    known = {str(c) for ids in (change.get("known_failing") or {}).values()
+             for c in ids or []}
+    changed = False
+    for rel in list(change.get("run_tests") or []):
+        got = await _run_settled_bar_file(
+            st, caps, wt, cdir, place, rel,
+            f"settled-bar-{change['run'][:12]}-change")
+        if got["verdict"] is None and not got["gone"]:
+            rec["unmeasured"].append(f"{tag}/{rel}")
+            log(f"  settled bar: {rel} of {tag} could not be run here")
+            continue
+        if got["verdict"] is None:
+            rec["dropped"].append(f"{tag}/{rel}")
+            log(f"  settled bar: dropped {rel} of {tag} — it no longer runs "
+                "on this tree")
+            change["run_tests"].remove(rel)
+            changed = True
+            continue
+        per[rel] = got
+        old = known
+        if got["status"]:
+            for cid, s_ in got["status"].items():
+                if s_ == "passed":
+                    out.append(True)
+                elif s_ == "failed" and cid not in old:
+                    out.append(False)
+                    fails.setdefault(rel, []).append(cid)
+        elif got["verdict"]:
+            out.append(True)
+        elif not any(c.startswith(rel) for c in old):
+            out.append(False)
+            fails[rel] = got["failing"] or [f"{rel} :: (whole file)"]
+    return changed
 
 
 def _inject_settled_bar_sets(st: "State", sets: list[dict],
@@ -57624,8 +57974,12 @@ def _settled_bar_settles_run(st: "State") -> bool:
         st.data["no_work_acceptance"] = {
             "verdict": "settled_bar_holds",
             "advisory": len(_settled_bar_advisory(st.data))}
+        ch = bar.get("change") if isinstance(bar.get("change"), dict) else {}
+        on = (f"the change run {str(ch.get('run'))[:12]} shipped when this "
+              "task ended done is on this tree, and " if ch.get("landed")
+              else "")
         _finish_no_work_run(st, {"<settled bar holds>": (
-            f"this task's {int(bar.get('passed') or 0)} recorded test "
+            f"{on}this task's {int(bar.get('passed') or 0)} recorded test "
             "case(s) still pass on this tree"
             + (f". {SETTLED_BAR_ADVISORY_NOTE} Withheld: "
                + "; ".join(x.strip() for x in withheld) if withheld else ""))},
@@ -57637,6 +57991,7 @@ def _settled_bar_settles_run(st: "State") -> bool:
         cases = [str(c) for i in bar.get("injected") or []
                  for ids in ((by_index.get(i) or {}).get("scope") or {})
                  .get("counted_cases", {}).values() for c in ids]
+        cases += [str(c) for c in bar.get("change_failed") or []]
         conf = st.data.get("no_work_confirmation") or {}
         st.data.pop("no_work_pending", None)
         st.data["no_work_acceptance"] = {"verdict": "settled_bar_regressed",
