@@ -5384,6 +5384,36 @@ merge (2), accepting `other_domain` on one category (1), omitting the PR
 lines (1), accepting an out-of-range index (2), removing the re-plan
 preflight (1).
 
+`tests/test_item_exclusion_proof.py` (DESIGN §5 *An `already_on_tree`
+exclusion is a claim about the code, so it is proven by execution*): real
+git repositories and real commands through `_settle_by_execution` (B*'s
+host-pressure read pinned quiet, `claude_p` stubbed). It covers:
+- the earlier tree is the task's first run's start, and a first run has
+  none;
+- the proof tree carries the own start's test files over the earlier code;
+- a detecting test proves the exclusion, while a test passing on both
+  trees, a test missing on the earlier tree, and a command failing on the
+  own start each prove nothing;
+- a first run proves nothing and runs nothing;
+- rows and the check count only a proven exclusion of these exact
+  commands, and an unproven one goes back as `ITEM_EXCLUSION_UNPROVEN`
+  with its reason;
+- the real `phase_plan` re-invokes the planner on an unproven exclusion
+  and proceeds on a proven one, and on a first run it tells the planner
+  `already_on_tree_provable: false`;
+- the coverage gate puts an unproven residual in the PR with its reason.
+
+Falsified live, one mutation at a time (red tests in brackets):
+- counting an unproven exclusion (7);
+- not writing the test files onto the earlier tree (2);
+- not requiring the own-start pass (1);
+- a pass on the earlier tree proving it (3);
+- not looking up the earliest same-task base (6);
+- the planner call not proving (2);
+- dropping the context flag (2);
+- dropping the PR reason (1);
+- the check ignoring the proofs (2).
+
 Live strict-mode replays of a recorded v0.36.0 auditor call (CLI 2.1.289)
 chose the shape: dispositions alone came back non-empty 6/6, the prior schema
 10/10, while every variant that also carried a top-level

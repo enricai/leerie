@@ -67,9 +67,17 @@ def _verify_only(sid, *items):
                          "argv": ["pytest", "tests/test_flow_runner.py"]}])
 
 
-def _status(leerie, plans, items):
+def _status(leerie, plans, items, proofs=None):
     return {r["item_index"]: r["status"]
-            for r in leerie._item_accounting_rows(plans, items)}
+            for r in leerie._item_accounting_rows(plans, items, proofs)}
+
+
+def _proven(leerie, *indices):
+    """Recorded proofs of exclusions that name no verify command — the rows
+    read only the record (the proof itself is tests/test_item_exclusion_
+    proof.py's)."""
+    return {leerie._exclusion_proof_key(i, []): {"proven": True, "why": "w"}
+            for i in indices}
 
 
 # === the rows: set arithmetic on typed fields ==============================
@@ -81,9 +89,11 @@ def test_claimed_excluded_other_domain_and_uncovered(leerie):
               not_needed=[(2, "already_on_tree", "x.py:4 does it"),
                           (3, "other_domain", "tests own it")]),
     ]
-    assert _status(leerie, plans, items) == {
+    assert _status(leerie, plans, items, _proven(leerie, 2)) == {
         0: "claimed", 1: "claimed", 2: "excluded", 3: "other_domain",
         4: "uncovered"}
+    assert _status(leerie, plans, items)[2] == "uncovered", \
+        "an already_on_tree exclusion with no proof excludes nothing"
 
 
 def test_a_verification_only_deliverable_claim_does_not_count(leerie):
@@ -108,13 +118,13 @@ def test_a_claim_wins_over_an_exclusion_and_already_on_tree_over_other(
              _plan(_sub("test-001", change_kind="test"), domain="testing",
                    not_needed=[(1, "other_domain", "bug-fixing has it"),
                                (1, "already_on_tree", "b.py:9")])]
-    rows = leerie._item_accounting_rows(plans, items)
+    rows = leerie._item_accounting_rows(plans, items, _proven(leerie, 0, 1))
     assert [r["status"] for r in rows] == ["claimed", "excluded"]
     assert rows[1]["excluded"] == [
         {"domain": "test", "reason_kind": "other_domain",
          "reason": "bug-fixing has it"},
         {"domain": "test", "reason_kind": "already_on_tree",
-         "reason": "b.py:9"}]
+         "reason": "b.py:9", "verify": [], "proven": True, "proof_why": "w"}]
 
 
 @pytest.mark.parametrize("entry", [
@@ -275,12 +285,14 @@ def _4f9a_first_plan():
 def test_an_unaccounted_item_sends_the_plan_back_with_that_item(
         leerie, tmp_path, monkeypatch, repo):
     st = _state(leerie, tmp_path, required_items=ITEMS_4F9A)
+    # This state has no earlier tree of the task (a first run), so no
+    # exclusion can be proven: the second plan claims every item.
     second = _plan(
         _sub("bugfix-001", (0, "deliverable"), (1, "deliverable"),
              (2, "deliverable"), (4, "deliverable"), (8, "deliverable"),
              (13, "deliverable")),
-        not_needed=[(i, "already_on_tree", f"src/flow_runner.py:{i} does it")
-                    for i in (3, 5, 6, 7, 9, 10, 11, 12)])
+        _sub("bugfix-002", *[(i, "deliverable") for i in
+                             (3, 5, 6, 7, 9, 10, 11, 12)]))
     plans, calls = _drive_plan(leerie, monkeypatch, st,
                                [_4f9a_first_plan(), second])
 
@@ -296,7 +308,7 @@ def test_an_unaccounted_item_sends_the_plan_back_with_that_item(
     # The accepted plan accounts for every item: 13 is now claimed by the
     # subtask that changes the tree.
     rows = leerie._item_accounting_rows(plans, ITEMS_4F9A)
-    assert {r["status"] for r in rows} == {"claimed", "excluded"}
+    assert {r["status"] for r in rows} == {"claimed"}
     assert rows[13]["claimed_by"] == ["bugfix-001"]
 
 
@@ -305,7 +317,7 @@ def test_a_covered_plan_proceeds_without_another_round(
     st = _state(leerie, tmp_path, required_items=ITEMS_4F9A)
     covered = _plan(
         _sub("bugfix-001", *[(i, "deliverable") for i in range(13)]),
-        not_needed=[(13, "already_on_tree", "src/flow_runner.py:1 does it")])
+        _sub("bugfix-002", (13, "deliverable")))
     _, calls = _drive_plan(leerie, monkeypatch, st, [covered])
     assert len(calls) == 1
 

@@ -457,9 +457,10 @@ _LEERIE_ONLY = {
     "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",
     "_falsifier_gates", "_drop_lying_index", "_move_view",
-    # `<run-dir>/base-form/` (the base forms a held-out run places) and
-    # `<run-dir>/.settled-change-index`, which no grant names for writing.
-    "_settled_change_landed", "_base_form_place",
+    # `<run-dir>/base-form/` (the base forms a held-out run places),
+    # `<run-dir>/.settled-change-index` and `<run-dir>/.exclusion-proof-index`,
+    # which no grant names for writing.
+    "_settled_change_landed", "_base_form_place", "_exclusion_proof_commit",
     # A grant root itself, whose entry lies in a directory no grant names:
     # making it follows no link a confined process could have planted.
     "_payload_only_cwd", "_acceptance_scope_judge_sets",

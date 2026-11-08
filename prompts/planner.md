@@ -454,11 +454,21 @@ The orchestrator gives you, in your prompt:
      command to run, something never to do). A `deliverable` claim on a
      subtask with `verification_only: true` does not count: that subtask
      writes nothing.
-   - **Or exclude it** in the top-level `items_not_needed` as
-     `{"item_index": 3, "reason_kind": "already_on_tree", "reason": "..."}`
-     when the tree already carries every part of it — the `reason` gives
-     the code evidence (file:line, and what it does) for each part — or
-     with `reason_kind: "other_domain"` when another category's planner
+   - **Or exclude it** in the top-level `items_not_needed`. With
+     `reason_kind: "already_on_tree"` when the tree already carries every
+     part of it: the `reason` gives the code evidence (file:line, and what
+     it does) for each part, and `verify` lists the commands that prove it
+     (`{"argv": [...]}`, the same form as a subtask's `verify`, usually a
+     test that asserts the item). The orchestrator runs them: they must
+     pass on this tree **and fail on an earlier tree of this task where
+     the item was not done**, with their test files as this tree has them.
+     A command that would pass on both trees proves nothing, and the item
+     comes back to you. When CONTEXT's `already_on_tree_provable` is
+     `false` there is no earlier tree (this is the task's first run): do
+     not exclude as `already_on_tree`; claim the item on the subtask that
+     would change the tree for it, and if nothing needs changing the
+     orchestrator settles that subtask as a no-op on its own evidence.
+     With `reason_kind: "other_domain"` when another category's planner
      delivers it (only when this run has more than one category).
    An item you neither claim nor exclude is sent back to you by the
    orchestrator's mechanical check. If an item is still unmet after the
@@ -774,7 +784,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
   ],
   "items_not_needed": [
     {"item_index": 3, "reason_kind": "already_on_tree",
-     "reason": "code evidence that the tree already carries every part of this item"}
+     "reason": "code evidence that the tree already carries every part of this item",
+     "verify": [{"argv": ["pytest", "tests/test_timeout.py"]}]}
   ]
 }
 ```
