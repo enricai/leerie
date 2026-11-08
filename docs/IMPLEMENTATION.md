@@ -7283,7 +7283,49 @@ renders as `## Existing tests changed by this run` (listed in
 `_PR_END_STATE_HEADINGS`, so a worker-written copy is stripped), and which
 therefore reaches the launcher's fallback through `pr_end_state` and draft
 PRs alike. It changes no `outcome`, gate or retry; `_redrive_weakened_tests`
-(escalation gate (b)) is separate and untouched.
+(escalation gate (b)) is separate and untouched. The one thing it shows that
+is measured is `existing_behaviour.changed` (below): a file's cases that fail
+in their base form are its first entries, `- fails in its base form on this
+tree: <id>`.
+
+### Existing tests run in their base form (DESIGN §8)
+
+DESIGN §8 *What an existing test pins on the base holds on the tree that
+ships*. Measured, never read: no prompt, judge or text rule.
+
+| Name | Contract |
+|---|---|
+| `_base_form_path(rel)` | Where a test-case file's base form is placed, beside it: `a.test.ts` -> `a.leerie-base.test.ts` (`_BASE_FORM_JS_RE`: `.test.`/`.spec.` + `[cm]?[jt]sx?`), `test_a.py` -> `test_a__leerie_base.py`, `a_test.py` -> `a__leerie_base_test.py`; None for anything else (a helper, `conftest.py`, a fixture, `_test.go`). |
+| `_base_form_files(repo, base, head, globs)` | `(files, unsupported)` from `git diff --name-status --no-renames base head`: each `_is_test_file` path present at `base` (status not `A`) that `head` modified or deleted, with a `_base_form_path`; `unsupported` the test files whose extension is in `_BASE_FORM_UNSUPPORTED_EXT` (`.go .rb .rs .java .kt .cs .ex .exs .php .swift`: a runner that cannot hold a second copy beside the first). |
+| `_base_form_place(st, repo, base, files, trees)` | `(pairs, original, taken)`: each file's `base` blob written to `<run-dir>/base-form/<base[:12]>/<placed path>` and paired with its placed path, with a JS file's base `__snapshots__/<name>.snap` placed as `__snapshots__/<placed name>.snap`; `original` maps placed -> original path; a file whose placed path exists at any of `trees` is `taken` and never placed. |
+| `_base_form_id(cid, sib, rel)` | A case ID in its file's own name: the placed path and its dotted module (a JUnit class) replaced by the original's. |
+| `_base_form_regressions(st, caps, staging, before, *, label, log_path, reach_of=None)` | Base `_diff_base(st)`, after staging's branch head. `reach_of` (a round's start): files narrowed to those `reach_of..after` touched or `_change_reach` reaches, all of them when its reach is unknown. One `_capture_failing_test_ids(staging, test cmd, files=<placed paths>, place=<pairs>, serial=True)` on staging's committed view, in a held-out sandbox (the base form is never on disk). No failing ID: done. Else a `base-form-base` helper worktree at `before` with `_ensure_worktree_deps`, and B\* over the failing IDs, base side the same base forms placed on it (`_confirm_sized` when every ID has a file, else `_confirm_new_failures` over all of them; a failed checkout or install gives every candidate `no_verdict`). Returns `{base, before, after, files, unsupported, changed: [{id, file, placed_id, message}], unmeasured: [file], unsettled: [id], verdict, unmeasured_reason?}`: `changed` is B\*'s `new`, `unmeasured` the taken files, every file when no test or scoped command resolves or the first run gave no report, and the files of `no_verdict` IDs; `unsettled` the `budget_short_unsettled` IDs. A load failure (`<file> :: (file failed to load)`) is a case like any other. |
+| `_base_form_reason(changed)` | `"N case(s) an existing test pinned on the base fail when the base's own test file is run against this tree (existing_behaviour_changed): …"`, at most `_BASE_FORM_SHOWN` (5) IDs, each prefixed by its file when the ID does not name it, and `(+k more)`. |
+| `_check_existing_behaviour(leerie_dir, st, caps)` | Phase 5's last step before `phase_finalize`, after the final `_refresh_shipping_test_id_diff`: `_base_form_regressions(staging, before=_diff_base(st))` stored as `existing_behaviour` with `tree_sha` (`_view_tree_sha`); reused when that tree is recorded without `error`; a raise is stored as `{error, changed: [], …}`. Then `_set_base_form_gap`. |
+| `_set_base_form_gap(st, rec)` | One `needs_human_verification` entry, source `BASE_FORM_GAP_SOURCE` (`"base_form"`, group "Regression checks the run could not settle"), naming the `unmeasured`, `unsupported` and `unsettled` entries and an `error`; cleared when there are none. |
+
+Where it runs:
+
+- **Each acceptance repair round and each delivery re-drive group that
+  commits** — `_ratchet_exec(…, base_form=True)` calls
+  `_base_form_regressions(staging, before=pre_sha, reach_of=pre_sha)` before
+  the ID diff, whether or not either side of the diff was measured, and
+  returns it as `base_form` with `base_form_changed` (the changed IDs). A
+  raise is `base_form: {error}` with nothing changed. `_delivery_ratchet`
+  carries `base_form_changed` beside `new_failures` (each flags the
+  `execution` items); `_ratchet_rollback_reason` gives `"changed what an
+  existing test pinned on the base: " + _base_form_reason(...)` after the
+  two existing reasons, so `_settle_round` rolls the round back through
+  `_roll_back_round` with it. In `_run_delivery_redrive` a group's
+  `base_form_changed` is recorded and voids it; `_redrive_rollback_reason`
+  names it. `_acceptance_confirm_red_axis`'s call does not pass the flag.
+- **The tree that ships** — `_check_existing_behaviour` (above).
+  `_decide_outcome` adds `_base_form_reason(existing_behaviour.changed)` to
+  the reasons when it is non-empty (`unconverged`).
+  `_unmeasured_on_shipping_tree` adds, when `existing_behaviour` exists: its
+  `error` or a lone `unmeasured_reason`, a `tree_sha` that is not
+  `_shipping_tree(st)`, or its `unmeasured` files. No record (the check
+  never ran: a state from before it) adds nothing.
 
 ### Finalize evidence: site tokens, contract literals, whole-PR review (DESIGN §5, §8, §9)
 
@@ -10063,7 +10105,9 @@ nor void.
   diff_bytes, sample1_flags, touched, candidates, per_sample_regressed,
   confirmed, samples, met_evidence, errors, unverified?}`.
 - **Execution** (`_ratchet_exec(st, caps, staging, pre_sha, before, after,
-  *, label, log_path)`): with either side unmeasured, `{unmeasured: true}`.
+  *, label, log_path, base_form=False)`): with either side unmeasured,
+  `{unmeasured: true}`; with `base_form` it also carries `base_form` and
+  `base_form_changed` (*Existing tests run in their base form*, above).
   Otherwise `_ratchet_exec_in` on staging (its test runs read staging's
   committed view): `_redrive_new_failures` confirms `after`'s candidates
   under B\* against a worktree at `pre_sha` (it also returns the whole B\*
@@ -13478,6 +13522,7 @@ command line overrides it.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier, typed `unverified_external` with its `resource` only when it names `unexercisable_resource`, else `test_missing`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` with a non-empty `resource` (or `simulated_interleaving`) to the PR's "Needs human verification", grouped by that resource (an `unverified_external` entry stored with none, by an older leerie, is not rendered); `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
+| `existing_behaviour` | dict | the existing tests the run changed, run in their base form on the tree that ships (`_check_existing_behaviour`, DESIGN §8 *What an existing test pins on the base holds on the tree that ships*): `{tree_sha, base, before, after, files[], unsupported[], changed: [{id, file, placed_id, message}], unmeasured[], unsettled[], verdict, unmeasured_reason?, error?}`. `changed` makes the run `unconverged` (`_decide_outcome`); `error`, `unmeasured` or another tree is a reason of `_unmeasured_on_shipping_tree`. |
 | `tracked_test_report` | dict | existing tests the run changed (`_tracked_test_report`, DESIGN §8 *Existing tests the run changed are listed in the PR*): `{files: [{file, deleted?, removed[], cases_removed[], added[], cases_added[], skips_added?, lines_removed?, lines_added?, omitted?}], files_omitted}`, stored once at `phase_finalize` (base to final tree), report-only; rendered by `_pr_tracked_test_lines` under `## Existing tests changed by this run`. Lists are source-ordered and bounded by `_TRACKED_TEST_ITEMS_MAX` / `_TRACKED_TEST_FILES_MAX`; the PR shows at most `_PR_TRACKED_TEST_SHOWN` entries and counts the rest. |
 | `settled_heads` | dict[str, str] | per-sid subtask branch tip at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |

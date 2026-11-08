@@ -967,6 +967,11 @@ STATE_FIELDS = (
     # changed are listed in the PR*): {files: [...], files_omitted: n}, stored
     # at finalize, report-only.
     "tracked_test_report",
+    # What an existing test pinned on the base, on the tree that ships
+    # (DESIGN §8 *What an existing test pins on the base holds on the tree
+    # that ships*): {tree_sha, base, files, changed[], unmeasured[],
+    # unsupported[], unsettled[], verdict}, phase 5's last measurement.
+    "existing_behaviour",
     # Write-ahead marker of a wave-end re-drive round on a subtask's branch
     # (DESIGN §6 *A re-drive interrupted mid-round is undone, never
     # integrated*): per-sid {kind, pre_sha, round, status}.
@@ -7234,6 +7239,7 @@ def _needs_human_detail_groups() -> dict[str, str]:
         CONFIRM_BUDGET_GAP_SOURCE:
             "Regression checks the run could not settle",
         FINAL_DIFF_GAP_SOURCE: "Regression checks the run could not settle",
+        BASE_FORM_GAP_SOURCE: "Regression checks the run could not settle",
         ROLLBACK_GAP_SOURCE: "Work the run tried and rolled back",
     }
 
@@ -7470,10 +7476,21 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
         rep.get("files_omitted"), int) else 0
     out: list[str] = []
     shown = 0
+    # The cases whose base form fails on the tree that ships, by file
+    # (DESIGN §8 *What an existing test pins on the base holds on the tree
+    # that ships*): measured, so listed first.
+    behaviour = state.get("existing_behaviour")
+    failed: dict[str, list[str]] = {}
+    for r in ((behaviour.get("changed") or []) if isinstance(behaviour, dict)
+              else []):
+        if isinstance(r, dict) and isinstance(r.get("file"), str):
+            failed.setdefault(r["file"], []).append(str(r.get("id") or ""))
     for rec in files:
         if not isinstance(rec, dict) or not _pr_entry(rec.get("file")):
             continue
-        entries: list[str] = []
+        entries: list[str] = [
+            f"- fails in its base form on this tree: {_pr_code(i)}"
+            for i in failed.get(rec["file"], []) if i.strip()]
         if rec.get("deleted") is True:
             entries.append("- file deleted")
         for key, label in (("removed", "removed assertion"),
@@ -41359,6 +41376,29 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
     if sets:
         out.append(f"{len(sets)} held-out acceptance check(s) gave no "
                    "verdict on the tree that ships")
+    behaviour = data.get("existing_behaviour")
+    if isinstance(behaviour, dict):
+        # Recorded only by phase 5's check: present, it must be of the tree
+        # that ships and have measured every file it named.
+        shipping = _shipping_tree(st)
+        missed = [str(x) for x in behaviour.get("unmeasured") or []]
+        if behaviour.get("error") or (
+                behaviour.get("unmeasured_reason") and not behaviour.get(
+                    "files") and not missed):
+            out.append("the existing tests the run changed were not run in "
+                       "their base form on the tree that ships ("
+                       + str(behaviour.get("error")
+                             or behaviour.get("unmeasured_reason")) + ")")
+        elif shipping and behaviour.get("tree_sha") != shipping:
+            out.append("the existing tests the run changed were run in "
+                       "their base form on another tree than the one that "
+                       "ships")
+        elif missed:
+            out.append(f"{len(missed)} existing test file(s) the run "
+                       "changed gave no verdict in their base form on the "
+                       "tree that ships: " + ", ".join(missed[:5])
+                       + (f" (+{len(missed) - 5} more)"
+                          if len(missed) > 5 else ""))
     return out
 
 
@@ -41469,6 +41509,15 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         reasons.append(f"{int(regressed.get('failed') or 0)} test(s) that "
                        "passed when this task last ended done fail on this "
                        "tree, and the run changed nothing")
+    behaviour = st.data.get("existing_behaviour")
+    if isinstance(behaviour, dict) and behaviour.get("changed"):
+        # Behaviour an existing test pinned on the base, gone from a tree:
+        # the same as any new failure, whoever changed the test (DESIGN §8
+        # *What an existing test pins on the base holds on the tree that
+        # ships*). Of the tree that ships, or `_unmeasured_on_shipping_tree`
+        # says it was not measured.
+        reasons.append(_base_form_reason(
+            [r for r in behaviour["changed"] if isinstance(r, dict)]))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
@@ -58399,7 +58448,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 after = await _ids_at(post, f"{label}-ids")
                 ex = await _ratchet_exec(st, caps, staging, pre, before,
                                          after, label=label,
-                                         log_path=repair_log)
+                                         log_path=repair_log,
+                                         base_form=True)
             return await _delivery_ratchet(st, caps, models, efforts,
                                            staging, pre, post,
                                            exec_result=ex, label=label)
@@ -63029,7 +63079,7 @@ async def _near_rejection(st: "State", caps: dict, staging: Path,
 async def _ratchet_exec(st: "State", caps: dict, staging: Path,
                         pre_sha: str, before: dict | None,
                         after: dict | None, *, label: str,
-                        log_path: Path) -> dict:
+                        log_path: Path, base_form: bool = False) -> dict:
     """The ratchet's execution route: the failing-test-ID diff of one repair
     — IDs failing after it and not before — confirmed by B* against
     `pre_sha` (`_redrive_new_failures`), on staging's commit (staging
@@ -63041,13 +63091,37 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
     `resource_affected` ID meeting the intermittent-regression rule is typed
     as evidence (`_type_intermittent_regressions`), never counted. `after`
     from a near stage gets the confirm alone. `{new, resource_affected,
-    unmeasured, intermittent_regression[], discovery?}`."""
+    unmeasured, intermittent_regression[], discovery?}`.
+
+    `base_form` (a round that committed: an acceptance repair round, a
+    re-drive group): the existing tests the run changed are also run in
+    their base form on the round's commit against its start
+    (`_base_form_regressions`, narrowed to what the round reaches), and the
+    cases that fail there only after it are `base_form_changed` — measured
+    whether or not the ID diff could be (DESIGN §8 *What an existing test
+    pins on the base holds on the tree that ships*)."""
+    bf: dict | None = None
+    if base_form and pre_sha:
+        try:
+            bf = await _base_form_regressions(
+                st, caps, staging, pre_sha, label=label, log_path=log_path,
+                reach_of=pre_sha)
+        except Exception as e:
+            bf = {"error": f"{type(e).__name__}: {e}"[:300], "changed": []}
+            log(f"  {label}: base-form check raised {bf['error']} — no "
+                "verdict from it; the tree that ships is checked again "
+                "before the outcome")
     if before is None or after is None:
-        return {"new": [], "pre_existing": [], "no_verdict": [],
-                "resource_affected": [], "unmeasured": True,
-                "intermittent_regression": []}
-    return await _ratchet_exec_in(st, caps, staging, pre_sha, before, after,
-                                  label=label, log_path=log_path)
+        out = {"new": [], "pre_existing": [], "no_verdict": [],
+               "resource_affected": [], "unmeasured": True,
+               "intermittent_regression": []}
+    else:
+        out = await _ratchet_exec_in(st, caps, staging, pre_sha, before,
+                                     after, label=label, log_path=log_path)
+    if bf is not None:
+        out["base_form"] = bf
+        out["base_form_changed"] = [r["id"] for r in bf.get("changed") or []]
+    return out
 
 
 async def _ratchet_exec_in(st: "State", caps: dict, staging: Path,
@@ -63115,6 +63189,8 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
                  "exec_unchecked": [], "judge": None, "regressed": [],
                  "unverified": [],
                  "new_failures": list(ex.get("new") or []),
+                 "base_form_changed": list(ex.get("base_form_changed")
+                                           or []),
                  "intermittent_regression": list(
                      ex.get("intermittent_regression") or [])}
     prior = _ratchet_prior_met(st)
@@ -63148,7 +63224,7 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
     else:
         out["execution"] = [i for i in rest
                             if kinds.get(i) == "execution"]
-        if out["new_failures"]:
+        if out["new_failures"] or out["base_form_changed"]:
             out["exec_flagged"] = list(out["execution"])
             regressed |= set(out["execution"])
         elif ((ex.get("unmeasured") or ex.get("budget_short_unsettled"))
@@ -63319,6 +63395,10 @@ def _ratchet_rollback_reason(rat: dict) -> str | None:
         return "regressed a previously met required item"
     if rat.get("new_failures"):
         return "broke an existing test"
+    if rat.get("base_form_changed"):
+        return ("changed what an existing test pinned on the base: "
+                + _base_form_reason([{"id": i} for i in
+                                     rat["base_form_changed"]]))
     return None
 
 
@@ -63668,6 +63748,361 @@ async def _store_tracked_test_report(st: "State", base: str) -> None:
     except Exception as e:
         log(f"finalize: tracked-test report skipped "
             f"({type(e).__name__}: {e})")
+
+
+# --- What an existing test pins on the base holds on the tree that ships -----
+# DESIGN §8 *What an existing test pins on the base holds on the tree that
+# ships*. Every pattern here reads paths — mechanical strings (§12).
+
+# A JS/TS test-case file: `<stem>.test.<ext>` / `<stem>.spec.<ext>`.
+_BASE_FORM_JS_RE = re.compile(
+    r"^(?P<stem>.+?)(?P<tail>\.(?:test|spec)\.[cm]?[jt]sx?)$")
+# What a base form's file name carries, beside the final form's.
+_BASE_FORM_TAG = "leerie-base"
+# Test files of languages whose runner cannot hold a second copy of a test
+# file beside the first (a Go package declares each test function once):
+# never run in base form, listed as unchecked instead.
+_BASE_FORM_UNSUPPORTED_EXT = frozenset({
+    ".go", ".rb", ".rs", ".java", ".kt", ".cs", ".ex", ".exs", ".php",
+    ".swift"})
+# The most changed cases an outcome reason names; the rest are counted.
+_BASE_FORM_SHOWN = 5
+BASE_FORM_GAP_SOURCE = "base_form"
+
+
+def _base_form_path(rel: str) -> str | None:
+    """Where the base form of the test-case file `rel` is placed: beside it,
+    its name tagged (`a.test.ts` -> `a.leerie-base.test.ts`, `test_a.py` ->
+    `test_a__leerie_base.py`, `a_test.py` -> `a__leerie_base_test.py`), so
+    its relative imports resolve as the file's own and the runner's file
+    shapes still select it. None for any other path."""
+    d, b = posixpath.split(rel)
+    m = _BASE_FORM_JS_RE.match(b)
+    if m:
+        nb = f"{m['stem']}.{_BASE_FORM_TAG}{m['tail']}"
+    elif b.startswith("test_") and b.endswith(".py"):
+        nb = b[:-3] + "__leerie_base.py"
+    elif b.endswith("_test.py") and len(b) > len("_test.py"):
+        nb = b[:-len("_test.py")] + "__leerie_base_test.py"
+    else:
+        return None
+    return posixpath.join(d, nb) if d else nb
+
+
+def _base_form_files(repo: str | Path, base: str, head: str,
+                     globs: list[str] | None = None
+                     ) -> tuple[list[str], list[str]]:
+    """`(files, unsupported)`: every test-case file present at `base` that
+    `head` modified or deleted and that runs in base form, and every test
+    file of a language that cannot (`_BASE_FORM_UNSUPPORTED_EXT`). A test
+    helper, a fixture or a `conftest.py` is neither: it is not a case, and
+    it is reached through the cases that use it."""
+    rows = _redrive_git(repo, "diff", "--name-status", "--no-renames", "-z",
+                        base, head).split("\0")
+    files: list[str] = []
+    unsupported: list[str] = []
+    for status, f in zip(rows[0::2], rows[1::2]):
+        if not f or status.startswith("A") or not _is_test_file(f, globs):
+            continue
+        if _base_form_path(f) is not None:
+            files.append(f)
+        elif posixpath.splitext(f)[1] in _BASE_FORM_UNSUPPORTED_EXT:
+            unsupported.append(f)
+    return sorted(files), sorted(unsupported)
+
+
+def _base_form_id(cid: str, sib: str, rel: str) -> str:
+    """A base-form case's ID in its file's own name: the placed path, and a
+    JUnit class's dotted module, read as the original's."""
+    out = cid.replace(sib, rel)
+    s_mod = posixpath.splitext(sib)[0].replace("/", ".")
+    return out.replace(s_mod, posixpath.splitext(rel)[0].replace("/", "."))
+
+
+def _base_form_place(st: "State", repo: str | Path, base: str,
+                     files: list[str], trees: list[str]
+                     ) -> tuple[list[tuple[str, str]], dict[str, str],
+                                list[str]]:
+    """`(pairs, original, taken)`: the base forms of `files` written under
+    the run directory and paired with where each is placed
+    (`_base_form_path`), the original path of each placed one, and the files
+    whose placed path one of `trees` already has (never placed over). A
+    JS file's base snapshot (`__snapshots__/<name>.snap`) goes with it, so a
+    snapshot assertion compares against the base's, not a new one."""
+    root = Path(st.run_dir) / "base-form" / base[:12]
+    pairs: list[tuple[str, str]] = []
+    original: dict[str, str] = {}
+    taken: list[str] = []
+    for rel in files:
+        sib = _base_form_path(rel)
+        extra: list[tuple[str, str]] = []
+        d = posixpath.dirname(rel)
+        snap = posixpath.join(d, "__snapshots__",
+                              posixpath.basename(rel) + ".snap")
+        if (_BASE_FORM_JS_RE.match(posixpath.basename(rel))
+                and _redrive_exists_at(repo, base, snap)):
+            extra.append((snap, posixpath.join(
+                d, "__snapshots__", posixpath.basename(sib) + ".snap")))
+        want = [(rel, sib), *extra]
+        if any(_redrive_exists_at(repo, t, to) for t in trees
+               for _, to in want):
+            taken.append(rel)
+            continue
+        for frm, to in want:
+            blob = subprocess.run(
+                ["git", *_tree_git_args(repo), "show", f"{base}:{frm}"],
+                capture_output=True, check=False).stdout
+            src = root / to
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_bytes(blob)
+            pairs.append((str(src), to))
+        original[sib] = rel
+    return pairs, original, taken
+
+
+async def _base_form_regressions(st: "State", caps: dict, staging: Path,
+                                 before: str, *, label: str, log_path: Path,
+                                 reach_of: str | None = None) -> dict:
+    """Run every test-case file the run's base had and staging's commit
+    modified or deleted IN ITS BASE FORM — the base's own content, placed
+    beside the final form in a held-out sandbox, never on disk — on staging's
+    committed view, and confirm each failing case under B* against the same
+    base form placed on `before` (`_confirm_sized`). A case that fails there
+    and passed on `before` is behaviour the run's base pinned and the commit
+    no longer has (`changed`), the same as any new failure: a deleted case,
+    a loosened assertion and a deleted file all still run, and a file that
+    no longer loads (a removed export it imports) is a failing case of its
+    own. `reach_of`: a round's start, whose diff to staging narrows the files
+    to those it touched or reaches (`_change_reach`; all of them when its
+    reach is unknown). Never raises past its callers' guards: a run that
+    gives no verdict is `unmeasured`, never a pass."""
+    base = _diff_base(st) or ""
+    after = await _branch_head_sha(str(staging))
+    out: dict = {"base": base, "before": before, "after": after or "",
+                 "files": [], "unsupported": [], "changed": [],
+                 "unmeasured": [], "unsettled": [], "verdict": None}
+    if not base or not after or not before:
+        out["unmeasured_reason"] = "the base, the commit or its start is unreadable"
+        return out
+    repo = _run_repo(st)
+    globs = resolve_test_file_globs(st.repo_root)
+    files, unsupported = await asyncio.to_thread(
+        _base_form_files, repo, base, after, globs)
+    out["unsupported"] = unsupported
+    if files and reach_of:
+        touched = _redrive_git(repo, "diff", "--name-only", "--no-renames",
+                               "-z", reach_of, after).split("\0")
+        touched = [t for t in touched if t]
+        reached, unknown = await asyncio.to_thread(
+            _change_reach, repo, after, touched, globs)
+        if not unknown:
+            files = [f for f in files
+                     if f in reached or f in touched]
+    out["files"] = files
+    if not files:
+        return out
+    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
+           or "").strip()
+    if not cmd or not resolve_test_files_scoped(st.repo_root):
+        out["unmeasured"] = list(files)
+        out["unmeasured_reason"] = "no scoped test command resolves"
+        return out
+    pairs, original, taken = await asyncio.to_thread(
+        _base_form_place, st, repo, base, files, [before, after])
+    if taken:
+        out["unmeasured"] = list(taken)
+        out["unmeasured_reason"] = "the base form's path is in use"
+    sibs = sorted(original)
+    if not sibs:
+        return out
+
+    def _placed(units: Iterable[str] | None) -> tuple[tuple[str, str], ...]:
+        names = set(units or sibs)
+        snaps = {posixpath.join(posixpath.dirname(u), "__snapshots__",
+                                posixpath.basename(u) + ".snap")
+                 for u in names}
+        return tuple(p for p in pairs if p[1] in names or p[1] in snaps)
+    timeout = float(caps.get("worker_timeout_sec",
+                             DEFAULT_CAPS["worker_timeout_sec"]))
+    first = await _capture_failing_test_ids(
+        str(staging), cmd, st, caps, label=f"{label}-base-form",
+        log_path=log_path, timeout=timeout, serial=True, files=sibs,
+        place=_placed(None))
+    if first is None:
+        out["unmeasured"] = sorted(set(out["unmeasured"]) | set(files))
+        out["unmeasured_reason"] = "the base-form run gave no report"
+        return out
+    cand = sorted(first["ids"])
+    id_files = {c: first["files"].get(c) for c in cand}
+    messages = dict(first.get("messages") or {})
+    if not cand:
+        log(f"  {label}: {len(sibs)} existing test file(s) run in their "
+            "base form — every case the base pinned holds")
+        return out
+    wt = _helper_worktree_path(st, "base-form-base")
+
+    def _teardown() -> None:
+        subprocess.run(["git", "--git-dir", str(repo), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        _rmtree_owned(wt)
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+    _teardown()
+    add = await _worktree_add_detached_async(st, wt, before)
+    try:
+        if add.returncode != 0 or not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"{label}-base-form-base",
+                log_prefix="base form"):
+            # No base side: no candidate gets a verdict, never `pre_existing`
+            # (DESIGN §9 *A failed install is no measurement*).
+            verdict = await _confirm_new_failures(cand, _no_rerun, _no_rerun,
+                                                  caps, label=label)
+        else:
+            n = {"i": 0}
+
+            def _runner(tree: str, side: str, units: list[str] | None):
+                async def _run(left: float) -> set[str] | None:
+                    n["i"] += 1
+                    got = await _capture_failing_test_ids(
+                        tree, cmd, st, caps,
+                        label=f"{label}-base-form-{side}{n['i']}",
+                        log_path=log_path, timeout=left, serial=True,
+                        files=list(units or sibs), place=_placed(units))
+                    return None if got is None else set(got["ids"])
+                return _run
+
+            async def _pass(units: list[str] | None, cands: list[str],
+                            pcaps: dict, gate: dict | None,
+                            **more: object) -> dict:
+                return await _confirm_new_failures(
+                    cands, _runner(str(wt), "base", units),
+                    _runner(str(staging), "final", units), pcaps,
+                    label=f"{label} base form", seen_failing=True,
+                    prior_gate=gate, **more)
+            if all(id_files.get(c) for c in cand):
+                verdict = await _confirm_sized(
+                    {c: id_files[c] for c in cand},
+                    dict(st.data.get("test_file_durations") or {}),
+                    rank={}, caps=caps,
+                    overhead=_rerun_cost_or_default(st)[0],
+                    label=f"{label} base form", confirm=_pass,
+                    per_file=_rerun_cost_or_default(st)[1])
+            else:
+                verdict = await _pass(None, cand, caps, None)
+    finally:
+        _teardown()
+    out["verdict"] = {k: verdict.get(k) for k in (
+        "candidates", "new", "pre_existing", "no_verdict",
+        "resource_affected", "budget_short", "budget_short_unsettled",
+        "pairs_required", "pairs_run", "budget_exhausted")}
+
+    def _row(cid: str) -> dict:
+        # A JUnit report names a placed file only by its dotted module: the
+        # file is in the sandbox, never on disk, so it has no path there.
+        sib = id_files.get(cid) or next(
+            (s for s in sibs if cid.startswith(s)
+             or posixpath.splitext(s)[0].replace("/", ".") in cid), "")
+        rel = original.get(sib, sib)
+        return {"id": _base_form_id(cid, sib, rel) if sib else cid,
+                "file": rel, "placed_id": cid,
+                "message": str(messages.get(cid) or "")[:400]}
+    out["changed"] = [_row(c) for c in verdict.get("new") or []]
+    out["unmeasured"] = sorted(set(out["unmeasured"]) | {
+        _row(c)["file"] for c in verdict.get("no_verdict") or []})
+    out["unsettled"] = [_row(c)["id"] for c in
+                        verdict.get("budget_short_unsettled") or []]
+    if out["changed"]:
+        log(f"  WARNING: {label}: {len(out['changed'])} case(s) an existing "
+            "test pinned on the base fail in their base form: "
+            + "; ".join(r["id"] for r in out["changed"][:_BASE_FORM_SHOWN]))
+    return out
+
+
+def _base_form_reason(changed: list[dict]) -> str:
+    """The words for base-form cases that fail on a tree: what changed and
+    where, bounded."""
+    shown = [str(r.get("id")) if not r.get("file")
+             or str(r["file"]) in str(r.get("id"))
+             else f"{r['file']}: {r.get('id')}"
+             for r in changed[:_BASE_FORM_SHOWN]]
+    more = len(changed) - len(shown)
+    return (f"{len(changed)} case(s) an existing test pinned on the base "
+            "fail when the base's own test file is run against this tree "
+            "(existing_behaviour_changed): " + "; ".join(shown)
+            + (f" (+{more} more)" if more > 0 else ""))
+
+
+async def _check_existing_behaviour(leerie_dir: Path, st: "State",
+                                    caps: dict) -> None:
+    """Phase 5's last measurement before the outcome (DESIGN §8 *What an
+    existing test pins on the base holds on the tree that ships*): every
+    test-case file the base had and the tree that ships modified or deleted,
+    run in its base form against that tree and confirmed under B* against
+    the base (`_base_form_regressions`), recorded as `existing_behaviour`
+    with the tree it measured. Reused on the tree it already describes. The
+    decider reads it; a check that raised is recorded as unmeasured, never
+    as a pass."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    base = _diff_base(st)
+    if not base:
+        return
+    tree_sha = await _view_tree_sha(st, staging) or ""
+    prior = st.data.get("existing_behaviour")
+    if (isinstance(prior, dict) and tree_sha
+            and prior.get("tree_sha") == tree_sha and not prior.get("error")):
+        return
+    try:
+        rec = await _base_form_regressions(
+            st, caps, staging, base, label="existing-behaviour",
+            log_path=st.run_dir / "logs" / "existing-behaviour.log")
+    except Exception as e:
+        rec = {"error": f"{type(e).__name__}: {e}"[:300], "changed": [],
+               "unmeasured": [], "unsupported": []}
+        log(f"phase 5: existing-behaviour check raised {rec['error']} — "
+            "recorded as unmeasured")
+    rec["tree_sha"] = tree_sha
+    st.data["existing_behaviour"] = rec
+    st.save()
+    _set_base_form_gap(st, rec)
+
+
+def _set_base_form_gap(st: "State", rec: dict) -> None:
+    """The "Not verified" entry for existing test files the base-form check
+    could not run (a language it does not place, a run that gave no
+    verdict) and candidates its confirm budget left unsettled; cleared when
+    there are none."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == BASE_FORM_GAP_SOURCE)]
+    parts: list[str] = []
+    for key, what in (("unmeasured", "gave no verdict"),
+                      ("unsupported", "cannot be run beside its new form"),
+                      ("unsettled", "could not be confirmed within the "
+                                    "budget")):
+        xs = [str(x) for x in rec.get(key) or []]
+        if xs:
+            parts.append(f"{what}: " + ", ".join(xs[:5])
+                         + (f" (+{len(xs) - 5} more)" if len(xs) > 5 else ""))
+    if rec.get("error"):
+        parts.append(f"the check raised {rec['error']}")
+    if parts:
+        entries.append({
+            "source": BASE_FORM_GAP_SOURCE,
+            "detail": ("existing tests: run each one the run changed or "
+                       "deleted, in its base form, against the PR branch — "
+                       "whether the behaviour it pinned still holds is "
+                       "unknown. " + "; ".join(parts))})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
 
 
 _SG_ID = r"[A-Za-z_$][\w$]*"
@@ -64563,6 +64998,10 @@ def _redrive_rollback_reason(ge: dict) -> str:
     if ge.get("new_failures"):
         why.append(f"{len(ge['new_failures'])} test(s) newly fail: "
                    + ", ".join(ge["new_failures"]))
+    if ge.get("base_form_changed"):
+        why.append("it changed what an existing test pinned on the base: "
+                   + _base_form_reason([{"id": i} for i in
+                                        ge["base_form_changed"]]))
     gate = ge.get("gate") or {}
     if gate.get("void"):
         parts = [f"{k} {gate[k]}" for k in ("weakened", "schema", "ast")
@@ -65029,8 +65468,11 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     newv = await _ratchet_exec(
                         st, caps, staging, pre_sha, ids_before, ids_after,
                         label=f"redrive-r{rnd}g{gi}",
-                        log_path=st.run_dir / "logs" / _REDRIVE_LOG)
+                        log_path=st.run_dir / "logs" / _REDRIVE_LOG,
+                        base_form=True)
                 ge["new_failures"] = newv["new"]
+                if newv.get("base_form_changed"):
+                    ge["base_form_changed"] = list(newv["base_form_changed"])
                 if newv.get("intermittent_regression"):
                     ge["intermittent_regression"] = newv[
                         "intermittent_regression"]
@@ -65071,7 +65513,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["zero_progress"] = bool(
                     measured_live and not v["fixed_cases"]
                     and not v["held_fixed_cases"])
-                void = void or ge["zero_progress"]
+                void = (void or ge["zero_progress"]
+                        or bool(ge.get("base_form_changed")))
                 if escalate:
                     async with _exec_lock().shared():
                         eg = _redrive_escalation_gate(
@@ -73421,6 +73864,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"failing-test-ID diff refresh raised {type(e).__name__}: {e} — "
             "surfaced as advisory, finalize proceeds")
+    # What an existing test pinned on the base holds on the tree that ships
+    # (DESIGN §8): its base form is run there. The decider reads the record;
+    # one that could not be taken is unmeasured, never a pass.
+    await _check_existing_behaviour(leerie_dir, st, caps)
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

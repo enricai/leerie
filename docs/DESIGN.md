@@ -7709,7 +7709,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case) —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case), or when an existing test's base form fails on the tree that ships (`existing_behaviour_changed`, §8 *What an existing test pins on the base holds on the tree that ships*) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -7767,6 +7767,8 @@ the PR's "Needs human verification" listing it as before:
   not count.
 - *The held-out sets:* every set the final tree left unmeasured, the same
   sets `_acceptance_unmeasured_lines` lists for the PR.
+- *The existing tests' base forms:* a base-form check of another tree, one
+  that raised, or a file it gave no verdict for.
 
 The rule is in the decider, read from what the measurements recorded, so
 any future cause of an unmeasured tree ends the same way, whatever it is.
@@ -14917,7 +14919,9 @@ on every PR, a draft (`unconverged`) one included, and from the same
 `pr_end_state` text on the pr_writer path and the launcher's fallback.
 
 **It is report-only.** A flag changes no outcome, verdict, gate, retry or
-rollback, and a worker is not asked about it. Escalation gate (b) of the
+rollback, and a worker is not asked about it. What does change the outcome is
+measured, not read: the existing tests' base forms (*What an existing test
+pins on the base holds on the tree that ships*, below). Escalation gate (b) of the
 delivery re-drive (`_redrive_weakened_tests`: fewer expect/assert call sites,
 fewer cases, more skips, on the escalated round only) is a separate check
 and is unchanged.
@@ -14962,6 +14966,138 @@ removed and one added assertion. It sees only test-shaped paths. It lists at
 most `_TRACKED_TEST_ITEMS_MAX` items per list and `_TRACKED_TEST_FILES_MAX`
 files in state, and `_PR_TRACKED_TEST_SHOWN` entries in the PR, counting
 the rest.
+
+### What an existing test pins on the base holds on the tree that ships
+
+*Designed 2026-11-07, after run a79384a4.* The invariant: *the behaviour an
+existing test pins on the run's base keeps holding on the tree the run ships,
+unless a person decides otherwise.* Run a79384a4 ended `done` and its PR undid
+an earlier merged fix: acceptance repair round 2 (`4d80a79`) changed
+`click-settle.ts` and deleted the two cases of
+`flow-runner.post-click-settle.test.ts` that pinned the fix, because the run's
+two held-out sets asked for the opposite. Nothing stopped it. The failing-test-ID
+diff and B\* look for tests that newly fail, and a deleted case never runs; the
+ratchet read required items, not existing tests; escalation gate (b) runs on the
+re-drive's last round only; the list above is report-only. The task had said
+"We must ensure that any new changes NEVER INTRODUCE REGRESSIONS in current
+functionality."
+
+**The check is a run, not a reading.** Every test-case file the base had that a
+tree modified or deleted is run *in its base form* — the base's own content —
+against that tree, and every case that fails there is confirmed under B\*
+against the same base form on the tree's start. A deleted case still runs. A
+loosened assertion still asserts the old value. A deleted file is run from its
+base blob. A file that no longer loads (a removed export it imports) is a
+failing case of its own (`(file failed to load)`), as it is in every report
+leerie reads. No prompt, judge or text rule takes part: nothing here asks a
+worker or reads an assertion.
+
+*Where the base form runs.* Beside the final form, its name tagged
+(`a.test.ts` -> `a.leerie-base.test.ts`, `test_a.py` -> `test_a__leerie_base.py`),
+so its relative imports resolve as the file's own and the runner's file shapes
+still select it; a JS file's base snapshot goes with it. It is placed in a
+held-out sandbox over the committed view and never written to a tree (§6 *A
+held-out evaluation runs alone*), so what is measured is still exactly the
+commit plus that one file. A placed path the tree already has is never placed
+over: the file is unmeasured. A test helper, fixture or `conftest.py` is not
+run in base form; it is reached through the cases that use it. Languages whose
+runner cannot hold a second copy beside the first (a Go package declares each
+test function once; Ruby, Rust, the JVM and others alike) are listed under
+"Regression checks the run could not settle", not run.
+
+*Where it runs.* After every acceptance repair round and every delivery re-drive
+group that commits, inside the ratchet's execution route: the files the round
+touched or reaches (`_change_reach`; all of them when its reach is unknown), the
+round's own start as the base side. A case that fails only after the round
+rolls it back (`_roll_back_round`), the reason naming the case. A case an
+earlier round already broke is not this round's. And once more on the tree
+that ships, after the last refresh of the failing-test-ID diff and before the
+outcome, every file, against the run's base. There a failing case makes the run
+`unconverged` with a typed `existing_behaviour_changed` reason naming each case,
+and the PR's `## Existing tests changed by this run` lists it first under its
+file. A check that could not run (no report, a taken path, another tree than
+the one that ships, a raise) is unmeasured, which `done` does not rest on (§6
+*`done` rests on measurements that ran*).
+
+**Measured: the replay.** Every recorded run (barnacle and `web`) whose run
+branch modified or deleted a test-case file its base had: 41 runs, 157 files.
+For each, the base and final trees were extracted from the run's own
+repository, installed from their lockfiles, and every such file was run in its
+base form on both, under leerie's own Landlock shim; a case failing on the
+final tree and passing on the base was rerun in three interleaved base/final
+pairs (B\*'s rule). Read only, no worker call. The 4 `web` runs could not be
+measured (their install's `prisma generate` was refused under the replay's
+grant); 37 barnacle runs were. The base-form run on the final tree took a
+median 24 s, at most 58 s. 138 cases were confirmed changed in 17 runs; no case
+was mixed evidence, and none was a load failure.
+
+| `done` runs (13 measured) | stopped | real regression | task-required change |
+|---|---:|---:|---:|
+| a79384a4 | 4 cases | yes: the #696 fix the task said must not regress | |
+| 2e382c2f | 1 | | yes |
+| 7c1f0bfe | 2 | | yes |
+| b009c575 | 5 | | yes |
+| 43bd4671 | 12 | | yes |
+| ef425976 | 3 | | yes |
+| the other 7 | 0 | | |
+
+The five task-required rows change what their report calls the defect. 2e382c2f,
+7c1f0bfe and b009c575 carry the required item "Generated response schema for a
+recon:generate run must accept valid responses of sibling entities served by
+the same endpoint", and their failing base-form cases assert the strict
+one-entity schema (a "no WARN" case, `tags: z.array(z.string())` required, a
+lone sample strict); b009c575's other four are the generated contract's text,
+reshaped by the same change, not checked one by one. 43bd4671 and ef425976 fix
+"recon-generate-rest-get-hardcodes-path-segment-and-query-params-so-the-plugin-can-only-replay-the-recording",
+and their cases assert the hard-coded `/items/1` and the constant query keys.
+73751002, the run the tracked-test replay found had shipped a real weakening,
+is not stopped: its final conformer (`edc5083`) restored the behaviour, and the
+base form passes on the tree that shipped.
+
+So the check stops 6 of 13 measured `done` runs: 1 real regression, 5 changes
+the task asked for. Among the other 24, 11 carry changed cases. One is a second
+live case, a2a825c2 (it ended `unconverged` for other reasons): its final
+conformer (`aea6d06`) inverted #358's case "drops a same-host, non-mutation
+capture that passes isAllowedFixtureHost and the fold-return matcher but is
+structurally unrelated to the flow's mutation family", to satisfy the report's
+section C16, which asks for the one-line exemption. The base form fails
+(`expected [ 'PromotionsWidgetSearch', … ] to deeply equal [ 'SubmitBookingavailVas' ]`).
+A fix exists that satisfies both: exempt a declared fold-return capture only
+when it is joined to the flow's items.
+
+On a79384a4 the round check would have acted where it mattered: at round 2's
+start (`4a48b8c`, where the final conformer had restored the budget) all 67
+base-form cases pass; after it, the 4 above fail, 11 s a side.
+
+**Why a person decides, and not a re-drive first.** A failing base form is
+either a regression (a79384a4) or the task asking for the change (five of the
+six). Code cannot tell them apart: that is the task's meaning, and the
+declaration path that tried to read it failed its bench (§8 *Existing tests the
+run changed are listed in the PR*: weak quotes passed 4 of 6 weakenings). So
+the run stops and shows the conflict: the case that fails in its base form, its
+failure, and, beside it in the PR, what the run changed in that test. One read
+settles it. The cost is convergence, measured above: 5 of 13 `done` runs would
+have ended `unconverged` for a change their task required, and their PRs would
+have opened as drafts. That is the price of "never".
+
+A re-drive first — one more round told to satisfy both the task and the
+existing test — was not taken, because its benefit could not be measured here
+(no worker ran in this replay). It would help a case like a2a825c2's, where a
+fix satisfies both. It could not help the five task-required rows, where the
+pinned behaviour is the defect the report names: one round each spent, and the
+run still stops. Measure it before adding it.
+
+**Known limits.** A case that fails in its base form on the base itself (an
+environment it needs) is pre-existing under B\* and protects nothing; ef425976
+has three such cases, among them the tracked-test replay's weakened
+`tsc --noEmit` e2e file. The final conformer's own rounds are not checked one by
+one: the tree that ships is (a2a825c2's `aea6d06` was a final-conformer
+commit). Integration and subtask rounds are not checked one by one either; the
+shipping tree is. A JUnit report names a placed Python file by its dotted module
+only, so its cases are confirmed as a whole set. A removed export: pytest
+fails to load the file (pinned by a test); for vitest and jest it was not
+measured here: a runner that binds a missing named export to `undefined` fails
+the cases that use it rather than the load, and either way they fail.
 
 ### Held-out acceptance tests
 
