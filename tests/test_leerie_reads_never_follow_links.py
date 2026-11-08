@@ -464,6 +464,9 @@ _LEERIE_OWN = {
     "_cleanup_on_abnormal_exit", "_ensure_run_repo", "_resumed_wid",
     "_worker_dirs", "_remove_worker_dirs", "_claude_config_template", "_run_last_activity",
     "_invoke", "_restore_settings",
+    # Names only, listed beneath the run directory's `task-files/` (leerie's
+    # copies of the task's references); no content is read.
+    "_task_files_section",
     # The held-out sets and probes: leerie's copies, made through
     # `_read_beneath`, so regular files only.
     "_set_production_imports", "_acceptance_mechanical_findings",

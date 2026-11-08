@@ -24944,6 +24944,11 @@ _COMMITTING_WORKERS = frozenset({
     "surrogate_fixer", "falsifier", "rebaser"})
 # Workers whose prompt reads the run's subtask specs and notes.
 _RUN_NOTES_READERS = frozenset({"implementer", "conformer", "integrator"})
+# The files the task references, copied at plan time into `<run-dir>/task-files/`
+# and read by `_RUN_NOTES_READERS` (DESIGN §6 *A report the task names is read,
+# not searched for*): a worker's tree holds committed code, so an untracked
+# report is in none of them, and no tree it commits from may be given one (I1).
+TASK_FILES_DIRNAME = "task-files"
 # Where an implementer keeps its success-criteria notes and checkpoint:
 # `<run-dir>/notes/<subtask-id>/`, its own directory, so a grant can name
 # it before either file exists.
@@ -25367,6 +25372,10 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     if schema_key in _RUN_NOTES_READERS:
         ro += [str(run_dir / "subtasks"), str(run_dir / "task.md"),
                str(run_dir / NOTES_DIRNAME)]
+        # Read only where it exists: a run planned before the copies were
+        # made has none, and a grant names no path that is not there.
+        if (run_dir / TASK_FILES_DIRNAME).is_dir():
+            ro.append(str(run_dir / TASK_FILES_DIRNAME))
     if notes_id:
         own = _notes_dir(run_dir, notes_id)
         _mkdir_private(own, run_dir)
@@ -42267,6 +42276,7 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     # to decide whether to page the file, so the count and the write must
     # agree regardless of the host locale.
     task_path.write_text(task, encoding="utf-8")
+    _stage_task_files(st, leerie_dir, task)
     task_bytes = len(task.encode("utf-8"))
     sub_dir = leerie_dir / "subtasks"
     for sid, s in subtasks.items():
@@ -42439,6 +42449,44 @@ def _format_provision_recipe_section(recipe: list[dict],
     return "\n".join(lines)
 
 
+def _stage_task_files(st: "State", run_dir: Path, task: str) -> None:
+    """Copy the files the task references into `<run-dir>/task-files/`, where
+    the code-writing workers read them (`_task_files_section`). Best-effort,
+    as `_stage_worktree_extras` is: a failed copy leaves a worker with the
+    task text, which is what it had before."""
+    try:
+        dst = run_dir / TASK_FILES_DIRNAME
+        _mkdir_private(dst, run_dir)
+        _copy_task_references(st, dst, task)
+    except Exception as e:
+        log(f"task files: could not copy the files the task references "
+            f"(non-fatal): {e}")
+
+
+_TASK_FILES_LISTED = 20
+
+
+def _task_files_section(st: "State") -> list[str]:
+    """The prompt section naming the copies `_stage_task_files` made, as
+    data: absolute paths, read-only. Empty when there are none (a task that
+    references no file, or a run planned before the copies existed), so a
+    caller extends its prompt with it."""
+    root = st.run_dir / TASK_FILES_DIRNAME
+    try:
+        files = sorted(str(p) for p in root.rglob("*") if p.is_file())
+    except OSError:
+        return []
+    if not files:
+        return []
+    lines = [f"- {p}" for p in files[:_TASK_FILES_LISTED]]
+    if len(files) > _TASK_FILES_LISTED:
+        lines.append(f"- … {len(files) - _TASK_FILES_LISTED} more under "
+                     f"{root}")
+    return ["FILES THE TASK REFERENCES (read-only copies of files your tree "
+            "may not hold; the task names them by their repository path):\n"
+            + "\n".join(lines)]
+
+
 def _implementer_base_prompt(sid: str, leerie_dir: Path, caps: dict,
                              st: State, *, cwd_line: str) -> list[str]:
     """The implementer's user-prompt lines up to (not including) the
@@ -42471,6 +42519,7 @@ def _implementer_base_prompt(sid: str, leerie_dir: Path, caps: dict,
         audience="implementer")
     if recipe_section is not None:
         up.append(recipe_section)
+    up.extend(_task_files_section(st))
     # DESIGN §5 *Artifact passing between subtasks*: inject the
     # artifacts produced by this subtask's predecessors. The
     # predecessor graph is the same one the scheduler uses for wave
@@ -44617,6 +44666,7 @@ def _append_conformer_context_sections(up: list[str], blt_results: dict[str, dic
         audience="conformer")
     if recipe_section is not None:
         up.append(recipe_section)
+    up.extend(_task_files_section(st))
 
 
 async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
@@ -58606,6 +58656,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 _format_acceptance_task_section(
                     st.data.get("task", ""),
                     st.data.get("required_items") or []),
+                *_task_files_section(st),
                 _format_acceptance_failures_section(
                     final, sets, shown, rnd, shape, rounds,
                     held_back=bool(hidden)),
