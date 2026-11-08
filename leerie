@@ -11203,6 +11203,9 @@ else
   # kill happens BEFORE the cidfile is removed; it then chains the original
   # cleanup so $STAGE and the cidfile are still removed.
   _kill_container_from_cidfile() {
+    # Its processes are gone, and a kill would wait on the runtime that
+    # stopped answering (`_wait_run`).
+    [ -z "${_runtime_unanswered:-}" ] || return 0
     if [ -f "${_cidfile:-}" ]; then
       local _cid
       _cid="$(cat "$_cidfile" 2>/dev/null)"
@@ -11228,7 +11231,29 @@ else
     [ -f "${_cidfile:-}" ] && _cid="$(cat "$_cidfile" 2>/dev/null)"
     [ -n "$_cid" ] || _cid="${_container_name:-}"
     [ -n "$_cid" ] || return 0
-    nerdctl --namespace "$LEERIE_IMAGE_NS" rm -f "$_cid" >/dev/null 2>&1 || true
+    if [ -z "${_runtime_unanswered:-}" ]; then
+      nerdctl --namespace "$LEERIE_IMAGE_NS" rm -f "$_cid" >/dev/null 2>&1 || true
+      return 0
+    fi
+    # The launcher stopped waiting on a runtime that did not answer
+    # (`_wait_run`): the removal gets the same grace, and what it could not
+    # do is said, with the command that does it later.
+    local _rm_pid _n=0
+    nerdctl --namespace "$LEERIE_IMAGE_NS" rm -f "$_cid" </dev/null >/dev/null 2>&1 &
+    _rm_pid=$!
+    while kill -0 "$_rm_pid" 2>/dev/null \
+          && [ "$_n" -lt $((_run_end_grace_s * 10)) ]; do
+      sleep 0.1
+      _n=$((_n + 1))
+    done
+    if kill -0 "$_rm_pid" 2>/dev/null; then
+      kill -KILL "$_rm_pid" 2>/dev/null || true
+      wait "$_rm_pid" 2>/dev/null || true
+      _launch_note "could not remove container ${_container_name:-} ($_cid): the container runtime did not answer within ${_run_end_grace_s}s. No process of it is left; its record, and the image it holds, stay until the runtime answers: nerdctl --namespace $LEERIE_IMAGE_NS rm -f $_cid"
+    elif ! wait "$_rm_pid"; then
+      _launch_note "could not remove container ${_container_name:-} ($_cid): the container runtime refused. No process of it is left; its record, and the image it holds, stay until it is removed: nerdctl --namespace $LEERIE_IMAGE_NS rm -f $_cid"
+    fi
+    return 0
   }
 
   # Decoupled streaming (DESIGN §6 *Launcher hang on abnormal container exit*).
@@ -11284,8 +11309,10 @@ else
       # backgrounding time — a `jobs`/command-substitution fork issued
       # immediately after starting the pipeline measurably delays the
       # pipe's first bytes reaching our stdout, which is exactly what
-      # the sleep above exists to avoid.
-      _tail_writer_pid="$(jobs -l %% 2>/dev/null \
+      # the sleep above exists to avoid. From the whole job table, not
+      # the current job (`%%`): `_wait_run`'s poll `sleep` is the current
+      # job by now, and the awk names the pipeline by its `tail -n`.
+      _tail_writer_pid="$(jobs -l 2>/dev/null \
         | awk '/tail -n/ && !f { for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/ && !f) {print $i; f = 1} }')"
       kill "$_tail_pid" ${_tail_writer_pid:+"$_tail_writer_pid"} 2>/dev/null || true
       _tail_pid=""
@@ -11309,7 +11336,156 @@ else
   # and -it and --clarify need the terminal), and `_wait_run` waits for it;
   # a signal interrupts that `wait` and its trap runs at once.
   _run_pid=""
+  # A launch's host-side work starts when its run has ended, not when the
+  # container runtime says the container exited (DESIGN §6 *A launch's
+  # host-side work starts when its run has ended*). Measured 2026-11-07:
+  # a run recorded its end, then the runtime's shim stopped answering, the
+  # container read `Unknown`, and the client waited 42 minutes; when it
+  # returned, non-zero, the push and the PR were skipped. So `_wait_run`
+  # watches for the run's own end record while the client runs, and once
+  # the run has ended gives the client `_run_end_grace_s` to return. Past
+  # that it stops waiting only when the host's /proc proves no process of
+  # the container is left to write the run directory. Nothing bounds a run
+  # that has not ended.
+  _run_end_grace_s="${LEERIE_RUN_END_GRACE_S:-60}"
+  case "$_run_end_grace_s" in ''|*[!0-9]*) _run_end_grace_s=60 ;; esac
+  _run_end_code=""
+  # Set once the launcher stopped waiting on a runtime that did not answer:
+  # the EXIT trap then neither kills the container (its processes are gone,
+  # and a kill waits on that runtime) nor waits unbounded on its removal.
+  _runtime_unanswered=""
+  _poll_pid=""
+
+  # _launch_note — a line for the operator, on stderr and in the --log-file,
+  # where a run's record is read after the fact.
+  _launch_note() {
+    remote_log "$@"
+    if [ -n "${_log_tee_target:-}" ]; then
+      remote_log "$@" 2>>"$_log_tee_target" || true
+    fi
+  }
+
+  # _read_run_end_code — the exit code this launch's run recorded at its
+  # end, into `_run_end_code`; fails while it has recorded none. The run is
+  # the one the run-id file names, and the record its
+  # `orchestrator.exit_code`, which the orchestrator clears when it takes
+  # the run, before it names it there: a record found is this launch's.
+  # Only a whole line (the newline ends the write) of digits counts.
+  # Builtins only: it runs every poll.
+  _read_run_end_code() {
+    local _id="" _code=""
+    _run_end_code=""
+    [ -f "${_run_id_file:-}" ] || return 1
+    IFS= read -r _id 2>/dev/null <"$_run_id_file" || return 1
+    case "$_id" in ''|*[!A-Za-z0-9._-]*|.*) return 1 ;; esac
+    [ -f "$LEERIE_STATE_HOST_DIR/runs/$_id/orchestrator.exit_code" ] || return 1
+    IFS= read -r _code 2>/dev/null \
+      <"$LEERIE_STATE_HOST_DIR/runs/$_id/orchestrator.exit_code" || return 1
+    case "$_code" in ''|*[!0-9]*) return 1 ;; esac
+    _run_end_code=$_code
+  }
+
+  # _launch_container_is_empty — whether the host's /proc shows that no
+  # process of this launch's container is left. The runtime's shim (comm
+  # `containerd-shim`, `-id <the cidfile's ID>` in its argv) is the parent
+  # of the container's init, and the init of a PID namespace exits only
+  # once every other process in it has (the kernel kills them and waits
+  # for them). So: the shim has no child, or only a zombie with no thread
+  # left. Fails whenever that cannot be read: no ID, no /proc (macOS, where
+  # the container is in Colima's VM), no shim, an unreadable children list.
+  _launch_container_is_empty() {
+    local _cid="" _p _c _a _prev _shim="" _t _kids _k _st _n _x
+    [ -f "${_cidfile:-}" ] || return 1
+    IFS= read -r _cid 2>/dev/null <"$_cidfile" || :
+    [ -n "$_cid" ] || return 1
+    [ -d /proc/self/task ] || return 1
+    for _p in /proc/[0-9]*; do
+      _c=""
+      IFS= read -r _c 2>/dev/null <"$_p/comm" || continue
+      [ "$_c" = "containerd-shim" ] || continue
+      _prev=""
+      while IFS= read -r -d '' _a; do
+        if [ "$_prev" = "-id" ] && [ "$_a" = "$_cid" ]; then
+          _shim=${_p#/proc/}
+          break
+        fi
+        _prev=$_a
+      done 2>/dev/null <"$_p/cmdline" || :
+      [ -z "$_shim" ] || break
+    done
+    [ -n "$_shim" ] || return 1
+    for _t in /proc/"$_shim"/task/*; do
+      [ -r "$_t/children" ] || return 1
+      _kids=""
+      # The list ends in a space and no newline, so `read` fails at its end.
+      IFS= read -r _kids 2>/dev/null <"$_t/children" || :
+      for _k in $_kids; do
+        _st=""
+        IFS= read -r _st 2>/dev/null <"/proc/$_k/stat" || continue
+        _st=${_st##*) }
+        [ "${_st%% *}" = "Z" ] || return 1
+        _n=0
+        for _x in /proc/"$_k"/task/*; do
+          [ -e "$_x" ] && _n=$((_n + 1))
+        done
+        [ "$_n" -le 1 ] || return 1
+      done
+    done
+    return 0
+  }
+
+  # _abandon_run_client — stop a client still waiting on a runtime that does
+  # not answer, and its own children (`script` runs nerdctl as one): TERM,
+  # up to 10 s, then KILL.
+  _abandon_run_client() {
+    local _pids="$_run_pid" _t _k _n=0 _alive
+    for _t in /proc/"$_run_pid"/task/*; do
+      [ -r "$_t/children" ] || continue
+      _k=""
+      IFS= read -r _k 2>/dev/null <"$_t/children" || :
+      _pids="$_pids $_k"
+    done
+    # shellcheck disable=SC2086
+    kill -TERM $_pids 2>/dev/null || true
+    while [ "$_n" -lt 100 ]; do
+      _alive=""
+      for _k in $_pids; do
+        if kill -0 "$_k" 2>/dev/null; then _alive=1; fi
+      done
+      [ -n "$_alive" ] || break
+      sleep 0.1
+      _n=$((_n + 1))
+    done
+    # shellcheck disable=SC2086
+    kill -KILL $_pids 2>/dev/null || true
+    wait "$_run_pid" 2>/dev/null || true
+  }
+
   _wait_run() {
+    local _ended_at="" _said=""
+    while kill -0 "$_run_pid" 2>/dev/null; do
+      if [ -z "$_ended_at" ]; then
+        if _read_run_end_code; then _ended_at=$SECONDS; fi
+      elif [ $((SECONDS - _ended_at)) -ge "$_run_end_grace_s" ]; then
+        if _launch_container_is_empty; then
+          _launch_note "run ended (exit $_run_end_code) $((SECONDS - _ended_at))s ago and no process of its container ${_container_name:-} is left, but the container runtime has not reported the exit; finishing from the run directory"
+          _abandon_run_client
+          container_rc=$_run_end_code
+          _runtime_unanswered=1
+          _run_pid=""
+          return 0
+        elif [ -z "$_said" ]; then
+          _launch_note "run ended (exit $_run_end_code) $((SECONDS - _ended_at))s ago, but the container runtime has not reported its container ${_container_name:-} exited, and this host cannot show that none of the container's processes is left; waiting for the runtime"
+          _said=1
+        fi
+      fi
+      # In the background, so a signal interrupts the `wait` and its trap
+      # runs at once; holding none of the launcher's stdio.
+      sleep 2 </dev/null >/dev/null 2>&1 &
+      _poll_pid=$!
+      wait "$_poll_pid" 2>/dev/null || :
+      _poll_pid=""
+    done
     wait "$_run_pid" || container_rc=$?
     _run_pid=""
   }
@@ -11327,6 +11503,7 @@ else
   # Bounded at 30 s, then the client is killed.
   _stop_run() {
     local _n=0
+    [ -z "${_poll_pid:-}" ] || kill "$_poll_pid" 2>/dev/null || true
     _kill_container_from_cidfile || true
     if [ -n "${_run_pid:-}" ]; then
       kill -TERM "$_run_pid" 2>/dev/null || true
@@ -11379,6 +11556,8 @@ else
   #     --no-push; the run's record of the choice is the orchestrator's.
   #   - LEERIE_SKIP_PREPUSH_PREFLIGHT: gates a probe that runs on the host
   #     before the container starts; nothing inside reads it.
+  #   - LEERIE_RUN_END_GRACE_S: how long the launcher waits on the runtime
+  #     once the run has ended (`_wait_run`); nothing inside reads it.
   _leerie_env_denylist=" \
     LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
@@ -11386,6 +11565,7 @@ else
     LEERIE_STATE_HOST_DIR LEERIE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION \
     LEERIE_TASK_ARG LEERIE_RUN_ID_FILE \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
+    LEERIE_RUN_END_GRACE_S \
     LEERIE_NO_AUTO_PUBLISH LEERIE_LOCAL_BUILD LEERIE_FORCE_KILL \
     LEERIE_NO_RUNTIME_INSTALL LEERIE_INSPECT_HOST_TARGETS \
     LEERIE_FLY_APP LEERIE_FLY_IMAGE LEERIE_RUNTIME LEERIE_MACHINE_ID \
@@ -11481,8 +11661,8 @@ else
     # When a --log-file target is writable, tee that same stream into it —
     # no enclosing subshell, so $! names the pipeline's last process (tee
     # when teeing, tail otherwise, matching the pre-teeing behavior exactly).
-    # The client starts first, so the tail pipeline stays the current job
-    # `_reap_tail` reads (`jobs -l %%`); `tail -n +1` loses nothing to that.
+    # The client starts first; `_reap_tail` finds the tail pipeline in the
+    # job table by its `tail -n`, and `tail -n +1` loses nothing to that.
     _tail_writer_pid=""
     nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" >"$_run_log" 2>&1 <&0 &
     _run_pid=$!
@@ -11568,6 +11748,15 @@ else
     nerdctl --namespace "$LEERIE_IMAGE_NS" run "${_run_argv[@]}" <&0 &
     _run_pid=$!
     _wait_run
+  fi
+  # The run's own exit code when it recorded one, whatever code the runtime
+  # reported (DESIGN §6 *A launch's host-side work starts when its run has
+  # ended*): a shim that went away after the run ended returned non-zero
+  # for a run that had ended done, and the push was skipped. No record (a
+  # crash, a SIGKILL, an exit before the run was named) keeps the runtime's.
+  if _read_run_end_code && [ "$_run_end_code" != "$container_rc" ]; then
+    _launch_note "the container runtime reported exit $container_rc; the run recorded exit $_run_end_code at its end, which is what this launch finishes with"
+    container_rc=$_run_end_code
   fi
 fi
 

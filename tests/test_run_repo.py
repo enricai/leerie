@@ -476,6 +476,64 @@ def test_main_names_the_run_a_bare_resume_picked(leerie, tmp_path,
     assert target.read_text() == "newer-run\n"
 
 
+def test_a_resumed_runs_earlier_end_record_is_gone_before_it_is_named(
+        leerie, tmp_path, monkeypatch):
+    """The launcher reads `orchestrator.exit_code` of the run the run-id
+    file names as this launch's run having ended (DESIGN §6 *A launch's
+    host-side work starts when its run has ended*). A resumed run's file is
+    an earlier invocation's: the real `main()` removes it before it names
+    the run, so the launcher never reads it as this one's, and the record
+    the run leaves is this invocation's code. Falsified: the removal
+    dropped (the earlier `0` is still there when the run is named)."""
+    from tests.conftest import fake_claude_on_path
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=repo, check=True)
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
+    fake_claude_on_path(tmp_path, monkeypatch)
+    monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
+    run_dir = repo / ".leerie" / "runs" / "the-run"
+    run_dir.mkdir(parents=True)
+    started = "2026-01-01T00:00:00+00:00"
+    (run_dir / "state.json").write_text(json.dumps(
+        {"task": "t", "started_at": started,
+         "run_layout": leerie.RUN_LAYOUT_VERSION}))
+    (run_dir / "run.json").write_text(json.dumps(
+        {"run_id": "the-run", "started_at": started}))
+    (run_dir / "orchestrator.exit_code").write_text("0\n")
+    target = tmp_path / ".runid-launcher"
+    monkeypatch.setenv("LEERIE_RUN_ID_FILE", str(target))
+    seen: dict = {}
+    real_record = leerie._record_run_id_for_launcher
+
+    def record(run_id):
+        seen["record_when_named"] = (run_dir / "orchestrator.exit_code"
+                                     ).exists()
+        real_record(run_id)
+    monkeypatch.setattr(leerie, "_record_run_id_for_launcher", record)
+
+    async def orchestrate(args, caps, leerie_dir, st, *a, **k):
+        seen["record_when_driven"] = (run_dir / "orchestrator.exit_code"
+                                      ).exists()
+        sys.exit(7)
+    monkeypatch.setattr(leerie, "_orchestrate", orchestrate)
+    monkeypatch.setattr(sys, "argv", ["leerie", "resume", "--run-id",
+                                      "the-run"])
+    try:
+        leerie.main()
+    except SystemExit:
+        pass
+    assert target.read_text() == "the-run\n"
+    assert seen == {"record_when_named": False,
+                    "record_when_driven": False}, seen
+    # What the run leaves is this invocation's end, not the earlier `0`.
+    assert (run_dir / "orchestrator.exit_code").read_text() == "7\n"
+
+
 # ------------------------------------------------------- review round 17
 
 def test_a_workers_git_init_never_costs_the_run_its_repository(leerie, env):

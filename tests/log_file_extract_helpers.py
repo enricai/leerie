@@ -50,8 +50,12 @@ def extract_reap_tail() -> str:
 def extract_wait_run() -> str:
     """`_run_pid` and `_wait_run`, which every invocation form calls: the
     client runs in the background so a signal reaches the launcher's trap
-    at once (DESIGN §6 *container boundary's hidden precondition*)."""
-    return _extract('  _run_pid=""\n  _wait_run() {\n', "  }\n")
+    at once (DESIGN §6 *container boundary's hidden precondition*). With
+    the helpers `_wait_run` calls to see whether the run has ended (DESIGN
+    §6 *A launch's host-side work starts when its run has ended*)."""
+    return _extract('  _run_pid=""\n',
+                    '    wait "$_run_pid" || container_rc=$?\n'
+                    '    _run_pid=""\n  }\n')
 
 
 def extract_terminal_relay() -> str:

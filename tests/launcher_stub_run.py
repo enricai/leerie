@@ -44,6 +44,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -160,11 +161,21 @@ case "$1" in
     fi
     # What the container prints, for a test of the launcher's relay.
     [ -z "${STUB_RUN_PRINT:-}" ] || printf '%s\n' "$STUB_RUN_PRINT"
-    "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
-    printf '%s\n' "$!" > "$w/container.pid"
-    [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
-    wait "$!"
-    rc=$?
+    if [ -n "${STUB_SHIM:-}" ]; then
+      # The runtime's shim, the parent of the container's init, and what
+      # the client waits on (`_SHIM`).
+      [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
+      "$w/shim/containerd-shim-runc-v2" -I -S "$w/shim/shim.py" \
+        -namespace "$ns" -id stubcid -address /stub &
+      wait "$!"
+      rc=$?
+    else
+      "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
+      printf '%s\n' "$!" > "$w/container.pid"
+      [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
+      wait "$!"
+      rc=$?
+    fi
     # The orchestrator's exit status, for a run that ends (STUB_RUN_RC).
     [ -z "${STUB_RUN_RC:-}" ] || rc=$STUB_RUN_RC
     # `--rm` is the client's: done only by a client alive after the
@@ -218,6 +229,8 @@ case "$1" in
     exit 0 ;;
   rm)
     [ "$ns" = leerie ] || exit 0
+    # A runtime that does not answer (STUB_RM_HANG=1).
+    [ "${STUB_RM_HANG:-}" != 1 ] || exec "__SLEEP__" 3600
     c_get "${!#}" || { printf 'Error: no such container: %s\n' "${!#}" >&2; exit 1; }
     if [ "$C_ST" = running ] || [ "$C_ST" = paused ]; then
       if [ "$2" != -f ]; then
@@ -233,6 +246,49 @@ case "$1" in
   *) exit 0 ;;
 esac
 """
+
+
+# The runtime's shim, for `STUB_SHIM=1`: python by its absolute path, run
+# through a link named as containerd's runc shim is, so its comm reads
+# `containerd-shim` and its argv carries `-id stubcid`, as the real one's do.
+# It forks the container's init, which sleeps STUB_RUN_SECONDS, records the
+# run's end (STUB_END_CODE into STUB_END_FILE, a line written whole, as the
+# orchestrator's `orchestrator.exit_code`), lives STUB_LINGER more (the
+# container's processes still running after the run recorded its end) and
+# exits STUB_INIT_RC. A shim that answers exits with the init's code once it
+# has reaped it. One that does not (STUB_SHIM_HANG=1) never exits, so the
+# client waiting on it never returns, as a client waiting on a shim that
+# stopped answering does; it reaps the init first unless
+# STUB_SHIM_REAP=0, which leaves the init a zombie.
+_SHIM = r"""import os, sys, time
+e = os.environ
+init = os.fork()
+if init == 0:
+    time.sleep(float(e.get("STUB_RUN_SECONDS", "0")))
+    if e.get("STUB_END_CODE") and e.get("STUB_END_FILE"):
+        tmp = e["STUB_END_FILE"] + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(e["STUB_END_CODE"] + "\n")
+        os.replace(tmp, e["STUB_END_FILE"])
+    time.sleep(float(e.get("STUB_LINGER", "0")))
+    os._exit(int(e.get("STUB_INIT_RC", "0")))
+with open("__WORLD__/container.pid", "w") as f:
+    f.write(f"{init}\n")
+if e.get("STUB_SHIM_HANG") == "1":
+    if e.get("STUB_SHIM_REAP", "1") == "1":
+        os.waitpid(init, 0)
+    while True:
+        time.sleep(3600)
+_, status = os.waitpid(init, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""
+
+
+def _shim(world: Path) -> None:
+    shim = world / "shim"
+    shim.mkdir()
+    (shim / "shim.py").write_text(_SHIM.replace("__WORLD__", str(world)))
+    (shim / "containerd-shim-runc-v2").symlink_to(sys.executable)
 
 
 def _kernel(world: Path, bindir: Path, apparmor: str) -> None:
@@ -282,6 +338,7 @@ def make_world(tmp_path: Path, *, apparmor: str = "current") -> dict:
                     .replace("__SLEEP__", SLEEP))
     stub.chmod(0o755)
     _kernel(world, bindir, apparmor)
+    _shim(world)
     return {"world": world, "repo": repo, "home": home, "bin": bindir,
             "state": world / "state", "mark": uuid.uuid4().hex}
 

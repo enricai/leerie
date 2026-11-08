@@ -7175,7 +7175,10 @@ incomplete host-side state — never poisons the file with a bare
 `{"finished_at": …}` stub) before re-raising, and writes the exit code to
 `orchestrator.exit_code` so the tail wrapper can propagate it to
 `decide_teardown` (absent that file, the wrapper falls back to exit 0 and
-`decide_teardown` takes the clean-exit branch). `fetch_branch` needs the
+`decide_teardown` takes the clean-exit branch). `main()` removes the file when it
+takes the run, so it is always the last invocation's end, never one an
+earlier invocation of a resumed run left (*A launch's host-side work starts
+when its run has ended*). `fetch_branch` needs the
 `finished_at` write to discover the run at all — without it, every
 post-setup `die()` triggers the sync-failure banner. The value is
 idempotent on `resume`: `phase_finalize` overwrites it with the real
@@ -8593,6 +8596,68 @@ mux, so a stuck master can no longer wedge the pipeline. Gated to the
 piped (`-i`, non-TTY-stdout) case; the interactive `-it` path has a real
 pty and thus no hang. The stale-container reaper above remains the
 backstop for the uncatchable SIGKILL case.
+
+**A launch's host-side work starts when its run has ended.** The launcher
+used to start its host side (the push, the PR, the bring-back) when
+`nerdctl run` returned, which is when the container runtime reports that the
+container exited. It also took its exit code from the runtime. Measured
+2026-11-07, run a41a09fd on barnacle, host load 110–175:
+
+- The orchestrator recorded its end, code 0, at 22:56:12 and exited.
+- 55 s later the runtime's shim stopped answering containerd. containerd
+  logged `get state … context deadline exceeded` 144 times, and
+  `nerdctl ps` listed the container `Unknown`.
+- The client waited in a futex for 42 minutes, until the shim went away at
+  23:38:36. It then returned non-zero, so the launcher skipped the push and
+  the PR of a run that had ended done. Only the EXIT trap's bring-back ran.
+
+Other shims on that host went unanswering for over an hour the same day.
+The shim logged nothing, and nothing an unprivileged launcher can read
+says why. So the runtime's report is not what the host side waits for.
+
+- *The run's end is the orchestrator's record.* `main()` writes the
+  run's exit code to `orchestrator.exit_code` on every exit it reaches. It
+  removes that file when it takes the run, before it names the run in the
+  run-id file (*Which run the container ran*). So a record the launcher
+  finds for the run the file names is this launch's, never one a resumed
+  run's earlier invocation left. If the file cannot be removed, the run
+  stops. The launch finishes with the recorded code whatever code the
+  runtime reports. With no record (a crash, SIGKILL, an OOM kill, an exit
+  before the run was named), the runtime's code stands, as before.
+- *Ended, then a grace, then proof.* While the client runs, the launcher
+  checks every two seconds whether its run has recorded its end. From then
+  on it gives the client `LEERIE_RUN_END_GRACE_S` (60 s) to return. Past
+  that, it stops waiting only when it can prove that no process of the
+  container is left to write the run directory. A run's repository and its
+  bring-back must not race a container that is still writing.
+
+  The proof comes from the host's `/proc`. The runtime's shim (comm
+  `containerd-shim`, `-id <the container's ID>` in its argv) is the parent
+  of the container's init. The init of a PID namespace exits only after
+  every other process in the namespace has exited: the kernel kills them
+  and waits for them. So when the shim has no child, or has only a zombie
+  with no thread left, no process of the container is left. The launcher
+  then stops the client and does its finalize from the run directory,
+  which is on the host. Until then it waits, and says once why.
+- *No generic timeout.* Nothing bounds a run that has not recorded its
+  end. A 20-hour run is waited on for 20 hours. A container that ends
+  without a record (a crash) keeps the old behaviour: the launcher waits for
+  the runtime, however long that takes.
+- *Runtimes.* On rootless and rootful Linux the shim and its children are
+  in the host's `/proc`, whose `comm`, `cmdline` and `children` files any
+  user can read. On macOS the container runs in Colima's VM, and the host
+  has no `/proc`. A Linux host whose `/proc` hides other users' processes
+  (`hidepid`) cannot read them either. In both cases the proof is
+  unavailable, so the launcher waits for the runtime as before and says
+  so. The recorded code still decides how the launch finishes. Fly and EC2
+  start no local container, so none of this applies to them.
+- *Cleanup as far as the runtime allows.* Once the launcher has stopped
+  waiting on a runtime that did not answer, its EXIT trap does not `kill`
+  the container: its processes are gone, and a kill would wait on that
+  runtime. The trap's `rm -f` gets the same grace. If it does not return in
+  time, or it fails, the launcher stops it and names the container in the
+  log, with the command that removes it later. The container's record, and
+  the image it holds, stay until the runtime answers.
 
 **Nothing the launcher starts outlives it or keeps its output open.** A
 reader of the launcher's output (`leerie … | tee`, `$(leerie …)`, a CI
