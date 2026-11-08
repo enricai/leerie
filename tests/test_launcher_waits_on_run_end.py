@@ -59,7 +59,7 @@ def _world(tmp_path: Path) -> tuple[dict, Path]:
     return w, run_dir
 
 
-def _env(run_dir: Path, **extra: str) -> dict:
+def _shim_env(run_dir: Path, **extra: str) -> dict:
     env = {"STUB_SHIM": "1", "STUB_RUN_ID": RID,
            "STUB_END_FILE": str(run_dir / "orchestrator.exit_code"),
            "LEERIE_RUN_END_GRACE_S": GRACE}
@@ -109,7 +109,7 @@ def test_an_ended_run_is_finished_though_the_runtime_never_answers(
     hung `rm -f`)."""
     w, run_dir = _world(tmp_path)
     try:
-        p, log = _start(w, _env(run_dir, STUB_RUN_SECONDS="1",
+        p, log = _start(w, _shim_env(run_dir, STUB_RUN_SECONDS="1",
                                 STUB_END_CODE="0", STUB_SHIM_HANG="1",
                                 STUB_SHIM_REAP=reap_init, STUB_RM_HANG="1"))
         try:
@@ -146,7 +146,7 @@ def test_a_run_that_has_not_ended_is_waited_on(tmp_path: Path,
     finishes)."""
     w, run_dir = _world(tmp_path)
     try:
-        p, log = _start(w, _env(run_dir, STUB_RUN_SECONDS=run_seconds,
+        p, log = _start(w, _shim_env(run_dir, STUB_RUN_SECONDS=run_seconds,
                                 STUB_SHIM_HANG="1"))
         init = _init_pid(w)
         time.sleep(int(GRACE) + 6)
@@ -168,7 +168,7 @@ def test_an_ended_run_whose_container_still_runs_is_waited_on(
     shim's children (the launcher finishes while the init still runs)."""
     w, run_dir = _world(tmp_path)
     try:
-        p, log = _start(w, _env(run_dir, STUB_RUN_SECONDS="1",
+        p, log = _start(w, _shim_env(run_dir, STUB_RUN_SECONDS="1",
                                 STUB_END_CODE="0", STUB_LINGER="10",
                                 STUB_SHIM_HANG="1", STUB_RM_HANG="1"))
         init = _init_pid(w)
@@ -204,7 +204,7 @@ def test_the_run_finishes_with_its_own_code(tmp_path: Path, end_code,
     after the three run forms dropped (the `0` case is skipped)."""
     w, run_dir = _world(tmp_path)
     try:
-        env = _env(run_dir, STUB_RUN_SECONDS="1", STUB_RUN_RC=client_rc)
+        env = _shim_env(run_dir, STUB_RUN_SECONDS="1", STUB_RUN_RC=client_rc)
         if end_code:
             env["STUB_END_CODE"] = end_code
         p, log = _start(w, env)

@@ -74602,7 +74602,7 @@ def main() -> int | None:
         pass
     except OSError as e:
         die(f"could not clear the run's previous end record "
-            f"{st.run_dir / 'orchestrator.exit_code'}: {e}")
+            f"{_operator_path(st.run_dir / 'orchestrator.exit_code')}: {e}")
     # The run is this process's from here (its flock is held): tell the
     # launcher which one, for the bring-back after the container exits
     # (DESIGN §6 *Which run the container ran*).
