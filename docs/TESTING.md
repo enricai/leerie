@@ -8361,3 +8361,16 @@ confined as a measurement is, only the worker stubbed. It counts what really
 ran through a spy on `_run_streaming` that calls through. `CMD` is a prefix of
 every narrowed command, so a whole run is asserted with `Run.ran_whole`, never a
 substring: the first draft of these tests passed `CMD in c` on a narrowed run.
+
+`tests/test_near_tests_first.py` extends its `Run` (DESIGN §8 *A round's near
+tests are measured first*, §9 *Discovery on a tree that may not ship*). A broken
+test is really broken on disk, so B\*'s verdict comes from real reruns against a
+real base worktree. The flaky case fails only while a marker file exists and the
+capture spy removes it before the reruns, so B\* really sees a pass; it also
+asserts the failure happened (the ledger holds it red), or it would prove
+nothing. The final-loop case counts `run.runs` at each worker call and asserts
+what ran between them, because every assertion over the whole list passes once a
+later round runs the file. The re-drive case stubs `_ratchet_test_ids` and
+`_redrive_new_failures`, since `RD.World` has no runner: it pins the wiring
+(the controls named, the rollback, the control added), the rest being pinned on
+real runs by the others.

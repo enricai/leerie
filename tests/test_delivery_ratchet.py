@@ -643,8 +643,8 @@ def test_the_ratchet_exec_discovery_and_bstar_run_on_the_commit(
             w.st, w.caps, w.staging, "HEAD", ids, ids, label="x",
             log_path=w.st.run_dir / "x.log"))
     run()
-    assert seen == [("discovery", str(w.staging)), ("bstar", str(w.staging))]
+    assert seen == [("bstar", str(w.staging)), ("discovery", str(w.staging))]
     (w.staging / "src" / "leftover.ts").write_text("export const z = 1\n")
     seen.clear()
     run()
-    assert seen == [("discovery", str(w.staging)), ("bstar", str(w.staging))]
+    assert seen == [("bstar", str(w.staging)), ("discovery", str(w.staging))]

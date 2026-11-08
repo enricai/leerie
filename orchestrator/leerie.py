@@ -47509,6 +47509,62 @@ async def _carried_selection(st: "State", tree: str, tree_sha: str,
             "carried": carried}
 
 
+async def _near_selection(st: "State", tree: str, tree_sha: str, pre_sha: str,
+                          whole_cmd: str, replacement: dict | None,
+                          forbidden: list[str | dict], named: Iterable[str],
+                          *, log_prefix: str) -> dict | None:
+    """The first stage of a round's measurement (DESIGN §8 *A round's near
+    tests are measured first*): `{command, files, kept, carried, whole}` over
+    the tests nearest the round's diff from `pre_sha` (`_near_test_files`),
+    the files the ledger holds failed and the tests the round was `named`,
+    or None to measure the closure at once: no ledger to keep the rest in, a
+    head or diff git cannot read, a changed path whose reach is unknown (a
+    lockfile or config reaches everything, so nothing is nearer than the
+    rest), no scoped runner, a scoped command the task forbids, or nothing
+    the closure would not run anyway.
+
+    `kept` is the whole ledger but these files: the rest keep the trees they
+    were measured on, and `_carried_selection` reads the diff from each of
+    those when the closure comes. So a near stage can never stand in for
+    the closure: its result goes in no memo (`near_stage`), and a file it did
+    not run is re-run by whichever tree is measured next."""
+    ledger = _test_ledger(st)
+    head = await _branch_head_sha(tree)
+    if not ledger or not head:
+        return None
+    got = await run_proc(["git", *_tree_git_args(tree), "diff", "--name-only",
+                          "--no-renames", "-z", pre_sha, tree_sha], cwd=tree)
+    if got.returncode != 0:
+        return None
+    changed = [p for p in got.stdout.split("\0") if p]
+    globs = resolve_test_file_globs(st.repo_root)
+    _, unknown = _change_reach(tree, head, changed, globs)
+    if unknown:
+        return None
+    whole = (set((replacement or {}).get("files") or ())
+             or set(ledger) | {c for c in changed
+                               if _is_test_case_file(c, globs)})
+    near = (_near_test_files(tree, head, changed, globs)
+            | {f for f, e in ledger.items() if not e.get("passed")}
+            | set(named)) & whole
+    files = sorted(f for f in near
+                   if (Path(tree) / f).is_file()
+                   and not (ledger.get(f, {}).get("tree") == tree_sha
+                            and ledger[f].get("passed")))
+    if not files or set(files) >= whole:
+        return None
+    scoped = _acceptance_cmd(st, files, tree)
+    if not scoped or _forbidden_command_hit(scoped, forbidden):
+        return None
+    log(f"  {log_prefix}: tests near first — running {len(files)} of "
+        f"{len(whole)} test file(s): the round's own, those importing what it "
+        "changed, and those failing; the rest only if these hold")
+    kept = {f: e for f, e in ledger.items() if f not in set(files)}
+    return {"command": scoped, "files": files, "kept": kept,
+            "whole": len(whole),
+            "carried": {"files": 0, "from_trees": {}, "ran": len(files)}}
+
+
 async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         caps: dict, *, log_path: Path, verbosity: str,
                         label_prefix: str = "baseline",
@@ -47516,7 +47572,9 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         memo: bool = True,
                         failing_ids_axes: frozenset[str] | set[str] = frozenset(),
                         measure_peak: bool = False,
-                        carry: bool = False
+                        carry: bool = False,
+                        near_of: str | None = None,
+                        near_named: Iterable[str] = ()
                         ) -> dict[str, dict]:
     """Measure each axis in `axes` (axis name → command) on `tree`, serving
     repeat measurements of an unchanged tree from `st.data["blt_results"]`.
@@ -47535,6 +47593,13 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     measured once per change that can affect it*). The result is the tests'
     on this tree, stored under the whole command, and says so: `carried`,
     `whole_command`, and `command`, what really ran.
+
+    `near_of`, with `carry`, for a round that started at that commit: `tests`
+    runs only its near tests when anything would be left for later
+    (`_near_selection`, DESIGN §8 *A round's near tests are measured first*).
+    The result says `near_stage`, is no answer for the tree and is stored in
+    no memo: the caller measures again unless the near tests already reject
+    the round.
 
     This is what makes measuring before *and* after a conformer round
     affordable: measured across a real 91-subtask run, 182 of 224 conformer
@@ -47643,11 +47708,21 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         # measurement needs run (DESIGN §8 *A test's result is measured once
         # per change that can affect it*).
         whole_cmd = cmd
-        selection = (await _carried_selection(
+        near = (await _near_selection(
+            st, tree, tree_sha, near_of, cmd, replacement, forbidden,
+            near_named, log_prefix=log_prefix)
+                if (near_of and carry and axis == "tests" and tree_sha
+                    and deps_ok)
+                else None)
+        selection = near or (await _carried_selection(
             st, tree, tree_sha, cmd, replacement, forbidden,
             log_prefix=log_prefix)
                      if carry and axis == "tests" and tree_sha and deps_ok
                      else None)
+        if selection is None and replacement is not None:
+            log(f"  {log_prefix}: tests measured whole — running all "
+                f"{len(replacement.get('files') or ())} test file(s) of the "
+                "scoped replacement")
         if selection is not None and not selection["files"]:
             res = _all_carried_result(cmd, selection)
             if replacement is not None:
@@ -47706,6 +47781,9 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         if selection is not None:
             res["whole_command"] = whole_cmd
             res["carried"] = selection["carried"]
+        if near is not None:
+            res["near_stage"] = {"files": len(near["files"]),
+                                 "of": near["whole"]}
         results[axis] = res
 
         if not (memo and tree_sha) or not deps_ok:
@@ -47714,7 +47792,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             continue                      # crashed, or runner absent
         if str(res.get("summary", "")).startswith("timed out after"):
             continue                      # never reached a verdict
-        store[_blt_memo_key(axis, whole_cmd, tree_sha)] = dict(res)
+        if near is None:
+            store[_blt_memo_key(axis, whole_cmd, tree_sha)] = dict(res)
         if carry and axis == "tests":
             _ledger_record(st, tree_sha, res, cases, selection)
         st.save()
@@ -47874,8 +47953,11 @@ async def _scoped_test_replacement(tree: str, st: "State", canonical: str,
         return _gap("forbidden_scoped_runner",
                     f"the scoped runner is forbidden too (`{also}`)")
     _set_regression_gap(st, None)
-    log(f"  {log_prefix}: tests replaced — the task forbids `{hit}`; running "
-        f"the {len(tests)} test file(s) coupled to the run's changes")
+    # What runs is decided after this (the memo, the ledger, a near stage), and
+    # each of those says so: this line only says what stands in for the command.
+    log(f"  {log_prefix}: tests replaced — the task forbids `{hit}`; its scoped "
+        f"replacement covers the {len(tests)} test file(s) coupled to the "
+        "run's changes")
     return {"command": scoped,
             "scoped_replacement": {"replaces": canonical, "forbidden": hit,
                                    "files": tests,
@@ -48832,15 +48914,22 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                                        post: dict[str, dict], *,
                                        log_path: Path,
                                        label: str,
-                                       tree_sha: str | None = None
+                                       tree_sha: str | None = None,
+                                       shipping: bool = False
                                        ) -> dict | None:
     """The failing-test-ID diff (E3) for one final-conformance measurement:
     final IDs not failing on the base are candidates, confirmed by B*
-    against the base commit. Before the confirm, the import-coupled tests
-    are rerun `confirm_intermittent_repeats` times (`_intermittent_discovery`)
-    and every ID they fail joins the candidates; after it, a
-    `resource_affected` ID meeting the intermittent-regression rule is typed
-    (`_type_intermittent_regressions`) as evidence — never counted. None
+    against the base commit. When that confirms none new, or on the tree that
+    ships (`shipping`), the import-coupled tests are rerun
+    `confirm_intermittent_repeats` times (`_intermittent_discovery`; off the
+    shipping tree only when every one fits, DESIGN §9 *Discovery on a tree
+    that may not ship*); every ID they fail joins the candidates and is
+    confirmed with them. After that, a `resource_affected` ID meeting the
+    intermittent-regression rule is typed
+    (`_type_intermittent_regressions`) as evidence — never counted. A result
+    of a near stage (`near_stage`, DESIGN §8 *A round's near tests are
+    measured first*) gets the confirm only, and is recorded only when it
+    rejects the round, marked `near_stage`. None
     when the axis was not measured. When either side's IDs are unknown
     there is no diff — the axis verdict stands, and the verdict says so
     (`ids_unknown`) — but discovery still runs: it needs only the coupled
@@ -48872,8 +48961,11 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     if not tests.get("measured"):
         return None
     final_ids = tests.get("failing_ids")
+    near = bool(tests.get("near_stage"))
     ids_unknown = base_ids is None or final_ids is None
-    if final_ids is not None:
+    if near and ids_unknown:
+        return {"new": [], "near_stage": True}
+    if final_ids is not None and not near:
         st.data["final_failing_ids"] = list(final_ids)
         st.save()
     base_ids = list(base_ids or [])
@@ -48885,11 +48977,13 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     if tree_sha is None:
         tree_sha = await _view_tree_sha(st, staging)
     prior = st.data.get("test_id_diff") or {}
-    if (tree_sha and prior.get("tree_sha") == tree_sha
+    same = (tree_sha and prior.get("tree_sha") == tree_sha
             and not prior.get("base_install_failed")
             and bool(prior.get("ids_unknown")) == ids_unknown
+            and bool(prior.get("near_stage")) == near
             and prior.get("final_candidates",
-                          prior.get("candidates")) == cand):
+                          prior.get("candidates")) == cand)
+    if same and not (shipping and prior.get("discovery_deferred")):
         return prior
     cmd = tests.get("command") or ""
     base_sha = ((st.data.get("conformance") or {}).get("_baseline")
@@ -48898,9 +48992,122 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         base_sha = await _merge_base_sha(
             staging, _diff_base(st) or "",
             await _branch_head_sha(staging))
-    disc = await _intermittent_discovery(st, caps, staging, cmd, base_sha,
-                                         log_path=log_path, label=label)
     messages: dict[str, list[str]] = {}
+
+    async def _confirm_candidates(all_cand: list[str]) -> dict:
+        files = sorted({id_files.get(c) for c in all_cand}, key=str)
+        rerun_files = None if (None in files or not files) else list(files)
+        # Sized before the reruns (DESIGN §9 *Which failures are new*, step 2):
+        # one rerun runs every candidate file serially, so a long file must not
+        # starve the rest, and the budget a pass leaves goes to the files it
+        # left out. A candidate the final run itself failed ranks before one
+        # only discovery found.
+        rank: dict[str, int] = {}
+        for c in all_cand if rerun_files else ():
+            f = id_files[c]
+            rank[f] = min(rank.get(f, 1), 0 if c in cand else 1)
+        # Found only by discovery repeats: intermittent by construction, so
+        # never new on a budget shortfall.
+        weak = [c for c in all_cand if c not in cand]
+        wt = _helper_worktree_path(st, "confirm-base")
+
+        def _teardown() -> None:
+            subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
+                            "--force", str(wt)], capture_output=True, check=False)
+            _rmtree_owned(wt)
+            _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+        _teardown()
+        add = (await _worktree_add_detached_async(st, wt, base_sha)
+               if base_sha else None)
+        if add is None or add.returncode != 0:
+            log("  B*: could not create the base worktree for the confirm — "
+                "no candidate gets a verdict (no_verdict)")
+
+            async def _none(_t: float) -> set[str] | None:
+                return None
+            verdict = await _confirm_new_failures(all_cand, _none, _none,
+                                                  caps, label=label)
+            verdict["base_unavailable"] = True
+        elif not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"{label}-base", log_prefix="confirm"):
+            # A base that failed for want of its dependencies would fail every
+            # candidate and call it `pre_existing` (DESIGN §9 *A failed install
+            # is no measurement*): no base side, so no candidate gets a verdict.
+            _teardown()
+            log("  B*: the dependency install failed in the base worktree — "
+                "no candidate gets a verdict (no_verdict)")
+
+            async def _none(_t: float) -> set[str] | None:
+                return None
+            verdict = await _confirm_new_failures(all_cand, _none, _none,
+                                                  caps, label=label)
+            verdict["base_unavailable"] = True
+            verdict["base_install_failed"] = True
+        else:
+            try:
+                n = {"i": 0}
+
+                def _runner_for(tree: str, side: str, units: list[str] | None):
+                    async def _run(timeout: float) -> set[str] | None:
+                        n["i"] += 1
+                        got = await _capture_failing_test_ids(
+                            tree, cmd, st, caps,
+                            label=f"{label}-{side}{n['i']}", log_path=log_path,
+                            timeout=timeout, serial=True, files=units)
+                        if got is None:
+                            return None
+                        if side == "final":
+                            for cid, msg in (got.get("messages") or {}).items():
+                                messages.setdefault(cid, []).append(msg)
+                        return set(got["ids"])
+                    return _run
+
+                # Every candidate failed on the final tree (a final run or a
+                # discovery repeat) and not on the base list — which is empty
+                # for a scoped command, so a shortfall needs a finished pair.
+                async def _pass(units: list[str] | None, cands: list[str],
+                                pcaps: dict, gate: dict | None,
+                                **pairs: object) -> dict:
+                    return await _confirm_new_failures(
+                        cands, _runner_for(str(wt), "base", units),
+                        _runner_for(staging, "final", units), pcaps,
+                        label=label, seen_failing=True, intermittent=weak,
+                        prior_gate=gate, **pairs)
+                if rerun_files:
+                    verdict = await _confirm_sized(
+                        {c: id_files[c] for c in all_cand},
+                        dict(st.data.get("test_file_durations") or {}),
+                        rank=rank, caps=caps,
+                        overhead=_rerun_cost_or_default(st)[0], label=label,
+                        confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
+                else:
+                    verdict = await _pass(None, all_cand, caps, None)
+            finally:
+                _teardown()
+        return verdict
+
+    # The candidates the run itself failed are confirmed first: a tree they
+    # already reject is one no discovery can decide anything more about
+    # (DESIGN §9 *Discovery on a tree that may not ship*).
+    verdict: dict | None = (dict(prior) if same else None)
+    if verdict is None and cand:
+        verdict = await _confirm_candidates(cand)
+    rejected = bool(verdict and verdict.get("new"))
+    if near or (rejected and not shipping):
+        disc: dict = {"coupled": {}, "files": [], "repeats_required": 0,
+                      "repeats_run": 0, "budget_exhausted": False,
+                      "failed_ids": [], "fail_counts": {}, "id_files": {},
+                      "deferred": not near,
+                      "skipped": ("near stage" if near else
+                                  "not repeated: this tree is already "
+                                  "rejected")}
+    else:
+        disc = await _intermittent_discovery(st, caps, staging, cmd, base_sha,
+                                             log_path=log_path, label=label,
+                                             partial_ok=shipping)
     for run in disc.pop("_runs", []):
         for cid, msg in (run.get("messages") or {}).items():
             messages.setdefault(cid, []).append(msg)
@@ -48908,108 +49115,23 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                    - set(cand))
     id_files.update({c: disc["id_files"].get(c) for c in found})
     all_cand = sorted(set(cand) | set(found))
+    if near and not (verdict or {}).get("new"):
+        # Says nothing about the tree: the closure comes next.
+        return {"new": [], "near_stage": True}
     if not all_cand:
         verdict = await _confirm_new_failures([], _no_rerun, _no_rerun, caps,
                                               label=label)
         verdict.update(final_candidates=cand, tree_sha=tree_sha,
                        discovery=disc, intermittent_regression=[],
-                       **({"ids_unknown": True} if ids_unknown else {}))
+                       **({"ids_unknown": True} if ids_unknown else {}),
+                       **({"discovery_deferred": True}
+                          if disc.get("deferred") else {}))
         st.data["test_id_diff"] = verdict
         st.save()
         _set_confirm_budget_gap(st, _FINAL_DIFF_SITE, [])
         return verdict
-    files = sorted({id_files.get(c) for c in all_cand}, key=str)
-    rerun_files = None if (None in files or not files) else list(files)
-    # Sized before the reruns (DESIGN §9 *Which failures are new*, step 2):
-    # one rerun runs every candidate file serially, so a long file must not
-    # starve the rest, and the budget a pass leaves goes to the files it
-    # left out. A candidate the final run itself failed ranks before one
-    # only discovery found.
-    rank: dict[str, int] = {}
-    for c in all_cand if rerun_files else ():
-        f = id_files[c]
-        rank[f] = min(rank.get(f, 1), 0 if c in cand else 1)
-    # Found only by discovery repeats: intermittent by construction, so
-    # never new on a budget shortfall.
-    weak = [c for c in all_cand if c not in cand]
-    wt = _helper_worktree_path(st, "confirm-base")
-
-    def _teardown() -> None:
-        subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
-                        "--force", str(wt)], capture_output=True, check=False)
-        _rmtree_owned(wt)
-        _DEPS_INSTALLED.discard(os.path.realpath(wt))
-
-    _teardown()
-    add = (await _worktree_add_detached_async(st, wt, base_sha)
-           if base_sha else None)
-    if add is None or add.returncode != 0:
-        log("  B*: could not create the base worktree for the confirm — "
-            "no candidate gets a verdict (no_verdict)")
-
-        async def _none(_t: float) -> set[str] | None:
-            return None
-        verdict = await _confirm_new_failures(all_cand, _none, _none,
-                                              caps, label=label)
-        verdict["base_unavailable"] = True
-    elif not await _ensure_worktree_deps(
-            str(wt), st, caps, log_path=log_path,
-            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-            label_prefix=f"{label}-base", log_prefix="confirm"):
-        # A base that failed for want of its dependencies would fail every
-        # candidate and call it `pre_existing` (DESIGN §9 *A failed install
-        # is no measurement*): no base side, so no candidate gets a verdict.
-        _teardown()
-        log("  B*: the dependency install failed in the base worktree — "
-            "no candidate gets a verdict (no_verdict)")
-
-        async def _none(_t: float) -> set[str] | None:
-            return None
-        verdict = await _confirm_new_failures(all_cand, _none, _none,
-                                              caps, label=label)
-        verdict["base_unavailable"] = True
-        verdict["base_install_failed"] = True
-    else:
-        try:
-            n = {"i": 0}
-
-            def _runner_for(tree: str, side: str, units: list[str] | None):
-                async def _run(timeout: float) -> set[str] | None:
-                    n["i"] += 1
-                    got = await _capture_failing_test_ids(
-                        tree, cmd, st, caps,
-                        label=f"{label}-{side}{n['i']}", log_path=log_path,
-                        timeout=timeout, serial=True, files=units)
-                    if got is None:
-                        return None
-                    if side == "final":
-                        for cid, msg in (got.get("messages") or {}).items():
-                            messages.setdefault(cid, []).append(msg)
-                    return set(got["ids"])
-                return _run
-
-            # Every candidate failed on the final tree (a final run or a
-            # discovery repeat) and not on the base list — which is empty
-            # for a scoped command, so a shortfall needs a finished pair.
-            async def _pass(units: list[str] | None, cands: list[str],
-                            pcaps: dict, gate: dict | None,
-                            **pairs: object) -> dict:
-                return await _confirm_new_failures(
-                    cands, _runner_for(str(wt), "base", units),
-                    _runner_for(staging, "final", units), pcaps,
-                    label=label, seen_failing=True, intermittent=weak,
-                    prior_gate=gate, **pairs)
-            if rerun_files:
-                verdict = await _confirm_sized(
-                    {c: id_files[c] for c in all_cand},
-                    dict(st.data.get("test_file_durations") or {}),
-                    rank=rank, caps=caps,
-                    overhead=_rerun_cost_or_default(st)[0], label=label,
-                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
-            else:
-                verdict = await _pass(None, all_cand, caps, None)
-        finally:
-            _teardown()
+    if found or verdict is None:
+        verdict = await _confirm_candidates(all_cand)
     unsettled = list(verdict.get("budget_short_unsettled") or [])
     sized = set(verdict.get("sized_out") or [])
     if unsettled:
@@ -49027,6 +49149,12 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     verdict["discovery"] = disc
     if ids_unknown:
         verdict["ids_unknown"] = True
+    verdict.pop("discovery_deferred", None)
+    if disc.get("deferred"):
+        verdict["discovery_deferred"] = True
+    verdict.pop("near_stage", None)
+    if near:
+        verdict["near_stage"] = True
     verdict["intermittent_regression"] = _type_intermittent_regressions(
         verdict, final_ids=set(final_ids), base_ids=set(base_ids),
         discovery_counts=disc.get("fail_counts") or {},
@@ -49110,7 +49238,8 @@ def _discovery_select(ranked: list[str], durations: dict[str, float],
 async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                                   cmd: str, base_sha: str, *,
                                   log_path: Path, label: str,
-                                  clock: Callable[[], float] | None = None
+                                  clock: Callable[[], float] | None = None,
+                                  partial_ok: bool = True
                                   ) -> dict:
     """Discovery for the intermittent-regression rule (DESIGN §9 *An
     intermittent failure the run introduced is evidence*): the import-coupled
@@ -49122,11 +49251,14 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
     calibrated inside one repeat's share of the budget), ranked by
     `_discovery_rank` and chosen by `_discovery_select`; the rest are
     recorded in `skipped_files`, and with none chosen nothing is repeated
-    (`skipped: "over budget"`). Returns `{coupled, files, repeats_required,
-    repeats_run, budget_exhausted, failed_ids, fail_counts, id_files,
-    selection?, skipped_files?, skipped?, _runs}` (`_runs` carries each
-    repeat's messages for the caller and is popped before the verdict is
-    stored). Never raises."""
+    (`skipped: "over budget"`). Without `partial_ok`, on a tree that may not
+    ship, it repeats nothing unless every coupled file fits, and says
+    `deferred` (DESIGN §9 *Discovery on a tree that may not ship*): `coupled`
+    is still returned, for the typing. Returns `{coupled, files,
+    repeats_required, repeats_run, budget_exhausted, failed_ids, fail_counts,
+    id_files, selection?, skipped_files?, skipped?, deferred?, _runs}` (`_runs`
+    carries each repeat's messages for the caller and is popped before the
+    verdict is stored). Never raises."""
     out: dict = {"coupled": {}, "files": [], "repeats_required": 0,
                  "repeats_run": 0, "budget_exhausted": False,
                  "failed_ids": [], "fail_counts": {}, "id_files": {},
@@ -49152,6 +49284,24 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             # Without a scoped runner a repeat would run the whole suite.
             out["skipped"] = "no scoped test runner for the coupled files"
             return out
+
+        def _defer(covers: int) -> dict:
+            out.update(deferred=True, repeats_required=0, skipped=(
+                f"not repeated here: {covers} of {len(files)} import-coupled "
+                "test file(s) fit the budget, and the tree that ships is "
+                "repeated anyway"))
+            log(f"  B* {label}: discovery {out['skipped']}")
+            return out
+
+        known_sec = st.data.get("test_file_durations")
+        known_sec = known_sec if isinstance(known_sec, dict) else {}
+        if not partial_ok and reps * sum(
+                float(v) for f, v in known_sec.items()
+                if f in out["coupled"] and isinstance(v, (int, float))
+                ) > float(caps.get("confirm_budget_sec",
+                                   DEFAULT_CAPS["confirm_budget_sec"])):
+            # Known without a rerun, the gate wait or a calibration.
+            return _defer(0)
         out["repeats_required"] = reps
         counts: dict[str, int] = {}
         async with _confirm_hold():
@@ -49224,6 +49374,10 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             out["selection"] = {"budget_sec": round(left, 1),
                                 "planned_sec": sel["planned_sec"],
                                 "cost": cost, "calibration": calib}
+            if not partial_ok and sel["skipped"]:
+                covers = len(sel["chosen"])
+                sel["chosen"], out["files"] = [], []
+                return _defer(covers)
             if not sel["chosen"]:
                 out["skipped"] = ("over budget" if cost is not None
                                   else "overhead not measured")
@@ -51685,7 +51839,11 @@ def _orchestrator_results_digest(st: "State",
                      + (f"\n    carried: {carried.get('files')} test file(s) "
                         "from the trees they were measured on, which the "
                         "later change cannot reach"
-                        if carried.get("files") else ""))
+                        if carried.get("files") else "")
+                     + (f"\n    near stage only: {a['near_stage'].get('files')} "
+                        f"of {a['near_stage'].get('of')} test file(s); the "
+                        "rest were not measured on this tree"
+                        if isinstance(a.get("near_stage"), dict) else ""))
     diff = st.data.get("test_id_diff")
     if (isinstance(diff, dict) and diff.get("candidates") is not None
             and head_tree and diff.get("tree_sha") == head_tree):
@@ -52893,6 +53051,28 @@ def _change_reach(repo: str | Path, rev: str, changed: Iterable[str],
         else:
             unknown.append(c)
     return reached, unknown
+
+
+def _near_test_files(repo: str | Path, rev: str, changed: Iterable[str],
+                     globs: list[str] | None = None) -> set[str]:
+    """The tests nearest a change at `rev` (DESIGN §8 *A round's near tests
+    are measured first*): a changed test case, and a test case importing a
+    changed file itself, the changed file a test helper or not. Never raises:
+    an unreadable graph holds nothing, and everything then waits for the
+    closure."""
+    changed = [c for c in changed if isinstance(c, str) and c]
+    near = {c for c in changed if _is_test_case_file(c, globs)}
+    for build in (_js_source_graph, _py_source_graph):
+        try:
+            importers = build(repo, rev).get("importers") or {}
+        except Exception as e:
+            log(f"  near tests: import graph unreadable "
+                f"({type(e).__name__}: {e})")
+            continue
+        for c in changed:
+            near |= {b for b in importers.get(c, ())
+                     if _is_test_case_file(b, globs)}
+    return near
 
 
 def _git_recency(repo: str | Path, rev: str,
@@ -57858,9 +58038,13 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             before = (gate.get("test_ids") or {}).get(pre)
             if isinstance(before, dict) and before.get("unmeasured"):
                 before = None
-            after = await _ids_at(post, f"{label}-ids")
-            ex = await _ratchet_exec(st, caps, staging, pre, before, after,
-                                     label=label, log_path=repair_log)
+            ex = await _near_rejection(st, caps, staging, pre, post, before,
+                                       label=label, log_path=repair_log)
+            if ex is None:
+                after = await _ids_at(post, f"{label}-ids")
+                ex = await _ratchet_exec(st, caps, staging, pre, before,
+                                         after, label=label,
+                                         log_path=repair_log)
             return await _delivery_ratchet(st, caps, models, efforts,
                                            staging, pre, post,
                                            exec_result=ex, label=label)
@@ -62426,13 +62610,16 @@ async def _ratchet_judge_packs(st: "State", caps: dict, models: dict,
 
 
 async def _ratchet_test_ids(st: "State", caps: dict, tree: str, *,
-                            label: str, log_path: Path) -> dict | None:
+                            label: str, log_path: Path,
+                            near_of: str | None = None,
+                            near_named: Iterable[str] = ()) -> dict | None:
     """The test axis's failing IDs on `tree`, measured like every other
     measurement of a tree that ships (`_measure_axes`, `carry`): the same
     tree is never measured twice, a new one only where its change reaches,
     and a command the task forbids is replaced by its scoped run over the
-    coupled tests (DESIGN §9 *A command the task forbids*). None: no command,
-    nothing to run, or no report."""
+    coupled tests (DESIGN §9 *A command the task forbids*). `near_of`: its
+    near tests first, then `near_stage` in the result if anything is left
+    (`_near_rejection`). None: no command, nothing to run, or no report."""
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"]) or "").strip()
     if not cmd:
         return None
@@ -62440,13 +62627,48 @@ async def _ratchet_test_ids(st: "State", caps: dict, tree: str, *,
         tree, {"tests": cmd}, st, caps, log_path=log_path,
         verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
         label_prefix=label, log_prefix="delivery ratchet",
-        failing_ids_axes={"tests"}, carry=True)).get("tests") or {}
+        failing_ids_axes={"tests"}, carry=True, near_of=near_of,
+        near_named=near_named)).get("tests") or {}
     ids = res.get("failing_ids")
     if not res.get("measured") or not isinstance(ids, list):
         return None
     return {"ids": sorted(ids), "files": dict(res.get("failing_id_files") or {}),
             "command": res.get("command"),
-            "messages": dict(res.get("failing_messages") or {})}
+            "messages": dict(res.get("failing_messages") or {}),
+            **({"near_stage": res["near_stage"]}
+               if res.get("near_stage") else {})}
+
+
+async def _near_rejection(st: "State", caps: dict, staging: Path,
+                          pre_sha: str, post_sha: str, before: dict | None,
+                          *, label: str, log_path: Path,
+                          named: Iterable[str] = ()) -> dict | None:
+    """The round's near tests measured first (DESIGN §8 *A round's near tests
+    are measured first*): `_ratchet_exec`'s verdict when one of them is
+    confirmed new under B*, so the round is rejected with its closure and
+    discovery unpaid; None when the round must go on to its closure, which
+    then runs only what these did not settle (the ledger holds them). Only
+    the round's own tree can reject the round: staging moved past `post_sha`
+    (an interrupted attempt committed before a resume) is None."""
+    if (before is None or not pre_sha
+            or await _branch_head_sha(str(staging)) != post_sha):
+        return None
+    near = await _ratchet_test_ids(st, caps, str(staging),
+                                   label=f"{label}-near-ids",
+                                   log_path=log_path, near_of=pre_sha,
+                                   near_named=named)
+    if (near is None or not near.get("near_stage")
+            or not set(near["ids"]) - set(before.get("ids") or [])):
+        return None
+    ex = await _ratchet_exec(st, caps, staging, pre_sha, before, near,
+                             label=f"{label}-near", log_path=log_path)
+    if not ex.get("new"):
+        return None
+    ex["near_stage"] = near["near_stage"]
+    log(f"  {label}: {len(ex['new'])} near test(s) confirmed new under B* — "
+        f"round rejected on {near['near_stage']['files']} of "
+        f"{near['near_stage']['of']} test file(s); the rest not run")
+    return ex
 
 
 async def _ratchet_exec(st: "State", caps: dict, staging: Path,
@@ -62456,13 +62678,15 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
     """The ratchet's execution route: the failing-test-ID diff of one repair
     — IDs failing after it and not before — confirmed by B* against
     `pre_sha` (`_redrive_new_failures`), on staging's commit (staging
-    asserted clean: HEAD plus ignored files). The tests that directly import a
-    file the repair changed are first rerun `confirm_intermittent_repeats`
-    times (`_intermittent_discovery`, base `pre_sha`); every ID they fail
-    joins the candidates, and a `resource_affected` ID meeting the
-    intermittent-regression rule is typed as evidence
-    (`_type_intermittent_regressions`), never counted. `{new,
-    resource_affected, unmeasured, intermittent_regression[], discovery?}`."""
+    asserted clean: HEAD plus ignored files). When that confirms none, the
+    tests that directly import a file the repair changed are rerun
+    `confirm_intermittent_repeats` times if every one fits the budget
+    (`_intermittent_discovery`, base `pre_sha`, DESIGN §9 *Discovery on a tree
+    that may not ship*); every ID they fail joins the candidates, and a
+    `resource_affected` ID meeting the intermittent-regression rule is typed
+    as evidence (`_type_intermittent_regressions`), never counted. `after`
+    from a near stage gets the confirm alone. `{new, resource_affected,
+    unmeasured, intermittent_regression[], discovery?}`."""
     if before is None or after is None:
         return {"new": [], "pre_existing": [], "no_verdict": [],
                 "resource_affected": [], "unmeasured": True,
@@ -62475,9 +62699,14 @@ async def _ratchet_exec_in(st: "State", caps: dict, staging: Path,
                            pre_sha: str, before: dict, after: dict, *,
                            label: str, log_path: Path) -> dict:
     """`_ratchet_exec` in `staging`, a tree holding only the commit."""
-    disc = await _intermittent_discovery(
-        st, caps, str(staging), after.get("command") or "", pre_sha,
-        log_path=log_path, label=f"{label}-discovery")
+    newv = await _redrive_new_failures(st, caps, staging, pre_sha, before,
+                                       after, label)
+    disc: dict = {"skipped": "near stage" if after.get("near_stage")
+                  else "not repeated: the round is already rejected"}
+    if not newv["new"] and not after.get("near_stage"):
+        disc = await _intermittent_discovery(
+            st, caps, str(staging), after.get("command") or "", pre_sha,
+            log_path=log_path, label=f"{label}-discovery", partial_ok=False)
     messages: dict[str, list[str]] = {}
     for cid, msg in (after.get("messages") or {}).items():
         messages.setdefault(cid, []).append(msg)
@@ -62488,11 +62717,12 @@ async def _ratchet_exec_in(st: "State", caps: dict, staging: Path,
     files = dict(after.get("files") or {})
     for c in sorted(found):
         files.setdefault(c, (disc.get("id_files") or {}).get(c))
-    aug = {**after, "ids": sorted(set(after.get("ids") or []) | found),
-           "files": files}
-    newv = await _redrive_new_failures(
-        st, caps, staging, pre_sha, before, aug, label,
-        intermittent=sorted(found - set(after.get("ids") or [])))
+    if found - set(after.get("ids") or []):
+        aug = {**after, "ids": sorted(set(after.get("ids") or []) | found),
+               "files": files}
+        newv = await _redrive_new_failures(
+            st, caps, staging, pre_sha, before, aug, label,
+            intermittent=sorted(found - set(after.get("ids") or [])))
     verdict = newv.pop("verdict", None)
     newv["intermittent_regression"] = (_type_intermittent_regressions(
         verdict, final_ids=set(after.get("ids") or []),
@@ -62503,7 +62733,7 @@ async def _ratchet_exec_in(st: "State", caps: dict, staging: Path,
         messages=messages) if isinstance(verdict, dict) else [])
     newv["discovery"] = {k: disc.get(k) for k in (
         "files", "repeats_required", "repeats_run", "budget_exhausted",
-        "fail_counts", "skipped") if k in disc}
+        "fail_counts", "skipped", "deferred") if k in disc}
     return newv
 
 
@@ -63850,7 +64080,12 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
     rebased = await _retry_failed_baseline(st, caps, log_path=log_path)
     reusable = (diff is not None and not rebased
                 and not diff.get("base_install_failed"))
-    if tree_sha and reusable and diff.get("tree_sha") == tree_sha:
+    # A near stage's verdict, or one whose discovery waited for the tree that
+    # ships, does not settle this tree: measuring it is a memo hit if the
+    # closure has run, and the closure if it has not.
+    if (tree_sha and reusable and diff.get("tree_sha") == tree_sha
+            and not diff.get("near_stage")
+            and not diff.get("discovery_deferred")):
         _set_final_diff_gap(st, _final_diff_base_gap(st, diff))
         return tree_sha
     if tree_sha and reusable and diff.get("stale_for_tree") == tree_sha:
@@ -63870,7 +64105,7 @@ async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
             failing_ids_axes={"tests"}, carry=True)
         got = await _confirm_final_test_failures(
             st, caps, str(staging), post, log_path=log_path, label=label,
-            tree_sha=tree_sha)
+            tree_sha=tree_sha, shipping=True)
         if got is None and ((post or {}).get("tests")
                             or {}).get("deps_failed"):
             why = ("the dependency install failed in the tree "
@@ -64423,12 +64658,23 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
                     H1 = (None if unm_h and len(unm_h) == len(held)
                           else _redrive_carry(H, H1, unm_h))
-                ids_after = await _redrive_test_ids(
-                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
-                newv = await _ratchet_exec(
-                    st, caps, staging, pre_sha, ids_before, ids_after,
+                # A test an earlier attempt broke is the round's to keep
+                # passing, whatever its distance from this diff.
+                ids_after = None
+                newv = await _near_rejection(
+                    st, caps, staging, pre_sha, post_sha, ids_before,
                     label=f"redrive-r{rnd}g{gi}",
-                    log_path=st.run_dir / "logs" / _REDRIVE_LOG)
+                    log_path=st.run_dir / "logs" / _REDRIVE_LOG,
+                    named=[str(n["test"]).split(" :: ")[0]
+                           for n in rec.get("pending_controls") or []
+                           if " :: " in str(n.get("test") or "")])
+                if newv is None:
+                    ids_after = await _redrive_test_ids(
+                        st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
+                    newv = await _ratchet_exec(
+                        st, caps, staging, pre_sha, ids_before, ids_after,
+                        label=f"redrive-r{rnd}g{gi}",
+                        log_path=st.run_dir / "logs" / _REDRIVE_LOG)
                 ge["new_failures"] = newv["new"]
                 if newv.get("intermittent_regression"):
                     ge["intermittent_regression"] = newv[
@@ -64791,13 +65037,14 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                   for axis in ("build", "lint", "tests")}
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
-    async def _measure_final(rnd: int, label: str) -> dict[str, dict]:
+    async def _measure_final(rnd: int, label: str, *,
+                             near_of: str | None = None) -> dict[str, dict]:
         return await _measure_axes(
             str(staging), final_axes, st, caps,
             log_path=_final_axes_log(leerie_dir, rnd),
             verbosity=verbosity, label_prefix=f"final-{label}",
             log_prefix="final-conformer", failing_ids_axes={"tests"},
-            carry=True)
+            carry=True, near_of=near_of)
 
     # The baseline `_conformance_clean` judges against. The failing-test-ID
     # diff (DESIGN §9 *Which failures are new*) refines it per round: when B*
@@ -64814,11 +65061,17 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # *Every post-execution verdict is of the committed tree*).
     pre_tree: str | None = None
     post_stamp: str | None = None
+    # The tree a near stage rejected, as measured: the next round starts from
+    # it and is not to pay for its closure (DESIGN §8 *A round's near tests
+    # are measured first*).
+    near_rejected: dict[str, dict] | None = None
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
         post_taken = False
-        pre = await _measure_final(c_round, "pre")
+        pre = (near_rejected if near_rejected is not None
+               else await _measure_final(c_round, "pre"))
+        near_rejected = None
         pre_tree = await _view_tree_sha(st, staging)
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
@@ -65013,16 +65266,28 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
         # Same measure-after-and-overwrite as the per-subtask phase: the
         # worker's self-reported axes stop being load-bearing here too.
-        post = await _measure_final(c_round, "post")
+        post = await _measure_final(c_round, "post", near_of=before_sha)
+        id_diff = None
+        if (post.get("tests") or {}).get("near_stage"):
+            id_diff = await _confirm_final_test_failures(
+                st, caps, str(staging), post,
+                log_path=_final_axes_log(leerie_dir, c_round),
+                label=f"final-r{c_round}-near")
+            if id_diff is not None and id_diff.get("new"):
+                near_rejected = post
+            else:
+                id_diff = None
+                post = await _measure_final(c_round, "post")
         post_taken = True
         post_stamp = await _view_tree_sha(st, staging)
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
-        id_diff = await _confirm_final_test_failures(
-            st, caps, str(staging), post,
-            log_path=_final_axes_log(leerie_dir, c_round),
-            label=f"final-r{c_round}")
+        if id_diff is None:
+            id_diff = await _confirm_final_test_failures(
+                st, caps, str(staging), post,
+                log_path=_final_axes_log(leerie_dir, c_round),
+                label=f"final-r{c_round}")
         # The diff may have measured the base again (`_retry_failed_baseline`:
         # its install had failed), replacing `_baseline` in state; the old
         # copy's `red_axes` may count an axis red only for want of
