@@ -10551,19 +10551,19 @@ has none), persisted with the record; `_settle_pending_no_work` reads it
 
 ### The settled bar — `_record_settled_bar`, `_settled_bar_check`
 
-DESIGN §8 *Done is a fixed bar per task, not re-sampled each run*. Report-
-pointer tasks only (`_d1_report_sources(task, repo_root)` non-empty). No worker
-takes part.
+DESIGN §8 *Done is a fixed bar per task, not re-sampled each run*. Every task
+with a key; no worker takes part.
 
 **Key.** `_settled_bar_key(task, repo_root) -> str | None` is the first 32 hex
 characters of the sha256 of the JSON of `{task: task.strip(), reports: sorted
 [path, sha256 of the bytes]}` over `_d1_report_paths(task, repo_root)`, the
 references and filter `_d1_report_sources` reads: `_glob_task_references`, a
-markdown suffix, not tracked. None with no such report (not a report-pointer
-task), and None, logged, when any of them is over `D1_REPORT_MAX_BYTES` or
-cannot be read (`_read_beneath`, `READ_LIMIT_TEXT`): no bar applies.
-`phase_acceptance_write` computes it once, before the writers run, and keeps it
-as `acceptance.settled_bar_key`. `_record_settled_bar` reads that, never the file
+markdown suffix, not tracked; `reports` is `[]` for a task that points at none,
+which is then keyed by its text alone. None, logged, when any report is over
+`D1_REPORT_MAX_BYTES` or cannot be read (`_read_beneath`, `READ_LIMIT_TEXT`), and
+None for an empty task: no bar applies. `phase_acceptance_write` computes it
+once, before the writers run, and keeps it as `acceptance.settled_bar_key`, on
+the non-`bug-fixing` path too (beside `skipped`). `_record_settled_bar` reads that, never the file
 again, so a report edited during a run is a new bar for the next run. The same-
 task lookups (`_prior_delivery_residual`, `_prior_acceptance_dispute_record`)
 do not read it.
@@ -10574,14 +10574,51 @@ do not read it.
 (`READ_LIMIT_CONFIG`), `{"entries": []}` when absent or unreadable;
 `_save_settled_bar` writes it through `_write_beneath`. An entry is `{run, set,
 recorded_at, own_start, tree, defect{file: [case ids]}, control[], support[],
-modes{}}`, its files under `<run>/set-<k>/` (`_settled_bar_entry_dir`).
+modes{}}`, its files under `<run>/set-<k>/` (`_settled_bar_entry_dir`). The bar's
+`change` (absent when none) is `{run, own_start, tree, recorded_at, patches[{path,
+test, patch}], tests[], run_tests[], known_failing{file: [case ids]},
+backfilled}`, its files under `<run>/change/` (`_settled_change_dir(leerie_root,
+key, run)`, `SETTLED_CHANGE_DIRNAME`): `patches/<i>.patch`, one per file the diff
+touches, and `files/<path>`, each test file (`_is_test_file` with
+`resolve_test_file_globs`) the diff added or changed, as the shipped tree has it.
+`run_tests` is the subset still run (a dropped file stays placed: it may be a
+helper another one imports).
+
+**The change.** `_settled_change_capture(git_dir, own_start, tree, leerie_root,
+dest, globs, failing_ids) -> dict | None` writes it from any repository holding
+both commits (`git diff --no-renames --binary`, `git cat-file blob`, bytes); None,
+writing nothing, when the diff is empty, a git call fails, or one file's patch
+or test is over `READ_LIMIT_TEXT`. `known_failing` is the `failing_ids` (a run's
+`final_failing_ids`) whose part before ` :: ` is one of its test files' path
+(vitest, jest) or dotted module (pytest's report), keyed by that file; the check
+compares a failing case's ID against all of them.
+`_settled_change_hunks(patch: bytes) -> list[bytes]` splits one file's patch into
+its header plus each `@@` hunk (a binary patch, or one with no hunk, is one unit).
+`_settled_change_landed(st, leerie_root, key, change, base) -> bool` is True when
+every non-test hunk (every hunk, when the change touched only tests) passes
+`git apply --cached --check -R` against `base` read into a private index
+(`<run-dir>/.settled-change-index`) of the run's own repository; False on any
+failure, a missing patch, or no hunk. `_settled_change_backfill(st, key, task,
+bar) -> dict | None`, for a bar with no `change`: the newest (`run.json`
+`finished_at`) sibling run directory whose `run.json` has `outcome: "done"` and
+the same stripped task, limited to the runs of `bar.entries` when it has any;
+from its `state.json`, `acceptance.settled_bar_key` equal to `key` when present,
+else, for a task with reports, each report's mtime before its `started_at`; its
+own start (`repo_state_before_planning.head`, else `base_sha`) and its
+`refs/heads/<_compute_run_branch(run)>` in `<run-dir>/repo`. Only that newest run
+is tried: logged and None when its repository, own start or branch is gone.
+`backfilled: true`.
 
 **Recording.** `_decide_outcome` calls `_record_settled_bar_safely(st)` when the
 outcome is `done` (never raising; what was kept goes to
 `acceptance.settled_bar_recorded`). `_record_settled_bar(st) -> dict | None`
 returns None, changing nothing, with no `acceptance.settled_bar_key`, or when
-another run's entries exist and this run's
-`acceptance.settled_bar.status` is not `unlanded`: the bar is fixed. Otherwise,
+another run's entries or change exist and this run's
+`acceptance.settled_bar.status` is not `unlanded`: the bar is fixed. The change is
+`_record_settled_change(st, leerie_root, key)`: `_settled_change_capture` on the
+run's own repository from `acceptance.validity_base` (else
+`repo_state_before_planning.head`) to its run branch (else
+`acceptance.gate.final_sha`), with `final_failing_ids`. Otherwise,
 for each set of `acceptance.sets` that is not broken and not itself a bar set
 (`settled_bar` key), with a measured `acceptance.gate.final` result, the
 counted IDs (`scope.counted_cases` when bounded, else `base_failing_cases`)
@@ -10589,8 +10626,9 @@ minus those still failing (`failing_cases[file]`; a failing file without a
 per-case record keeps none), with the set's control files not failing; a set
 with no such counted case is not recorded. Files are copied beneath the state
 root (`_copy_beneath(..., src_anchor=st.run_dir, limit=READ_LIMIT_TEXT)`). The
-new entries replace every old one, whose directories are removed; when there
-are none, the old bar stays.
+new entries and change replace every old one, whose directories are removed;
+when there are neither, the old bar stays. The return is `{entries, cases}` plus
+`change{files, tests}` when one was recorded.
 
 **At the own start.** `phase_acceptance_write`, after `_acceptance_scope_judge_sets`
 and `_record_report_reproduced`, calls `_settled_bar_at_own_start(key, st, caps,
@@ -10598,10 +10636,14 @@ sets, base, written=n)` (fail-open: any exception gives `{status: "error",
 error}` and leaves the sets as typed) and returns its record as `settled_bar`
 (absent when None: no key, or no bar under it). When the categories
 lack `bug-fixing` it makes the same call with no sets if there is an own start
-and a scoped test command, returning `{skipped, settled_bar}`, or a full record
+and a scoped test command, returning `{skipped, settled_bar_key, settled_bar}`, or a full record
 with `written: 0` when a regression injected sets. `--skip-acceptance-check` and
 no scoped test command return as they did, with no check. `_settled_bar_check`
-sets up one `_acceptance_tree` at the own start (`acceptance-bar`; `{status:
+takes the bar's `change`, or `_settled_change_backfill` (saved into `bar.json`),
+returns None with neither entries nor change, and when there is a change records
+`change{run, landed, backfilled}` from `_settled_change_landed`; a change not
+landed with no entries is `unlanded` at once, with entries it is set aside and
+the entries decide as before. It then sets up one `_acceptance_tree` at the own start (`acceptance-bar`; `{status:
 "unmeasured"}` when it cannot) and runs each entry's defect and control files
 with `_run_settled_bar_file` (`_run_acceptance_file(..., validating=True,
 place=<the entry's files>)`, so per case, in the held-out sandbox, never on
@@ -10612,14 +10654,27 @@ failed both times). An entry any of whose paths the tree already has is not run
 no-verdict exit) or `load_failure` is dropped from the entry; any other with no
 verdict is listed in `unmeasured` and kept. A defect case the runner's report no
 longer names is dropped; any drop rewrites `bar.json` (entries left with no
-defect case removed) and is logged. The record is `{status, entries, passed,
-failed, dropped[], skipped[], unmeasured[], advisory[], injected[]}`, `status`:
+defect case removed) and is logged. A landed change's `run_tests` then run
+(`_settled_change_tests`): every file of `tests` is written onto the
+`acceptance-bar` tree (`_write_beneath`, after the entries ran; the shim never
+places over a tree path), and each runs unplaced through `_run_settled_bar_file`
+(label `settled-bar-<run>-change`), never `skipped` for a path the tree has: each case
+reported passed counts as a passing bar case, each failed one not in
+`known_failing` as a failure (a file with no per-case record by its verdict; a
+failing one in `known_failing` is not one), and a file that ran nothing or did
+not load leaves `run_tests` for good, rewriting `bar.json`. The record is
+`{status, entries, passed, failed, dropped[], skipped[], unmeasured[],
+advisory[], injected[], change, change_failed[]}`, `status`:
 
-- `empty` — no defect case of the bar ran, none unmeasured;
+- `empty` — no defect case of the bar ran, none unmeasured, and no landed change;
 - `unmeasured` — the tree could not be set up, or a file could not be run and no
   regression was seen;
-- `unlanded` — every defect case that ran failed;
-- `regressed` — some case failed and some defect case passed:
+- `unlanded` — the change is not on the own start and no entry ran, or there is
+  no landed change and every defect case that ran failed;
+- `regressed` — some case failed, and some defect case passed or the change is
+  landed. A change failure is not injected: its IDs are `change_failed[]`, which
+  `_settled_bar_settles_run` names in `no_work_dispute` and `no_work_acceptance.cases`
+  after the injected sets' cases. Entry failures are injected:
   `_inject_settled_bar_sets(st, sets, failures, written)` appends, per entry
   with a failure, a set indexed past `max(written, every set index)`, its
   files copied to `<run_dir>/acceptance/bar-<index>/`, `defect_files` the
@@ -10628,7 +10683,8 @@ failed, dropped[], skipped[], unmeasured[], advisory[], injected[]}`, `status`:
   (`scope.by = "settled_bar"`), `settled_bar{run, set}`. Such a set is always in
   `_acceptance_shown_indices`, does not count toward its four, and is skipped by
   `_acceptance_audit_and_rewrite`;
-- `holds` — every case that ran passed: `_settled_bar_withdraw(sets) ->
+- `holds` — every case that ran passed, or none ran and the change is landed:
+  `_settled_bar_withdraw(sets) ->
   list[dict]` sets each fresh set's `scope.counted_cases` to `{}` (an unbounded
   set becomes bounded, `by: "settled_bar"`, `unbounded_error`) and returns the
   withdrawn cases as `advisory[{set, file, case}]`, `case` null for a file that
@@ -13179,16 +13235,17 @@ disposable; the coordination directory outlives them.
 
 Every run's artifacts live under `<state-root>/runs/<run-id>/`. The state
 root is otherwise empty of run data; it hosts the `runs/` directory and,
-outside any one run, `settled-bars/` — what a `done` run of a report-pointer
-task leaves for later runs of the same task.
+outside any one run, `settled-bars/` — what a `done` run of a task leaves for
+later runs of the same task.
 Two concurrent runs in the same repository share no coordination state.
 
 ```
 <state-root>/          (default: $HOME/.leerie/<basename>/)
                         also contains: .owner (sidecar — abs_path of the owning repo)
-├── settled-bars/<_settled_bar_key(task, repo)>/   a report-pointer task's settled bar (DESIGN §8 *Done is a fixed bar per task*)
-│   ├── bar.json                     `{task_sha256, entries[{run, set, recorded_at, own_start, tree, defect{file: [case ids]}, control[], support[], modes{}}]}`
-│   └── <run-id>/set-<k>/            copies of that entry's passed test files (tests only, never a fix)
+├── settled-bars/<_settled_bar_key(task, repo)>/   a task's settled bar (DESIGN §8 *Done is a fixed bar per task*)
+│   ├── bar.json                     `{task_sha256, entries[{run, set, recorded_at, own_start, tree, defect{file: [case ids]}, control[], support[], modes{}}], change?}`
+│   ├── <run-id>/set-<k>/            copies of that entry's passed test files (tests only, never a fix)
+│   └── <run-id>/change/             `patches/<i>.patch` (the done run's diff, per file) and `files/<path>` (its added or changed test files)
 └── runs/
     └── <run-id>/                    (container/machine ID — known from creation)
         ├── state.json               run state — see field table below

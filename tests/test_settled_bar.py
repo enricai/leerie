@@ -160,7 +160,8 @@ def _settle_done_run(leerie, tmp_path, monkeypatch, repo, buggy, fixed,
     assert len(s1["scope"]["counted_cases"]["acc/test_bar.py"]) == 2
     _done_gate(st, fixed)
     got = leerie._record_settled_bar(st)
-    assert got == {"entries": 1, "cases": 2}
+    assert got == {"entries": 1, "cases": 2,
+                   "change": {"files": 1, "tests": 0}}
     return st
 
 
@@ -251,17 +252,25 @@ def test_a_case_still_failing_or_a_variant_or_broken_set_is_not_the_bar(
         "test_add_sums"]
 
 
-def test_only_a_report_pointer_task_has_a_bar(leerie, tmp_path, monkeypatch):
+def test_a_task_naming_no_report_is_keyed_by_its_text_alone(
+        leerie, tmp_path, monkeypatch):
+    """A task that points at no report asks exactly what it says (DESIGN §8
+    *Done is a fixed bar per task*): it has a key of its own, distinct from
+    every report-pointer key, and its done run records a bar under it."""
     repo, buggy = _lineage_repo(tmp_path)
     fixed = _commit(repo, FIXED, "fix")
     plain = "fix the add bug"                   # names no report
-    assert leerie._settled_bar_key(plain, repo) is None
+    key = leerie._settled_bar_key(plain, repo)
+    assert key and key != leerie._settled_bar_key(TASK, repo)
+    assert key != leerie._settled_bar_key("fix the add bug, please", repo)
     st = _mkst(leerie, tmp_path, repo, buggy, "run-plain", task=plain)
     acc = _write(leerie, st, monkeypatch, _fresh(BAR_DEFECT), task=plain)
-    assert "settled_bar_key" not in acc
+    assert acc["settled_bar_key"] == key
     _done_gate(st, fixed)
-    assert leerie._record_settled_bar(st) is None
-    assert not (st.leerie_root / "settled-bars").exists()
+    got = leerie._record_settled_bar(st)
+    assert got["change"] == {"files": 1, "tests": 0}
+    assert leerie._load_settled_bar(st.leerie_root, key)["change"]["run"] \
+        == "run-plain"
 
 
 def test_the_outcome_decider_records_the_bar_only_on_done(
@@ -484,7 +493,9 @@ def test_a_classifier_that_drops_bug_fixing_does_not_reopen_a_done_task(
                   categories=("feature-implementation",))
     got = _write(leerie, other, monkeypatch, _fresh(),
                  task="fix the other bug in bug-report.md")
-    assert got == {"skipped": "not a defect-fix run (no defect-scope audit)"}
+    assert got == {"skipped": "not a defect-fix run (no defect-scope audit)",
+                   "settled_bar_key": leerie._settled_bar_key(
+                       "fix the other bug in bug-report.md", repo)}
 
 
 def test_a_reworded_task_has_no_bar_and_is_not_swallowed(
@@ -550,7 +561,8 @@ def test_a_report_edited_during_a_run_is_a_new_bar_for_the_next_run(
     read_at_start = acc["settled_bar_key"]
     (repo / "bug-report.md").write_text(REPORT + "New finding.\n")
     _done_gate(st, fixed)
-    assert leerie._record_settled_bar(st) == {"entries": 1, "cases": 2}
+    assert leerie._record_settled_bar(st) == {
+        "entries": 1, "cases": 2, "change": {"files": 1, "tests": 0}}
     assert len(leerie._load_settled_bar(st.leerie_root,
                                         read_at_start)["entries"]) == 1
     assert _bar(leerie, st)["entries"] == []
