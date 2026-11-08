@@ -51,7 +51,7 @@ def test_the_report_is_copied_outside_every_tree(leerie, planned):
     assert not copy.is_relative_to(repo)
 
 
-def _env(run_dir: Path, tag: str) -> dict:
+def _worker_env(run_dir: Path, tag: str) -> dict:
     own = run_dir / "workers" / tag
     env = {"CLAUDE_CONFIG_DIR": str(own / "config"),
            "TMPDIR": str(own / "tmp")}
@@ -72,7 +72,7 @@ def test_exactly_the_fix_writers_read_it(leerie, planned, tmp_path, kind,
     cwd.mkdir()
     g = leerie._worker_grants(
         run_dir=st.run_dir, state={}, schema_key=kind, cwd=cwd,
-        allowed_tools=leerie.ACT_TOOLS, env=_env(st.run_dir, kind))
+        allowed_tools=leerie.ACT_TOOLS, env=_worker_env(st.run_dir, kind))
     copy = os.path.realpath(
         st.run_dir / leerie.TASK_FILES_DIRNAME / "notes" / "report.md")
     reads = [os.path.realpath(p) for p in g.ro]
