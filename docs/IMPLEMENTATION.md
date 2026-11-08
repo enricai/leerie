@@ -2593,6 +2593,74 @@ guarantee, and a worker-emitted copy of any of them is removed
 unconditionally (span-limited and whole-line-anchored, via
 `_strip_worker_risk_sections`) even when nothing is appended in its place.
 
+**What is still unmet when the run ends** (DESIGN §6 *What is still unmet
+when the run ends is shown as tests the reader can run*).
+`_record_unmet_evidence(st) -> None` runs in `phase_finalize` after
+`_decide_outcome` and `_store_tracked_test_report`, before `pr_end_state` is
+rendered, and is the only writer of `state.data["unmet_evidence"]` and of
+`<run_dir>/unmet-evidence/` (`UNMET_EVIDENCE_DIRNAME`); nothing before
+finalize writes either, and nothing but `_pr_unmet_evidence_lines` reads
+them. It removes the directory, then collects:
+
+- per `delivery_gate.unmet_final` entry whose `by` names `falsifier`, the
+  first confirmed sample of `items[i].falsifier` with a `probe_saved`: an
+  entry `{kind: "falsifier", item_index, item, label: "item <i>", file,
+  cases[{case, line, assertion, message}], bstar}` — `case` the sample's
+  `case_name`, `line`/`assertion` the probe line the sample's
+  `failure_line` names, else the first line holding its normalised
+  `assertion_quote` (that quote alone when no line does), `message` its
+  `failure_message`;
+- per `acceptance.gate.final` result that is measured, failing and
+  `_acceptance_result_has_work` for its set, per failing file with work
+  (`_acceptance_file_has_work` when the set is bounded): `{kind:
+  "held_out", set_index, label: "held-out set <k>", file, cases[…],
+  bstar}`, its cases the result's `failing_cases[file]` (only counted ones
+  when bounded; one whole-file entry when the runner named none), each case's
+  `message`/`line` from the result's `failing_case_evidence[file][case]`,
+  and `bstar` from `failing_basis[file]`.
+
+Every such file is copied with `_read_beneath` from its saved directory
+(`probe_saved.dir`, the set's `dir`) to `item-<i>/<file>` or
+`set-<k>/<file>` with `_write_beneath` — for a set, every defect, control
+and support file — and each entry carries `artifact` (the copy's
+`_operator_path`), `lines_total`, an `excerpt` of at most
+`_UNMET_SOURCE_LINES` lines (each cut to `_UNMET_LINE_MAX` characters)
+centred on the first failing line, and `excerpt_start`; a file it cannot
+read keeps its entry with no excerpt. `cmd` is `_acceptance_cmd(st,
+[file], placed={file: copy})` when it renders. The record is `{dir:
+<operator path of the directory>, entries[]}`, or the key is removed when
+no entry is collected; the rendered section is logged and written to
+`run.json` as `unmet_evidence{dir, text}`. Fail-open: an
+exception logs and leaves no record. `_record_unmet_evidence(st,
+results=...)` is also called by `_settle_pending_no_work` at the dispute
+bound (`verdict: "accepted after dispute"`), after `no_work_acceptance`
+is recorded and before `_finish_no_work_run`: its held-out entries then
+come from that verdict's `results` (no item entries — there is no
+delivery verdict), and the section's text goes to the final log and
+`run.json` only (there is no PR). `_acceptance_results_on_head`'s
+validity-base shortcut carries, per set, `failing_case_evidence` built
+from `base_failure_messages` (the validation's own runs on that commit,
+`line` by `_evidence_line`) and `failing_basis` `validated` for each
+defect file. `_pr_unmet_evidence_lines(state)`
+renders it under `## Still failing when the run ended` (in
+`_PR_END_STATE_HEADINGS`, directly after `## Unconverged`): per entry a
+`### <label>: <file>` heading, the item text (quoted), the full copy's
+path, the run command, then per case (at most `_UNMET_CASES_SHOWN`) its
+name, `Failing assertion (line N)`, the B* verdict and the message in a
+fence, then the excerpt in a fence longer than any backtick run in it;
+blocks are added while the section stays under `_UNMET_SECTION_MAX`
+characters, and the rest are counted (`N more file(s) with M case(s) not
+shown here`) with the directory's path.
+
+`_acceptance_run_placed` records, per failing result, `failing_case_evidence
+{file: {case id: {message, line?}}}` — the runner's message from the last
+failing run of that file that gave one (`_note` sees every first run,
+rerun and discovery run), cut to `_UNMET_MESSAGE_MAX`, and `line` from
+`_evidence_line(message, file)` (the first `<file>:<N>` the message names,
+a fixed runner stack frame) — and `failing_basis{file: held_case |
+bstar | budget_short | intermittent | unconfirmed}`. Only
+`_record_unmet_evidence` reads either.
+
 These are **module constants, not `DEFAULT_CAPS` entries**, by design:
 `DEFAULT_CAPS` is the surface for user-tunable run-wide operational caps
 (`max_total_workers`, `worker_timeout_sec`, `max_rate_limit_wait_sec`,
@@ -9889,7 +9957,12 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   report=<its report path>)`, `_heldout_grants` and
   `_acceptance_cmd(…, placed=)`: `case_fails`
   (`_falsifier_case_id` finds the named case among the failing IDs, never a
-  load failure), `fails_under_bstar` (`_confirm_still_failing` on that ID);
+  load failure), `fails_under_bstar` (`_confirm_still_failing` on that ID;
+  with it the sample records `failure_message`, the runner's message for
+  that case from the last of its runs that gave one, cut to
+  `_UNMET_MESSAGE_MAX` characters, and `failure_line`, the line that message
+  names in the probe (`_evidence_line`), or neither when the runner gave
+  none — read only by `_record_unmet_evidence`);
   then `_probe_case_facts_placed(st, tree, src, rel, case)` (node
   `scripts/test-case-facts.cjs <tree>/<rel> <case> <report>` through
   `_run_streaming` in the same kind of sandbox, alone, the probe placed,
@@ -13392,6 +13465,7 @@ discovery without parsing the full `state.json`):
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix; the launcher prepends it). Null when the worker errored, or when no push has been chosen for the run (a `--no-push` finalize; a later `resume <id> --push` runs the worker then); `host_finalize` falls back to a deterministic title. |
 | `pr_body` | str \| null | PR body (markdown): the `pr_writer` worker's accepted body, with any worker-emitted copy of a code-owned end-state section stripped and `_format_pr_end_state_section` appended when it is non-empty (`_compose_pr_via_llm` — those sections are deliberately never LLM-written). Null on the same conditions as `pr_title`. |
 | `pr_end_state` | str | the PR's end-state section (`_format_pr_end_state_section`, DESIGN §6 *The PR's end-state section is rendered by code, from typed state*), rendered once by `phase_finalize` after `_decide_outcome` and written with `finished_at`; `""` when there is nothing to say. `host-finalize.sh`'s LLM-less fallback appends it as-is. |
+| `unmet_evidence` | dict | `{dir, text}`: what was still unmet when the run ended, as the tests that show it (`_record_unmet_evidence`; DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*) — `dir` the operator path of `<run_dir>/unmet-evidence/`, `text` the section's lines; written by `phase_finalize` and by the dispute-bound no-work exit; absent when nothing is unmet. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 | `rebase_disposition_status` | str \| null | set to `"unusable"` by the rebase fallback arm when the rebaser seam returns rc=0 but its JSON is empty, unparseable, or lacks `status`. |
 | `rebase_disposition_jq_rc` | str \| null | the `jq -e` exit code from parsing `$_rebaser_json` in that fallback arm — non-zero means the payload was unparseable JSON, not merely missing `.status`. Null under the same conditions as `rebase_disposition_status`. |
@@ -13463,6 +13537,7 @@ command line overrides it.
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
+| `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
 | `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim, reason?}` (`_verify_external_claim`), dropped when a later attempt reports `complete`; one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |

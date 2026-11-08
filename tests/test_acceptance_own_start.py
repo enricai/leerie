@@ -676,8 +676,12 @@ def test_head_at_the_validity_base_is_known_without_running(
     monkeypatch.setattr(leerie, "_judgment_cwd", lambda _st: repo)
     monkeypatch.setattr(leerie, "_evaluate_acceptance_sets", boom)
     res = asyncio.run(leerie._acceptance_results_on_head(st, {}))
+    # The validation's own verdict on this commit, typed as such for what a
+    # finished run shows (DESIGN §6 *What is still unmet when the run ends
+    # is shown as tests the reader can run*).
     assert res == [{"index": 1, "passed": False, "unmeasured": False,
-                    "failing_files": ["a/test_d.py"]}]
+                    "failing_files": ["a/test_d.py"],
+                    "failing_basis": {"a/test_d.py": "validated"}}]
 
 
 # --- A2: the broken-set hook ------------------------------------------------
