@@ -1302,7 +1302,7 @@ leerie/
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a descriptor the orchestrator inherits, no socket path; v1+v2); the dropped-privilege orchestrator drives it
 │   ├── load-typescript.cjs        loads a `typescript` with the JS compiler API for the AST scripts: the tree's own (resolved from the cwd) when `typeof ts.createSourceFile === 'function'`, else the image's pinned copy named by `LEERIE_BUNDLED_TYPESCRIPT`; run directly (`node load-typescript.cjs`) it prints `tree` / `bundled` and exits 0, or exits 1 — `_ts_resolvable`'s probe (DESIGN §8 "Delivery detection")
 │   ├── redrive-ast-gate.cjs       D1/D2/D3 safety facts of one changed production file, base vs head (TypeScript compiler API), for the delivery re-drive's escalation gate (d+); loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery re-drive")
-│   ├── test-case-facts.cjs        AST facts of one test case (reachable code, file reads, evals, imports) for the falsifier's coupling check; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
+│   ├── test-case-facts.cjs        AST facts of one test case (reachable code, its statements, file reads, evals, imports) for the falsifier's coupling check; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
 │   ├── symbol-references.cjs      which of the given JS/TS files use one symbol outside its own declaration (TypeScript compiler API), for the coupling check's R3; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
 │   ├── forbidden-command-hook.py  PreToolUse hook wired by `claude_p` through `--settings`: denies a Bash call running a command the task forbids, or killing processes by name; imports leerie's own matcher; fails open (DESIGN §9 "A command the task forbids is denied in every spelling", "A worker never kills a process by name")
 │   ├── dockerfile-frontend.sh     LEERIE_DOCKERFILE_FRONTEND (the one Dockerfile frontend every build is given, pinned by digest), ensure_frontend_in_worker_ns, LEERIE_IMAGE_NS and the BuildKit worker-namespace checks; sourced by the launcher and remote/build-push.sh
@@ -10312,10 +10312,21 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   already in it. `_falsifier_gates` (either channel) records every failing
   run's message per case ID and, after `not_coupled`, sets `at_assertion =
   _falsifier_failed_at_assertion(messages, rel, probe_source,
-  assertion_quote)`: True when some message names no line of `rel`
-  (`_evidence_line` None, an empty list included) or names a line whose
-  `_scope_norm` text (at least 6 characters) is inside the quote's, or
-  holds it; `confirmed` is the conjunction of every gate.
+  assertion_quote, steps=facts["steps"])`: True when some message names no
+  line of `rel` (`_evidence_line` None, an empty list included), or names a
+  line whose `_scope_norm` text (at least 6 characters) is inside the
+  quote's, or holds it, or names a line inside the span of a statement of
+  the assertion's binding slice. `steps` is the facts script's list of the
+  reachable code's statements, nested ones included (`{start,
+  end, fn, binds[], reads[]}`: 1-based lines, the start offset of the
+  innermost enclosing function, the names a variable statement declares or
+  an assignment statement assigns, the identifiers it reads outside
+  property names). The slice's anchors are the innermost statements holding a quoted
+  line (`_falsifier_assertion_slice`); a statement joins an anchor's
+  slice when it starts before that anchor, in the same function, and binds
+  a name the slice reads, to a fixpoint. With no
+  `steps` (facts that carry none) the slice is empty: the line rule alone,
+  as before. `confirmed` is the conjunction of every gate.
 - **Final** — `_run_ci_parity_final(leerie_dir, st, caps) -> list[dict]`,
   called in `_run_phases` after `_run_acceptance_gate` and before
   `phase_finalize`, in a detached `worktrees/ci-final` worktree at the
