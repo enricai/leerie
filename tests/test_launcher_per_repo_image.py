@@ -15,7 +15,8 @@ from pathlib import Path
 
 from tests.committed_tree import commit_tree
 from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
-from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+from tests.repo_image_block_extract import (BUILT_DOCKERFILE,
+                                            EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
 from tests.repo_image_block_extract import extract_block as _extract_block
@@ -56,6 +57,18 @@ nerdctl() {
       return "${NERDCTL_INSPECT_RC:-0}"
       ;;
     build)
+      # With FIRST_BUILD_OUT, keep a copy of the first build's Dockerfile
+      # (`-f <build dir>/repo/Dockerfile`): the launch removes its build
+      # directory before the test can read it.
+      if [ -n "${FIRST_BUILD_OUT:-}" ]; then
+        local _a _prev=""
+        for _a in "$@"; do
+          case "$_prev:$_a" in
+            -f:*/repo/Dockerfile) /usr/bin/cp "$_a" "$FIRST_BUILD_OUT" ;;
+          esac
+          _prev="$_a"
+        done
+      fi
       _stub_build_done "$@"
       return "${NERDCTL_BUILD_RC:-0}"
       ;;
@@ -446,7 +459,7 @@ def test_setup_packages_generates_dockerfile(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'echo "done"; cat "$USER_REPO/.leerie/Dockerfile"',
+        'echo "done"; ' + BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -456,7 +469,7 @@ def test_setup_packages_generates_dockerfile(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
-    assert "auto-generating .leerie/Dockerfile" in result.stderr
+    assert "generating the repository image's Dockerfile" in result.stderr
     assert "libvips-dev" in result.stdout
     assert "fonts-noto" in result.stdout
     assert "ARG BASE_IMAGE" in result.stdout
@@ -479,7 +492,7 @@ def test_existing_dockerfile_wins_over_setup_packages(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -490,7 +503,7 @@ def test_existing_dockerfile_wins_over_setup_packages(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     # auto-gen should NOT have run
-    assert "auto-generating" not in result.stderr
+    assert "generating the repository image's Dockerfile" not in result.stderr
     # The committed Dockerfile content is preserved
     assert "# CUSTOM" in result.stdout
 
@@ -522,7 +535,7 @@ def test_language_dep_layer_included_for_pnpm_repo(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -562,7 +575,7 @@ def test_language_dep_layer_includes_patches_for_pnpm(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -587,7 +600,7 @@ def test_language_dep_layer_disabled_by_env(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -620,7 +633,7 @@ def test_language_dep_disabled_via_zero(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -650,7 +663,7 @@ def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
 
     # First run: generate Dockerfile, record its sha.
     result1 = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -670,7 +683,7 @@ def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
     lockfile.write_text("lockfileVersion: '6.0'\n# changed\n")
 
     result2 = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -699,7 +712,7 @@ def test_no_lockfile_no_language_dep_layer(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -819,7 +832,7 @@ def test_language_dep_full_copy_for_yarn_workspace(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -841,7 +854,7 @@ def test_language_dep_full_copy_for_npm_workspace(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -870,14 +883,14 @@ def test_patch_edit_changes_copy_input_sha(tmp_path):
         "NERDCTL_BUILD_RC": "0",
         "FAKE_GIT_REMOTE": "",
     }
-    r1 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"', env=env)
+    r1 = _run_harness(BUILT_DOCKERFILE, env=env)
     assert r1.returncode == 0, r1.stderr
     sha1 = next((l for l in r1.stdout.splitlines() if "copy-input-shas:" in l), "")
 
     # Edit the patch only; lockfile untouched. Generated Dockerfile refreshes
     # in place (sentinel), so no manual removal.
     (user_repo / "patches" / "foo.patch").write_text("--- a/f\n+++ b/f\n@@ changed\n")
-    r2 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"',
+    r2 = _run_harness(BUILT_DOCKERFILE,
                       env={**env, "NERDCTL_INSPECT_RC": "0"})
     assert r2.returncode == 0, r2.stderr
     sha2 = next((l for l in r2.stdout.splitlines() if "copy-input-shas:" in l), "")
@@ -898,7 +911,7 @@ def test_generated_dockerfile_has_sentinel(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     result = _run_harness(
-        'head -1 "$USER_REPO/.leerie/Dockerfile"',
+        '{ ' + BUILT_DOCKERFILE + '; } | head -1',
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -927,12 +940,12 @@ def test_generated_dockerfile_refreshes_on_setup_packages_change(tmp_path):
         "NERDCTL_BUILD_RC": "0",
         "FAKE_GIT_REMOTE": "",
     }
-    r1 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"', env=env)
+    r1 = _run_harness(BUILT_DOCKERFILE, env=env)
     assert r1.returncode == 0 and "curl" in r1.stdout
 
     # Change setup_packages; the generated Dockerfile must be refreshed.
     (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
-    r2 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"',
+    r2 = _run_harness(BUILT_DOCKERFILE,
                       env={**env, "NERDCTL_INSPECT_RC": "0"})
     assert r2.returncode == 0, r2.stderr
     assert "postgresql" in r2.stdout, "generated Dockerfile must refresh from new setup_packages"
@@ -950,7 +963,7 @@ def test_committed_dockerfile_is_never_overwritten(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -973,88 +986,161 @@ def _git_init_commit(repo: Path, path_rel: str) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "add"], cwd=repo, check=True)
 
 
-def test_committed_generated_dockerfile_with_sentinel_not_overwritten(tmp_path):
-    """GAP 4 / D3: a COMMITTED (git-tracked) Dockerfile that carries the
-    leerie-generated sentinel is authoritative (DESIGN §6½ "a committed
-    Dockerfile always takes precedence") — the auto-gen guard must NOT
-    regenerate it, even though setup_packages changed. Only an UNCOMMITTED
-    generated file is refreshed in place. This is the concern-#7 edge that the
-    sentinel-only guard got wrong."""
-    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+SENTINEL = ("# leerie-generated: do not edit (regenerated from "
+            ".leerie/config.toml)")
+_ENV_KEYS = {"NERDCTL_INSPECT_RC": "1", "NERDCTL_BUILD_RC": "0",
+             "FAKE_GIT_REMOTE": ""}
+
+
+def _launch(user_repo: Path, state_dir: Path, body: str = BUILT_DOCKERFILE,
+            **env: str) -> subprocess.CompletedProcess:
+    return _run_harness(body, env={"USER_REPO": str(user_repo),
+                                   "LEERIE_STATE_HOST_DIR": str(state_dir),
+                                   **_ENV_KEYS, **env})
+
+
+def _built_bytes(tmp_path: Path) -> bytes:
+    """The bytes the stub `nerdctl build` was given as the first build's
+    Dockerfile (`-f <dir>/repo/Dockerfile`), copied out (FIRST_BUILD_OUT)
+    before the launch removed its build directory."""
+    return (tmp_path / "first-build.Dockerfile").read_bytes()
+
+
+
+
+def test_a_committed_generated_dockerfile_stops_the_launch(tmp_path):
+    """OPEN-ISSUES #18 (DESIGN §6½ *A generated Dockerfile is leerie's
+    output, never the repository's*): a COMMITTED file that carries
+    leerie's mark froze the image — the launcher left a tracked one alone
+    as the repository's, so later setup_packages edits never reached the
+    image (navegando, api, funeralworks, barnacle, measured 2026-11-09).
+    It is never an authority: the launch stops before any build, naming
+    the file and both ways out, and writes nothing in the checkout.
+    Falsified: the old tracked gate restored (exit 0, the stale file
+    built)."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
     (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    # A generated Dockerfile the user committed AND then hand-edited below the
-    # sentinel (they left line 1 intact, not knowing it is load-bearing).
-    committed = (
-        sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
-        "RUN echo MY-CUSTOM-LAYER\n"
-    )
+    committed = (SENTINEL + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
+                 "RUN echo MY-CUSTOM-LAYER\n")
     (leerie_dir / "Dockerfile").write_text(committed)
     _git_init_commit(user_repo, ".leerie/Dockerfile")
-
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    # Change setup_packages — under the sentinel-only guard this would clobber.
+    log = tmp_path / "nerdctl.log"
+    result = _launch(user_repo, state_dir, "echo REACHED-THE-END")
+    assert result.returncode == 1, result.stderr
+    assert "REACHED-THE-END" not in result.stdout
+    assert ".leerie/Dockerfile is committed" in result.stderr, result.stderr
+    assert "git rm .leerie/Dockerfile" in result.stderr, result.stderr
+    assert "delete its first line" in result.stderr, result.stderr
+    assert "building per-repo container image" not in result.stderr
+    assert not log.exists()
+    assert (leerie_dir / "Dockerfile").read_text() == committed
+    assert sorted(p.name for p in leerie_dir.iterdir()) == [
+        "Dockerfile", "config.toml"]
+
+
+def test_a_committed_dockerfile_whose_mark_was_removed_is_the_repositorys(
+        tmp_path):
+    """The second way out of the refusal: the same committed file with its
+    first line deleted is the repository's own, built byte for byte;
+    setup_packages is not read, and the launch says so."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
     (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
-    result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
+    mine = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo MY-CUSTOM-LAYER\n"
+    (leerie_dir / "Dockerfile").write_text(mine)
+    _git_init_commit(user_repo, ".leerie/Dockerfile")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    out = tmp_path / "first-build.Dockerfile"
+    result = _launch(user_repo, state_dir, "true",
+                     FIRST_BUILD_OUT=str(out))
     assert result.returncode == 0, result.stderr
-    assert result.stdout == committed, (
-        "a committed (git-tracked) generated Dockerfile must NOT be regenerated"
-    )
-    assert "postgresql" not in result.stdout, "committed file's custom layer clobbered"
+    assert _built_bytes(tmp_path) == mine.encode()
+    assert "setup_packages and language_installs are not read" in \
+        result.stderr, result.stderr
+    assert "generating the repository image's Dockerfile" not in result.stderr
 
 
-def test_uncommitted_generated_dockerfile_still_refreshes_in_git_repo(tmp_path):
-    """D3 complement: in a git repo, an UNTRACKED generated Dockerfile is still
-    refreshed in place when setup_packages changes (git-tracked gate lets
-    untracked ones through)."""
+def test_an_untracked_generated_dockerfile_is_not_read(tmp_path):
+    """An UNTRACKED file carrying the mark — what an earlier leerie wrote
+    into the checkout and rewrote on every launch — is not read: the
+    launch generates from config.toml, builds those bytes, warns that the
+    file is not read, and leaves it as it was (the launcher writes nothing
+    in the checkout)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
+    stale = (SENTINEL + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+             "RUN apt-get install -y curl\n")
+    (leerie_dir / "Dockerfile").write_text(stale)
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _launch(user_repo, state_dir)
+    assert result.returncode == 0, result.stderr
+    assert "postgresql" in result.stdout and "curl" not in result.stdout, \
+        result.stdout
+    assert "is a file an earlier leerie generated; it is not read" in \
+        result.stderr, result.stderr
+    assert (leerie_dir / "Dockerfile").read_text() == stale
+    assert sorted(p.name for p in leerie_dir.iterdir()) == [
+        "Dockerfile", "config.toml"]
+
+
+def test_the_image_builds_the_generated_bytes_not_the_checkouts(tmp_path):
+    """The first build is given the bytes this launch generated, from the
+    build directory, never a file of the checkout: with a stale untracked
+    copy in the checkout, the Dockerfile `nerdctl build -f` reads holds
+    the configuration's packages. Falsified: _repo_image_prepare reading
+    the checkout's file (the first build gets the stale copy)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
+    (leerie_dir / "Dockerfile").write_text(
+        SENTINEL + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n")
+    (leerie_dir / "config.toml").write_text(
+        'setup_packages = "ffmpeg postgresql-client"\n')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    out = tmp_path / "first-build.Dockerfile"
+    result = _launch(user_repo, state_dir, "true", FIRST_BUILD_OUT=str(out))
+    assert result.returncode == 0, result.stderr
+    built = _built_bytes(tmp_path).decode()
+    assert built.startswith(SENTINEL + "\n"), built
+    assert "    ffmpeg \\\n" in built and "    postgresql-client \\\n" in built, \
+        built
+
+
+def test_generation_writes_nothing_in_the_checkout(tmp_path):
+    """Generation leaves the checkout's .leerie/ as the operator left it:
+    no Dockerfile, no temporary file."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
     (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    # git repo exists, but the Dockerfile is NOT added/committed.
-    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
-    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
-    (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get install -y curl\nUSER leerie\n")
-
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
-    result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "0",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
+    result = _launch(user_repo, state_dir)
     assert result.returncode == 0, result.stderr
-    assert "postgresql" in result.stdout, (
-        "untracked generated Dockerfile should refresh from new setup_packages"
-    )
+    assert "curl" in result.stdout
+    assert sorted(p.name for p in leerie_dir.iterdir()) == ["config.toml"]
 
 
-def test_a_submodules_generated_dockerfile_is_not_overwritten(tmp_path):
+def test_a_submodules_generated_dockerfile_stops_the_launch(tmp_path):
     """Review round 31, S1's class: `.leerie` a submodule holding a generated
     Dockerfile. `git ls-files --error-unmatch .leerie/Dockerfile` fails in
-    the superproject (the submodule is one gitlink entry), so the refresh
-    took the committed file for an uncommitted one and rewrote it. A file
-    another repository holds is committed (`_checkout_file_tracked`)."""
-    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
-    committed = sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo MINE\n"
+    the superproject (the submodule is one gitlink entry); a file another
+    repository holds is committed (`_checkout_file_tracked`), so a marked
+    one stops the launch as a committed one does, and is left as it is."""
+    committed = SENTINEL + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo MINE\n"
     ident = ["-c", "user.email=t@t.co", "-c", "user.name=t",
              "-c", "protocol.file.allow=always"]
     sub = tmp_path / "sub"
@@ -1073,15 +1159,8 @@ def test_a_submodules_generated_dockerfile_is_not_overwritten(tmp_path):
                    check=True)
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == committed
+    result = _launch(user_repo, state_dir, "echo REACHED-THE-END")
+    assert result.returncode == 1, result.stderr
+    assert "REACHED-THE-END" not in result.stdout
+    assert ".leerie/Dockerfile is committed" in result.stderr, result.stderr
+    assert (user_repo / ".leerie" / "Dockerfile").read_text() == committed

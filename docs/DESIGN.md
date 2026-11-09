@@ -4744,8 +4744,10 @@ of its own. It is constructed in two parts.
    not track it applies this one rule (`_checkout_file_tracked`; the
    launcher's `_checkout_file_tracked`): the settings files above, a report
    the task points at (§8 *A task that points at a report is bounded by the
-   report's own scenarios*), and the launcher's refresh of a generated
-   `.leerie/Dockerfile`, which leaves a committed one alone.
+   report's own scenarios*), and the launcher's test of a
+   `.leerie/Dockerfile` that carries leerie's generated mark, which refuses
+   a committed one (§6½ *A generated Dockerfile is leerie's output, never
+   the repository's*).
 
 **The names an untracked settings file may still set.** Round 28 suggested a
 further list of names no checkout settings layer may set, tracked or not:
@@ -11417,18 +11419,96 @@ call — neither calls `_infer_build_lint_test` directly any longer.
 System packages requiring root (C libraries for native gems, fonts,
 specialized tooling) cannot be installed by `.leerie-setup.sh` — that
 hook runs as the unprivileged `leerie` user. A repo that needs such
-packages commits `.leerie/Dockerfile` that extends the base image with
-`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
+packages either declares them in `.leerie/config.toml` (`setup_packages`),
+or writes and commits a `.leerie/Dockerfile` of its own that extends the
+base image with `ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds an image
 tagged `leerie-repo/<repo-id>-<checkout-id>:<version>` (where `<repo-id>`
 is derived from the git remote URL, sanitized to tag chars, and
 `<checkout-id>` from the checkout's path), in leerie's containerd namespace
 `leerie` (§6 *No build consumes what another build left in BuildKit*), and
-uses it for all subsequent `nerdctl run` invocations. When no
-`.leerie/Dockerfile` exists
-but `.leerie/config.toml` declares `setup_packages`, the launcher
-auto-generates an apt-install Dockerfile and proceeds through the same
-build path. A committed Dockerfile always takes precedence — `setup_packages`
-is ignored when both are present.
+uses it for all subsequent `nerdctl run` invocations. When the checkout
+holds no Dockerfile of the repository's own, the launcher generates one
+from `.leerie/config.toml` (`setup_packages`, `language_installs`) and the
+committed lockfiles, on every launch, and builds it through the same path.
+A Dockerfile the repository wrote always takes precedence: while one is
+there, `setup_packages`, `language_installs` and the lockfiles generate
+nothing, and the launch says so when the configuration declares either key.
+
+**A generated Dockerfile is leerie's output, never the repository's.**
+*Designed 2026-11-09 (OPEN-ISSUES #18).*
+
+*Root cause.* The launcher wrote the file it generated into the checkout,
+at `.leerie/Dockerfile`, its first line leerie's mark (`# leerie-generated:
+do not edit (regenerated from .leerie/config.toml)`), and refreshed it in
+place only while git did not track it. A tracked one was left alone as the
+repository's ("a committed Dockerfile always takes precedence"), and this
+document told the operator to commit the file (*No auto-commit* below). So
+a committed generated file froze the repository image at the configuration
+it was generated from: every later edit of `setup_packages` and
+`language_installs` reached `.leerie/config.toml` and never the image, and
+nothing said so. Measured 2026-11-09 on four repositories, each with its
+generated file committed: navegando's configuration asks for `ffmpeg
+postgresql-client` and a pnpm layer, its committed file (2026-08-25) is
+`FROM $BASE_IMAGE` and `USER root` and nothing else, and its image's
+worker root had no `psql` and no `ffmpeg`; api's image lacked
+`ffmpeg` and the pnpm layer; funeralworks' lacked `libflite1`; barnacle's
+committed file hid a `setup_packages` that names words no Debian package
+is. The mark said which file was leerie's; whether git tracked it decided
+whether that was believed, and the instruction to commit it made the
+answer "no".
+
+*Invariant.* What the launcher generates is a function of
+`.leerie/config.toml` and the committed tree at this launch, generated on
+every launch and read back from nowhere. It is never written into the
+checkout: the checkout is the operator's, and a file there can be
+committed, which is how the generated file became an input. It is written
+into the launch's own build directory and built from there (*A repository
+image's build directory lives only as long as its launch*). A
+`.leerie/Dockerfile` in the checkout is the repository's own only when its
+first line is not leerie's mark. One that carries the mark is a copy of
+leerie's output from some earlier configuration and is never an authority:
+
+- *Committed* (git tracks it, or a submodule or nested repository holds
+  it; `_checkout_file_tracked`): the launch stops before any build, naming
+  the file and the two ways out. Remove it from the repository (`git rm
+  .leerie/Dockerfile`), and the launch builds what `.leerie/config.toml`
+  asks for; or, if lines in it are the operator's, delete its first line,
+  and it is the repository's own Dockerfile. Leerie cannot tell a stale
+  copy from one edited under the mark: the bytes an earlier leerie
+  generated differ from today's for the same configuration (the lockfile
+  hashes it carries change with every lockfile commit, and the template
+  changed between versions), so comparing them answers nothing. Building
+  the copy is the freeze above; building the regenerated file in its place
+  silently drops whatever the operator wrote under the mark. Only the
+  operator knows which it is, so the launch asks.
+- *Untracked*: an earlier leerie wrote it and rewrote it on every launch,
+  so no edit of it ever reached an image. The launch does not read it,
+  warns that it is not read and can be removed, and generates. It is left
+  where it is: the launcher writes nothing in the checkout.
+
+Considered instead: regenerating a committed marked file in place (writes a
+tracked file of the operator's checkout on every launch, and overwrites an
+edit made under the mark); treating it as the repository's own (the
+defect); building the regenerated file with a warning and going on (an
+image without the lines an operator wrote, for a run that does not stop).
+
+*Upgrade.* An image built from a committed stale file is keyed on that
+file's bytes (`.dockerfile-hash`, the Fly tag's hash); the file the launch
+generates has other bytes, so once the operator removes the copy the next
+launch rebuilds, locally and on Fly. `REPO_IMAGE_LAYOUT` does not change:
+the image's layout is the same, and only which bytes the first build reads
+moved. A checkout whose untracked generated file an earlier leerie kept
+refreshed generates the same bytes from the same inputs and reuses its
+image. On Fly the per-repo tag is computed from the same generated bytes
+(`_set_fly_per_repo_image`); the machine's `/work/.leerie/` copy was never
+a build input. A configuration the frozen file hid is read again, and one
+that is not valid (a `setup_packages` word that is not a Debian package
+name) now stops the launch with that refusal; a language-dep layer the
+frozen file hid is built for the first time, and one that does not build
+takes the apt-only fallback of *Language deps* below, with its warning
+(measured on a clone of navegando, 2026-11-09: its pnpm layer's
+`postinstall` runs `prisma generate`, which finds no schema among the
+layer's inputs).
 
 The repository's Dockerfile builds only the *worker stage*: its result is
 copied whole to `/opt/leerie-worker-root` in an image whose own root is
@@ -11596,9 +11676,8 @@ and reuses the image, so a layer that cannot build costs one failed build,
 not one per launch; a change to any input the key holds tries the layer
 again, and so does removing `.dockerfile-hash` from the state root. The
 record marks such an image as the apt-only one, and every launch that
-reuses it says so, naming that file: the checkout's generated
-`.leerie/Dockerfile` again shows the language-dep layer, so nothing else
-tells the operator that the image running lacks it, or that a failure that
+reuses it says so, naming that file: the file each launch generates
+again holds the language-dep layer, so nothing else tells the operator that the image running lacks it, or that a failure that
 was only a registry outage is still being reused. *Revised 2026-11-03
 (review round 36, execution X3).* The warning said the apt-only bake was
 "for this run", and later launches reused the image without a word.
@@ -11707,11 +11786,12 @@ sentinel and sets `dep_capture_done = True` in `state.json`. The run-start
 backstop skips any run whose sentinel is already present. When the union
 merge finds nothing new, `.leerie/config.toml` is not touched.
 
-**No auto-commit.** An applied capture leaves `.leerie/config.toml` (and, if
-generated, `.leerie/Dockerfile`) as uncommitted files, and the operator
-commits them when they choose. The user controls when to commit — this
-preserves the committed-Dockerfile authority rule: a hand-authored
-`.leerie/Dockerfile` is never surprised by an auto-commit.
+**No auto-commit.** An applied capture leaves `.leerie/config.toml` as an
+uncommitted change, and the operator commits it when they choose. The
+Dockerfile leerie generates from it is never in the checkout, so there is
+nothing generated to commit (*A generated Dockerfile is leerie's output,
+never the repository's*); a hand-authored `.leerie/Dockerfile` is never
+surprised by an auto-commit.
 
 **Non-fatal.** Any error during capture or write — log parsing failure, TOML
 write error, filesystem permission issue — is caught, logged at debug level,
@@ -11724,11 +11804,14 @@ The `capture_deps` knob is resolved by `resolve_capture_deps()` with
 `LEERIE_CAPTURE_DEPS` env > `.leerie/config.toml` > default `true`
 precedence. There is no CLI flag and no `leerie.toml` tier.
 
-**Committed Dockerfile is authoritative.** When `.leerie/Dockerfile` is
-already committed to the repo, capture skips writing `setup_packages` — the
-Dockerfile speaks for itself. This mirrors the existing rule: `setup_packages`
-is ignored when a committed Dockerfile is present (see *Per-repo container
-image* above).
+**The repository's own Dockerfile is authoritative.** When `.leerie/Dockerfile`
+is the repository's own (its first line is not leerie's mark), capture skips
+writing `setup_packages` — the Dockerfile speaks for itself. This mirrors the
+existing rule: `setup_packages` is ignored when the repository's own
+Dockerfile is present (see *Per-repo container image* above). A committed
+file that carries leerie's mark is not the repository's own; the launch
+refuses it (*A generated Dockerfile is leerie's output, never the
+repository's*).
 
 **Fly parity.** Capture records the same file regardless of runtime. On
 `--runtime fly` the workflow splits across two directions:

@@ -22,7 +22,8 @@ from pathlib import Path
 from tests.committed_tree import commit_tree
 from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+from tests.repo_image_block_extract import (BUILT_DOCKERFILE,
+                                            NERDCTL_IMAGE_INSPECT_STUB)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,7 +161,7 @@ def test_pip_install_emits_copy_run_layer(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -196,7 +197,7 @@ def test_pip_install_emits_apt_layer_alongside(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -228,7 +229,7 @@ def test_pip_install_emits_sha_comment(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -263,7 +264,7 @@ def test_hallucinated_copy_input_drops_copy_keeps_run(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -325,7 +326,7 @@ def test_partial_hallucination_only_existing_files_in_copy(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -372,7 +373,7 @@ def test_multi_manager_emits_both_layers(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -413,7 +414,7 @@ def test_multi_manager_emits_two_sha_comments(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -454,7 +455,7 @@ def test_pip_without_lockfile_still_emits_layer(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -479,7 +480,7 @@ def _run_and_get_dockerfile(user_repo: "Path", state_dir: "Path") -> str:
     if df.exists():
         df.unlink()
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -583,7 +584,7 @@ def test_committed_dockerfile_not_overwritten_by_language_installs(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -627,7 +628,7 @@ def test_persisted_pnpm_pulls_in_patches_dir(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -663,7 +664,7 @@ def test_persisted_pnpm_does_not_flatten_patches(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -701,7 +702,7 @@ def test_persisted_non_node_ignores_patches(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -735,7 +736,7 @@ def test_persisted_node_workspace_child_path_preserved(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -766,7 +767,7 @@ def test_autogen_apt_layer_has_no_trailing_user_leerie(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),

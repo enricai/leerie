@@ -61,7 +61,7 @@ def _extract_rebuild_decision_block() -> str:
     the launcher: resolves REPO_IMAGE_TAG, computes the current/stored
     Dockerfile hash, and decides `_need_build`."""
     src = LAUNCHER.read_text()
-    start = src.index("# Only proceed if a Dockerfile is now present")
+    start = src.index("# Only proceed when there is a Dockerfile to build")
     end_marker = "unset _leerie_dockerfile\n"
     end = src.index(end_marker, start) + len(end_marker)
     return src[start:end]
@@ -150,6 +150,13 @@ LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-/tmp/leerie-state-test}"
 """ + NERDCTL_IMAGE_INSPECT_STUB + _extracted_block() + r"""
 
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
+# What the launcher's Dockerfile decision sets for a checkout whose
+# .leerie/Dockerfile is the repository's own (no leerie mark, as every
+# fixture here writes): the build reads it, and nothing was generated.
+_REPO_DF_GEN=""
+_REPO_GEN_FALLBACK=""
+_REPO_DF_OWN=false
+if [ -f "$_leerie_dockerfile" ]; then _REPO_DF_OWN=true; fi
 
 """
 
