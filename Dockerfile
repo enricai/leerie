@@ -356,7 +356,7 @@ RUN npm install -g '@anthropic-ai/claude-code@>=2.1.289' \
     && ln -s /usr/local/share/mise/installs/node/lts-current/bin/claude /opt/leerie-vendor/bin/claude \
     && test -x /opt/leerie-vendor/bin/claude
 
-# A pinned JS-API `typescript` for leerie's two AST scripts
+# A pinned JS-API `typescript` for leerie's AST scripts
 # (scripts/load-typescript.cjs falls back to it when the tree under test's
 # own `typescript` has no compiler API — the TypeScript 7 native port
 # exports a version string only; DESIGN §8 *Delivery detection*). The facts

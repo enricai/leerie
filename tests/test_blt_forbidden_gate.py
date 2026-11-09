@@ -86,7 +86,8 @@ LEERIE_OWNED_HEADS = {
     "mise": "toolchain install from the repo's pinned versions",
     "ps": "process-tree inspection",
     "grep": "a fixed search",
-    "node": "leerie's own scripts (TEST_CASE_FACTS, REDRIVE_AST_GATE) "
+    "node": "leerie's own scripts (TEST_CASE_FACTS, SYMBOL_REFERENCES, "
+            "REDRIVE_AST_GATE) "
             "and a require.resolve probe",
     "bash": "leerie's scripts/ and the operator's .leerie-setup.sh — "
             "never `-c`, which the shell-list test refuses",
