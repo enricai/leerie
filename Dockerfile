@@ -116,6 +116,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN echo 'CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"' \
     > /etc/chromium.d/leerie-container-flags
 
+# PostgreSQL server binaries for scripts/sandbox-db.sh, leerie's stand-in for
+# the database service a repository's CI starts (DESIGN §6½ *A database
+# server in the base image*): every command leerie gives a database starts a
+# private cluster from these, inside its own confinement. No cluster is
+# created here (create_main_cluster = false) — nothing runs one but
+# sandbox-db.sh, in a command's own /tmp — and nothing is chowned: initdb
+# writes only the confined command's own directory.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      postgresql-common \
+    && sed -ri 's/^#?[[:space:]]*create_main_cluster[[:space:]]*=.*/create_main_cluster = false/' \
+         /etc/postgresql-common/createcluster.conf \
+    && grep -qx 'create_main_cluster = false' /etc/postgresql-common/createcluster.conf \
+    && apt-get install -y --no-install-recommends postgresql \
+    && test -x "$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)/initdb" \
+    && rm -rf /var/lib/apt/lists/*
+
 # Replace the Debian chrome_crashpad_handler with a protocol-compatible stub.
 #
 # Root cause: in this container environment Chrome spawns the crashpad handler

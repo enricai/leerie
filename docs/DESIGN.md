@@ -11788,6 +11788,36 @@ image-layer posture as elsewhere in this doc: fix a class of failure once
 instead of asking every worker, in every worktree, on every run, to route
 around it.
 
+### A database server in the base image
+
+*Built 2026-11-09 (lane BP).* **Root cause.** Every command leerie gives a
+database — a held-out set run, an acceptance writer's session, a falsifier,
+a CI check that `requires` one, the browser suite — gets it from
+`scripts/sandbox-db.sh`, which starts a private PostgreSQL cluster from the
+server binaries in the confined command's root. Those binaries were left to
+"the repository's own provisioning", a channel no repository could learn
+of: a CI declares its database as a *service* (a container image), not a
+package; `dep_capture` reads manifests and the install commands workers
+ran; and the wrapper, without a server, runs the command without a database
+and says so in one log line. Measured: navegando's and web's images (both
+Prisma with a PostgreSQL datasource) had no server, so every one of those
+commands ran without a database; funeralworks found the need by hand
+(`setup_packages = "postgresql ..."`, with a comment saying why).
+**Invariant:** a command leerie decides to give a database gets one, from
+binaries leerie's own image ships. The wrapper is leerie's stand-in for the
+CI's database service, and its server is part of it, as Chromium is part of
+running a browser suite (above).
+
+The base image installs Debian's `postgresql` with `create_main_cluster =
+false`: no cluster exists in the image, nothing runs a server but the
+wrapper, in the command's own `/tmp`, under its grant (§6 *No database
+server leerie starts is ever unconfined*), and nothing is chowned. A
+repository that installs another major through its own provisioning gets
+that one (the wrapper takes the newest complete
+`/usr/lib/postgresql/<major>/bin`). Only PostgreSQL: it is the one server
+the wrapper starts. A CI service of another kind (Redis, MySQL) is not
+provided, and a check that needs one fails at the baseline as before.
+
 ### `leerie config` — host-side onramp
 
 Not every repo author wants to hand-write `.leerie/config.toml` or
@@ -13429,8 +13459,8 @@ part "iOS-specific issues are handled (viewport/safe-area, 100vh, input
 zoom)" was never typed `neither` (18 of 18 samples over the three forms),
 where safe-area insets are a device's. *The falsifier* on a70fb4a6's shipped tree (its one item, SW's container
 harness, real confinement; navegando's image with a PostgreSQL server in
-its worker root and its runner's browser in its recipe — what the
-repository's own provisioning must supply, below): with today's channels
+its worker root and its runner's browser in its recipe — what leerie now
+provides itself, below): with today's channels
 0 of 4 samples confirmed, each a DOM-class probe (SW: 0 of 6). The channel
 took four pre-registered rounds of 6 samples, each fixing what the last
 measured: as first built, 0 confirmed and no sample ran the suite, each
@@ -13451,12 +13481,25 @@ probe fails on the shipped commit and passes on the header fix. No sample
 found the audit's header finding itself: each probed page-wide overflow,
 which the app shell's own scroll container masks.
 
-What the repository's provisioning must supply: a database server in its
-image when its suite needs one (navegando's image has the client only, so
-its suite does not run here and is not offered — measured, the seed
-fails), and its runner's browser from an install that needs no root
-(navegando's CI installs it with `--with-deps`, which fails here and
-installs nothing). Leerie offers what it saw run, and says why it did not.
+What the suite needs that its CI provides is leerie's to provide (lane
+BP): the database server, which a CI starts as a service, ships in leerie's
+base image (§6½ *A database server in the base image*); and the runner's
+browser install runs in the form that needs no root (§9 *A prerequisite
+runs in the form that needs no root*). As first built, both were left to
+"the repository's own provisioning", which no repository can learn of:
+navegando's image had no server (its CI starts one as a service; its
+configuration names the client), so the seed failed, and its CI's
+`playwright install --with-deps chromium` stopped at "Switching to root
+user to install dependencies ... su: Authentication failure" and installed
+nothing — on its real image the suite did not run and was not offered.
+Measured after the change (lane BP, a real launch on navegando's checkout,
+its committed `.leerie/` unchanged, the image built by the launcher): the
+`ci_checks` worker typed that prerequisite `root: part` with the rootless
+form `pnpm exec playwright install chromium`, which downloaded the
+runner's browser into the tree's stores; each command's cluster started
+from the image's server; the suite at the baseline ran 74 cases passed, 1
+failed, 2 skipped, and was offered to the run. Leerie offers what it saw
+run, and says why it did not.
 
 What is not built: the held-out acceptance writers are not offered the
 channel — their sets are written before planning, and CI parity discovers
@@ -16626,8 +16669,8 @@ in its checkout, an evaluation, the audit, the surrogate's clone, a
 delivery-detection falsifier's (§8 *Delivery detection*), a CI-parity
 check that `require`s a database (§9 *The repository's own merge checks
 run too*) — gets a private PostgreSQL cluster of its own, from the server
-binaries the image provides (the repository's own provisioning installs
-them), started inside that command's own confinement and isolation and
+binaries leerie's base image ships (§6½ *A database server in the base
+image*), started inside that command's own confinement and isolation and
 gone with it, listening only on a socket in that command's own `/tmp`,
 with a database named `leerie_<hash>_test` and the tree's schema pushed by
 `prisma db push` inside the same confinement: the push loads the tree's
@@ -19513,7 +19556,10 @@ on the final tree:
    cites; a strict form's non-flag tokens must appear in that file or a
    manifest beside it; a coverage threshold's glob, metric and minimum must
    appear in the config file it cites. A check that fails provenance, or
-   still carries a CI expression placeholder, never runs.
+   still carries a CI expression placeholder, never runs. Each
+   prerequisite is also typed by what of it needs root, and runs in the
+   form that needs none (*A prerequisite runs in the form that needs no
+   root*, below).
 2. *Selection is code.* A check runs only when one of its triggers is a pull
    request or a blocking hook (pre-push / pre-commit) and `requires` names no
    external resource (`browser`, `network`, `secrets`, `cloud_credentials`,
@@ -19603,6 +19649,53 @@ dropped a 95% branch threshold (91.62% → 91.53%, fixed by the next PR);
 the base against a rerun of the base fired 0 times.
 The same check runs gave identical exit codes under rootless and rootful
 containers, with no file left unowned or unwritable.
+
+**A prerequisite runs in the form that needs no root.** *Built 2026-11-09
+(lane BP).* **Root cause.** CI parity turns a CI step into a command leerie
+runs, and a CI runner has root (passwordless `sudo`) while nothing leerie
+runs does (I5): every command is an unprivileged process over a read-only
+system root. The translation kept the root-only part. navegando's suite's
+prerequisite `pnpm exec playwright install --with-deps chromium` installs
+the browser's system libraries first, as root: here it printed "Switching
+to root user to install dependencies ... su: Authentication failure" and
+installed nothing, so the suite found no browser and was never offered
+(lane BR, measured). No repository configuration can fix that — the step
+is right for its CI. The system libraries are the image's (a browser's are
+already there, as Chromium's dependencies: the form without the option ran
+Chromium in every BR sample). **Invariant:** a prerequisite runs in the
+form that needs no root; what needs root is the image's, and a
+prerequisite that is only that is not run here.
+
+The worker types each prerequisite's `root` (`CI_PREREQ_ROOT`): `none`
+runs as written; `part` — it also installs operating-system packages and
+does the rest without root — runs its `rootless_argv`; `all` is not run,
+with a log line naming it and saying its packages belong in
+`setup_packages`. Which words ask for root is the worker's reading of the
+tool; what may be run is code's: a rootless form is accepted only as the
+step's own argv with one or more words removed, in order
+(`_ci_rootless_form`), so the command run is still one the CI file names,
+and a `part` whose form is not is a provenance problem — the check is never
+selected. A record from before the field runs as written. No tool or
+package manager is named in code.
+
+Benched (lane BP, pre-registered; the real `ci_checks` worker, confined,
+3 samples per repository on the CI files navegando, barnacle, web, api and
+funeralworks had at their recorded runs, against the prompt before this
+field as control). Root typing: 17 of 17 root-needing prerequisites typed
+as hand-labelled, 112 of 112 others `none`; every rootless form passed
+`_ci_rootless_form` and equalled the label (15 of 15), and each ran,
+confined, with exit 0. The prompt's first wording said commands run over
+"a read-only system", and web's file-writing pre-push lint check dropped
+out of 3 of 3 samples (3 of 3 in the control); the shipped wording says
+only that no command installs operating-system packages, and it is back
+(3 of 3). The set of checks selected to run equals the control's on all
+five repositories; the registered check-by-check equality still failed on
+trigger grouping (api: one check carrying both its pre-push and
+pull-request triggers instead of two; funeralworks: an accessibility check
+listing all four of its file's triggers, where the control listed one).
+Not provided: what a `part` step's root part would have installed beyond
+the image — a bare `playwright install` fetches WebKit and Firefox, whose
+system libraries leerie's base does not have (only Chromium's).
 
 ---
 

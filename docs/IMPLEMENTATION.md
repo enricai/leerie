@@ -509,6 +509,14 @@ Base layers (top-down):
   pre-created (chowned to `leerie` at runtime). Workers run as non-root
   `leerie`, so Chrome's SUID sandbox is disabled via baked flags in
   `/etc/chromium.d/leerie-container-flags`.
+- `postgresql-common` (its `/etc/postgresql-common/createcluster.conf` set
+  to `create_main_cluster = false`, checked by `grep -qx`) then
+  `postgresql` — the server binaries `scripts/sandbox-db.sh` starts a
+  command's private cluster from (DESIGN §6½ *A database server in the base
+  image*); the step fails unless the newest `/usr/lib/postgresql/<major>/bin`
+  has an executable `initdb`. No cluster in the image, nothing chowned
+  (rootless, rootful and Fly/EC2 alike: `initdb` writes only the confined
+  command's own `/tmp`).
 - LTS Node **and** Python 3.12 baked via `mise install --system node@lts
   python@3.12`, with a stable `.../installs/node/lts-current` symlink so
   `ENV PATH` doesn't need the concrete version. These are the fallback
@@ -3755,7 +3763,7 @@ which are specified in their own sections.)
 | `observability_judge` | `prompts/observability_judge.md` | sonnet | 0, or `OBSERVABILITY_SAMPLES` (3) concurrent samples per final delivery detection on a commit it has not typed (phase 5, `_run_delivery_detection` → `_observability_verdicts`, after the falsifier; cached in `delivery_gate.observability`, reused only on its `sha`); a failed sample is `None`, a vote for observable | `{items[{item_index, parts[{part_index, observable: reading\|test_command\|neither (OBSERVABLE_KINDS), needs: ""\|rendering_engine\|physical_device\|external_service (OBSERVABILITY_NEEDS), reason, cites[{path, line_start, line_end, quote}]}]}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `OBSERVABILITY_MAX_TURNS` = 12) in staging; user prompt `_observability_user_prompt(task, _observability_payload(normalized, indices), resolve_blt(repo_root)["test"])` over the falsifier's indices |
 | `forbidden_command_extractor` | `prompts/forbidden_command_extractor.md` | sonnet | `forbidden_command_samples` (3) per `phase_classify` call, concurrent with the classifier (`asyncio.gather`); a crashed sample is no vote and is not redrawn, budget exhaustion propagates | `{forbidden_commands[{command, evidence_quote, scope: any\|whole_suite}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `FORBID_EXTRACTOR_MAX_TURNS` = 8) from `_judgment_cwd`; user prompt `_forbidden_extractor_prompt(sources, units, repo_root)`: the task and each referenced report verbatim, plus `resolve_blt(repo_root)["test"]`. In `NOTICE_FREE_WORKERS`. DESIGN §9 *A command the task forbids* || `delivery_ratchet` | `prompts/delivery_judge.md` + `prompts/delivery_ratchet.md` | sonnet | per acceptance-repair round or delivery re-drive group that committed and survived its own rules, with a previously met `in_tree` item: 1 per pack (`_d1_judge_packs`), 3 when sample 1 flags an item or an item's `evidence_files` meet the diff (`_ratchet_judge`) | the delivery judge's verdicts plus `evidence_files[]`; read-only (`SATISFIED_PROBE_TOOLS`, `min(30 + 6×pack, 90)` turns) in staging |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | sonnet | 0 or 1 per acceptance gate (only when a set still fails after the repair rounds and neither M1/M2 nor the set audit fired) | `{summary, files_changed[]}` — acting (`ACT_TOOLS`, 150 turns, autonomous) in a ref-less clone of the own start; never sees a set (its grant names none, `_worker_grants`) |
-| `ci_checks` | `prompts/ci_checks.md` | sonnet | 0 or 1 per run (phase 4, `_capture_ci_parity_baseline`; only when a file matching `CI_CONFIG_GLOBS` exists on the base, and not under `skip_base_baseline`) | `{checks[{id, kind, argv, cwd, env[{name, value}], prerequisites[{argv, cwd}], trigger[], path_filters[], requires[], strict_argv[], source{file, job, step}, coverage{summary_path, config_file, thresholds[{glob, metric, min}]}, notes}], excluded[{file, job, reason}]}` — read-only (`INSPECT_TOOLS`, 40 turns) in its own detached checkout of the staging base (`_judge_checkout(st, staging, "ci-checks")`, no install), never staging itself; code checks provenance and selects (see *CI parity* below) |
+| `ci_checks` | `prompts/ci_checks.md` | sonnet | 0 or 1 per run (phase 4, `_capture_ci_parity_baseline`; only when a file matching `CI_CONFIG_GLOBS` exists on the base, and not under `skip_base_baseline`) | `{checks[{id, kind, argv, cwd, env[{name, value}], prerequisites[{argv, cwd, root: none \| part \| all, rootless_argv[]}], trigger[], path_filters[], requires[], strict_argv[], source{file, job, step}, coverage{summary_path, config_file, thresholds[{glob, metric, min}]}, notes}], excluded[{file, job, reason}]}` — read-only (`INSPECT_TOOLS`, 40 turns) in its own detached checkout of the staging base (`_judge_checkout(st, staging, "ci-checks")`, no install), never staging itself; code checks provenance and selects (see *CI parity* below) |
 | `integrator` | `prompts/integrator.md` | sonnet | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
 | `fit_judge` | `prompts/fit_judge.md` | sonnet | 0 or more per subtask (P1 recursive decomposition — one per `_recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §5½ (P1) |
 | `splitter` | `prompts/splitter.md` | sonnet | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `_partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §5½ (P1) |
@@ -10115,14 +10123,20 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   check judged on its plain argv. Provenance (`_ci_check_problems`): the
   `source.file` and `cwd` lie inside the repo; every `argv`, prerequisite
   `argv` and `env` name/value token appears, whitespace-collapsed, in the
-  source file; no token carries a `${{` placeholder; every non-flag
+  source file; a prerequisite typed `root: part` has a rootless form
+  (`_ci_rootless_form(pre) -> list[str] | None`: `rootless_argv` non-empty,
+  shorter than `argv`, and an ordered subsequence of it); no token carries a `${{` placeholder; every non-flag
   `strict_argv` token appears in the source file or a `CI_STRICT_MANIFESTS`
   file in the check's cwd or the root; a coverage check names an existing
   `config_file`, a `summary_path` and thresholds whose glob (`**` exempt),
   metric and minimum each appear in that config. The selected checks then
   run in a detached `worktrees/ci-base` worktree at the base sha
   (`_ci_worktree` / `_ci_teardown`; deps and prerequisites via
-  `_ci_prepare`). Per check: `kind: coverage` → `ratchet: coverage` when the
+  `_ci_prepare`, which runs each prerequisite's `_ci_prereq_argv(pre) ->
+  list[str] | None` — `argv` for `root: none` or a record without `root`,
+  `_ci_rootless_form(pre)` for `part`, nothing for `all` (logged: needs root,
+  its packages belong in `setup_packages`); DESIGN §9 *A prerequisite runs
+  in the form that needs no root*). Per check: `kind: coverage` → `ratchet: coverage` when the
   summary yields a percentage (`_ci_coverage_pcts`, else
   `coverage_unmeasured`); a run that changed tracked files →
   `writes_tracked_files`; otherwise a `strict_argv` green at the baseline →

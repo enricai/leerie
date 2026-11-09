@@ -2981,6 +2981,12 @@ CI_REQUIRES = ("database", "browser", "network", "secrets",
 CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
                                   "cloud_credentials", "gpu"})
 CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
+# What of a CI prerequisite needs root (DESIGN §9 *A prerequisite runs in the
+# form that needs no root*): a CI runner has it, nothing leerie runs does
+# (I5). `none` runs as written; `part` runs its `rootless_argv`, the step's
+# own words with the root-only ones removed (`_ci_rootless_form`); `all` is
+# not run — what it installs is the image's.
+CI_PREREQ_ROOT = ("none", "part", "all")
 # The browser-suite runners leerie can run one file of (DESIGN §8 *A
 # repository's browser suite is a channel the run provisions*): runner ->
 # the argv prefix that runs its suite, whose positional words are test-file
@@ -3764,10 +3770,16 @@ SCHEMAS: dict[str, dict] = {
                                        "value": {"type": "string"}}}},
                     "prerequisites": {"type": "array", "items": {
                         "type": "object", "additionalProperties": False,
-                        "required": ["argv", "cwd"],
+                        "required": ["argv", "cwd", "root",
+                                     "rootless_argv"],
                         "properties": {"argv": {"type": "array", "items":
                                                 {"type": "string"}},
-                                       "cwd": {"type": "string"}}}},
+                                       "cwd": {"type": "string"},
+                                       "root": {"type": "string", "enum":
+                                                list(CI_PREREQ_ROOT)},
+                                       "rootless_argv": {
+                                           "type": "array", "items":
+                                           {"type": "string"}}}}},
                     "trigger": {"type": "array", "items": {
                         "type": "string", "enum": list(CI_TRIGGERS)}},
                     "path_filters": {"type": "array",
@@ -50588,6 +50600,34 @@ def _ci_config_files(tree: Path) -> list[str]:
     return sorted(out)
 
 
+def _ci_rootless_form(pre: dict) -> list[str] | None:
+    """A `root: part` prerequisite's `rootless_argv` when it is the step's
+    own argv with one or more words removed, in order (DESIGN §9 *A
+    prerequisite runs in the form that needs no root*); None otherwise. The
+    worker says which words ask for root; code only lets it drop words, so
+    the command run is still the one the CI file names. Mechanical (argv)."""
+    argv = [str(a) for a in (pre.get("argv") or [])]
+    form = [str(a) for a in (pre.get("rootless_argv") or [])]
+    if not form or len(form) >= len(argv):
+        return None
+    words = iter(argv)
+    return form if all(any(w == f for w in words) for f in form) else None
+
+
+def _ci_prereq_argv(pre: dict) -> list[str] | None:
+    """The argv leerie runs for a CI prerequisite, or None when it runs
+    nothing: `root: all` (only what needs root, which no command here has),
+    or a `part` whose rootless form is not the step's own words (also a
+    provenance problem, so such a check is never selected). A record from
+    before the field (no `root`) runs as written."""
+    root = pre.get("root") or "none"
+    if root == "all":
+        return None
+    if root == "part":
+        return _ci_rootless_form(pre)
+    return [str(a) for a in (pre.get("argv") or [])] or None
+
+
 def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     """Provenance and shape, checked in code (DESIGN §9): every argv,
     prerequisite and env token must appear verbatim (whitespace-collapsed)
@@ -50616,6 +50656,10 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
         if _ci_safe_rel(tree, pre.get("cwd") or ".") is None:
             probs.append(f"prerequisite cwd {pre.get('cwd')!r} escapes the "
                          "repo")
+        if pre.get("root") == "part" and _ci_rootless_form(pre) is None:
+            probs.append(f"prerequisite {pre.get('argv')!r}: its rootless "
+                         f"form {pre.get('rootless_argv')!r} is not its own "
+                         "words with some removed")
     for e in check.get("env") or []:
         tokens += [str(e.get("name") or ""), str(e.get("value") or "")]
     for t in tokens:
@@ -50957,15 +51001,25 @@ async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
     done = set() if done is None else done
     for rec in recs:
         for j, pre in enumerate(rec.get("prerequisites") or []):
+            argv = _ci_prereq_argv(pre)
             key = json.dumps([pre.get("cwd") or ".", pre.get("argv") or [],
                               _ci_requires_db(rec)])
             if key in done or not pre.get("argv"):
                 continue
             done.add(key)
+            if argv is None:
+                # Only what a CI runner's root can do (DESIGN §9 *A
+                # prerequisite runs in the form that needs no root*).
+                log(f"  ci parity: {rec['id']} prerequisite "
+                    f"{shlex.join(pre['argv'])[:200]} not "
+                    "run — it needs root, which no command here has; what it "
+                    "installs belongs in the image (.leerie/config.toml "
+                    "setup_packages)")
+                continue
             # A prerequisite sets the tree up — a code generator, a browser
             # or a sub-directory install — and reaches its inputs as an
             # install does (DESIGN §6 *An install reaches its inputs*).
-            await _ci_run(pre["argv"], tree=tree,
+            await _ci_run(argv, tree=tree,
                           rec={"cwd": pre.get("cwd") or ".",
                                "env": rec.get("env"),
                                "requires": rec.get("requires")},

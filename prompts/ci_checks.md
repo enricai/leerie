@@ -48,7 +48,20 @@ distinct command a merge-gating job step or blocking hook runs:
   `requires`.
 - `prerequisites`: commands the same job runs first that this check depends on
   (code generation, schema push, browser install, a dependency install in a
-  sub-directory) — each `{argv, cwd}`. Omit the root dependency install.
+  sub-directory) — each `{argv, cwd, root, rootless_argv}`. Omit the root
+  dependency install. A CI runner has root (passwordless `sudo`); the
+  orchestrator runs commands without `sudo`, so a command cannot install
+  operating-system packages — those come from its image. `root` says what of
+  the prerequisite needs root:
+  - `"none"`: nothing (a code generator, a download into the project or the
+    user's cache). `rootless_argv` is `[]`.
+  - `"part"`: the command also installs operating-system packages (through
+    `sudo`, `su`, a system package manager, or an option of the tool that
+    installs its system dependencies) and does the rest without root.
+    `rootless_argv` is `argv` with only the words that ask for the root part
+    removed — remove words, never add or change one.
+  - `"all"`: all it does needs root (a system package install, `sudo …`).
+    `rootless_argv` is `[]`.
 - `trigger`: the events that run it — any of `"pull_request"`,
   `"push_default_branch"`, `"push_other"`, `"pre_push_hook"`,
   `"pre_commit_hook"`, `"schedule"`, `"manual"`, `"tag"`.
