@@ -62515,11 +62515,13 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             # It failed at its assertion, not in the setup that reaches it
             # (DESIGN §8 *A repository's browser suite is a channel the run
             # provisions*): some failing run names no line of the probe, or
-            # names one of the lines the quoted assertion is.
+            # names one of the lines the quoted assertion is, or a line of a
+            # statement whose value it reads.
             g["at_assertion"] = _falsifier_failed_at_assertion(
                 runs_msgs.get(cid) or [], rel,
                 probe_bytes.decode(errors="replace"),
-                str(res.get("assertion_quote") or ""))
+                str(res.get("assertion_quote") or ""),
+                steps=facts.get("steps"))
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(src)
@@ -62527,25 +62529,73 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         return out
 
 
+def _falsifier_assertion_slice(steps: list, quoted: Callable[[int], bool]
+                               ) -> list[tuple[int, int]]:
+    """The line spans of the quoted assertion's statements and of every
+    statement whose value it reads (DESIGN §8 *A repository's browser suite
+    is a channel the run provisions*, point 4): the anchors are the
+    innermost statements (`steps`, the facts script's) holding a line
+    `quoted` accepts; a statement joins an anchor's slice when it starts
+    before that anchor, in its function, and binds a name the slice reads,
+    to a fixpoint."""
+    st = [x for x in steps or [] if isinstance(x, dict)
+          and isinstance(x.get("start"), int) and isinstance(x.get("end"), int)]
+
+    def innermost(n: int) -> dict | None:
+        holding = [x for x in st if x["start"] <= n <= x["end"]]
+        return min(holding, key=lambda x: (x["end"] - x["start"],
+                                           -x["start"]), default=None)
+    anchors: list[dict] = []
+    for x in st:
+        for n in range(x["start"], x["end"] + 1):
+            a = innermost(n) if quoted(n) else None
+            if a is not None and a not in anchors:
+                anchors.append(a)
+    chosen = list(anchors)
+    for a in anchors:
+        reads = {str(r) for r in a.get("reads") or []}
+        grew = True
+        while grew:
+            grew = False
+            for x in st:
+                if (x in chosen or x.get("fn") != a.get("fn")
+                        or x["start"] >= a["start"]
+                        or not reads & {str(b) for b in x.get("binds") or []}):
+                    continue
+                chosen.append(x)
+                reads |= {str(r) for r in x.get("reads") or []}
+                grew = True
+    return [(x["start"], x["end"]) for x in chosen]
+
+
 def _falsifier_failed_at_assertion(messages: list[str], rel: str,
-                                   source: str, quote: str) -> bool:
+                                   source: str, quote: str,
+                                   steps: list | None = None) -> bool:
     """True when some failing run's message names no line of the probe
-    `rel` (`_evidence_line`; the runner gave no location, as before), or
-    names a line of `source` that is part of the quoted assertion
-    (whitespace-normalised, at least 6 characters). A failure at another
+    `rel` (`_evidence_line`, its innermost probe frame; the runner gave no
+    location, as before), or names a line of `source` that is part of the
+    quoted assertion (whitespace-normalised, at least 6 characters), or a
+    line inside the quoted assertion's statement or a statement whose value
+    it reads (`_falsifier_assertion_slice` over the facts' `steps`): a value
+    bound to a local first is the assertion's own. A failure at another
     line — a navigation or a login that timed out, a setup step that threw
     — shows the environment, not the item, and B* reruns it under the same
     conditions. Stack frames are fixed runner output (DESIGN §12)."""
     q = _scope_norm(quote)
     lines = source.splitlines()
+
+    def quoted(n: int) -> bool:
+        if not 1 <= n <= len(lines):
+            return False
+        ln = _scope_norm(lines[n - 1])
+        return len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln))
+    spans = _falsifier_assertion_slice(steps or [], quoted)
     for m in messages or [""]:
         n = _evidence_line(m, rel)
         if n is None:
             return True
-        if 1 <= n <= len(lines):
-            ln = _scope_norm(lines[n - 1])
-            if len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln)):
-                return True
+        if quoted(n) or any(a <= n <= b for a, b in spans):
+            return True
     return False
 
 

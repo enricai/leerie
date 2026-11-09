@@ -13584,7 +13584,19 @@ The mechanism:
    probe of either channel: *it failed at its assertion*
    (`_falsifier_failed_at_assertion`). A case counts only when some
    failing run's message names no line of the probe (the runner gave no
-   location: as before) or names a line of the quoted assertion. Measured:
+   location: as before) or names a line of the quoted assertion — its
+   statement, or an earlier statement of the same function that binds a
+   name the assertion reads, followed through such bindings. A value bound
+   to a local first is the same assertion as one computed inside it:
+   `const v = f(x); expect(v)…` fails where `expect(f(x))…` does, and a
+   throw from the code under test while computing `v` is the assertion's
+   failure. A statement that binds nothing the assertion reads is setup,
+   wherever its failure comes from (measured, barnacle run e7512406: item
+   0's call under test threw on the line binding the value its `expect`
+   read and was rejected as setup; item 8's probe threw inside a helper's
+   step that binds nothing, and stays rejected). The probe frame read is
+   the innermost one, so a failure inside a helper the case calls is that
+   helper's statement's. The statements come from the facts script. Measured:
    on the loaded bench host the hand probe's first two attempts failed
    before its assertion — the login's wait and the chat page's navigation,
    each `TimeoutError: … Timeout 90000ms exceeded` — and only the third

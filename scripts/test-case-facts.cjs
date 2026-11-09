@@ -130,6 +130,55 @@ for (const r of reach) (function v(x) {
 const usedImports = [];
 for (const [local, b] of importBind) if (usedNames.has(local)) usedImports.push({ local, ...b });
 for (const s of dyn) usedImports.push({ local: null, spec: s, imported: '*dynamic', typeOnly: false });
+// The reachable code's statements, nested ones included, for the
+// at-assertion gate's binding slice (`_falsifier_failed_at_assertion`): the
+// lines each spans, its innermost enclosing function, the names it binds (a
+// variable statement's declarations, an assignment statement's targets) and
+// the identifiers it reads (never a property name).
+const lineOf = (pos) => sf.getLineAndCharacterOfPosition(pos).line + 1;
+const isFn = (x) => ts.isFunctionLike(x) && !ts.isTypeNode(x);
+function namesIn(b, into) {
+  if (ts.isIdentifier(b)) into.push(b.text);
+  else if (ts.isObjectBindingPattern(b) || ts.isArrayBindingPattern(b)) b.elements.forEach(e => e.name && namesIn(e.name, into));
+  else if (ts.isObjectLiteralExpression(b)) b.properties.forEach(p => namesIn(ts.isShorthandPropertyAssignment(p) ? p.name : (p.initializer || p.expression || p.name), into));
+  else if (ts.isArrayLiteralExpression(b)) b.elements.forEach(e => namesIn(ts.isSpreadElement(e) ? e.expression : e, into));
+  return into;
+}
+function bindsOf(st) {
+  if (ts.isVariableStatement(st)) return st.declarationList.declarations.flatMap(d => namesIn(d.name, []));
+  if (ts.isExpressionStatement(st)) {
+    let e = st.expression;
+    while (ts.isAwaitExpression(e) || ts.isParenthesizedExpression(e)) e = e.expression;
+    if (ts.isBinaryExpression(e) && e.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && e.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return namesIn(e.left, []);
+  }
+  return [];
+}
+function readsOf(st) {
+  const out = new Set();
+  (function v(x) {
+    if (ts.isIdentifier(x)) {
+      const p = x.parent;
+      const propName = p && ((ts.isPropertyAccessExpression(p) && p.name === x)
+        || (ts.isPropertyAssignment(p) && p.name === x)
+        || (ts.isMethodDeclaration(p) && p.name === x)
+        || (ts.isPropertyDeclaration(p) && p.name === x));
+      if (!propName) out.add(x.text);
+    }
+    ts.forEachChild(x, v);
+  })(st);
+  return [...out];
+}
+const steps = []; const seenSteps = new Set();
+for (const r of reach) (function v(x, fn) {
+  if (isFn(x)) fn = x.pos;
+  const exec = ts.isStatement(x) && !ts.isBlock(x) && !ts.isEmptyStatement(x);
+  if (exec && !seenSteps.has(x)) {
+    seenSteps.add(x);
+    steps.push({ start: lineOf(x.getStart(sf)), end: lineOf(x.getEnd()), fn, binds: bindsOf(x), reads: readsOf(x) });
+  }
+  ts.forEachChild(x, c => v(c, fn));
+})(r, -1);
 const reach_src = [...reach].map(n => n.getText(sf));
-emit({ title: best.title, reach_src, case_src: best.node.getText(sf), reads, execs, evals, imports: usedImports,
+emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, reads, execs, evals, imports: usedImports,
   vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports });

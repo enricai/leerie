@@ -988,6 +988,115 @@ class TestCouplingPolicy:
                                         "probe/missing.test.ts", "x")
 
 
+# === where a probe failed: the assertion's binding slice ==================
+
+AT_PROBE = """import { describe, expect, it, beforeEach } from "vitest";
+import { act, setup } from "../src/lib";
+let shared: number;
+async function runStep(n: number) {
+  await act(n);
+  return { window: n };
+}
+describe("m", () => {
+  beforeEach(() => {
+    shared = setup();
+  });
+  it("bound first", async () => {
+    const env = { k: 1 };
+    const out = act(env.k);
+    const k = act(2);
+    await act(3);
+    const doubled = out * 2;
+    expect(
+      doubled + shared,
+    ).toBe(4);
+    const { window } = await runStep(1);
+    expect(window).toBe(2);
+    shared = act(5);
+    if (out) {
+      await act(4);
+      expect(out).toBe(1);
+    }
+    let late = 0;
+    late = act(6);
+    expect(late).toBe(6);
+  });
+});
+"""
+AT_REL = "probe/at.test.ts"
+AT_QUOTE = "expect(doubled + shared).toBe(4);"
+
+
+def _at_facts(leerie, tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "node_modules").mkdir(parents=True)
+    os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+    probe = tmp_path / "at-src.test.ts"
+    probe.write_text(AT_PROBE)
+    facts = _placed_facts(leerie, tmp_path, tree, probe, AT_REL,
+                          "m bound first")
+    assert "error" not in facts, facts
+    return facts
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+@pytest.mark.parametrize("line,quote,ok", [
+    # The binding the assertion reads (barnacle e7512406 item 0: the call
+    # under test threw while computing the value its `expect` read).
+    (14, AT_QUOTE, True),
+    # Transitively: `out` feeds `doubled`, which the assertion reads.
+    (17, AT_QUOTE, True),
+    # A binding of a name the assertion reads only through `out`'s.
+    (13, AT_QUOTE, True),
+    # A continuation line of the quoted statement itself.
+    (20, AT_QUOTE, True),
+    # A step that binds nothing: setup, wherever it threw.
+    (16, AT_QUOTE, False),
+    # A binding whose name the slice holds only as a property name (`env.k`).
+    (15, AT_QUOTE, False),
+    # A hook's assignment of a name the assertion reads: another function,
+    # run before the case — setup.
+    (10, AT_QUOTE, False),
+    # A helper's inner step (barnacle e7512406 item 8): the innermost probe
+    # frame binds nothing, even though the helper's call binds what a later
+    # assertion reads, and even when the quote is that call itself.
+    (5, "expect(window).toBe(2);", False),
+    (5, "const { window } = await runStep(1);", False),
+    # The call binding what the assertion reads, when the throw is its own.
+    (21, "expect(window).toBe(2);", True),
+    # A binding after the assertion is never its value, even of a name it
+    # reads.
+    (21, AT_QUOTE, False),
+    (23, AT_QUOTE, False),
+    # The quoted statement is the innermost one holding it: a step beside
+    # it in the same block is not part of it.
+    (25, "expect(out).toBe(1);", False),
+    (14, "expect(out).toBe(1);", True),
+    # An assignment binds as a declaration does.
+    (29, "expect(late).toBe(6);", True),
+])
+def test_a_failure_counts_in_the_assertions_binding_slice(
+        leerie, tmp_path, line, quote, ok):
+    facts = _at_facts(leerie, tmp_path)
+    msg = [f"Error: boom\n    at /t/{AT_REL}:{line}:9"]
+    assert leerie._falsifier_failed_at_assertion(
+        msg, AT_REL, AT_PROBE, quote, steps=facts["steps"]) is ok
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+def test_without_statements_only_the_quoted_lines_count(leerie, tmp_path):
+    """Facts that carry no statements leave the line rule alone: the
+    binding the assertion reads is then outside it, as before."""
+    facts = _at_facts(leerie, tmp_path)
+    msg = [f"at /t/{AT_REL}:14:9"]
+    assert leerie._falsifier_failed_at_assertion(
+        msg, AT_REL, AT_PROBE, AT_QUOTE, steps=facts["steps"]) is True
+    assert leerie._falsifier_failed_at_assertion(
+        msg, AT_REL, AT_PROBE, AT_QUOTE) is False
+
+
 # === the bundled typescript fallback =======================================
 
 def _ts7_tree(root: Path) -> Path:
