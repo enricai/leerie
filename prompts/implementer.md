@@ -710,5 +710,19 @@ check out is driven again as `other`, with the reason.
   when your subtask produces structured deliverables for downstream
   subtasks — see the "Producing artifacts for downstream subtasks"
   section above for when this applies.
+- `probe_objections` is optional, and only for a delivery re-drive note
+  that hands you a falsifier probe (an `unmet_item` with `probe`). Omit it
+  otherwise. Make the probe pass by fixing the production code; never
+  edit or weaken an existing test to make room for it. If you think the
+  probe is wrong, name it in `probe_test_file`, give a `kind`
+  (`input_outside_domain`: it asserts on an input this repository's code
+  never gives the entry point it calls; `contradicts_task`: it asserts
+  behaviour the task forbids; `breaks_existing_test`: making it pass
+  breaks an existing test) and say why in `reason`. A person reads it as
+  your unverified words; it exempts nothing. The orchestrator itself
+  re-runs the probe and the existing tests on your commit: a commit that
+  leaves the probe failing is rolled back, and one that makes it pass but
+  breaks a case an existing test pins is rolled back and the conflict
+  recorded for a person.
 
 {{include: _confidence.md}}
