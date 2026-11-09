@@ -2709,7 +2709,7 @@ the container's `/tmp`.
 |---|---|---|---|---|
 | committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `task-files/`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
 | committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
-| non-committing, own checkout | delivery judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
+| non-committing, own checkout | delivery judge, observability judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
 | judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
 | payload-only | judge, patch generator, PR writer, dep capture, scope judge, contract extractor | read its empty directory | read | — |
 
@@ -13227,6 +13227,75 @@ a sentence against proxy evidence, each citing the tree's own heuristic
 guard test as proof that no hard-coded string remained), so the judge's
 input is unchanged. Not re-run: the Q2 corpora F+ was frozen on; the
 change is held to the controls above instead.
+
+**A met is only what the run could observe.** Both detectors above can
+only show an item *unmet*; a `met` is what is left when neither does. That
+reads absence of evidence as evidence wherever the run has no way to see
+the item's behaviour at all. The run observes in exactly two ways: reading
+the tree, and running the repository's own test command in the environment
+its configuration gives. Measured on navegando a70fb4a6 (leerie 0.48.0):
+the item asked that every part of the site work on phones; the five
+held-out sets were source scans and DOM-emulation renders checking for a
+16px class (the writers said why: "I did not write Playwright tests,
+because the e2e suite needs a running app"), all three falsifier samples
+rendered components in the same DOM emulation and found the class there,
+the judge cited class names, and the item was `met` — while an independent
+audit of the merged tree found the header pushing the availability toggle
+off a 375px screen, a composer text box about 60px wide, a reply button
+shown only on hover, and long links overflowing their bubble. A DOM
+emulation computes no layout: there, a test sees which classes an element
+carries, never what they render, so each of those checks would have passed
+on the broken tree as well. The repository's mobile browser suite existed
+(its Playwright config names iPhone and Pixel projects) but its test
+command does not run it, and CI parity leaves a browser check to a human
+(`left_to_test_axis`, `browser` in `CI_EXTERNAL_REQUIRES`).
+
+So after the falsifier, an `observability_judge` types every part of every
+item the falsifier was asked about (the classifier's `parts`, or the item
+as its one part): `reading` (a fact about the files), `test_command` (a
+behaviour a test the test command runs, in its environment, could exercise
+and would fail on), or `neither`, with what it needs —
+`rendering_engine` (layout, what is visible on screen, viewport, hover,
+touch), `physical_device`, or `external_service` (what a system outside the
+repository does, where its tests hold only a double) — and, for `neither`,
+a cite of the test configuration or setup line that shows the environment
+the command provides. Code checks every cite against the tree's HEAD
+(`_verify_delivery_cite`). A part counts as unobservable only when a
+majority of `OBSERVABILITY_SAMPLES` (3) samples typed it `neither` with
+every cite verified; a failed sample or an unproven claim is a vote for
+observable, so the rule can only withhold a `met`, never invent a finding.
+An item no detector found unmet but with such a part is `unknown`, never
+`met`: listed under "Not verified by this run" (`unobservable_here`), with
+each part, what it needs and the cited environment, and kept out of the
+delivery ratchet's prior met. An item the judge or a falsifier found unmet
+stays unmet: a check through a proxy can show a gap (navegando e99c1df1's
+falsifier did, through the same DOM emulation), it cannot certify that
+there is none. The typing is reused only on the commit it was made on, and
+a judge that fails leaves every verdict as the detectors left it.
+
+Measured (bench RT, pre-registered, frozen prompt, schema and rule; 6
+samples per case, scored as two production draws of 3). On navegando
+a70fb4a6's item and its earlier run e99c1df1's, the rule flagged the
+layout parts in 4 of 4 draws; on nine items written from the independent
+audit of the merged tree, the six layout and device findings were flagged
+in 12 of 12 draws and the three observable ones (a history entry, a class
+on every input, a search filter) in 0 of 6. The first bench's controls had
+been labelled run by run, and failed its own rule: one control, a proof
+step of evals "×22" against a live API and model, was flagged in both draws.
+A second bench, pre-registered after that result, had an independent
+adjudicator label every part blind to the judge: it labelled that item
+unobservable, and over 108 fresh items it labelled observable (six runs,
+four repositories) the rule flagged 0 of 216 item-draws, and over the first
+bench's 54 relabelled observable controls 0 of 108. Misses lean safe: one
+fresh item the adjudicator labelled unobservable (a style-rules item with
+one "responsive UI" clause) was not flagged, which leaves today's verdict.
+
+What this does not do: it makes no run able to see layout. A repository
+whose test command itself drives a real browser types `test_command`, and
+the rule never fires there. Running a repository's browser suite inside the
+run (the image ships Chromium; navegando's suite also needs its database and
+dev server) would be a new observation channel, not a better verdict, and is
+not built.
 
 **A probe that breaks another part of its own item is a contested reading,
 not a finding.** *Status: designed, not built — see the last paragraph.*

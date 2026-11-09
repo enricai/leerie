@@ -33,7 +33,8 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
            "ci_checks", "scope_judge", "pr_reviewer",
            "contract_extractor", "falsifier", "verifiability_classifier",
-           "delivery_ratchet", "forbidden_command_extractor")
+           "delivery_ratchet", "forbidden_command_extractor",
+           "observability_judge")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -83,6 +84,9 @@ DEFAULTS = {
     "delivery_ratchet": "sonnet",
     # The forbidden-command extractor (DESIGN §9): MODEL_DEFAULT.
     "forbidden_command_extractor": "sonnet",
+    # The observability judge (DESIGN §8 *A met is only what the run could
+    # observe*): MODEL_DEFAULT.
+    "observability_judge": "sonnet",
 }
 
 

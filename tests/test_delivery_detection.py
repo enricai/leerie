@@ -1231,6 +1231,8 @@ def _falsifier_stub(leerie, monkeypatch, st, behave):
                                "line_end": 1,
                                "quote": "def add(a, b):"}]}]}
                 for i in asked]}
+        if kw["schema_key"] == "observability_judge":
+            return {"items": []}        # every part observable
         assert kw["schema_key"] == "falsifier"
         n = sum(1 for c in calls if c["schema_key"] == "falsifier") - 1
         return behave(kw, n)
@@ -1378,7 +1380,10 @@ class TestRunDeliveryDetection:
         asyncio.run(leerie._run_delivery_detection(
             st.run_dir, st, caps, MODELS, EFFORTS))
         gate = st.data["delivery_gate"]
-        assert [c["sid"] for c in calls] == [
+        # The observability judge's own calls are pinned in
+        # tests/test_observability_judge.py.
+        assert [c["sid"] for c in calls
+                if c["schema_key"] != "observability_judge"] == [
             "delivery_judge-final-s0", "delivery_judge-final-s1",
             "delivery_judge-final-s2"]
         assert gate["final_judge"]["source"] == "final"
@@ -1441,7 +1446,9 @@ class TestRunDeliveryDetection:
         calls = _falsifier_stub(leerie, monkeypatch, st, behave)
         asyncio.run(leerie._run_delivery_detection(
             st.run_dir, st, caps, MODELS, EFFORTS))
-        assert [c["sid"] for c in calls] == ["falsifier-i0-s0"]
+        assert [c["sid"] for c in calls
+                if c["schema_key"] != "observability_judge"] == [
+            "falsifier-i0-s0"]
         gate = st.data["delivery_gate"]
         assert gate["unmet_final"] == []
         smp = gate["items"][0]["falsifier"]["samples"][0]
@@ -1781,7 +1788,8 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     st.save()
     asyncio.run(leerie._run_delivery_detection(
         st.run_dir, st, caps, MODELS, EFFORTS))
-    assert [c["schema_key"] for c in calls] == ["delivery_judge"]
+    assert [c["schema_key"] for c in calls
+            if c["schema_key"] != "observability_judge"] == ["delivery_judge"]
     row = st.data["delivery_gate"]["items"][0]
     assert row["verdict"] == "unknown" and row["by"] == ["test_id_diff"]
     assert row["reason"].startswith(f"met except: {part}, unknown — ")

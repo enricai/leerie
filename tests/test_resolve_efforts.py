@@ -309,6 +309,9 @@ def test_judgment_workers_pinned_set(leerie):
         # Re-draws the forbidden-command extraction (DESIGN §9 *A command
         # the task forbids*): the judgment tier's medium.
         "forbidden_command_extractor",
+        # Types how the run can observe each item's parts (DESIGN §8 *A met
+        # is only what the run could observe*), benched at medium (RT).
+        "observability_judge",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

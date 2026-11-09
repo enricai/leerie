@@ -2158,6 +2158,10 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
     "verifiability_classifier": "medium",
     "delivery_ratchet": "medium",
+    # Types how the run can observe each required item's part (DESIGN §8
+    # *A met is only what the run could observe*), benched at medium (RT).
+    # Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
+    "observability_judge": "medium",
     # Re-draws the classifier's forbidden-command extraction (DESIGN §9 *A
     # command the task forbids*). Judgment tier; absent from
     # TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
@@ -2296,7 +2300,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "set_auditor", "surrogate_fixer", "ci_checks",
                 "scope_judge", "pr_reviewer", "contract_extractor",
                 "falsifier", "verifiability_classifier", "delivery_ratchet",
-                "forbidden_command_extractor")
+                "forbidden_command_extractor", "observability_judge")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2325,7 +2329,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
     "scope_judge", "pr_reviewer", "contract_extractor",
     "verifiability_classifier", "delivery_ratchet",
-    "forbidden_command_extractor",
+    "forbidden_command_extractor", "observability_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2977,6 +2981,13 @@ CI_REQUIRES = ("database", "browser", "network", "secrets",
 CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
                                   "cloud_credentials", "gpu"})
 CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
+# The `observability_judge`'s typed vocabulary (DESIGN §8 *A met is only what
+# the run could observe*): how the run can observe a required item's part —
+# by reading the tree, through the repository's test command, or neither —
+# and, for `neither`, what observing it needs.
+OBSERVABLE_KINDS = ("reading", "test_command", "neither")
+OBSERVABILITY_NEEDS = ("rendering_engine", "physical_device",
+                       "external_service")
 # What code can settle an `execution`-typed required item or part by
 # (DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*).
 TEST_OUTCOME_CHECKS = ["test_id_diff"]
@@ -5087,6 +5098,68 @@ SCHEMAS: dict[str, dict] = {
                             "type": "string",
                             "enum": ["in_tree", "execution"]},
                         "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    "observability_judge": {
+        # Types each part of each required item by how this run can observe
+        # it (DESIGN §8 *A met is only what the run could observe*): by
+        # reading, through the repository's test command, or neither — and
+        # then what it needs. Aligned by `item_index`/`part_index`, never by
+        # text; a `neither` counts only with a verified cite of the test
+        # setup (`_observability_unobservable`).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "parts"],
+                    "properties": {
+                        "item_index": {"type": "integer"},
+                        "parts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["part_index", "observable",
+                                             "needs", "reason", "cites"],
+                                "properties": {
+                                    "part_index": {"type": "integer"},
+                                    "observable": {
+                                        "type": "string",
+                                        "enum": list(OBSERVABLE_KINDS)},
+                                    "needs": {
+                                        "type": "string",
+                                        "enum": ["", *OBSERVABILITY_NEEDS]},
+                                    "reason": {"type": "string"},
+                                    "cites": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": False,
+                                            "required": ["path",
+                                                         "line_start",
+                                                         "line_end",
+                                                         "quote"],
+                                            "properties": {
+                                                "path": {"type": "string"},
+                                                "line_start": {
+                                                    "type": "integer"},
+                                                "line_end": {
+                                                    "type": "integer"},
+                                                "quote": {"type": "string"},
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
                     },
                 },
             },
@@ -7318,6 +7391,7 @@ def _needs_human_detail_groups() -> dict[str, str]:
         JUDGE_UNINSPECTED_GAP_SOURCE: "Task requirements",
         DELIVERY_JUDGE_GAP_SOURCE: "Task requirements",
         RATCHET_UNVERIFIED_GAP_SOURCE: "Task requirements",
+        UNOBSERVABLE_GAP_SOURCE: "Task requirements",
         REGRESSION_GAP_SOURCE: "Regression checks the run could not settle",
         TEST_OUTCOME_GAP_SOURCE: "Regression checks the run could not settle",
         CONFIRM_BUDGET_GAP_SOURCE:
@@ -62013,6 +62087,182 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             _remove_acceptance_checkout(st, wt)
 
 
+# DESIGN §8 *A met is only what the run could observe*. Samples per run (the
+# benched rule: a part is unobservable on a majority of them), and the turn
+# budget of each read-only sample.
+OBSERVABILITY_SAMPLES = 3
+OBSERVABILITY_MAX_TURNS = 12
+# The "Needs human verification" source for a required item that no
+# detector found unmet but that has a part this run could not observe.
+UNOBSERVABLE_GAP_SOURCE = "unobservable_here"
+# How the PR names what an unobservable part needs.
+_OBSERVABILITY_NEEDS_TEXT = {
+    "rendering_engine": "a real rendering engine (layout, what is visible "
+                        "on screen, viewport, hover and touch)",
+    "physical_device": "a real device and its operating system",
+    "external_service": "the real external service, not a test double",
+}
+
+
+def _observability_payload(normalized: list[dict],
+                           indices: Iterable[int]) -> list[dict]:
+    """The items the judge types, each with its parts numbered: the
+    classifier's `parts`, or the item itself as part 0 when it has none."""
+    out: list[dict] = []
+    for i in indices:
+        it = normalized[i]
+        parts = [p for p in (it.get("parts") or [])
+                 if isinstance(p, str) and p.strip()]
+        out.append({"item_index": i, "item": it.get("item", ""),
+                    "parts": [{"part_index": j, "part": p} for j, p in
+                              enumerate(parts or [it.get("item", "")])]})
+    return out
+
+
+def _observability_user_prompt(task: str, payload: list[dict],
+                               test_cmd: str | None) -> str:
+    cmd = (f"`{test_cmd}`" if test_cmd and test_cmd.strip()
+           else "none is configured: the run runs no tests")
+    return ("TASK:\n" + task + "\n\nTHE REPOSITORY'S TEST COMMAND: " + cmd
+            + "\n\nREQUIRED ITEMS (each with its numbered parts):\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False)
+            + "\n\nReturn one entry per item_index, and in it one entry per "
+              "part_index, per your schema.")
+
+
+def _observability_unobservable(samples: list[dict | None],
+                                payload: list[dict], tree: str | Path,
+                                quorum: int | None = None
+                                ) -> dict[int, list[dict]]:
+    """item_index -> its parts a quorum of `samples` typed `neither` with
+    every cite verified against `tree`'s HEAD (`_verify_delivery_cite`).
+    A failed sample (None) and a `neither` without a verified cite are
+    votes for observable: the rule only ever withholds a `met` the run
+    could not have measured, so an unproven claim never withholds one.
+    Each part carries its text, the most voted `needs` (ties to the
+    vocabulary's order) and one verified cite."""
+    if quorum is None:
+        quorum = OBSERVABILITY_SAMPLES // 2 + 1
+    known = {e["item_index"]: {p["part_index"]: p["part"]
+                               for p in e["parts"]} for e in payload}
+    votes: dict[tuple[int, int], list[tuple[str, dict]]] = {}
+    cache: dict = {}
+    for smp in samples:
+        if not isinstance(smp, dict):
+            continue
+        seen: set[tuple[int, int]] = set()
+        for ent in smp.get("items") or []:
+            if not isinstance(ent, dict) or ent.get("item_index") not in known:
+                continue
+            i = ent["item_index"]
+            for p in ent.get("parts") or []:
+                if not isinstance(p, dict):
+                    continue
+                j = p.get("part_index")
+                if (j not in known[i] or (i, j) in seen
+                        or p.get("observable") != "neither"
+                        or p.get("needs") not in OBSERVABILITY_NEEDS):
+                    continue
+                cites = [c for c in p.get("cites") or []
+                         if isinstance(c, dict)]
+                if not cites or not all(
+                        _verify_delivery_cite(c, tree, "", cache)
+                        in _DELIVERY_CITE_OK for c in cites):
+                    continue
+                seen.add((i, j))
+                votes.setdefault((i, j), []).append((p["needs"], cites[0]))
+    out: dict[int, list[dict]] = {}
+    for (i, j), vs in sorted(votes.items()):
+        if len(vs) < quorum:
+            continue
+        needs = max(OBSERVABILITY_NEEDS,
+                    key=lambda n: (sum(1 for v in vs if v[0] == n),
+                                   -OBSERVABILITY_NEEDS.index(n)))
+        cite = next(c for n, c in vs if n == needs)
+        out.setdefault(i, []).append({
+            "part_index": j, "part": known[i][j], "needs": needs,
+            "votes": len(vs),
+            "cite": {k: cite.get(k) for k in
+                     ("path", "line_start", "line_end", "quote")}})
+    return out
+
+
+async def _observability_verdicts(st: "State", caps: dict, models: dict,
+                                  efforts: dict, *, staging: Path, sha: str,
+                                  task: str, normalized: list[dict],
+                                  indices: list[int]) -> dict:
+    """`{sha, unobservable: {item_index: [part, ...]}, samples}` for the
+    commit `sha`, cached in `delivery_gate.observability` and reused only on
+    that commit. Advisory: a judge that fails leaves every part observable,
+    so the verdicts stand as the detectors left them."""
+    gate = st.data.get("delivery_gate") or {}
+    rec = gate.get("observability")
+    if isinstance(rec, dict) and rec.get("sha") == sha:
+        return rec
+    if not indices:
+        return {"sha": sha, "unobservable": {}, "samples": 0}
+    payload = _observability_payload(normalized, indices)
+    user = _observability_user_prompt(
+        task, payload, resolve_blt(st.repo_root).get("test"))
+
+    async def _one(n: int) -> dict | None:
+        try:
+            st.bump_workers(caps)
+            return await claude_p(
+                user_prompt=user,
+                system_prompt=_load_prompt("observability_judge"),
+                schema_key="observability_judge", cwd=str(staging),
+                allowed_tools=SATISFIED_PROBE_TOOLS,
+                max_turns=OBSERVABILITY_MAX_TURNS, autonomous=False,
+                caps=caps, st=st,
+                model=models.get("observability_judge", MODEL_DEFAULT),
+                effort=efforts.get("observability_judge"),
+                sid=f"observability_judge-s{n}")
+        except (WorkerError, subprocess.TimeoutExpired) as e:
+            log(f"  delivery detection: observability judge sample {n} "
+                f"failed ({_brief_worker_exc(e)}) — counted as observable")
+            return None
+    samples = await asyncio.gather(*[_one(n)
+                                     for n in range(OBSERVABILITY_SAMPLES)])
+    found = _observability_unobservable(list(samples), payload, staging)
+    rec = {"sha": sha, "samples": sum(1 for s in samples if s is not None),
+           "unobservable": {str(i): v for i, v in found.items()}}
+    gate = dict(st.data.get("delivery_gate") or {})
+    gate["observability"] = rec
+    st.data["delivery_gate"] = gate
+    st.save()
+    return rec
+
+
+def _set_unobservable_gap(st: "State", rows: dict[int, dict]) -> None:
+    """The `UNOBSERVABLE_GAP_SOURCE` entries, one per item `rows` names
+    (item_index -> {item, parts}), replacing every earlier one: final
+    detection types the whole item list on the tree that ships."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == UNOBSERVABLE_GAP_SOURCE)]
+    for i, r in sorted(rows.items()):
+        what = "; ".join(
+            f"\"{p['part']}\" needs "
+            f"{_OBSERVABILITY_NEEDS_TEXT.get(p['needs'], p['needs'])}"
+            for p in r["parts"])
+        c = r["parts"][0].get("cite") or {}
+        entries.append({
+            "source": UNOBSERVABLE_GAP_SOURCE, "item_index": i,
+            "detail": (f"{r['item']} — not shown met: {what}, which this "
+                       f"run cannot observe (the repository's test command "
+                       f"runs with `{' '.join(str(c.get('quote') or '').split())[:200]}`, "
+                       f"{c.get('path')}:{c.get('line_start')}). Check it "
+                       f"on the PR branch.")})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
+
+
 async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                                   models: dict[str, str],
                                   efforts: dict[str, str | None]) -> None:
@@ -62142,6 +62392,18 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
         fmeta = {"enabled": False, "skipped": f"{type(e).__name__}: {e}"}
     if fmeta.get("skipped"):
         log(f"  delivery detection: falsifier not run — {fmeta['skipped']}")
+    try:
+        obs = await _observability_verdicts(
+            st, caps, models, efforts, staging=staging, sha=sha,
+            task=st.data.get("task", ""), normalized=normalized,
+            indices=f_idx)
+    except Exception as e:
+        # Advisory, as the falsifier: every part stays observable.
+        log(f"  delivery detection: observability judge raised "
+            f"{type(e).__name__}: {e} — every part counted observable")
+        obs = {"unobservable": {}}
+    unobservable = obs.get("unobservable") or {}
+    unobservable_rows: dict[int, dict] = {}
     judge_unmet = {u.get("item_index"): u for u in (judged.get("unmet") or [])
                    if isinstance(u, dict)}
     fitems = progress.get("items") or {}
@@ -62239,6 +62501,23 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             rows.append(row)
             unjudged.append(str(it.get("item", "")))
             continue
+        if not by and unobservable.get(str(i)):
+            # Nothing showed it unmet, but a part of it is a behaviour
+            # neither reading the tree nor the repository's test command can
+            # observe: a passing test or a cited line there is no evidence
+            # it holds, so it is unknown, listed for a human, never met
+            # (DESIGN §8 *A met is only what the run could observe*).
+            parts = unobservable[str(i)]
+            row.update(verdict="unknown", by=[], falsifier=fi,
+                       judge=details_by_idx.get(i), unobservable=parts,
+                       reason=("a part of it can only be observed through "
+                               "what this run cannot drive: "
+                               + ", ".join(sorted({p["needs"]
+                                                   for p in parts}))))
+            rows.append(row)
+            unobservable_rows[i] = {"item": it.get("item", ""),
+                                    "parts": parts}
+            continue
         row.update(verdict="unmet" if by else "met", by=by,
                    judge=details_by_idx.get(i), falsifier=fi)
         if outcome_parts and tid is not None and tid["verdict"] != "met":
@@ -62255,6 +62534,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                                 "by": by, "evidence_by": evidence_by})
     _set_test_outcome_gap(st, unknown_tests,
                           (tid or {}).get("reason") or "")
+    _set_unobservable_gap(st, unobservable_rows)
     _set_delivery_unknown_gap(st, DELIVERY_JUDGE_GAP_SOURCE, unjudged,
                               "the final delivery judge crashed on every "
                               "attempt, so nothing read the shipping commit "

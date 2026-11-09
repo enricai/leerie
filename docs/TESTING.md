@@ -6898,6 +6898,24 @@ are); and the real `finalize` verb reads the record (a recorded `no_push` is
 not pushed, `--no-push` on the verb skips a run recorded to push, and a run
 recorded to push reaches the push).
 
+`tests/test_observability_judge.py` (11 tests; DESIGN §8 *A met is only
+what the run could observe*). The rule `_observability_unobservable`: a
+quorum of samples with verified cites flags a part; one vote, a failed
+sample, a fabricated quote or a cite-less `neither` flags nothing; votes on
+two different parts of one item do not add up (inputs that disagree); a
+sample repeating a part counts once, out-of-range indices drop; `needs` is
+the most voted. Through the real `_run_delivery_detection`: an otherwise-met
+item with an unobservable part is an `unknown` row, out of `unmet_final` and
+`_ratchet_prior_met`, with its `unobservable_here` entry rendered in the PR
+end-state section, while the control item stays met; a falsifier-confirmed
+item stays unmet whatever the typing; a failing judge leaves every verdict;
+another commit's cached typing is not reused. Each check was falsified by
+mutating the code (no cite check, per-item votes, no wiring, the rule
+applied to unmet items, no gap entry): each mutation turns one test red.
+`_falsifier_stub` answers the observability judge with no items, and the
+three call-list pins in `tests/test_delivery_detection.py` leave its calls
+out.
+
 `tests/test_delivery_detection.py::TestReask` (9 tests; DESIGN §8 *Delivery
 detection*, *One re-ask*; review round 24 M1), rewritten over a real git
 lane: `created` is read from the lane's untracked test-shaped files, `ran`
