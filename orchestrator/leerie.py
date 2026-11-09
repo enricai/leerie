@@ -52988,6 +52988,17 @@ def _test_id_diff_item(it: object) -> bool:
             and it.get("check") == "test_id_diff")
 
 
+def _falsifier_item(it: object) -> bool:
+    """A required item the falsifier is asked about, at detection and at
+    every re-check: never an `external` item (the PR's "needs human
+    verification" owns it), a `test_id_diff` one or an `untouched_paths`
+    one (code settles those) — DESIGN §8 *Delivery detection*."""
+    return (isinstance(it, dict) and it.get("verifiability") != "external"
+            and not _test_id_diff_item(it)
+            and not (isinstance(it.get("untouched_paths"), list)
+                     and it["untouched_paths"]))
+
+
 def _test_outcome_parts(it: object) -> list[str]:
     """The parts of a mixed item the classifier typed as decided by the
     failing-test-ID diff: each `part_checks` entry whose `part` is one of the
@@ -63134,13 +63145,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     details_by_idx = {d.get("item_index"): d
                       for d in (judged.get("details") or [])
                       if isinstance(d, dict)}
-    # Never double-routed: an external item belongs to the PR's "needs
-    # human verification", an untouched-paths item to code.
-    f_idx = [i for i, it in enumerate(normalized)
-             if it.get("verifiability") != "external"
-             and not _test_id_diff_item(it)
-             and not (isinstance(it.get("untouched_paths"), list)
-                      and it["untouched_paths"])]
+    f_idx = [i for i, it in enumerate(normalized) if _falsifier_item(it)]
     try:
         fmeta = await _falsify_items(
             st, caps, models, efforts, sha=sha, normalized=normalized,
@@ -66886,10 +66891,7 @@ async def _redrive_falsify_met(st: "State", caps: dict, models: dict,
     todo = [i for i, v in sorted(out.items())
             if not v.get("unmet") and not v.get("unknown")
             and not v.get("crashed") and 0 <= i < len(normalized)
-            and normalized[i].get("verifiability") != "external"
-            and not _test_id_diff_item(normalized[i])
-            and not (isinstance(normalized[i].get("untouched_paths"), list)
-                     and normalized[i]["untouched_paths"])]
+            and _falsifier_item(normalized[i])]
     sha = await _branch_head_sha(str(staging)) if todo else None
     if not sha:
         return
@@ -66935,6 +66937,27 @@ async def _redrive_falsify_met(st: "State", caps: dict, models: dict,
         cur["evidence"] = (cur["evidence"] + " | " if cur.get("evidence")
                            else "") + mine
         cur.setdefault("evidence_by", {})["falsifier"] = mine[:1200]
+
+
+def _redrive_met_unread(st: "State", sha: str) -> list[int]:
+    """The items `delivery_gate.items` reports met — the row, or its parts
+    other than the test outcome (`other_parts`) — that the falsifier is
+    asked about (`_falsifier_item`) and that no re-check read on `sha`
+    (`redrive_recheck.sha`). Every one of them, not only those a kept
+    group's diff or its ratchet judge's `evidence_files` name: neither says
+    which items a change reaches (DESIGN §8 *Every item the tree that ships
+    reports met passed detection's bar on it*)."""
+    items = st.data.get("required_items") or []
+    out: list[int] = []
+    for r in (st.data.get("delivery_gate") or {}).get("items") or []:
+        i = r.get("item_index") if isinstance(r, dict) else None
+        if (isinstance(i, int) and 0 <= i < len(items)
+                and (r.get("verdict") == "met"
+                     or r.get("other_parts") == "met")
+                and _falsifier_item(_delivery_norm_item(items[i]))
+                and (r.get("redrive_recheck") or {}).get("sha") != sha):
+            out.append(i)
+    return sorted(set(out))
 
 
 def _resettle_test_outcome_rows(st: "State", tree_sha: str | None) -> None:
@@ -68031,6 +68054,26 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             st.data["delivery_ratchet"] = rr
             st.save()
             _set_ratchet_unverified_gap(st)
+        # Every item `final` reports met has passed detection's bar on it
+        # (DESIGN §8 *Every item the tree that ships reports met passed
+        # detection's bar on it*): a kept group invalidated detection's
+        # falsification of every item it can reach, and its ratchet read
+        # the items no group was sent for with its judge alone.
+        met = _redrive_met_unread(st, final)
+        if met:
+            log(f"  delivery re-drive: {len(met)} met item(s) not read on "
+                f"{final[:12]} since a kept group moved it — judged and "
+                f"falsified there {met}")
+            ver = await _redrive_recheck_items(
+                leerie_dir, st, caps, models, efforts, staging, met)
+            crashed = sorted(i for i, v in ver.items() if v.get("crashed"))
+            _redrive_apply_item_verdicts(
+                st, {i: v for i, v in ver.items() if not v.get("crashed")},
+                final, final_tree)
+            # A judge that crashed read nothing: unknown and listed, never
+            # met, and the verdict is not re-keyed to `final` (below).
+            _ratchet_mark_unverified(st, crashed, final,
+                                     "the delivery re-drive")
         # The diff may have moved even when no item needed a re-check.
         _resettle_test_outcome_rows(st, final_tree)
         rec["items_rechecked_sha"] = final

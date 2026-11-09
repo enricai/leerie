@@ -8498,3 +8498,28 @@ own `node_modules`, so the fixture links the package into a real
 Falsified, one at a time: the shim writing a replacement as a `--place`, no
 removal, no replacement on the first run, the base snapshot left out, and the
 writability check made always true. Each turns its tests red.
+
+## Every item the tree that ships reports met passed detection's bar on it
+
+`tests/test_met_items_refalsified_after_kept_rounds.py` replays the shape of
+lane T9 bench 4, navegando 4134b78c sample 1. The test uses a real pytest
+repository, its run repository and staging, and the real
+`_run_delivery_redrive`: routing, the group's commit, the ratchet, the
+re-checks, and the falsifier's gates with B\* on a pristine checkout. Only
+`claude_p` is stubbed, plus the TS AST facts, because the probes are Python.
+The group is sent for item 1 and, while fixing it, undoes item 0, which was
+met. The ratchet judge and the delivery judge both say met.
+
+- On the tree that ships, item 0 gets falsifier samples, and its probe is
+  confirmed, so the item is unmet by `falsifier`.
+- When the group keeps item 0, the item still gets 3 samples on that tree,
+  stays met, and the verdict is re-keyed.
+- A group that changes nothing costs no falsifier.
+- A final judge that crashes leaves the item `unknown` and listed, and
+  the verdict is not re-keyed.
+- A unit test pins `_redrive_met_unread`'s selection.
+
+Falsified three ways, each turning its tests red: the end-of-re-drive read
+removed, which reproduces the live run with item 0 met and no falsifier
+call on it; the crash marking removed; and the read-commit filter removed,
+which re-reads item 1, already read on that commit.
