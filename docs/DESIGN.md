@@ -13666,6 +13666,77 @@ next step. No other runner has a row yet, and a suite that needs a service
 besides PostgreSQL (navegando's CI also starts Redis, which its app does
 without) gets none from leerie.
 
+**A probe is re-run through the channel that confirmed it.** *Built
+2026-11-09 (lane SR).* A probe confirmed through the browser suite was
+confirmed once, through the suite, and every later run of it went through
+the repository's test command, which cannot run a browser spec: the
+re-drive's re-check (`_redrive_recheck_items`) re-ran the saved probe that
+way, so its verdict came from no measurement. Measured on a70fb4a6 (leerie
+0.54.0, lane BR's hand header probe, which fails through the suite on the
+shipped commit): the re-check ran `vitest run e2e/br-header.spec.ts
+--passWithNoTests`, which the repository's vitest configuration excludes,
+ran no test, exited 0, and read the item met on the shipped commit, the
+defect still on screen. And a fixer could not be shown such a probe at all, since its
+self-check ran the test command only: it was declined (*Delivery
+re-drive* rule 4, as first built), stayed unreproducible, was never
+driven, and the conflict with an existing test could not be measured for
+it either. Navegando's responsive task is the case: its layout defects are
+found only through the suite, so none of them could ever reach a fixer.
+**Root cause:** which channel a probe ran through was recorded on its
+sample (`via_browser_suite`) and read at the confirm alone; nothing that
+re-ran the probe carried it. **Invariant:** every run of a probe goes
+through the channel that confirmed it — the fixer's self-check, the re-runs
+after a group's commit (its progress and the conflict check), the
+re-check, and the command the PR names for it — and a run that has no such
+channel gives no verdict, never the test command's.
+
+The mechanism: the mark travels with the probe. The shown probe
+(`_falsifier_shown_probe`) and the probe set every re-run is built from
+(`_redrive_probe_sets`, `_falsifier_probe_set`) carry `via_browser_suite`;
+an evaluation runs such a set's file through the suite's own command, in
+its CI environment, with a database of its own, in a held-out sandbox over
+a checkout its prerequisites set up — the confirm's terms
+(`_acceptance_set_suite`, `_run_acceptance_file(suite=)`) — and B\*
+confirms a failure as for any set. The self-check runs each file through
+its own channel: the shown sets' files and test-command probes through the
+test command, a suite probe through the suite's command over the copy of
+the fixer's tree, in the suite's CI environment less the database
+variables, which are the fixer's own — each command through the one gate
+every launch passes (§9 *A command the task forbids*): a channel the task
+forbids is never launched, and its files have no verdict, never a pass; the suite's prerequisites set
+staging up first, as they set up the checkout the probe was confirmed in,
+since the copy shares staging's ignored paths and stores. A probe is shown
+only when the run has the channel to run it through; a run with none (its
+suite record gone) leaves it unreproducible and any re-run of it
+unmeasured (`no_browser_suite`).
+
+Measured (lane SR replay, the a70fb4a6 case on lane BR's harness:
+navegando's image with a PostgreSQL server, real confinement, the hand
+header probe recorded as a sample confirmed through the suite with
+shown-only leads; no worker spawned, `claude_p` refused). On 0.54.0 the
+probe was not shown (the item `unreproducible`), and the re-check read the
+item met on the shipped commit, through vitest as above. With this change
+the re-drive's split handed the probe on (`via_browser_suite` on the note
+and its self-check set); on the shipped commit the re-check and the re-run
+of a group's probes each ran the suite's command and read `fail`, B\*
+confirmed (3 of 3 reruns); after the header fix was committed in staging
+and taken into the run's repository, the re-run read `pass` and the
+re-check read the item met.
+
+What is not built: the self-check runs the probe through the suite's
+command (its output names it), but on navegando the app's server does not
+start in the self-check's copy. The copy shares staging's ignored paths as
+symlinks, and Turbopack refuses one that leaves its root ("Symlink
+[project]/node_modules is invalid, it points out of the filesystem
+root"), so the call fails before the browser opens, on the fix as on the
+defect. Sharing them as hard links instead fails under the fixer's own
+confinement (`cp -al`: "Invalid cross-device link" from staging into the
+self-check's directory), and a copy of the bytes is the size of the
+installed tree on every call. The commit's re-run, the conflict check and
+the re-check are leerie's own and correct, so a fix is kept or rolled back
+on the suite's verdict; until the self-check can host the app's server, a
+fixer shown such a probe cannot see it pass before it commits.
+
 **A probe that breaks another part of its own item is a contested reading,
 not a finding.** *Status: designed, not built — see the last paragraph.*
 An item is the classifier's one-sentence wording of a span of the source,
@@ -13814,16 +13885,15 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    sample with no `lead_sets`, recorded before leads were shown sets
    only, or one whose `lead_sets` names a set the run holds back — is
    held-out content: its fixer can neither run nor read it, and all a
-   note could say is that some input in the item's words fails. So is,
-   for this purpose, a probe its sample ran and confirmed through the
-   repository's browser suite (`via_browser_suite`, §8 *A repository's
-   browser suite is a channel the run provisions*): the fixer's
-   self-check runs the repository's test command only, so the fixer could
-   not run it as it was confirmed, and its progress and any conflict with
-   an existing test (below) could not be read through that command either.
-   Running such a probe through the suite in the self-check and in the
-   re-drive's re-runs is a later step. An item whose only unmet evidence
-   (`by`) is such a probe is therefore not driven: it is recorded as an `unrouted_item` with reason
+   note could say is that some input in the item's words fails. A probe
+   its sample confirmed through the repository's browser suite
+   (`via_browser_suite`) is shown like any other, and its self-check, the
+   re-runs after the group's commit and the re-check all run it through
+   the suite (§8 *A probe is re-run through the channel that confirmed
+   it*); only in a run with no browser channel to run it through is it
+   unreproducible. An item whose only unmet evidence (`by`) is a probe
+   its fixer cannot be shown is therefore not driven: it is recorded as an
+   `unrouted_item` with reason
    `unreproducible` (*An unmet item reaches its owner, or is recorded as
    reaching none*, below), stays unmet, and spends no round. An item
    unmet on such a probe and on reproducible evidence too is driven on

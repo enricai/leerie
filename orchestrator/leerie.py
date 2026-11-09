@@ -56062,7 +56062,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                failure_mode: str = "assertion",
                                observed: dict | None = None,
                                cases_out: dict | None = None,
-                               place: tuple[tuple[str, str], ...] = ()
+                               place: tuple[tuple[str, str], ...] = (),
+                               suite: dict | None = None
                                ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
@@ -56102,8 +56103,14 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     `tree`) are the set's files, copied into the sandbox's overlay and never
     onto disk; the runner's report comes back through a descriptor. In a
     Prisma repo whose datasource is PostgreSQL it has a database of its own,
-    started inside the sandbox (`_test_db_argv`)."""
-    cmd = _acceptance_cmd(st, [rel], tree, {r: src for src, r in place})
+    started inside the sandbox (`_test_db_argv`).
+
+    With `suite` (the run's browser channel, `_browser_suite`: a falsifier
+    probe confirmed through it), the file runs through the suite's own
+    command in the environment its CI declares, as it was confirmed (DESIGN
+    §8 *A probe is re-run through the channel that confirmed it*)."""
+    cmd = (_browser_suite_cmd(suite, [rel]) if suite is not None
+           else _acceptance_cmd(st, [rel], tree, {r: src for src, r in place}))
     if cmd is None:
         return None
     written = cmd
@@ -56128,6 +56135,9 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             run_cmd, env, _kind = spec
     if path_env:
         env = {**(env if env is not None else os.environ), **path_env}
+    if suite is not None:
+        env = {**(env if env is not None else os.environ),
+               **_browser_suite_env(suite)}
     try:
         if written != cmd:
             _blt_shell_argv(written, _forbidden_specs(st.data))
@@ -56864,11 +56874,34 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
             log("  acceptance: dependency install failed in the evaluation "
                 "worktree — no evidence either way")
             return unmeasured_all("deps_failed")
+        suite = _browser_suite(st)
+        if suite is not None and any(_acceptance_set_suite(st, s_)
+                                     for s_ in sets):
+            # A probe confirmed through the browser suite runs through it
+            # here too: its prerequisites (a code generator, the runner's
+            # browser) set this checkout up, as they set up the checkout it
+            # was confirmed in (DESIGN §8 *A probe is re-run through the
+            # channel that confirmed it*).
+            await _ci_prepare(wt, [_browser_suite_rec(suite)], st, caps,
+                              f"acceptance-{label}")
         results = await _acceptance_run_placed(st, caps, wt, sets, label,
                                                confirm=confirm)
     finally:
         _teardown()
     return results
+
+
+def _acceptance_set_suite(st: "State", s_: dict) -> dict | None | bool:
+    """The channel a set's files run through (DESIGN §8 *A probe is re-run
+    through the channel that confirmed it*): None, the repository's test
+    command; the run's browser suite (`_browser_suite`) for a set marked
+    `via_browser_suite` — a falsifier probe confirmed through it; False for
+    such a set when the run has no browser channel, so it gives no verdict
+    rather than one from a command that cannot run it."""
+    if not s_.get("via_browser_suite"):
+        return None
+    suite = _browser_suite(st)
+    return suite if suite is not None else False
 
 
 async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
@@ -56888,10 +56921,22 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
     B* (`_confirm_still_failing`); a defect file with held cases that did
     not end failing is rerun by `_acceptance_discover`; and a file whose
     held case was seen failing, but only with resource signatures, is
-    failing and typed `intermittent_cases` — never unmeasured."""
+    failing and typed `intermittent_cases` — never unmeasured.
+
+    A set marked `via_browser_suite` (a falsifier probe confirmed through
+    the run's browser suite) runs every file through that suite
+    (`_acceptance_set_suite`); with no such channel in the run it is
+    unmeasured (`no_browser_suite`), never run through the test command
+    (DESIGN §8 *A probe is re-run through the channel that confirmed it*)."""
     log_path = _held_out_logs(st.run_dir) / f"acceptance-{label}.log"
     results: list[dict] = []
     for s_ in sets:
+        suite = _acceptance_set_suite(st, s_)
+        if suite is False:
+            results.append({"index": s_["index"], "passed": False,
+                            "unmeasured": True, "failing_files": [],
+                            "unmeasured_reason": "no_browser_suite"})
+            continue
         failing, ran = [], []
         placed: list[tuple[str, str]] = []
         resource_affected: list[str] = []
@@ -56954,7 +56999,8 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 obs: dict = {}
                 verdict = await _run_acceptance_file(
                     st, caps, str(wt), rel, log_path,
-                    f"acceptance-{label}", cases_out=obs, place=place)
+                    f"acceptance-{label}", cases_out=obs, place=place,
+                    suite=suite)
                 if verdict is None:
                     unmeasured = True
                     why_files[rel] = "no_runner_verdict"
@@ -56967,8 +57013,8 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 n_rerun = {"i": 0}
 
                 async def _rerun(_left: float, _files=tuple(vote),
-                                 _n=n_rerun, _nt=_note, _runs=runs
-                                 ) -> set[str] | None:
+                                 _n=n_rerun, _nt=_note, _runs=runs,
+                                 _suite=suite) -> set[str] | None:
                     _n["i"] += 1
                     still: set[str] = set()
                     done: set[str] = set()
@@ -56984,7 +57030,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                             st, _budget_caps(caps, left), str(wt), rel,
                             log_path,
                             f"acceptance-{label}-confirm{_n['i']}",
-                            cases_out=o, place=place)
+                            cases_out=o, place=place, suite=_suite)
                         if v is None:
                             return None
                         if o.get("resource") and time.monotonic() >= end:
@@ -57025,7 +57071,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 if pending:
                     discovery = await _acceptance_discover(
                         st, caps, wt, pending, log_path, label,
-                        place, _note, index=s_["index"])
+                        place, _note, index=s_["index"], suite=suite)
                     failing += [r for r in pending if r in asserted]
                 for rel in ran:
                     if rel not in failing and seen.get(rel):
@@ -57233,7 +57279,8 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                                place: tuple[tuple[str, str], ...] | None,
                                note: Callable[[str, dict], bool], *,
                                index: object = None,
-                               clock: Callable[[], float] | None = None
+                               clock: Callable[[], float] | None = None,
+                               suite: dict | None = None
                                ) -> dict:
     """Discovery for held cases (DESIGN §8 *A held case that fails again*,
     rule 2): rerun each of `rels` — defect files with held cases that did
@@ -57248,7 +57295,8 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     a set never rerun is never read as one rerun clean; `disabled` (and
     `reason: disabled`, never incomplete) when the operator set the repeats
     to 0 (DESIGN §8 *A held case that fails again*, rule 2). `place`: the
-    set's files, placed in each rerun's sandbox (`_run_acceptance_file`)."""
+    set's files, placed in each rerun's sandbox (`_run_acceptance_file`);
+    `suite`: the channel the set's files run through (`_acceptance_set_suite`)."""
     reps = max(0, min(int(caps.get(
         "acceptance_intermittent_repeats",
         DEFAULT_CAPS["acceptance_intermittent_repeats"])),
@@ -57283,7 +57331,7 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                 v = await _run_acceptance_file(
                     st, _budget_caps(caps, left), str(wt), rel, log_path,
                     f"acceptance-{label}-discover{i + 1}", cases_out=obs,
-                    place=tuple(place or ()))
+                    place=tuple(place or ()), suite=suite)
                 if obs.get("resource") and budget - (clock() - t0) <= 0:
                     # The budget, not the run, ended it: no evidence, and
                     # the round is not one run.
@@ -63388,29 +63436,30 @@ _REDRIVE_UNREPRODUCIBLE_BY = frozenset({"falsifier"})
 _REDRIVE_PROBE_TEXT_MAX = 600
 
 
-def _falsifier_shown_probe(row: object, shown_idx: Iterable
-                           ) -> dict | None:
+def _falsifier_shown_probe(row: object, shown_idx: Iterable,
+                           suite: dict | None = None) -> dict | None:
     """The confirmed falsifier probe of a `delivery_gate.items[]` row as a
     fixer may be shown it (DESIGN §6 *A falsifier reads only what a fixer
     may read*), or None: `{dir, file, lead_sets, case_name,
-    assertion_quote, reason, item_span_quote}`. None unless the confirmed
-    sample recorded the sets it read (`lead_sets`, a list of indices) and
-    every one is in `shown_idx`, its saved probe is a regular file, and it
-    was not confirmed through the browser suite (`via_browser_suite`: the
-    self-check cannot run it that way) — a sample with no `lead_sets` read
-    every valid set, held-back ones included, so its probe is held-out
-    content and is never shown."""
+    assertion_quote, reason, item_span_quote, via_browser_suite?}`. None
+    unless the confirmed sample recorded the sets it read (`lead_sets`, a
+    list of indices) and every one is in `shown_idx`, and its saved probe
+    is a regular file — a sample with no `lead_sets` read every valid set,
+    held-back ones included, so its probe is held-out content and is never
+    shown. A probe confirmed through the browser suite
+    (`via_browser_suite`) keeps that mark, so every re-run of it — the
+    fixer's self-check, the re-runs after its commit, the re-check — goes
+    through the suite; it is shown only when the run has that channel
+    (`suite`, `_browser_suite`) to run it through (DESIGN §8 *A probe is
+    re-run through the channel that confirmed it*)."""
     fi = row.get("falsifier") if isinstance(row, dict) else None
     samples = fi.get("samples") if isinstance(fi, dict) else None
     s_ = next((x for x in samples or [] if isinstance(x, dict)
                and x.get("confirmed")), None)
     if s_ is None:
         return None
-    if s_.get("via_browser_suite"):
-        # Confirmed through the browser suite's runner (DESIGN §8 *A
-        # repository's browser suite is a channel the run provisions*): the
-        # fixer's self-check runs the repository's test command only, so it
-        # could not run this probe as it was confirmed.
+    via = bool(s_.get("via_browser_suite"))
+    if via and suite is None:
         return None
     leads = s_.get("lead_sets")
     if not isinstance(leads, list) or not all(
@@ -63433,7 +63482,8 @@ def _falsifier_shown_probe(row: object, shown_idx: Iterable
             "lead_sets": sorted(leads),
             **{k: str(s_.get(k) or "")[:_REDRIVE_PROBE_TEXT_MAX]
                for k in ("case_name", "assertion_quote", "reason",
-                         "item_span_quote")}}
+                         "item_span_quote")},
+            **({"via_browser_suite": True} if via else {})}
 
 
 def _redrive_item_note_reproducible(n: dict, shown_idx: Iterable) -> bool:
@@ -63455,13 +63505,14 @@ def _redrive_item_note_reproducible(n: dict, shown_idx: Iterable) -> bool:
 def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
                         n_items: int, rows: list, *,
                         shown_idx: Iterable = (),
-                        contested: Iterable[int] = ()
+                        contested: Iterable[int] = (),
+                        suite: dict | None = None
                         ) -> tuple[list[dict], list[dict]]:
     """(notes, unreproducible) for the open unmet items (DESIGN §8 *Delivery
     re-drive* rules 2 and 4), from typed fields only. An item every claimer
     types `process` is neither. A falsifier source is reproducible when its
     row's confirmed probe is shown (`_falsifier_shown_probe(row,
-    shown_idx)`) and no measured conflict with an existing test contested
+    shown_idx, suite)`, `suite` the run's browser channel) and no measured conflict with an existing test contested
     it (`contested`, item indices); the other sources of
     `_REDRIVE_UNREPRODUCIBLE_BY` never are. An item whose sources (`by`;
     `["judge"]` when absent) less the unreproducible ones are none is no
@@ -63487,7 +63538,7 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
             continue   # rule 2: a process constraint is not routed
         by = ([str(b) for b in u["by"]] if isinstance(u.get("by"), list)
               else ["judge"])
-        probe = (_falsifier_shown_probe(by_row.get(i), shown_idx)
+        probe = (_falsifier_shown_probe(by_row.get(i), shown_idx, suite)
                  if "falsifier" in by and i not in contested else None)
         repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY
                  or (b == "falsifier" and probe is not None)]
@@ -63522,8 +63573,8 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
 def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
     """The shown probes a group's notes carry, as self-check sets (DESIGN
     §8 *Delivery re-drive* rule 4): `{index: "probe-i<k>", item_index, dir,
-    defect_files: [file], control_files: [], support_files: []}`, one per
-    item."""
+    defect_files: [file], control_files: [], support_files: [],
+    via_browser_suite?}`, one per item."""
     out: dict[int, dict] = {}
     for n in notes:
         p_ = n.get("probe") if n.get("kind") == "unmet_item" else None
@@ -63531,7 +63582,9 @@ def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
         if isinstance(p_, dict) and isinstance(i, int) and i not in out:
             out[i] = {"index": f"probe-i{i}", "item_index": i,
                       "dir": p_["dir"], "defect_files": [p_["file"]],
-                      "control_files": [], "support_files": []}
+                      "control_files": [], "support_files": [],
+                      **({"via_browser_suite": True}
+                         if p_.get("via_browser_suite") else {})}
     return [out[i] for i in sorted(out)]
 
 
@@ -63539,13 +63592,16 @@ def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
 _REDRIVE_CONTEST_TESTS_MAX = 10
 
 
-def _falsifier_probe_set(item_index: int, dir_: str, rel: str) -> dict:
+def _falsifier_probe_set(item_index: int, dir_: str, rel: str, *,
+                         via_browser_suite: bool = False) -> dict:
     """A saved falsifier probe as a one-file set `_evaluate_acceptance_sets`
     runs in a held-out sandbox: an integer index of its own, out of the
-    range of a run's sets."""
+    range of a run's sets. `via_browser_suite`: it was confirmed through the
+    run's browser suite, and runs through it (`_acceptance_set_suite`)."""
     return {"index": 1_000_000 + item_index, "dir": dir_,
             "defect_files": [rel], "control_files": [],
-            "support_files": [], "cases": {}}
+            "support_files": [], "cases": {},
+            **({"via_browser_suite": True} if via_browser_suite else {})}
 
 
 async def _redrive_probe_verdicts(st: "State", caps: dict, staging: Path,
@@ -63557,8 +63613,10 @@ async def _redrive_probe_verdicts(st: "State", caps: dict, staging: Path,
     run that gives no verdict is `unmeasured`: no evidence either way."""
     if not probes:
         return {}
-    sets = [_falsifier_probe_set(p_["item_index"], p_["dir"],
-                                 p_["defect_files"][0]) for p_ in probes]
+    sets = [_falsifier_probe_set(
+                p_["item_index"], p_["dir"], p_["defect_files"][0],
+                via_browser_suite=bool(p_.get("via_browser_suite")))
+            for p_ in probes]
     res = await _evaluate_acceptance_sets(st, caps, str(staging), sets,
                                           label, rev=rev)
     by = {r.get("index"): r for r in res if isinstance(r, dict)}
@@ -63890,8 +63948,8 @@ SELFCHECK_SCRIPT = ROOT / "scripts" / "selfcheck.py"
 # fixed CLI surface). vitest and jest share `-t`; pytest's `-k` takes an
 # expression over names.
 _SELFCHECK_NAME_FLAGS: dict[str, str] = {"vitest": "-t", "jest": "-t",
-                                         "pytest": "-k"}
-_SELFCHECK_NAME_ARGS = ("-t", "--testNamePattern", "-k")
+                                         "pytest": "-k", "playwright": "-g"}
+_SELFCHECK_NAME_ARGS = ("-t", "--testNamePattern", "-k", "-g")
 _SELFCHECK_CALLS_MAX = 50
 
 
@@ -63909,11 +63967,21 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     `{dir, bin, command, src, run_files, name_flag, probes{item_index:
     path}}`. Nothing is written to `staging`. It runs inside the
     implementer's own process tree, so a database the implementer has
-    (`claude_p(db=True)`) is the self-check's through its environment."""
+    (`claude_p(db=True)`) is the self-check's through its environment.
+
+    A probe confirmed through the run's browser suite (`via_browser_suite`)
+    runs through the suite's own command and its CI's environment, never
+    the test command (DESIGN §8 *A probe is re-run through the channel that
+    confirmed it*): its file is in the config's `suite.files`, with the
+    suite's `template` and `env` — less the database variables when the
+    suite requires a database, whose values are the implementer's own
+    (`TEST_DB_ENV_NAMES`). `name_flag` is offered only when every channel's
+    runner takes one."""
     root = st.run_dir / "selfcheck" / label
     _rmtree_owned(root)
     sets: list[dict] = []
     probe_paths: dict[int, str] = {}
+    suite_files: set[str] = set()
     for s_ in [*shown, *probes]:
         is_probe = "item_index" in s_ and str(s_.get("index") or
                                               "").startswith("probe-i")
@@ -63921,6 +63989,8 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
                                else f"set-{s_.get('index')}")
         if is_probe:
             probe_paths[s_["item_index"]] = str(dst / s_["defect_files"][0])
+            if s_.get("via_browser_suite"):
+                suite_files.update(s_["defect_files"])
         for rel in _set_files(s_):
             f = dst / rel
             f.parent.mkdir(parents=True, exist_ok=True)
@@ -63932,15 +64002,31 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
                      "support_files": list(s_.get("support_files") or [])})
     run_files = sorted({r for s_ in sets
                         for r in s_["defect_files"] + s_["control_files"]})
-    cmd = _acceptance_cmd(st, run_files, str(staging)) if run_files else None
-    runner = (_acceptance_runner(cmd, _RUNNER_REPORTS, run_files)
-              if cmd else None)
+    plain = [r for r in run_files if r not in suite_files]
+    cmd = _acceptance_cmd(st, plain, str(staging)) if plain else None
+    runners = ([_acceptance_runner(cmd, _RUNNER_REPORTS, plain)]
+               if cmd else [])
+    suite_cfg = None
+    if suite_files:
+        suite = _browser_suite(st)
+        if suite is None:
+            # `_falsifier_shown_probe` shows such a probe only with the
+            # channel: a note outside its self-check is a leerie defect.
+            raise RuntimeError("a probe confirmed through the browser suite "
+                               "was shown in a run without that channel")
+        db = "database" in (suite.get("requires") or [])
+        suite_cfg = {"template": suite["template"],
+                     "files": sorted(suite_files),
+                     "env": {k: v for k, v in _browser_suite_env(suite).items()
+                             if not (db and k in TEST_DB_ENV_NAMES)}}
+        runners.append(str(suite.get("runner") or ""))
+    flags = {_SELFCHECK_NAME_FLAGS.get(r or "") for r in runners}
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     cfg = {"tree": str(staging), "repo_root": str(st.repo_root),
            "sets": sets, "run_files": run_files,
            "snap_root": str(root / "run"),
-           "env": {},
+           "env": {}, "suite": suite_cfg,
            "forbidden": _forbidden_specs(getattr(st, "data", None)),
            "timeout": float(caps.get("worker_timeout_sec",
                                      DEFAULT_CAPS["worker_timeout_sec"])),
@@ -63953,9 +64039,9 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
         f"{shlex.quote(str(root / 'config.json'))} \"$@\"\n")
     wrapper.chmod(0o755)
     return {"dir": str(root), "bin": str(bin_dir),
-            "command": str(wrapper) if cmd else None,
+            "command": str(wrapper) if cmd or suite_cfg else None,
             "src": str(root / "sets"), "run_files": run_files,
-            "name_flag": _SELFCHECK_NAME_FLAGS.get(runner or ""),
+            "name_flag": (flags.pop() if len(flags) == 1 else None),
             "probes": probe_paths}
 
 
@@ -63970,6 +64056,9 @@ def _selfcheck_calls(sc: dict) -> list[dict]:
                 r = json.loads(line)
                 out.append({k: r.get(k) for k in (
                     "args", "subset", "name_filter", "rc", "secs_total")})
+                # A channel the task forbids: its files and why, typed.
+                out[-1].update({k: r[k] for k in ("unmeasured", "forbidden")
+                                if k in r})
     return out
 
 
@@ -64144,61 +64233,107 @@ def selfcheck_main(argv: list[str]) -> int:
             for f in copied:
                 f.chmod(0o444)
         run = subset or run_files
-        cmd = _acceptance_cmd(
-            types.SimpleNamespace(repo_root=Path(cfg["repo_root"])),
-            run, str(snap))
-        if not cmd:
-            _selfcheck_say("SELF-CHECK ERROR: no test command here can run these "
-                  "files")
-            rc = 2
-            return rc
-        runner = _acceptance_runner(cmd, _RUNNER_REPORTS, run)
-        extra: list[str] = []
-        if name is not None:
-            flag = _SELFCHECK_NAME_FLAGS.get(runner or "")
-            if flag is None:
-                _selfcheck_say("SELF-CHECK ERROR: this repository's test runner "
-                      "takes no test-name filter here; name set files "
-                      "instead")
+        # Each file runs through the channel that confirmed it: a probe
+        # confirmed through the browser suite through the suite's own
+        # command, every other file through the test command (DESIGN §8 *A
+        # probe is re-run through the channel that confirmed it*).
+        sc = cfg.get("suite") or None
+        on_suite = set((sc or {}).get("files") or [])
+        groups = [g for g in ([f for f in run if f not in on_suite],
+                              [f for f in run if f in on_suite]) if g]
+        runs: list[tuple[str, dict[str, str], list[str]]] = []
+        for files in groups:
+            genv: dict[str, str] = {}
+            if files[0] in on_suite:
+                cmd, path_env = _runner_command(
+                    _browser_suite_cmd(sc, files), str(snap),
+                    _RUNNER_REPORTS, files)
+                genv.update(path_env or {})
+                genv.update(sc.get("env") or {})
+            else:
+                cmd = _acceptance_cmd(
+                    types.SimpleNamespace(repo_root=Path(cfg["repo_root"])),
+                    files, str(snap))
+            if not cmd:
+                _selfcheck_say("SELF-CHECK ERROR: no test command here can "
+                               "run these files")
                 rc = 2
                 return rc
-            extra += [flag, name]
-        extra += rest
-        if extra:
-            placed = (_append_runner_flags(
-                cmd, runner, run, " ".join(shlex.quote(x) for x in extra))
-                if runner else None)
-            if placed is None:
-                _selfcheck_say("SELF-CHECK ERROR: those arguments cannot be passed "
-                      "to this repository's test runner")
-                rc = 2
-                return rc
-            cmd = placed
-        try:
-            run_argv = _blt_shell_argv(cmd, cfg.get("forbidden") or [])
-        except ForbiddenByTask as e:
-            _selfcheck_say(f"SELF-CHECK ERROR: {e}")
-            rc = 2
-            return rc
-        env = {**_repo_command_env(), **(cfg.get("env") or {}),
-               "GIT_CEILING_DIRECTORIES": str(root)}
-        _selfcheck_say(f"SELF-CHECK: {cmd}")
+            runner = _acceptance_runner(cmd, _RUNNER_REPORTS, files)
+            extra: list[str] = []
+            if name is not None:
+                flag = _SELFCHECK_NAME_FLAGS.get(runner or "")
+                if flag is None:
+                    _selfcheck_say("SELF-CHECK ERROR: this repository's test "
+                                   "runner takes no test-name filter here; "
+                                   "name set files instead")
+                    rc = 2
+                    return rc
+                extra += [flag, name]
+            extra += rest
+            if extra:
+                placed = (_append_runner_flags(
+                    cmd, runner, files,
+                    " ".join(shlex.quote(x) for x in extra))
+                    if runner else None)
+                if placed is None:
+                    _selfcheck_say("SELF-CHECK ERROR: those arguments cannot "
+                                   "be passed to this repository's test "
+                                   "runner")
+                    rc = 2
+                    return rc
+                cmd = placed
+            runs.append((cmd, genv, files))
+        # One budget for the whole call, whichever channels it runs.
+        end = time.monotonic() + float(cfg.get("timeout") or 1800)
         t1 = time.monotonic()
-        # Its own process group, killed whole on every way out: a runner's
-        # children (a worker pool, a wrapper's server) would otherwise
-        # outlive the copy they run in.
-        proc = subprocess.Popen(run_argv, cwd=snap, env=env,
-                                start_new_session=True)
-        try:
-            rc = proc.wait(timeout=float(cfg.get("timeout") or 1800))
-        except subprocess.TimeoutExpired:
-            _selfcheck_say("SELF-CHECK: the runner timed out")
-            rc = 124
-        finally:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=10)
+        # The call's exit only once its runs end: a signal mid-run leaves
+        # it unset (99), never a pass.
+        got = 0
+        refused = False
+        for cmd, genv, files in runs:
+            # The one gate every launch of a repository command passes
+            # (DESIGN §9 *A command the task forbids*), the suite's own
+            # command as much as the test command: a channel whose command
+            # the task forbids is never launched, and its files have no
+            # verdict — never a pass.
+            try:
+                run_argv = _blt_shell_argv(cmd, cfg.get("forbidden") or [])
+            except ForbiddenByTask as e:
+                refused = True
+                rec["forbidden"] = str(e)
+                rec.setdefault("unmeasured", {}).update(
+                    {f: "forbidden_by_task" for f in files})
+                _selfcheck_say(f"SELF-CHECK UNMEASURED: {', '.join(files)} "
+                               f"not run — {e}")
+                continue
+            env = {**_repo_command_env(), **(cfg.get("env") or {}), **genv,
+                   "GIT_CEILING_DIRECTORIES": str(root)}
+            _selfcheck_say(f"SELF-CHECK: {cmd}")
+            # Its own process group, killed whole on every way out: a
+            # runner's children (a worker pool, a wrapper's server) would
+            # otherwise outlive the copy they run in.
+            proc = subprocess.Popen(run_argv, cwd=snap, env=env,
+                                    start_new_session=True)
+            try:
+                one = proc.wait(timeout=max(1.0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _selfcheck_say("SELF-CHECK: the runner timed out")
+                one = 124
+            finally:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=10)
+            # The call fails when any channel's run failed: its first
+            # failing exit is the call's.
+            if got == 0:
+                got = one
+            if one == 124:
+                break
+        # A refused channel leaves the call without a verdict for its files:
+        # never read as passed (exit 2, which reports neither).
+        rc = 2 if refused and got == 0 else got
         rec["secs_run"] = round(time.monotonic() - t1, 2)
         return rc
     finally:
@@ -66488,13 +66623,16 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
         if "falsifier" not in set((prior.get(i) or {}).get("by") or []):
             continue
         fi = (rows.get(i) or {}).get("falsifier") or {}
-        saved = next((s_.get("probe_saved") for s_ in fi.get("samples") or []
-                      if isinstance(s_, dict) and s_.get("probe_saved")),
-                     None)
+        smp = next((s_ for s_ in fi.get("samples") or []
+                    if isinstance(s_, dict) and s_.get("probe_saved")), {})
+        saved = smp.get("probe_saved")
         still = True
         if isinstance(saved, dict) and saved.get("file"):
-            probe = _falsifier_probe_set(i, saved.get("dir"),
-                                         saved["file"])
+            # Through the channel that confirmed it (DESIGN §8 *A probe is
+            # re-run through the channel that confirmed it*).
+            probe = _falsifier_probe_set(
+                i, saved.get("dir"), saved["file"],
+                via_browser_suite=bool(smp.get("via_browser_suite")))
             res = await _evaluate_acceptance_sets(
                 st, caps, str(staging), [probe], f"redrive-probe-i{i}")
             r = res[0] if res else {"unmeasured": True}
@@ -66963,6 +67101,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("defects_driven", [])
     rec.setdefault("contested_probes", [])
     rec.setdefault("probe_objections", [])
+    # The browser suite's prerequisites run in staging once per pass.
+    suite_prepared: set[str] = set()
     st.data["current_phase"] = "phase 5: delivery re-drive"
     acc = st.data.get("acceptance") or {}
     all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
@@ -67016,7 +67156,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             dg.get("items") or [],
             shown_idx={s_.get("index") for s_ in shown},
             contested=set(_redrive_contests_by_item(
-                rec["contested_probes"])))
+                rec["contested_probes"])),
+            suite=_browser_suite(st))
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).
@@ -67260,6 +67401,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             effort = (EFFORT_REDRIVE_ESCALATION if escalate
                       else efforts.get("implementer"))
             try:
+                suite = _browser_suite(st)
+                if suite is not None and any(p_.get("via_browser_suite")
+                                             for p_ in probe_sets):
+                    # A probe confirmed through the browser suite runs
+                    # through it in the fixer's self-check, over a copy of
+                    # staging that shares its ignored paths and its tree
+                    # stores: the suite's prerequisites (a code generator,
+                    # the runner's browser) set staging up, as they set up
+                    # the checkout it was confirmed in (DESIGN §8 *A probe
+                    # is re-run through the channel that confirmed it*).
+                    await _ci_prepare(staging, [_browser_suite_rec(suite)],
+                                      st, caps, "redrive", done=suite_prepared)
                 if shown or probe_sets:
                     sc = _selfcheck_prepare(st, caps, staging, shown,
                                             label, probes=probe_sets)
@@ -74447,10 +74600,15 @@ def _unmet_copy(st: "State", dst: Path, src_dir: object,
 
 
 def _unmet_attach(st: "State", entry: dict, dst: Path,
-                  text: str | None) -> None:
+                  text: str | None,
+                  suite: dict | None | bool = None) -> None:
     """Add to one `unmet_evidence` entry where its file's full copy is, a
     bounded excerpt of its source around its first failing line, and the
-    repository's own command for it, when one renders."""
+    repository's own command for it, when one renders: through the channel
+    that confirmed it (`suite`, `_acceptance_set_suite`: the browser
+    suite's command for a probe confirmed through it, none when the run has
+    no such channel; DESIGN §8 *A probe is re-run through the channel that
+    confirmed it*)."""
     rel = entry["file"]
     if text is None:
         return
@@ -74466,8 +74624,11 @@ def _unmet_attach(st: "State", entry: dict, dst: Path,
     entry["excerpt_start"] = start
     entry["excerpt"] = [t[:_UNMET_LINE_MAX] for t in
                         lines[start - 1:start - 1 + _UNMET_SOURCE_LINES]]
+    if suite is False:
+        return
     try:
-        cmd = _acceptance_cmd(st, [rel], None, {rel: str(dst / rel)})
+        cmd = (_browser_suite_cmd(suite, [rel]) if suite is not None
+               else _acceptance_cmd(st, [rel], None, {rel: str(dst / rel)}))
     except Exception:
         cmd = None
     if cmd:
@@ -74550,7 +74711,7 @@ def _collect_unmet_evidence(st: "State",
                 {"kind": str(o.get("kind") or ""),
                  "reason": str(o.get("reason") or "")[:_UNMET_MESSAGE_MAX]}
                 for o in objections[i]]
-        _unmet_attach(st, entry, dst, text)
+        _unmet_attach(st, entry, dst, text, _acceptance_set_suite(st, s_))
         entries.append(entry)
     acc = st.data.get("acceptance")
     acc = acc if isinstance(acc, dict) else {}

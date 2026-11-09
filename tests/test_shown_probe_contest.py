@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,75 @@ PROBE_SRC = ("from calc import add\n\n\n"
              "    assert add(2, 3) == 5\n")
 SET_REL = "acc/test_d.py"
 
+# The repository's browser suite (DESIGN §8 *A repository's browser suite is a
+# channel the run provisions*): a stand-in for `playwright test` that runs only
+# as the suite runs it — the CI's environment (`CI=true`) and its project — and
+# writes a Playwright-shaped JSON report where the runner's environment says.
+# A spec's case passes when the file its `// probe:` line names holds the text
+# it names. It runs only in a tree its prerequisite (`SUITE_PREP`, as a code
+# generator or the runner's browser install would) set up. Shell builtins
+# only: neither script calls a program on PATH.
+SUITE_RUNNER_REL = "bin/playwright"
+SUITE_PREP_REL = "bin/suite-prep"
+SUITE_READY = ".suite-ready"
+SUITE_PREP = f"#!/bin/bash\nprintf 'ready\\n' > {SUITE_READY}\n"
+SUITE_RUNNER = r"""#!/bin/bash
+[[ $CI == true ]] || exit 64
+[[ -f .suite-ready ]] || exit 65
+proj= files=() skip=
+for a in "$@"; do
+  if [[ $skip ]]; then skip=; continue; fi
+  case $a in
+    --project=chromium) proj=1 ;;
+    -g|--grep) skip=1 ;;
+    test|-*) ;;
+    *) files+=("$a") ;;
+  esac
+done
+[[ $proj ]] || exit 64
+specs= rc=0
+for f in "${files[@]}"; do
+  title= src= want= at=0 n=0
+  while IFS= read -r line; do
+    n=$((n + 1))
+    [[ $line =~ ^test\(\"([^\"]*)\" ]] && title=${BASH_REMATCH[1]}
+    [[ $line =~ ^//\ probe:\ ([^ ]+)\ (.*)$ ]] && \
+      { src=${BASH_REMATCH[1]}; want=${BASH_REMATCH[2]}; }
+    [[ $line == *expect\(* ]] && at=$n
+  done < "$f"
+  ok=
+  while IFS= read -r line; do
+    [[ $line == *"$want"* ]] && ok=1
+  done < "$src"
+  if [[ $ok ]]; then
+    t='{"projectName":"chromium","status":"expected","results":[{"status":"passed"}]}'
+  else
+    rc=1
+    t='{"projectName":"chromium","status":"unexpected","results":[{"status":"failed","error":{"message":"Error: expect(received).toBe(expected)\n    at '"$PWD/$f:$at"':3"}}]}'
+  fi
+  specs+="${specs:+,}"'{"title":"'"$f"'","file":"'"$f"'","specs":[{"title":"'"$title"'","file":"'"$f"'","tests":['"$t"']}]}'
+done
+[[ $PLAYWRIGHT_JSON_OUTPUT_FILE ]] && \
+  printf '{"config":{"rootDir":"%s"},"errors":[],"suites":[%s]}' \
+    "$PWD" "$specs" > "$PLAYWRIGHT_JSON_OUTPUT_FILE"
+exit $rc
+"""
+SPEC_REL = "e2e/probe-falsify/add.spec.ts"
+SPEC_SRC = ('import { expect, test } from "@playwright/test";\n'
+            "// probe: calc.py return a + b\n"
+            'test("add returns the sum on screen", async ({ page }) => {\n'
+            "  expect(await page.locator('#sum').innerText()).toBe('5');\n"
+            "});\n")
+SPEC_CASE = f"{SPEC_REL} :: add returns the sum on screen"
+SUITE = {"check_id": "e2e", "argv": [SUITE_RUNNER_REL, "test",
+                                     "--project=chromium"],
+         "runner": "playwright",
+         "template": f"{SUITE_RUNNER_REL} test --project=chromium "
+                     "{test_files}",
+         "env": [], "prerequisites": [{"argv": [SUITE_PREP_REL], "cwd": "."}],
+         "requires": ["browser"],
+         "source": {}, "viable": True}
+
 
 @pytest.fixture(autouse=True)
 def _quiet_host(leerie, monkeypatch):
@@ -71,10 +142,14 @@ class World:
     `s1` owning `calc.py`; one shown held-out set, passing; required item
     0 unmet on a confirmed falsifier probe from shown-only leads,
     `add(2, 3) == 5`. With `pin_added_by_run`, the pinning test is not on
-    the base: the run's own subtask added it."""
+    the base: the run's own subtask added it. With `via_suite`, the probe
+    is a spec the falsifier confirmed through the repository's browser
+    suite (`SUITE_RUNNER`), which the plain test command cannot run; with
+    `channel` false, the run has no browser channel."""
 
     def __init__(self, leerie, tmp_path: Path, *,
-                 pin_added_by_run: bool = False, via_suite: bool = False):
+                 pin_added_by_run: bool = False, via_suite: bool = False,
+                 channel: bool = True):
         self.L = leerie
         repo = tmp_path / "repo"
         (repo / "tests").mkdir(parents=True)
@@ -88,12 +163,18 @@ class World:
         (repo / KEPT_REL).write_text(KEPT_SRC)
         if not pin_added_by_run:
             (repo / PIN_REL).write_text(PIN_SRC)
+        (repo / "bin").mkdir()
+        for rel, text in ((SUITE_RUNNER_REL, SUITE_RUNNER),
+                          (SUITE_PREP_REL, SUITE_PREP)):
+            (repo / rel).write_text(text)
+            (repo / rel).chmod(0o755)
         (repo / ".leerie").mkdir()
         (repo / ".leerie" / "config.toml").write_text(
             'test_scoped = "python3 -m pytest -q -p no:cacheprovider '
             '{test_files}"\n'
             'test = "python3 -m pytest -q -p no:cacheprovider tests"\n')
-        (repo / ".gitignore").write_text("__pycache__/\n.leerie/\n")
+        (repo / ".gitignore").write_text(
+            f"__pycache__/\n.leerie/\n{SUITE_READY}\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-qm", "base")
         base = _git(repo, "rev-parse", "HEAD")
@@ -119,8 +200,10 @@ class World:
                       "defect_files": [SET_REL], "control_files": [],
                       "support_files": [], "cases": {SET_REL: ["test_d"]}}]
         probe_dir = st.run_dir / "acceptance" / "probes" / "i0"
-        (probe_dir / PROBE_REL).parent.mkdir(parents=True)
-        (probe_dir / PROBE_REL).write_text(PROBE_SRC)
+        self.probe_rel = SPEC_REL if via_suite else PROBE_REL
+        (probe_dir / self.probe_rel).parent.mkdir(parents=True)
+        (probe_dir / self.probe_rel).write_text(
+            SPEC_SRC if via_suite else PROBE_SRC)
         evidence = (f"a falsifier probe of the item's words \"{ITEM}\" "
                     "fails under B* on the final tree")
         row = {"item_index": 0, "verdict": "unmet", "by": ["falsifier"],
@@ -131,7 +214,7 @@ class World:
                     "assertion_quote": "    assert add(2, 3) == 5",
                     "reason": "add subtracts",
                     "probe_saved": {"dir": str(probe_dir),
-                                    "file": PROBE_REL},
+                                    "file": self.probe_rel},
                     **({"via_browser_suite": True} if via_suite else {})}]}}
         plan = {"subtasks": {"s1": {
             "id": "s1", "title": "Fix add", "intent": "make add sum",
@@ -153,6 +236,8 @@ class World:
                 "items": [row], "final_sha": head},
             "acceptance": {"validity_base": base, "sets": self.sets,
                            "gate": {}}}
+        if via_suite and channel:
+            st.data["ci_parity"] = {"browser_suite": dict(SUITE)}
         st.save()
         # The run's own repository (DESIGN §6 *The run's own repository*),
         # with staging on the run branch, as setup-run.sh leaves it.
@@ -196,6 +281,7 @@ class World:
             assert kw["schema_key"] == "implementer", kw["schema_key"]
             world.calls.append({"prompt": kw["user_prompt"],
                                 "cwd": kw["cwd"]})
+            world.kw = kw
             edit = world.edits.pop(0) if world.edits else None
             if edit:
                 edit(world)
@@ -400,15 +486,158 @@ def test_the_pr_shows_the_conflict_and_the_objection(
     assert section.index(f"### Item 0: `{PROBE_REL}`") < section.index(head)
 
 
-def test_a_probe_confirmed_through_the_browser_suite_is_not_shown(
+def _selfcheck(w, *args: str) -> subprocess.CompletedProcess:
+    """The fixer's self-check, as its shell runs it: the command the note
+    names, with the PATH and environment the drive gave the worker."""
+    kw = w.kw
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+    env.update(kw.get("env_extra") or {})
+    cmd = str(Path(kw["selfcheck_dir"]) / "bin" / "leerie-selfcheck")
+    assert f"  {cmd}\n" in kw["user_prompt"]
+    return subprocess.run([cmd, *args], cwd=kw["cwd"], capture_output=True,
+                          text=True, env=env, timeout=300)
+
+
+SUITE_LINE = f"SELF-CHECK: {SUITE_RUNNER_REL} test --project=chromium {SPEC_REL}"
+
+
+def test_a_suite_probe_is_shown_and_every_rerun_goes_through_the_suite(
         leerie, tmp_path, monkeypatch):
-    """A probe the falsifier ran and confirmed through the repository's
-    browser suite is not shown: the fixer's self-check runs the test
-    command only, so it could not run the probe as it was confirmed, and
-    neither its progress nor a conflict could be read through that command.
-    It stays unreproducible, as before shown probes: never driven, never
-    contested."""
+    """A probe the falsifier confirmed through the repository's browser
+    suite (DESIGN §8 *A probe is re-run through the channel that confirmed
+    it*): handed to the fixer, run through the suite by its self-check
+    (failing on the shipped tree, passing on its uncommitted fix), re-run
+    through the suite on its commit (the progress read), and by the
+    re-check, which makes the item met. The test command cannot run the
+    spec at all: through it, none of these could be read."""
     w = World(leerie, tmp_path, via_suite=True)
+    out: list = []
+
+    def fixer(w):
+        out.append(_selfcheck(w))
+        (w.staging / "calc.py").write_text(FITTED)
+        out.append(_selfcheck(w))
+        out.append(_selfcheck(w, "add.spec.ts"))
+        w.commit({"calc.py": FITTED})
+    w.edits = [fixer]
+    rec = w.run(monkeypatch)
+    assert len(w.calls) == 1
+    # Shown: the note names the spec as a probe in the self-check.
+    assert SPEC_REL in w.calls[0]["prompt"]
+    before, after, alone = out
+    # Both channels, each with its own command: the shown set through the
+    # test command, the probe through the suite.
+    assert "python3 -m pytest" in before.stdout and SUITE_LINE in before.stdout
+    assert before.returncode == 1, before.stdout
+    assert "SELF-CHECK FAILED" in before.stdout
+    assert after.returncode == 0 and "SELF-CHECK PASSED" in after.stdout, (
+        after.stdout)
+    # Naming the probe runs it alone, through the suite.
+    assert alone.returncode == 0 and SUITE_LINE in alone.stdout
+    assert "pytest" not in alone.stdout
+    [g] = _groups(rec)
+    assert g["probes_after"] == {"0": "pass"}
+    assert not g.get("rolled_back") and not g["zero_progress"]
+    assert _git(w.staging, "show", "HEAD:calc.py") == FITTED.rstrip("\n")
+    # The re-check re-ran the probe through the suite: the item is met.
+    assert w.st.data["delivery_gate"]["unmet_final"] == []
+
+
+def test_a_suite_probe_still_failing_is_measured_failing(
+        leerie, tmp_path, monkeypatch):
+    """A commit that leaves the spec failing is read so through the suite:
+    `fail`, a measured verdict, so the group is zero progress — never
+    `unmeasured`, which is what the test command gives a spec."""
+    w = World(leerie, tmp_path, via_suite=True)
+    w.edits = [lambda w: w.commit({"calc.py": TIDIED}),
+               lambda w: w.commit({"calc.py": TIDIED + "# again\n"})]
+    rec = w.run(monkeypatch)
+    for g in _groups(rec):
+        assert g["probes_after"] == {"0": "fail"}
+        assert g["zero_progress"] is True and g["rolled_back"] is True
+    assert len(w.calls) == 2
+    # The `fail` is the suite's: every run of the probe on a commit went
+    # through its command (the test command fails a spec it cannot load on
+    # every tree, which reads the same).
+    logs = leerie._held_out_logs(w.st.run_dir)
+    for rnd in (1, 2):
+        text = (logs / f"acceptance-redrive-r{rnd}g0-probes.log").read_text()
+        assert f"{SUITE_RUNNER_REL} test --project=chromium {SPEC_REL}" in text
+        assert "-m pytest" not in text
+    assert [u["item_index"] for u in
+            w.st.data["delivery_gate"]["unmet_final"]] == [0]
+
+
+def test_a_suite_probe_that_conflicts_with_an_existing_test_is_contested(
+        leerie, tmp_path, monkeypatch):
+    """The conflict is measured through the suite too: the spec passes on
+    the commit while the existing test it breaks fails, so the group is
+    rolled back and the probe recorded contested; the PR names the suite's
+    own command for it."""
+    w = World(leerie, tmp_path, via_suite=True)
+    w.edits = [lambda w: w.commit({"calc.py": HONEST})]
+    rec = w.run(monkeypatch)
+    [g] = _groups(rec)
+    assert g["probes_after"] == {"0": "pass"}
+    assert g["rolled_back"] is True
+    [c] = rec["contested_probes"]
+    assert c["probe_test_file"] == SPEC_REL
+    assert [t["file"] for t in c["tests"]] == [PIN_REL]
+    assert len(w.calls) == 1
+    leerie._decide_outcome(w.st, any_commits=True)
+    leerie._record_unmet_evidence(w.st)
+    [e] = [x for x in w.st.data["unmet_evidence"]["entries"]
+           if x.get("kind") == "falsifier"]
+    assert e["cmd"] == f"{SUITE_RUNNER_REL} test --project=chromium {SPEC_REL}"
+
+
+def test_a_suite_command_the_task_forbids_never_launches(
+        leerie, tmp_path, monkeypatch):
+    """DESIGN §9 *A command the task forbids*: the suite's own command goes
+    through the one gate wherever a probe is re-run. With the task
+    forbidding it, the fixer's self-check runs the test-command channel and
+    never launches the suite's, saying so, with no pass for the probe and a
+    typed record of why; the commit's re-run and the re-check launch it
+    neither, and give no verdict, so the item stays unmet."""
+    w = World(leerie, tmp_path, via_suite=True)
+    w.st.data["process_constraints"] = {
+        "forbidden_commands": [SUITE_RUNNER_REL]}
+    w.st.save()
+    out: list = []
+
+    def fixer(w):
+        (w.staging / "calc.py").write_text(FITTED)
+        out.append(_selfcheck(w))
+        w.commit({"calc.py": FITTED})
+    w.edits = [fixer]
+    rec = w.run(monkeypatch)
+    [r] = out
+    assert r.returncode == 2, r.stdout
+    assert "SELF-CHECK PASSED" not in r.stdout
+    assert SUITE_LINE not in r.stdout
+    assert "python3 -m pytest" in r.stdout          # the other channel ran
+    assert (f"SELF-CHECK UNMEASURED: {SPEC_REL} not run — the task forbids "
+            f"`{SUITE_RUNNER_REL}`") in r.stdout
+    g = _groups(rec)[0]
+    [call] = g["selfcheck_calls"]
+    assert call["rc"] == 2
+    assert call["unmeasured"] == {SPEC_REL: "forbidden_by_task"}
+    assert call["forbidden"] == f"the task forbids `{SUITE_RUNNER_REL}`"
+    # Leerie's own re-runs: gated too, no verdict, never launched.
+    assert g["probes_after"] == {"0": "unmeasured"}
+    assert [u["item_index"] for u in
+            w.st.data["delivery_gate"]["unmet_final"]] == [0]
+    for log in leerie._held_out_logs(w.st.run_dir).glob("*.log"):
+        assert f"{SUITE_RUNNER_REL} test" not in log.read_text(), log
+
+
+def test_a_suite_probe_in_a_run_without_the_channel_is_not_shown(
+        leerie, tmp_path, monkeypatch):
+    """With no browser channel in the run, nothing can run the probe as it
+    was confirmed: it is not shown, never driven or contested, and a
+    re-run of it gives no verdict rather than the test command's."""
+    w = World(leerie, tmp_path, via_suite=True, channel=False)
     w.edits = [lambda w: w.commit({"calc.py": HONEST})]
     rec = w.run(monkeypatch)
     assert w.calls == []
@@ -416,6 +645,13 @@ def test_a_probe_confirmed_through_the_browser_suite_is_not_shown(
     assert [(u["item_index"], u["reason"]) for u in
             rec["unrouted_items"]] == [(0, "unreproducible")]
     assert _git(w.staging, "rev-parse", "HEAD") == w.head
+    probe = leerie._falsifier_probe_set(
+        0, str(w.st.run_dir / "acceptance" / "probes" / "i0"), SPEC_REL,
+        via_browser_suite=True)
+    [r] = asyncio.run(leerie._evaluate_acceptance_sets(
+        w.st, w._caps(), str(w.staging), [probe], "nochannel"))
+    assert r["unmeasured"] is True
+    assert r["unmeasured_reason"] == "no_browser_suite"
 
 
 def test_the_implementer_schema_types_the_objection(leerie):
