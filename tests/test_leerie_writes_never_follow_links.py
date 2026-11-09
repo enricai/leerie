@@ -469,7 +469,12 @@ _LEERIE_ONLY = {
 _CONFINED = {
     # Runs inside a confined worker's process tree (the re-drive's
     # self-check, `scripts/selfcheck.py`), under that worker's grant.
-    "selfcheck_main", "_share_ignored_paths",
+    "selfcheck_main",
+    # The same, and leerie's making of the pr_reviewer's checkout: every
+    # step relative to an open directory, following no link
+    # (`_share_ignored_paths`, DESIGN §8 *The self-check's copy is a tree
+    # of its own*).
+    "_link_entry_at",
 }
 
 

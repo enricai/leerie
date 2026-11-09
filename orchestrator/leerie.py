@@ -13197,8 +13197,9 @@ def _run_scratch_names() -> tuple[str, ...]:
     # The run's stores too: a resumed process installs again, cold, rather
     # than every finished run keeping a store until it is pruned (DESIGN §6
     # *The stores a view installs from are leerie's*).
+    # A self-check's copies too: one outlives only a killed call.
     return (MEASURE_DIRNAME, f"worktrees/{STORES_HOME_NAME}",
-            CLONE_GITS_NAME)
+            f"worktrees/{SELFCHECK_COPIES_NAME}", CLONE_GITS_NAME)
 
 
 def _release_run_dir(run_dir: Path) -> bool:
@@ -25703,7 +25704,8 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     readable. A worker whose prompt
     reads the run's specs and notes reads `subtasks/`, `task.md` and
     `notes/`; `notes_id` names its own notes directory, written. The re-drive's
-    self-check directory (`selfcheck_dir`) is read, its `run/` written."""
+    self-check directory (`selfcheck_dir`) is read, its `run/` written, and
+    its copies (`_selfcheck_copies`) written."""
     run_dir = Path(run_dir).resolve()
     state_root = run_dir.parent.parent
     cwd_r = Path(cwd).resolve()
@@ -25767,6 +25769,10 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         (sc / "run").mkdir(mode=0o700, parents=True, exist_ok=True)
         ro.append(str(sc))
         rw.append(str(sc / "run"))
+        # Its copies, beneath the link root with the tree they copy.
+        copies = _selfcheck_copies(run_dir, sc.name)
+        _mkdir_private(copies, run_dir)
+        rw.append(str(copies))
     # The stores of a tree leerie installed for, as the tree itself is
     # granted: the worker sees that install (DESIGN §6 *A worker started in
     # a tree leerie installed for runs on that tree's stores*).
@@ -25986,6 +25992,18 @@ def _stores_home(run_dir: str | Path) -> Path:
     """`<run-dir>/worktrees/.stores`: where every store a tree installs
     from lives."""
     return Path(run_dir) / TREES_DIRNAME / STORES_HOME_NAME
+
+
+# The re-drive's self-check makes its copies of a tree beside the trees, on
+# their one mount, so a copy hard-links its tree's ignored files (DESIGN §8
+# *The self-check's copy is a tree of its own*).
+SELFCHECK_COPIES_NAME = ".selfcheck"
+
+
+def _selfcheck_copies(run_dir: str | Path, label: str) -> Path:
+    """`<run-dir>/worktrees/.selfcheck/<label>`: where the self-check of the
+    group `label` makes its copies (its config's `snap_root`)."""
+    return Path(run_dir) / TREES_DIRNAME / SELFCHECK_COPIES_NAME / label
 _MEASURE_ID_FILE = "leerie-measure-id"
 _MEASURE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _MEASURE_SUBDIRS = ("mise-state", "reports", "coverage")
@@ -52794,9 +52812,9 @@ async def _judge_checkout(st: "State", staging: Path, name: str, *,
     `grep -r`/`cat`, and anything a worker runs there is left in a tree
     leerie measures. No install unless `share_ignored` (the pr_reviewer,
     which runs the repo's build and test verbs): then staging's ignored
-    paths are symlinked in (`_share_ignored_paths`). Raises WorkerError
-    when the checkout cannot be made — the worker read nothing, so it takes
-    its crash path."""
+    paths are made the checkout's own (`_share_ignored_paths`). Raises
+    WorkerError when the checkout cannot be made — the worker read nothing,
+    so it takes its crash path."""
     head = rev or await _branch_head_sha(str(staging))
     wt = _helper_worktree_path(st, name)
     # A checkout of the run repository, never of staging's own repository,
@@ -63979,6 +63997,7 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     runner takes one."""
     root = st.run_dir / "selfcheck" / label
     _rmtree_owned(root)
+    _rmtree_owned(_selfcheck_copies(st.run_dir, label))
     sets: list[dict] = []
     probe_paths: dict[int, str] = {}
     suite_files: set[str] = set()
@@ -64023,9 +64042,10 @@ def _selfcheck_prepare(st: "State", caps: dict, staging: Path,
     flags = {_SELFCHECK_NAME_FLAGS.get(r or "") for r in runners}
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
+    (root / "run").mkdir(mode=0o700, exist_ok=True)
     cfg = {"tree": str(staging), "repo_root": str(st.repo_root),
            "sets": sets, "run_files": run_files,
-           "snap_root": str(root / "run"),
+           "snap_root": str(_selfcheck_copies(st.run_dir, label)),
            "env": {}, "suite": suite_cfg,
            "forbidden": _forbidden_specs(getattr(st, "data", None)),
            "timeout": float(caps.get("worker_timeout_sec",
@@ -64064,7 +64084,9 @@ def _selfcheck_calls(sc: dict) -> list[dict]:
 
 def _selfcheck_cleanup(sc: dict | None) -> None:
     if sc:
-        _rmtree_owned(Path(sc["dir"]))
+        d = Path(sc["dir"])
+        _rmtree_owned(d)
+        _rmtree_owned(_selfcheck_copies(d.parent.parent, d.name))
 
 
 def _selfcheck_args(args: list[str], run_files: list[str]
@@ -64148,28 +64170,117 @@ def _selfcheck_snapshot(tree: str, snap: Path) -> int:
     return len(files)
 
 
+# Why a link cannot be made, where a copy of the file's bytes is the same
+# tree: two mounts (`EXDEV`), a file the process may not link
+# (`protected_hardlinks`: `EPERM`), an inode at its link limit (`EMLINK`).
+_NO_LINK_ERRNOS = (errno.EXDEV, errno.EPERM, errno.EMLINK)
+
+
+def _link_entry_at(sfd: int, dfd: int, name: str, counts: dict) -> None:
+    """`name` in the directory `sfd` made in `dfd` as the same tree: a
+    directory as a directory of its own (`_link_tree_at`), a link as the
+    same link, anything else as a hard link to the same file — its bytes
+    copied when the filesystem cannot link it (`_NO_LINK_ERRNOS`), a
+    regular file only. Follows no link: every step is relative to an open
+    directory, so a link planted mid-walk names no other file."""
+    st_ = os.stat(name, dir_fd=sfd, follow_symlinks=False)
+    if stat.S_ISLNK(st_.st_mode):
+        os.symlink(os.readlink(name, dir_fd=sfd), name, dir_fd=dfd)
+        return
+    if stat.S_ISDIR(st_.st_mode):
+        os.mkdir(name, 0o700, dir_fd=dfd)
+        s2 = os.open(name, _DIR_NOFOLLOW, dir_fd=sfd)
+        try:
+            d2 = os.open(name, _DIR_NOFOLLOW, dir_fd=dfd)
+            try:
+                _link_tree_at(s2, d2, counts)
+                os.chmod(d2, stat.S_IMODE(st_.st_mode) | 0o700)
+            finally:
+                os.close(d2)
+        finally:
+            os.close(s2)
+        return
+    try:
+        os.link(name, name, src_dir_fd=sfd, dst_dir_fd=dfd,
+                follow_symlinks=False)
+        counts["linked"] += 1
+        return
+    except OSError as e:
+        if e.errno not in _NO_LINK_ERRNOS or not stat.S_ISREG(st_.st_mode):
+            raise
+    src = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                  dir_fd=sfd)
+    try:
+        dst = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      stat.S_IMODE(st_.st_mode), dir_fd=dfd)
+        try:
+            with open(src, "rb", closefd=False) as fi, \
+                    open(dst, "wb", closefd=False) as fo:
+                shutil.copyfileobj(fi, fo, 1 << 20)
+        finally:
+            os.close(dst)
+    finally:
+        os.close(src)
+    counts["copied"] += 1
+
+
+def _link_tree_at(sfd: int, dfd: int, counts: dict) -> None:
+    """Every entry of the open directory `sfd` made in `dfd`
+    (`_link_entry_at`)."""
+    with os.scandir(sfd) as it:
+        names = [e.name for e in it]
+    for name in names:
+        _link_entry_at(sfd, dfd, name, counts)
+
+
 def _share_ignored_paths(tree: str | Path, snap: Path,
-                         set_files: Iterable[str] = ()) -> list[str]:
-    """Symlink every ignored path of `tree` (`node_modules`, nested ones, a
-    generated client, build output) into `snap`, so nothing is installed
-    or generated there — except a path that is one of `set_files` or holds
-    one (the self-check's sets: a set file placed through such a link would
-    be written into `tree`)."""
+                         set_files: Iterable[str] = ()) -> dict:
+    """Give `snap` every ignored path of `tree` (`node_modules`, nested
+    ones, a generated client, build output) as part of its own tree, so
+    nothing is installed or generated there: each directory a directory of
+    `snap`'s, each file a hard link to `tree`'s, each link the same link
+    (DESIGN §8 *The self-check's copy is a tree of its own*). Never a link
+    out of `snap`: a tool that takes its directory as its root refuses a
+    path that resolves outside it (Turbopack: "Symlink [project]/node_modules
+    is invalid, it points out of the filesystem root"). Skipped: a path
+    that is one of `set_files` or holds one (the self-check's sets: one
+    placed over a linked file would be written into `tree`'s), and one that
+    holds `snap` itself. Returns `{paths, linked, copied}`: the paths
+    shared, the files linked, and those whose bytes were copied because
+    the filesystem could not link them (`_NO_LINK_ERRNOS`)."""
     set_files = list(set_files)
-    linked: list[str] = []
+    tree = Path(tree)
+    snap_real = os.path.realpath(snap)
+    out: dict = {"paths": [], "linked": 0, "copied": 0}
     for rel in _untracked_listing(tree, which="ignored",
                                   directory=True) or []:
         rel = rel.rstrip("/")
         if not rel or any(f == rel or f.startswith(rel + "/")
                           for f in set_files):
             continue
-        dst = snap / rel
-        if dst.exists() or dst.is_symlink():
+        held = os.path.realpath(tree / rel)
+        if snap_real == held or snap_real.startswith(held + os.sep):
             continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(Path(tree) / rel, dst)
-        linked.append(rel)
-    return linked
+        if os.path.lexists(snap / rel):
+            continue
+        parent, name = posixpath.split(rel)
+        try:
+            sfd = _open_dir_beneath(tree, tree / parent)
+        except OSError:
+            continue                    # gone, or a link on the way
+        try:
+            dfd = _open_dir_beneath(snap, snap / parent, make=True)
+            try:
+                _link_entry_at(sfd, dfd, name, out)
+            except FileNotFoundError:
+                continue                # gone since it was listed
+            finally:
+                os.close(dfd)
+        finally:
+            os.close(sfd)
+        out["paths"].append(rel)
+    return out
 
 
 def _selfcheck_say(msg: str) -> None:
@@ -64217,7 +64328,9 @@ def selfcheck_main(argv: list[str]) -> int:
     rc = 99
     try:
         rec["files"] = _selfcheck_snapshot(tree, snap)
-        rec["shared"] = len(_share_ignored_paths(tree, snap, set_files))
+        shared = _share_ignored_paths(tree, snap, set_files)
+        rec["shared"] = len(shared["paths"])
+        rec["linked"], rec["copied"] = shared["linked"], shared["copied"]
         rec["secs_snapshot"] = round(time.monotonic() - t0, 2)
         collide = [f for f in set_files
                    if (snap / f).exists() or (snap / f).is_symlink()]
@@ -67077,6 +67190,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         # A crash mid-group: what it left is unknown, so it is undone; its
         # self-check directory (never in staging) goes too.
         _rmtree_owned(st.run_dir / "selfcheck")
+        _rmtree_owned(st.run_dir / TREES_DIRNAME / SELFCHECK_COPIES_NAME)
         if flight.get("pre_sha"):
             await _roll_back_round(
                 st, staging, flight["pre_sha"],

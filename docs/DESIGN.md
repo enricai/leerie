@@ -13723,19 +13723,12 @@ confirmed (3 of 3 reruns); after the header fix was committed in staging
 and taken into the run's repository, the re-run read `pass` and the
 re-check read the item met.
 
-What is not built: the self-check runs the probe through the suite's
-command (its output names it), but on navegando the app's server does not
-start in the self-check's copy. The copy shares staging's ignored paths as
-symlinks, and Turbopack refuses one that leaves its root ("Symlink
-[project]/node_modules is invalid, it points out of the filesystem
-root"), so the call fails before the browser opens, on the fix as on the
-defect. Sharing them as hard links instead fails under the fixer's own
-confinement (`cp -al`: "Invalid cross-device link" from staging into the
-self-check's directory), and a copy of the bytes is the size of the
-installed tree on every call. The commit's re-run, the conflict check and
-the re-check are leerie's own and correct, so a fix is kept or rolled back
-on the suite's verdict; until the self-check can host the app's server, a
-fixer shown such a probe cannot see it pass before it commits.
+Built since (*The self-check's copy is a tree of its own*): on navegando
+the app's server did not start in the self-check's copy, whose ignored
+paths were symlinks out of it, so a fixer shown such a probe could not see
+it pass before it committed. The copy now holds them as its own, and the
+same replay's self-check failed the probe on the shipped commit and passed
+it on the uncommitted fix.
 
 **A probe that breaks another part of its own item is a contested reading,
 not a finding.** *Status: designed, not built — see the last paragraph.*
@@ -14782,11 +14775,12 @@ its own disposable detached checkout of the commit it reviews
 whatever is in it — write bits restored first, so a read-only directory or
 a nested repository goes too. Nothing is restored anywhere, because
 nothing of it was ever in a measured tree. The `pr_reviewer` runs the
-repo's build and test verbs, so its checkout shares staging's ignored
+repo's build and test verbs, so its checkout is given staging's ignored
 paths (installed dependencies, nested `node_modules`, a generated client)
-as symlinks, the way the re-drive's self-check does; a write through one
-lands only in an ignored path, which no measured tree's cleanliness
-counts. The `ci_checks` and `integration_judge` workers run nothing by
+as its own, files hard-linked, the way the re-drive's self-check's copy is
+(*The self-check's copy is a tree of its own*); a write in place through a
+linked file lands only in an ignored path, which no measured tree's
+cleanliness counts. The `ci_checks` and `integration_judge` workers run nothing by
 default (their tools read files and git), and under
 `--dangerously-skip-permissions`, which widens their tools with the
 build verbs, they still run where nothing is measured; their checkouts
@@ -15202,15 +15196,19 @@ orchestrator); one call:
 1. copies the worker's current working tree — HEAD, its uncommitted
    edits and its untracked, not-ignored files, as the one listing (§8
    *One ignore rule*) gives them — into a run-private
-   directory with no `.git`, with `GIT_CEILING_DIRECTORIES` at that
+   directory with no `.git` beside the run's trees
+   (`<run-dir>/worktrees/.selfcheck/<group>/`), with `GIT_CEILING_DIRECTORIES` at that
    directory's parent so a test that shells out to git resolves no
    enclosing repository;
-2. shares every ignored path of the worker tree (`node_modules`, nested
-   ones, a generated Prisma client, build output) into the copy as a
-   symlink, so nothing is installed or generated per call — except a path
-   that is a set file or holds one, which the set's own placement needs as
-   a real directory, so a set file is never written through a link into
-   the worker's tree;
+2. gives the copy every ignored path of the worker tree (`node_modules`,
+   nested ones, a generated Prisma client, build output) as its own: each
+   directory a directory of the copy's, each file a hard link to the
+   tree's, each link the same link — so nothing is installed or generated
+   per call, and nothing in the copy resolves outside it (*The
+   self-check's copy is a tree of its own*) — except a path that is a set
+   file or holds one, which the set's own placement needs as a directory
+   of nothing but the copy's, so a set file is never written over a file
+   of the worker's tree;
 3. places the shown sets (`_place_set`), refusing — exit 3, with the
    paths — when the copy already has a file at a set's path, since a set is
    never placed over the tree's own file;
@@ -15229,6 +15227,74 @@ placed, and `-t`/`--testNamePattern <pattern>` (or
 `-k`) becomes the runner's own test-name filter. A signal to the
 command (a shell timeout, a cancelled call) unwinds through the same
 clean-up as any other exit, so the copy is deleted on every exit.
+
+**The self-check's copy is a tree of its own.** *Built 2026-11-09 (lane
+SC); the navegando run a70fb4a6.* The copy shared the worker tree's
+ignored paths as symlinks into that tree (`node_modules ->
+<staging>/node_modules`), so a tool that takes its directory as its root
+found a path that leaves it. Turbopack, which the app's server runs on,
+refuses one: "Symlink [project]/node_modules is invalid, it points out of
+the filesystem root". Measured on lane BR's a70fb4a6 case (lane SR's
+replay), the self-check ran the header probe through the browser suite,
+and the server never started — on the shipped commit and on the fixer's
+uncommitted fix alike — so a fixer shown a probe confirmed through the
+suite could never see it pass. **Root cause:** the copy was a tree only
+in name: a third of it was another tree's, reached through links that
+name that tree's path. **Invariant:** the copy is a tree every tool of
+the repository accepts as its own root, as the committed views leerie
+measures in are: no path leerie makes in it resolves outside it.
+
+So each ignored path is made in the copy as the copy's own: each
+directory a directory of the copy's, each file a hard link to the
+tree's, each link the same link (`_share_ignored_paths`). A link the tree
+itself holds stays what it is, outside or not: the tree chose it, as it
+chose its tracked links, which the copy keeps too. The copy is made
+beside the trees, in `<run-dir>/worktrees/.selfcheck/<group>/`, which
+the implementer's grant writes: beneath the grant's link root, so the
+shim binds the copy and the tree it copies as one mount (*The write
+grants on one mount are one mount*). Lane SR's hard-link attempt (`cp
+-al` into `<run-dir>/selfcheck/<group>/run/`) got `EXDEV` for exactly
+that reason: its copies lay on a mount of their own. A file the
+filesystem still cannot link (`EXDEV`, `EPERM` under
+`protected_hardlinks`, `EMLINK`) has its bytes copied instead, the way
+every package manager that links from its store does, and the call's
+log counts both (`linked`, `copied`). The walk follows no link: every
+step is relative to an open directory, because the `pr_reviewer`'s
+checkout is given staging's ignored paths the same way, by leerie,
+unconfined.
+
+What this keeps and gives up. A file is still shared, so a write in
+place through it reaches the worker tree's file — and the run store's,
+which that file is linked from — as a write through the symlink did; a
+file made, renamed or removed in the copy is now the copy's alone. The
+symlinked copy cost nothing per call; the linked one costs a walk of
+the ignored paths. Rejected: running the self-check in an overlay of the
+worker tree, as a held-out evaluation runs (`HeldOutSandbox`), which
+needs a mount the self-check cannot make — it runs inside the
+implementer's confinement, whose seccomp filter refuses every namespace
+and mount call and whose Landlock domain refuses a change of mount
+topology; installing from the run's stores into each copy, as a
+committed view is installed, which reruns the recipe (an install and a
+generate) per call for the files staging already holds; and copying the
+bytes, the size of the installed tree per call.
+
+Measured (lane SC, the same a70fb4a6 replay: navegando's image with a
+PostgreSQL server, real confinement, the implementer's grant, lane BR's
+hand header probe recorded as confirmed through the suite; one call per
+row, run by the replay as the implementer's shell runs it). With the
+symlinked copy (the base, lane SR's branch) the app's server refused to
+start on the shipped commit and on the uncommitted fix (exit 1 both).
+With this change the copy linked 69,567 files and copied none; the
+browser suite ran the probe and failed it on the shipped commit (the
+assertion, after three retries) and passed it on the uncommitted fix,
+and a plain vitest set through the test command passed (the barnacle
+shape). The cost is the walk and the deletion of the linked files: the
+copy (the tracked files' `tar` and the sharing) took 6.3–8.9 s against
+0.3–1.1 s, and a call's time outside its runner 13.6–18.8 s against
+0.5–1.4 s, beside a suite run of 115–172 s. Measured, not chased: as
+with the bar I3 failed on latency (below), the cost is the run's, not a
+defect it ships, and the symlinked copy it replaces could not run the
+suite at all.
 
 **The pre-registered latency bar failed, three times.** Each bench round
 ran the in-tree staging (IN) against the out-of-tree command over four
