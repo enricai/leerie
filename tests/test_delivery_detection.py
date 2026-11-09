@@ -1038,12 +1038,28 @@ class TestFalsifierGates:
             "new_file": True, "not_a_lead": True, "runnable": True,
             "item_quote": True, "case_fails": True, "fails_under_bstar": True,
             "facts_read": True, "assertion_in_case": True,
-            "not_coupled": True}
+            "not_coupled": True, "at_assertion": True}
         assert out["case_id"].endswith("test_add_returns_the_sum")
         # The probe ran in the pristine checkout and was removed after.
         assert gate_env.facts[0][0] == str(gate_env.confirm)
         assert not (gate_env.confirm / PROBE_REL).exists()
         assert not (gate_env.confirm / "falsify_probe").exists()
+
+    def test_a_probe_that_fails_before_its_assertion_confirms_nothing(
+            self, leerie, gate_env):
+        """It fails every run, at a setup line — the environment, not the
+        item (DESIGN §8 *A repository's browser suite is a channel the run
+        provisions*); the same probe failing at the assertion confirms."""
+        setup_fails = ("from calc import add\n\n\n"
+                       "def test_add_returns_the_sum():\n"
+                       "    raise TimeoutError('page.goto: Timeout 90000ms')\n"
+                       "    assert add(2, 3) == 5\n")
+        out = _gates(leerie, gate_env, _claim(), setup_fails)
+        assert out["gates"]["fails_under_bstar"] is True
+        assert out["gates"]["at_assertion"] is False
+        assert out["confirmed"] is False
+        assert _gates(leerie, gate_env, _claim())["gates"][
+            "at_assertion"] is True
 
     def test_a_probe_that_passes_on_the_final_tree_confirms_nothing(
             self, leerie, gate_env):

@@ -13292,10 +13292,178 @@ one "responsive UI" clause) was not flagged, which leaves today's verdict.
 
 What this does not do: it makes no run able to see layout. A repository
 whose test command itself drives a real browser types `test_command`, and
-the rule never fires there. Running a repository's browser suite inside the
-run (the image ships Chromium; navegando's suite also needs its database and
-dev server) would be a new observation channel, not a better verdict, and is
-not built.
+the rule never fires there. A repository whose CI runs a browser suite gets
+that suite as a third channel when it runs here (next).
+
+**A repository's browser suite is a channel the run provisions.** *Built
+2026-11-09 (lane BR).* The rule above made the responsive task honest — its
+layout parts are `unknown`, "Not verified by this run" — but no run could
+finish it: the run's channels were fixed at reading the tree and the
+repository's test command. **Root cause:** the repository declares a third
+channel, and leerie read it and dropped it. CI parity's `ci_checks` worker
+recorded navegando's browser suite — `pnpm run test:e2e --project=chromium`,
+kind `test`, `requires: [database, browser, network]`, with its CI
+environment and its prerequisites (`db:generate`, `playwright install
+--with-deps chromium`) — and code set it aside as `left_to_test_axis`,
+which is false for a suite the test command does not run, while the image
+ships Chromium and the suite starts the app itself (its `webServer` runs the
+dev server, its global setup seeds the database). Measured before building
+anything (lane BR feasibility, the real shim, rootless, navegando's image
+with a PostgreSQL server in its worker root): on a70fb4a6's shipped tree a
+probe file run through the suite's own command, in a held-out sandbox with a
+database of its own, brought the dev server up, seeded it, logged in through
+Chromium at 375×812 and read the header: the "Nueva conversación" link at
+x = 444.9 and the sound toggle's right edge at 436.9, off a 375-pixel screen
+(the audit's first finding); on a commit hiding three header controls below
+the `sm` breakpoint the same probe passed. **Invariant:** a way the run
+observes is one code has seen work here, and every one the repository
+declares and the run can provide is offered; a part such a channel could
+show is never `unknown` for want of it, and no worker is promised one that
+did not run.
+
+The mechanism:
+
+1. *Which check is the suite* (`_browser_suite_candidate`, code over CI
+   parity's typed records): the first merge-gating `test` check that
+   `requires` a browser, runs at the repository root, passes the checks'
+   provenance rule (its argv and environment appear in the CI file it
+   names), resets no database, runs nothing the task forbids, and whose
+   command — resolved through `package.json` when it is a script call —
+   runs a `BROWSER_SUITE_RUNNERS` runner *bare*: only options after the
+   runner, so a file appended runs that file under the suite's whole
+   configuration (navegando's second e2e check, which names one spec, is
+   not the suite). The runner table is a fixed CLI surface, as
+   `_RUNNER_REPORTS` is; `playwright test` is its one entry, and a
+   repository whose suite runs another runner has no channel until that
+   runner's row (its file filter and its report) is added.
+2. *Seen running here, then offered* (`_establish_browser_suite`, in CI
+   parity's baseline): in a checkout of the base, the check's
+   prerequisites run as installs (`_ci_prepare`; a database push among them
+   is not run — the wrapper's is the only one), then the suite's own command
+   as a measurement, confined, with a database of its own when the check
+   requires one (`_test_db_argv`), its runner's JSON report requested
+   (`playwright-json`: one case per file and title across the suite's
+   projects, failed when any project failed it; a run error naming no file
+   — a web server that never came up, a global setup that threw — is the
+   run's load error, never a case). `ci_parity.browser_suite.viable` is
+   true only when a case passed: then the app, its database and the browser
+   all came up here. Its environment is the CI's: what every CI service
+   sets in a job (`BROWSER_SUITE_CI_ENV`, `CI=true`: a suite's
+   configuration reads it for its CI form, one worker, retries) and the
+   check's declared variables (measured: without `CI`, navegando's suite
+   ran a worker per core against one cold dev server and 29 of 71 cases
+   failed, most of them waits that timed out).
+3. *Its browser is the tree's own store.* A runner's own browser
+   download (`PLAYWRIGHT_BROWSERS_PATH`) is one of `_TREE_STORE_VARS`
+   (§6 *Which stores an install may share*): the tree's install fetches it
+   into the tree's own stores, which a held-out sandbox over the tree
+   overlays — where a private temp directory would be an empty copy
+   (measured: the tree's `XDG_CACHE_HOME` is empty inside its held-out
+   sandbox) — and a worker started in a tree leerie installed for runs
+   that browser (§6 *A worker started in a tree leerie installed for runs
+   on that tree's stores*). In the run's shared stores it was invisible to
+   the falsifier, whose store variables name its side's cache: both
+   samples that wrote a browser probe failed at the browser's launch
+   ("Playwright's chromium executable is missing").
+   The image ships the operating-system libraries; a CI step that installs
+   them as root (`playwright install --with-deps`) fails here (no root, by
+   design) and installs no browser: the repository's provisioning provides
+   one (its recipe's `playwright install chromium`), or the suite does not
+   run at the baseline and is not offered — stated in the log, the run
+   unchanged.
+4. *A probe runs through it.* The falsifier's payload names the suite's
+   one-file command and its environment (`_browser_suite_payload`) — less
+   the database URL when the suite requires a database: the run's
+   (`TEST_DB_ENV_NAMES`, what `scripts/sandbox-db.sh` exports) replaces
+   the CI's and is already in the worker's environment, and a worker
+   handed the CI's set it over its own (measured: both samples that ran
+   the suite in their session failed at the seed, "denied access on the
+   database") — and says that a part about layout, what is visible, the
+   viewport, hover or touch is one only the suite can show, so it is
+   probed there (measured: without that sentence 0 of 6 samples ran the
+   suite, each anchored on the held-out DOM-class leads); a
+   sample whose own shell commands ran its probe through the suite's runner
+   (`_browser_suite_ran_probe`, a mechanical read of the commands it ran)
+   is confirmed through the suite's command (`_capture_failing_test_ids
+   (suite=)`), in a held-out sandbox over the confirm checkout with a
+   database of its own, under every gate a test-command probe meets: a new
+   file, not a lead, the named case failing, B*, the quoted assertion in the
+   case, no coupling to the implementation — and one more, for every
+   probe of either channel: *it failed at its assertion*
+   (`_falsifier_failed_at_assertion`). A case counts only when some
+   failing run's message names no line of the probe (the runner gave no
+   location: as before) or names a line of the quoted assertion. Measured:
+   on the loaded bench host the hand probe's first two attempts failed
+   before its assertion — the login's wait and the chat page's navigation,
+   each `TimeoutError: … Timeout 90000ms exceeded` — and only the third
+   reached it. A case whose every attempt fails like that is named, fails
+   again under B* on the same host, and holds its quoted assertion: every
+   earlier gate passes it. A failure at another line is the environment's,
+   not the item's; the prompt always said so
+   ("not ... an environment problem"), and now code checks it. A browser
+   case's message leads with its error's location (its last attempt's:
+   a retried case's verdict is its last attempt's), so the cap on a long
+   call log keeps it. The confirm checkout and every lane run the suite's
+   prerequisites first.
+5. *The judge is told.* The observability judge's payload names the same
+   channel and says a part a test written for it could exercise in this
+   browser, and would fail on, is `test_command`; `rendering_engine` is then
+   only for what this browser cannot show (another engine, a device).
+6. *No channel, no change.* A run whose CI declares no browser suite, or
+   whose suite did not run here, has no `browser_suite` (or one with
+   `viable` false), and the falsifier's and the judge's payloads are byte
+   for byte the ones benched before (pinned). No recorded run of barnacle or
+   web declares one (every `ci_parity` record scanned: 0 browser checks).
+
+Measured (bench BR, pre-registered; RT's harness for the judge, SW's
+container harness for the falsifier). *The judge*, with the channel, 6
+samples per case as two production draws of 3, the same on the shipped
+payload and on two earlier forms of its environment line: the audit's four layout and
+touch items (header, composer width, URL overflow, hover-only reply)
+flagged in 0 of 8 item-draws (8 of 8 without it, bench RT); a70fb4a6's
+"layouts responsive across viewport sizes" part 0 of 2 (2 of 2); the two
+items a Chromium suite cannot show (an iPhone's notifications, Safari's
+voice recording) 4 of 4, typed `physical_device`; the three observable
+items 0 of 6. One reading leans the unsafe way and is listed: e99c1df1's
+part "iOS-specific issues are handled (viewport/safe-area, 100vh, input
+zoom)" was never typed `neither` (18 of 18 samples over the three forms),
+where safe-area insets are a device's. *The falsifier* on a70fb4a6's shipped tree (its one item, SW's container
+harness, real confinement; navegando's image with a PostgreSQL server in
+its worker root and its runner's browser in its recipe — what the
+repository's own provisioning must supply, below): with today's channels
+0 of 4 samples confirmed, each a DOM-class probe (SW: 0 of 6). The channel
+took four pre-registered rounds of 6 samples, each fixing what the last
+measured: as first built, 0 confirmed and no sample ran the suite, each
+anchored on the held-out DOM-class leads; with the layout sentence, 0 —
+the 3 that wrote browser probes failed at the seed on the CI's database
+URL; with the URL withheld, 0 — the 2 that ran one found no browser in
+their session (it was in the run's stores, not the lane's); with the
+browser a tree store, as shipped, 2 of 6 confirmed, both through the
+suite, both at their assertion line, and 5 of the 6 samples ran their
+probe through it. Both are layout defects no earlier channel showed and
+the static audit did not list: the auth pages scroll sideways at 320 px
+(scrollWidth 351, the language switcher past the edge), and the privacy,
+terms and DPA pages at 375 px. Discrimination through the confirm path
+(`_capture_failing_test_ids(suite=)`, held-out sandbox, own database): the
+320 px probe fails on the shipped commit and passes on one hiding the
+wordmark below 360 px, and still fails on the header fix; the hand header
+probe fails on the shipped commit and passes on the header fix. No sample
+found the audit's header finding itself: each probed page-wide overflow,
+which the app shell's own scroll container masks.
+
+What the repository's provisioning must supply: a database server in its
+image when its suite needs one (navegando's image has the client only, so
+its suite does not run here and is not offered — measured, the seed
+fails), and its runner's browser from an install that needs no root
+(navegando's CI installs it with `--with-deps`, which fails here and
+installs nothing). Leerie offers what it saw run, and says why it did not.
+
+What is not built: the held-out acceptance writers are not offered the
+channel — their sets are written before planning, and CI parity discovers
+the suite at the execution phase; moving discovery ahead of them is the
+next step. No other runner has a row yet, and a suite that needs a service
+besides PostgreSQL (navegando's CI also starts Redis, which its app does
+without) gets none from leerie.
 
 **A probe that breaks another part of its own item is a contested reading,
 not a finding.** *Status: designed, not built — see the last paragraph.*
@@ -19354,7 +19522,9 @@ on the final tree:
    its own (§8 *Prisma repositories get a real database*); elsewhere a check
    without one goes red at the baseline and drops out). Test-kind checks are left to the test axis (§9
    *Which failures are new*), which already runs the suite with failing-ID
-   diffs.
+   diffs — except as an observation channel: a browser suite the test
+   command does not run is the run's browser channel once it ran here (§8
+   *A repository's browser suite is a channel the run provisions*).
 3. *The baseline decides what gates.* Each selected check runs at the
    baseline in its own detached worktree of the base. A check red there is
    not a gate (the repo was already red; leerie cannot attribute it). The

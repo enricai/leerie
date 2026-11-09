@@ -2981,6 +2981,14 @@ CI_REQUIRES = ("database", "browser", "network", "secrets",
 CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
                                   "cloud_credentials", "gpu"})
 CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
+# The browser-suite runners leerie can run one file of (DESIGN §8 *A
+# repository's browser suite is a channel the run provisions*): runner ->
+# the argv prefix that runs its suite, whose positional words are test-file
+# filters. A fixed CLI surface (DESIGN §12), like `_RUNNER_REPORTS`; a
+# suite whose resolved command starts with none of these is no channel.
+BROWSER_SUITE_RUNNERS: dict[str, tuple[str, ...]] = {
+    "playwright": ("playwright", "test"),
+}
 # The `observability_judge`'s typed vocabulary (DESIGN §8 *A met is only what
 # the run could observe*): how the run can observe a required item's part —
 # by reading the tree, through the repository's test command, or neither —
@@ -6340,6 +6348,11 @@ _STORE_VARS: dict[str, str] = {
     "PYTHONUSERBASE": "pyuser",
     "DOTNET_CLI_HOME": "dotnet-home",
     "BUNDLE_USER_HOME": "bundle-home",
+    # Where a browser-suite runner's own browser download lands (DESIGN §8 *A
+    # repository's browser suite is a channel the run provisions*): a store
+    # (a private temp directory is an empty copy in a sandbox), and one of
+    # the tree's own (`_TREE_STORE_VARS`).
+    "PLAYWRIGHT_BROWSERS_PATH": "playwright-browsers",
 }
 # The repository image's bake target (DESIGN *Persistent out-of-repo dependency bake*): a
 # variable already pointing beneath it names dependencies leerie built into
@@ -6381,7 +6394,11 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
 _TREE_STORE_VARS: frozenset[str] = frozenset({
     "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
     "GOCACHE", "WORKON_HOME", "npm_config_cache_dir", "PYTHONUSERBASE",
-    "DOTNET_CLI_HOME", "BUNDLE_USER_HOME"})
+    "DOTNET_CLI_HOME", "BUNDLE_USER_HOME",
+    # A browser-suite runner's browser, which the tree's install fetches:
+    # a worker started in the tree runs that browser (DESIGN §8 *A
+    # repository's browser suite is a channel the run provisions*).
+    "PLAYWRIGHT_BROWSERS_PATH"})
 
 
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
@@ -48641,6 +48658,7 @@ _SERIAL_RUNNER_FLAGS: dict[str, str] = {
     "pytest": "-p no:xdist",
     "jest": "--runInBand",
     "vitest": "--no-file-parallelism --maxWorkers=1",
+    "playwright": "--workers=1",
 }
 # One confirm at a time per event loop (Q9 ran confirms through a single-
 # slot semaphore), created lazily for the same cross-loop reason as
@@ -49402,7 +49420,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     db: bool = False,
                                     place: tuple[tuple[str, str], ...] = (),
                                     replace: tuple[tuple[str, str], ...] = (),
-                                    remove: tuple[str, ...] = ()
+                                    remove: tuple[str, ...] = (),
+                                    suite: dict | None = None
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
@@ -49425,14 +49444,18 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     tree that ships*): in the same sandbox, the pairs written over the
     tree's own files and the paths removed, never on disk either. A worker
     tree is run in its committed view, installed there (`_measured_tree`;
-    DESIGN §8 *Every measurement reads the committed view*)."""
+    DESIGN §8 *Every measurement reads the committed view*). With `suite`
+    (the run's browser channel, `_browser_suite`), `files` run through the
+    suite's own command in the environment its CI declares (DESIGN §8 *A
+    repository's browser suite is a channel the run provisions*)."""
     tree = await _measured_tree(st, tree, caps, log_path=log_path,
                                 label=label)
     run_files = list(files or [])
     sandboxed = bool(place or replace or remove)
     placed = {rel: src for src, rel in (*place, *replace)}
     if run_files:
-        scoped = _acceptance_cmd(st, run_files, tree, placed)
+        scoped = (_browser_suite_cmd(suite, run_files) if suite is not None
+                  else _acceptance_cmd(st, run_files, tree, placed))
         if scoped:
             cmd = scoped
         else:
@@ -49485,6 +49508,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             return None
         if path_env:
             env = {**(env if env is not None else os.environ), **path_env}
+        if suite is not None:
+            env = {**(env if env is not None else os.environ),
+                   **_browser_suite_env(suite)}
         if db:
             # Its own database, as its own report: one per run.
             argv = _test_db_argv(st, tree, report.name) + argv
@@ -50985,6 +51011,229 @@ async def _ci_discover(staging: Path, st: "State", caps: dict,
             "excluded": list(res.get("excluded") or [])}
 
 
+def _browser_suite_words_bare(words: list[str], prefix: tuple[str, ...]
+                              ) -> bool:
+    """True when `words` run `prefix` with only options after it — no
+    positional selector of the suite's own, so a file appended runs that file
+    under the suite's whole configuration. A `--flag value` pair counts as an
+    option. Mechanical (an argv)."""
+    n = len(prefix)
+    starts = [i for i in range(len(words) - n + 1)
+              if tuple(os.path.basename(w) if j == 0 else w
+                       for j, w in enumerate(words[i:i + n])) == prefix]
+    if len(starts) != 1:
+        return False
+    rest = words[starts[0] + n:]
+    prev_opt = False
+    for w in rest:
+        if w.startswith("-"):
+            prev_opt = "=" not in w
+            continue
+        if prev_opt and "/" not in w and not w.endswith(
+                (".ts", ".js", ".mjs", ".cjs", ".tsx", ".jsx", ".py")):
+            prev_opt = False
+            continue
+        return False
+    return True
+
+
+def _browser_suite_candidate(recs: list[dict], tree: Path,
+                             forbidden: list[str | dict] | tuple = ()
+                             ) -> dict | None:
+    """The repository's declared browser suite (DESIGN §8 *A repository's
+    browser suite is a channel the run provisions*), from CI parity's own
+    records: the first merge-gating `test` check that `requires` a browser,
+    runs at the repository root, passes the checks' provenance rule
+    (`_ci_check_problems`), runs no database reset and nothing the task
+    forbids, and whose command — resolved through `package.json` when it is
+    a script call — runs a `BROWSER_SUITE_RUNNERS` runner bare. None when
+    there is none: the run then has no browser channel."""
+    reset_pats = _db_reset_rule_patterns(tree)
+    for r in recs:
+        argv = [str(a) for a in (r.get("argv") or [])]
+        if (r.get("kind") != "test" or not argv
+                or "browser" not in (r.get("requires") or [])
+                or not set(r.get("trigger") or []) & CI_GATING_TRIGGERS
+                or (r.get("cwd") or ".") not in (".", "./", "")
+                or _ci_runs_db_reset(argv, reset_pats)
+                or (forbidden and _forbidden_command_hit(shlex.join(argv),
+                                                         list(forbidden)))
+                or _ci_check_problems(r, tree)):
+            continue
+        cmd = shlex.join(argv)
+        resolved, _env = _runner_command(cmd, tree, BROWSER_SUITE_RUNNERS)
+        runner = _acceptance_runner(resolved, BROWSER_SUITE_RUNNERS)
+        if runner is None:
+            continue
+        try:
+            words = shlex.split(resolved)
+        except ValueError:
+            continue
+        if not _browser_suite_words_bare(words, BROWSER_SUITE_RUNNERS[runner]):
+            continue
+        return {"check_id": r.get("id"), "argv": argv, "runner": runner,
+                "template": cmd + " {test_files}",
+                "env": [{"name": str(e.get("name")),
+                         "value": str(e.get("value") or "")}
+                        for e in (r.get("env") or []) if e.get("name")],
+                "prerequisites": list(r.get("prerequisites") or []),
+                "requires": list(r.get("requires") or []),
+                "source": r.get("source")}
+    return None
+
+
+def _browser_suite(st: "State") -> dict | None:
+    """The run's browser channel: `ci_parity.browser_suite` when code saw it
+    run here (`viable`), else None."""
+    data = getattr(st, "data", None)
+    ci = data.get("ci_parity") if isinstance(data, dict) else None
+    bs = ci.get("browser_suite") if isinstance(ci, dict) else None
+    return bs if isinstance(bs, dict) and bs.get("viable") else None
+
+
+def _browser_suite_cmd(suite: dict, files: list[str]) -> str:
+    """The suite's command over `files` (the files appended as its runner's
+    filters)."""
+    return str(suite["template"]).replace(
+        "{test_files}", " ".join(shlex.quote(f) for f in files)).strip()
+
+
+# What every CI service the checks are read from sets in each job (GitHub
+# Actions, GitLab CI, CircleCI, Buildkite, Travis, Azure Pipelines): a suite's
+# configuration reads it for its CI form (one worker, retries, no interactive
+# report server). Measured on navegando's suite: without it, every core ran a
+# worker against one cold dev server and 22 cases timed out at the baseline.
+BROWSER_SUITE_CI_ENV: dict[str, str] = {"CI": "true"}
+
+
+def _browser_suite_env(suite: dict) -> dict[str, str]:
+    """The environment the repository's CI gives the suite: what every CI
+    sets (`BROWSER_SUITE_CI_ENV`), then its declared variables (a database
+    URL among them is replaced by the command's own, `scripts/sandbox-db.sh`)."""
+    return {**BROWSER_SUITE_CI_ENV,
+            **{str(e["name"]): str(e.get("value") or "")
+               for e in suite.get("env") or [] if e.get("name")}}
+
+
+def _browser_suite_rec(suite: dict) -> dict:
+    """The suite as a CI record `_ci_prepare` runs the prerequisites of."""
+    return {"id": f"browser-{suite.get('check_id')}",
+            "prerequisites": suite.get("prerequisites") or [],
+            "env": suite.get("env") or [],
+            "requires": suite.get("requires") or []}
+
+
+def _browser_suite_ran_probe(cmds: Iterable[str], rel: str, tree: Path,
+                             suite: dict) -> bool:
+    """True when one of the shell commands `cmds` ran the probe `rel`
+    through the browser suite's runner: a segment whose words — resolved
+    through `package.json` when it is a script call — hold the runner's
+    prefix and name the probe, its basename or a directory holding it.
+    Which command ran a file is a mechanical string (DESIGN §12)."""
+    prefix = BROWSER_SUITE_RUNNERS.get(str(suite.get("runner") or ""))
+    if not prefix:
+        return False
+    rel = os.path.normpath(rel)
+    base = os.path.basename(rel)
+    root = str(tree).rstrip("/") + "/"
+    for cmd in cmds:
+        for seg in _BLT_SEG_RE.split(cmd):
+            seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+            if not seg:
+                continue
+            body = _resolve_pm_script(seg, tree) or seg
+            try:
+                words = shlex.split(body)
+            except ValueError:
+                words = body.split()
+            n = len(prefix)
+            at = [i for i in range(len(words) - n + 1)
+                  if os.path.basename(words[i]) == prefix[0]
+                  and tuple(words[i + 1:i + n]) == prefix[1:]]
+            if not at:
+                continue
+            for a in words[at[0] + n:]:
+                if a.startswith(root):
+                    a = a[len(root):] or "."
+                if not a or a.startswith("-") or os.path.isabs(a):
+                    continue
+                a = os.path.normpath(a)
+                if a in (rel, base, ".") or rel.startswith(a + "/"):
+                    return True
+    return False
+
+
+async def _establish_browser_suite(st: "State", caps: dict, ci: dict,
+                                   base_sha: str | None) -> None:
+    """Offer the run a browser channel only once code has seen the
+    repository's browser suite run here (DESIGN §8 *A repository's browser
+    suite is a channel the run provisions*): in a checkout of the base, its
+    prerequisites run as installs (`_ci_prepare`), then the suite's own
+    command, confined as a measurement with a database of its own when it
+    requires one, with its runner's report. `ci["browser_suite"]` is the
+    candidate with `viable` (a case passed) and `base` (the counts, or why
+    nothing was counted). No candidate: no key, and the run is as before."""
+    cand = _browser_suite_candidate(ci.get("checks") or [],
+                                    st.repo_root, _forbidden_specs(st.data))
+    if cand is None or not base_sha:
+        return
+    rec: dict = {**cand, "viable": False}
+    ci["browser_suite"] = rec
+    wt = await _ci_worktree(st, "ci-browser", base_sha)
+    if wt is None:
+        rec["base"] = {"why": "no base worktree"}
+        return
+    try:
+        await _ci_prepare(wt, [_browser_suite_rec(cand)], st, caps,
+                          "browser")
+        cmd, path_env = _runner_command(shlex.join(cand["argv"]), wt,
+                                        BROWSER_SUITE_RUNNERS)
+        own = _measure_dir(st, wt)
+        reports = own / "reports"
+        _mkdir_private(reports, own)
+        report = reports / f"browser-suite-{uuid.uuid4().hex[:8]}"
+        spec = _acceptance_report_spec(cmd, report)
+        if spec is None:
+            rec["base"] = {"why": "its runner's report cannot be requested"}
+            return
+        run_cmd, env, kind = spec
+        env = {**(env if env is not None else os.environ), **(path_env or {})}
+        env = [{"name": k, "value": v} for k, v in {
+            **{k: v for k, v in env.items() if k not in os.environ
+               or os.environ[k] != v},
+            **_browser_suite_env(cand)}.items()]
+        try:
+            # The one gate every orchestrator-side launch passes (DESIGN §9
+            # *A command the task forbids*).
+            shell = _blt_shell_argv(run_cmd, _forbidden_specs(st.data),
+                                    source=cmd)
+        except ForbiddenByTask as e:
+            rec["base"] = {"why": f"not run: {e}"}
+            return
+        run = await _ci_run(shell, tree=wt,
+                            rec={"cwd": ".", "env": env,
+                                 "requires": cand["requires"]},
+                            st=st, caps=caps, label="base-browser-suite")
+        data = None
+        with contextlib.suppress(OSError):
+            data = _read_beneath(own, report, limit=READ_LIMIT_LARGE)
+        with contextlib.suppress(OSError):
+            _unlink_beneath(own, report)
+        cases = _runner_report_cases(kind, data, str(wt)) or []
+        counts = {k: sum(1 for c in cases if c["status"] == k)
+                  for k in ("passed", "failed", "skipped", "load_error")}
+        rec["base"] = {"rc": run.get("rc"), "timed_out": run.get("timed_out"),
+                       **counts,
+                       **({} if data else {"why": "no report was written"})}
+        rec["viable"] = counts["passed"] > 0
+    finally:
+        _ci_teardown(st, wt)
+    log(f"  ci parity: browser suite {cand['check_id']} at the baseline: "
+        f"{rec['base']} -> "
+        + ("offered to the run" if rec["viable"]
+           else "not offered (no case passed here)"))
+
+
 async def _capture_ci_parity_baseline(
         leerie_dir: Path, st: State, caps: dict, models: dict[str, str],
         efforts: dict[str, str | None]) -> None:
@@ -51076,6 +51325,12 @@ async def _capture_ci_parity_baseline(
     finally:
         if wt is not None:
             _ci_teardown(st, wt)
+    # The repository's browser suite, when it declares one: offered to the
+    # falsifier and the observability judge once it ran here (DESIGN §8 *A
+    # repository's browser suite is a channel the run provisions*). Its
+    # expected outcomes are its own typed `base.why`; anything else is an
+    # error of CI parity's, as every other one is.
+    await _establish_browser_suite(st, caps, ci, base_sha)
     st.data["ci_parity"] = ci
     st.save()
 
@@ -54004,6 +54259,9 @@ def _db_reset_denials(repo_root: str | Path) -> str:
 # confined process has its own network*).
 SANDBOX_DB_SCRIPT = ROOT / "scripts" / "sandbox-db.sh"
 TEST_DB_HOST, TEST_DB_PORT = "127.0.0.1", 5432
+# What `scripts/sandbox-db.sh` exports to the command it wraps: a command's
+# database URL is the run's own, never one a payload names.
+TEST_DB_ENV_NAMES = ("DATABASE_URL", "DIRECT_URL")
 _TEST_DB_NAME_RE = re.compile(r"leerie_[0-9a-f]{16}_test")
 
 
@@ -54435,7 +54693,12 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "ruby": ("minitest-json", "rbplugin"),
     "go": ("go-json", "stdout:-json"),
     "cargo": ("libtest-json", "stdout:-- -Z unstable-options --format json"),
+    "playwright": ("playwright-json", "pwenv"),
 }
+# Playwright's JSON reporter writes to the file these name (1.38+ reads the
+# first, earlier releases the second), not to a flag.
+_PLAYWRIGHT_JSON_ENV = ("PLAYWRIGHT_JSON_OUTPUT_FILE",
+                        "PLAYWRIGHT_JSON_OUTPUT_NAME")
 # The form of a report request that leaves the runner's own output as it was,
 # where `_RUNNER_REPORTS`' does not: `--reporter=json` alone replaces vitest's
 # default reporter (checked on vitest 4.1.11).
@@ -54537,6 +54800,12 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = (),
         # The flags landed as the last words of the runner's own simple
         # command, so a redirect after them is that command's stdout.
         return f"{placed} >{shlex.quote(str(path))}", env, kind
+    if how == "pwenv":
+        placed = _append_runner_flags(cmd, runner, files, "--reporter=json")
+        if placed is None:
+            return None
+        return placed, {**os.environ, **{v: str(path) for v in
+                                         _PLAYWRIGHT_JSON_ENV}}, kind
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
@@ -55241,6 +55510,71 @@ def _runner_report_cases(kind: str, report: bytes | None,
                 if pkg not in tested:
                     _add(f"{pkg} :: (package failed to build)", None,
                          "load_error")
+        elif kind == "playwright-json":
+            data = json.loads(report.decode())
+            root_dir = str((data.get("config") or {}).get("rootDir") or "")
+            for err in data.get("errors") or []:
+                # A file that did not compile names itself; an error with no
+                # file (a global setup, the web server not starting) is the
+                # run's, so no case of it is a verdict.
+                f = str(((err or {}).get("location") or {}).get("file") or "")
+                rel = _rel(f) if f else None
+                _add(f"{rel or '(playwright)'} :: (file failed to load)", rel,
+                     "load_error", str((err or {}).get("message") or ""))
+            seen: dict[str, int] = {}
+
+            def _walk(suite: dict, titles: list[str]) -> None:
+                for spec in suite.get("specs") or []:
+                    f = str(spec.get("file") or suite.get("file") or "")
+                    if f and root_dir and not os.path.isabs(f):
+                        f = os.path.join(root_dir, f)
+                    rel = _rel(f) if f else None
+                    name = " ".join([*titles, str(spec.get("title") or "")])
+                    for t in spec.get("tests") or []:
+                        st_ = t.get("status")
+                        status = ("skipped" if st_ == "skipped"
+                                  else "failed" if st_ == "unexpected"
+                                  else "passed")
+                        # The last attempt's error (a retried case's
+                        # verdict is its last attempt's), with where it was
+                        # thrown: its stack, else its location.
+                        errs = [r["error"] for r in t.get("results") or []
+                                if isinstance(r, dict)
+                                and isinstance(r.get("error"), dict)]
+                        msg = ""
+                        if errs:
+                            e = errs[-1]
+                            loc = e.get("location") or {}
+                            # The location first: the message is capped,
+                            # and a call log can be long.
+                            msg = (f"at {loc['file']}:{loc['line']}:"
+                                   f"{loc.get('column') or 0}\n"
+                                   if loc.get("file") and loc.get("line")
+                                   else "") + str(e.get("message") or "")
+                            if e.get("stack") and str(e["stack"]) not in msg:
+                                msg += "\n" + str(e["stack"])
+                        cid = f"{rel} :: {name}"
+                        # One case per name across the suite's projects:
+                        # failed when any project failed it.
+                        if cid in seen:
+                            row = out[seen[cid]]
+                            if status == "failed" or row["status"] == "skipped":
+                                row["status"] = status
+                            if msg and not row.get("message"):
+                                row["message"] = msg[:4000]
+                            continue
+                        seen[cid] = len(out)
+                        _add(cid, rel, status, msg)
+                for child in suite.get("suites") or []:
+                    if isinstance(child, dict):
+                        # A file's own suite is titled with its path; a
+                        # describe block is a title of the case's name.
+                        t_ = str(child.get("title") or "")
+                        named = bool(t_) and t_ != child.get("file")
+                        _walk(child, [*titles, t_] if named else titles)
+            for top in data.get("suites") or []:
+                if isinstance(top, dict):
+                    _walk(top, [])
         elif kind == "libtest-json":
             for ev in _json_lines():
                 if ev.get("type") == "test" and ev.get("event") in (
@@ -61340,7 +61674,8 @@ _COUPLING_PATHY_RE = re.compile(r"\.[A-Za-z]+$")
 # (the re-ask predicate), beside the repository's own BLT verbs.
 _FALSIFIER_RUNNER_VERBS = frozenset({"vitest", "jest", "pytest", "npx",
                                      "pnpm", "npm", "yarn", "bun", "bunx",
-                                     "go", "cargo", "rspec", "bundle"})
+                                     "go", "cargo", "rspec", "bundle",
+                                     "playwright"})
 # Paths at a commit, memoised per (repo, sha): the coupling check resolves
 # imports against them.
 _PATHS_AT: dict[tuple[str, str], set[str]] = {}
@@ -61722,13 +62057,47 @@ def _falsifier_item_text(item: dict) -> str:
                       *_falsifier_item_parts(item)])
 
 
+def _browser_suite_payload(suite: dict) -> str:
+    """What a worker is told of the run's browser channel (DESIGN §8 *A
+    repository's browser suite is a channel the run provisions*): the
+    command over one file, its declared environment, and that it starts
+    what it needs itself."""
+    db = "database" in (suite.get("requires") or [])
+    # The run's database replaces the CI's: a worker told the CI's URL sets
+    # it, and its run reaches no server (measured: the suite's global setup
+    # "denied access on the database" in 2 of 2 samples that ran it).
+    env = " ".join(f"{k}={shlex.quote(v)}"
+                   for k, v in _browser_suite_env(suite).items()
+                   if not (db and k in TEST_DB_ENV_NAMES))
+    return (
+        "THE REPOSITORY'S BROWSER SUITE (this run runs it): its own "
+        "command, over one file, is\n  "
+        + _browser_suite_cmd(suite, ["<file>"])
+        + "\nIt runs a real browser and starts what the suite's own "
+          "configuration starts (the app's server, its global setup); the "
+          "run gives each run a database of its own when the repository's "
+          "schema is a database's"
+        + (" — its URL is already in your environment ("
+           + ", ".join(TEST_DB_ENV_NAMES) + "): never set those"
+           if db else "")
+        + ". The rest of its environment, as the repository's CI gives it: "
+        + (env or "(none)") + ".\nA test file for it follows "
+          "the suite's own conventions (its directory, its helpers) and may "
+          "set any viewport or device the runner offers. Use it for what "
+          "only a browser shows: layout, what is visible on screen, "
+          "viewport, hover and touch.")
+
+
 def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                            stat: str, ctx: list[str], refs: list[str],
-                           parts: list[dict]) -> str:
+                           parts: list[dict],
+                           suite: dict | None = None) -> str:
     """The falsifier's payload: the frozen F+ user prompt line for line
     (DESIGN §8 *What ships is what was measured* — the only differences
     are an unknown start commit and the item's span as its
-    `source_ref`)."""
+    `source_ref`). With the run's browser channel (`suite`), its section
+    follows the reviewer's parts, and a probe may be written for it; with
+    none the payload is unchanged."""
     lines = ["TASK:", task, "",
              "Files the task references:",
              *[f"- {r}" for r in refs], "",
@@ -61754,6 +62123,17 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                  "by execution):\n" + json.dumps(parts, indent=1)[:6000]
                  if parts else "")
     lines.append("")
+    if suite is not None:
+        lines += [_browser_suite_payload(suite)
+                  + "\nA part about layout, what is visible on screen, "
+                    "viewport, hover or touch is one only this suite can "
+                    "show: a test the test command runs renders without "
+                    "layout (where it emulates a page, an element's classes "
+                    "are all it sees), so a probe there passes whether or "
+                    "not the part holds. Probe such a part with a test file "
+                    "for this suite, run on its own with the command above. "
+                    "The held-out files and a reviewer's parts say where to "
+                    "look, not how to observe it.", ""]
     lines.append(
         "Your working directory is a disposable copy of the FINISHED tree. "
         "Try to demonstrate this item is NOT delivered per your rules, and "
@@ -61764,7 +62144,7 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
 async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                            lane: Path, confirm_tree: Path, sha: str,
                            item_text: str, acc_paths: set[str],
-                           label: str) -> dict:
+                           label: str, suite: dict | None = None) -> dict:
     """Code decides whether a sample demonstrated anything (bench Q2 F+
     G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
     held-out content (its writer read every valid set): it is placed in a
@@ -61773,7 +62153,10 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     confirmed under B* (`_confirm_still_failing`) and read by the AST facts
     script the same way (DESIGN §6 *A held-out evaluation runs alone*).
     In a Prisma/PostgreSQL repo each run has a database of its own
-    (`_capture_failing_test_ids(db=True)`)."""
+    (`_capture_failing_test_ids(db=True)`). With `suite` (the sample ran its
+    probe through the run's browser channel), the probe runs through the
+    suite's own command (DESIGN §8 *A repository's browser suite is a
+    channel the run provisions*)."""
     g: dict = {}
     out: dict = {"gates": g, "confirmed": False}
     if res.get("verdict") != "unmet_demonstrated":
@@ -61789,7 +62172,8 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     g["not_a_lead"] = bool(
         safe and not rel.startswith(FALSIFIER_LEADS_DIR + "/")
         and rel not in acc_paths)
-    cmd = (_acceptance_cmd(st, [rel], str(lane))
+    cmd = ((_browser_suite_cmd(suite, [rel]) if suite is not None
+            else _acceptance_cmd(st, [rel], str(lane)))
            if g["new_file"] else None)
     g["runnable"] = cmd is not None
     quote = _scope_norm(str(res.get("item_span_quote") or ""))
@@ -61819,12 +62203,15 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                                    suffix=Path(rel).suffix)
         os.close(fd)
         # The runner's last message per failing case, for what the finished
-        # run shows (`_record_unmet_evidence`) and nothing else.
+        # run shows (`_record_unmet_evidence`); and every failing run's, for
+        # where in the probe it failed.
         msgs: dict[str, str] = {}
+        runs_msgs: dict[str, list[str]] = {}
         try:
             # Read from the lane, which its falsifier wrote, without
             # following a link it left there.
-            Path(src).write_bytes(_read_beneath(lane, lane / rel, limit=READ_LIMIT_TEXT))
+            probe_bytes = _read_beneath(lane, lane / rel, limit=READ_LIMIT_TEXT)
+            Path(src).write_bytes(probe_bytes)
             place = ((src, rel),)
 
             async def _run(left: float) -> set[str] | None:
@@ -61832,11 +62219,14 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                     str(confirm_tree), cmd, st, caps,
                     label=f"falsifier-{label}", log_path=log_path,
                     timeout=min(left, timeout), serial=True, files=[rel],
-                    db=True, place=place)
+                    db=True, place=place, suite=suite)
                 if got is not None:
                     msgs.update({str(k): str(v) for k, v in
                                  (got.get("messages") or {}).items()
                                  if str(v or "").strip()})
+                    for k in got.get("ids") or []:
+                        runs_msgs.setdefault(str(k), []).append(
+                            str((got.get("messages") or {}).get(k) or ""))
                 return set(got["ids"]) if got is not None else None
             first = await _run(timeout)
             cid = _falsifier_case_id(first or (),
@@ -61878,11 +62268,41 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                                          _run_repo(st), sha, item_text)
             out["coupling"] = cp
             g["not_coupled"] = cp.get("coupled") is False
+            # It failed at its assertion, not in the setup that reaches it
+            # (DESIGN §8 *A repository's browser suite is a channel the run
+            # provisions*): some failing run names no line of the probe, or
+            # names one of the lines the quoted assertion is.
+            g["at_assertion"] = _falsifier_failed_at_assertion(
+                runs_msgs.get(cid) or [], rel,
+                probe_bytes.decode(errors="replace"),
+                str(res.get("assertion_quote") or ""))
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(src)
         out["confirmed"] = all(g.values())
         return out
+
+
+def _falsifier_failed_at_assertion(messages: list[str], rel: str,
+                                   source: str, quote: str) -> bool:
+    """True when some failing run's message names no line of the probe
+    `rel` (`_evidence_line`; the runner gave no location, as before), or
+    names a line of `source` that is part of the quoted assertion
+    (whitespace-normalised, at least 6 characters). A failure at another
+    line — a navigation or a login that timed out, a setup step that threw
+    — shows the environment, not the item, and B* reruns it under the same
+    conditions. Stack frames are fixed runner output (DESIGN §12)."""
+    q = _scope_norm(quote)
+    lines = source.splitlines()
+    for m in messages or [""]:
+        n = _evidence_line(m, rel)
+        if n is None:
+            return True
+        if 1 <= n <= len(lines):
+            ln = _scope_norm(lines[n - 1])
+            if len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln)):
+                return True
+    return False
 
 
 def _falsifier_save_probe(st: "State", lane: Path, i: int,
@@ -61960,6 +62380,14 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             return {"enabled": False, "skipped": "AST coupling check "
                     "unavailable (no typescript compiler API from the tree "
                     "or the bundled copy)"}
+        # The run's browser channel, when the repository's browser suite ran
+        # here: its prerequisites (a code generator, the runner's browser)
+        # set up every checkout a probe runs in (DESIGN §8 *A repository's
+        # browser suite is a channel the run provisions*).
+        suite = _browser_suite(st)
+        if suite is not None:
+            await _ci_prepare(confirm_tree, [_browser_suite_rec(suite)], st,
+                              caps, "falsifier-confirm")
         sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
                               or []) if isinstance(s_, dict)]
         acc_paths = {rel for s_ in sets
@@ -61981,6 +62409,9 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                     verbosity=verbosity, label_prefix=f"falsifier-lane{n}",
                     log_prefix="delivery detection"):
                 continue
+            if suite is not None:
+                await _ci_prepare(lane, [_browser_suite_rec(suite)], st,
+                                  caps, f"falsifier-lane{n}")
             lanes.put_nowait(lane)
         if lanes.empty():
             return {"enabled": False, "skipped": "no falsifier checkout "
@@ -62005,7 +62436,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                              item: dict) -> dict:
             ctx, refs = _falsifier_place_leads(st, lane, sets, task)
             user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
-                                          parts_by_idx.get(i) or [])
+                                          parts_by_idx.get(i) or [],
+                                          suite=suite)
             sid = f"falsifier-i{i}-s{n}"
             common = dict(system_prompt=_load_prompt("falsifier"),
                           schema_key="falsifier", cwd=str(lane),
@@ -62033,12 +62465,26 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             rec.update({key: res.get(key) for key in (
                 "verdict", "probe_path", "case_name", "assertion_quote",
                 "item_span_quote", "entry_point", "reason")})
+            # A probe the sample ran through the browser suite's runner is
+            # confirmed through it; any other through the test command.
+            via = None
+            if suite is not None and res.get("probe_path"):
+                cmds = [str(inp.get("command") or "") for sid_ in (
+                            sid, f"{sid}-reask")
+                        for _k, inp, _r in _iter_log_tool_use(
+                            _worker_log_path(st.run_dir, sid_, "falsifier"),
+                            kinds=("Bash",))]
+                if _browser_suite_ran_probe(
+                        cmds, _delivery_cite_rel(str(res["probe_path"]),
+                                                 lane), lane, suite):
+                    via = suite
+                    rec["via_browser_suite"] = True
             # Its confirm queues on the execution lock
             # (`_falsifier_gates`' section), one at a time.
             rec.update(await _falsifier_gates(
                 st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
                 sha=sha, item_text=_falsifier_item_text(item),
-                acc_paths=acc_paths, label=f"i{i}-s{n}"))
+                acc_paths=acc_paths, label=f"i{i}-s{n}", suite=via))
             if rec.get("confirmed"):
                 saved = _falsifier_save_probe(st, lane, i, res)
                 if saved:
@@ -62120,10 +62566,26 @@ def _observability_payload(normalized: list[dict],
 
 
 def _observability_user_prompt(task: str, payload: list[dict],
-                               test_cmd: str | None) -> str:
+                               test_cmd: str | None,
+                               suite: dict | None = None) -> str:
     cmd = (f"`{test_cmd}`" if test_cmd and test_cmd.strip()
            else "none is configured: the run runs no tests")
+    extra = ""
+    if suite is not None:
+        # DESIGN §8 *A repository's browser suite is a channel the run
+        # provisions*: a third way the run observes, named in the payload
+        # only when code saw the suite run here, so a run without one gets
+        # the payload it was benched on.
+        extra = ("\n\n" + _browser_suite_payload(suite)
+                 + "\nSo this run observes in a third way besides the two "
+                   "your instructions name: a test it writes for this "
+                   "suite. A part such a test could exercise in a real "
+                   "browser, and would fail on, is `test_command`; "
+                   "`rendering_engine` is then only for what this browser "
+                   "cannot show (another engine, a real device). Cite the "
+                   "suite's configuration for a `neither`.")
     return ("TASK:\n" + task + "\n\nTHE REPOSITORY'S TEST COMMAND: " + cmd
+            + extra
             + "\n\nREQUIRED ITEMS (each with its numbered parts):\n"
             + json.dumps(payload, indent=2, ensure_ascii=False)
             + "\n\nReturn one entry per item_index, and in it one entry per "
@@ -62203,7 +62665,8 @@ async def _observability_verdicts(st: "State", caps: dict, models: dict,
         return {"sha": sha, "unobservable": {}, "samples": 0}
     payload = _observability_payload(normalized, indices)
     user = _observability_user_prompt(
-        task, payload, resolve_blt(st.repo_root).get("test"))
+        task, payload, resolve_blt(st.repo_root).get("test"),
+        suite=_browser_suite(st))
 
     async def _one(n: int) -> dict | None:
         try:
