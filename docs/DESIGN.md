@@ -13116,7 +13116,11 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
      `START COMMIT of this run: unknown.` in place of the commit and its
      diff stat (the bench always had one);
   3. the item's `source_ref` is its typed span when it has one (the
-     bench corpus carried `source_ref` directly).
+     bench corpus carried `source_ref` directly);
+  4. the item's classifier `parts` ride inside THE ITEM TO CHECK, and step
+     1 of the prompt says each part is required and a part covering many
+     places fails when any one of them falls short (bench SW, *The
+     falsifier gets the item whole* below).
   The first shipped prompt also told the worker what the orchestrator
   checks and offered the executed-commands record as a lead, and its
   input carried that record: none of it was benched, so the Q2 numbers
@@ -13130,7 +13134,8 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   sample is confirmed only when all of these hold: the probe is one
   new file, outside the leads and not an acceptance file, that the
   repository's scoped test runner can run; the item quote it claims to
-  test is verbatim in the item (after NFC/whitespace normalisation);
+  test is verbatim in the item's sentence or one of its parts (after
+  NFC/whitespace normalisation);
   its named case fails under B* on a pristine installed copy of the
   final commit (`_confirm_still_failing`, serial runner, so a load
   flake never confirms), the probe placed in a held-out sandbox over that
@@ -13182,6 +13187,47 @@ target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
 77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
 28/35 and 9/144). One sample alone caught 19/31.
 
+**The falsifier gets the item whole.** An item is the classifier's
+one-sentence wording of a span, with `parts`, and the sentence can leave a
+part out: a whole-site sweep's requirement then lives in a part no
+detector was shown. Measured on navegando 4134b78c (leerie 0.48.0, "make
+the translations fully complete for the entire site"): the item's sentence
+named only the two catalog files; its fourth part was "Coverage: the
+entire site's user-facing strings are present in the messages files". The
+judge was handed the sentence and wrote parts of its own, none of its 11
+samples about the site's strings; the falsifier was handed the sentence
+and the judge's leads, all about one catalog, and demonstrated one catalog
+defect; after the re-drive fixed it, the re-check re-ran only that probe
+(*A re-check replaces a verdict only on a tree that changed*, below). The
+run shipped `met` while an independent audit of the merged tree found
+about 13 components still hard-coding Spanish and about 255 server
+messages shown untranslated. On the earlier run of the same task
+(e0d101e3), whose sentence did say "all site strings covered", the
+falsifier's first sample demonstrated a hard-coded component. So the
+falsifier's input carries the item's `parts`, its prompt says each part is
+required and that a part covering many places fails when any one place
+falls short, and its `item_span_quote` may come from the sentence or a
+part (the quote gate and the coupling check read both). Measured (bench
+SW, the real falsifier in leerie's container on each run's shipped tree,
+dependencies installed, pre-registered): on 4134b78c's shipped tree the
+falsifier with the parts confirmed a remaining hard-coded component in 4
+of 5 samples, without them 0 of 5; on e0d101e3, 2 of 3 with them and 3 of
+3 without; on the non-sweep controls (two web runs, one item each; two
+barnacle runs, 3 and 14 items; 3 samples per arm) no sample of either arm
+confirmed an item labelled met but one: the barnacle umbrella item "fix
+every issue the report lists", confirmed once in each arm on the report's
+layered-dropdown finding, which the report itself lists as not fixed — a
+real gap, not a false unmet — and the one known-unmet item was confirmed
+in 3 of 3 samples with the parts and 2 of 3 without. On the responsive
+task (a70fb4a6) neither arm confirmed anything (0 of 3 each): its gaps are
+layout, which no probe in its test environment observes. Handing the
+read-only judge the same parts was tried first and did not change its
+verdict (bench SW part 1: 5 of 5 `met` with the checklist and 5 of 5 with
+a sentence against proxy evidence, each citing the tree's own heuristic
+guard test as proof that no hard-coded string remained), so the judge's
+input is unchanged. Not re-run: the Q2 corpora F+ was frozen on; the
+change is held to the controls above instead.
+
 **A probe that breaks another part of its own item is a contested reading,
 not a finding.** *Status: designed, not built — see the last paragraph.*
 An item is the classifier's one-sentence wording of a span of the source,
@@ -13207,7 +13253,8 @@ breaking the default. The design:
    (the span's own floor, quoted) — instead of collapsing them into one
    sentence. Code checks each quote is a substring of the span's source,
    as it checks every quote.
-2. *The falsifier gets the item whole.* Its input adds the item's `parts`,
+2. *The falsifier gets the rest of the item.* Its input already carries
+   the item's `parts` (*The falsifier gets the item whole* above); it adds
    `alternatives` and `minimum`, and the span's source text, and it
    returns, besides the part it probes, `other_parts_held[]`: per other
    part, whether its probe's asserted behaviour can coexist with that
@@ -13456,6 +13503,16 @@ re-drive's one group made no change (`pre_sha == post_sha`, `no_change`),
 and one sample on that same tree overturned the 2-of-3 unmet verdict on
 "cookies from intermediate hops carried by the following request"; the
 run shipped `done`.
+
+The same rule covers the falsifier: an item reads met on a tree only by the
+bar a met has at detection, the judge and the falsifier on that tree. The
+re-check used to re-run a falsifier-confirmed item's saved probe and stop
+there, so a sweep whose one demonstrated place was fixed read met with
+nothing trying the others: on 4134b78c no falsifier ever ran on the tree
+that shipped. So every re-checked item the re-check reads met is falsified
+afresh on that commit (`falsifier_samples` samples, no leads); a confirmed
+sample makes it unmet again, and its probe is the one the next re-check
+re-runs.
 
 **An unmet item reaches its owner, or is recorded as reaching none.**
 Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
