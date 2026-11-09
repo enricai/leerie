@@ -497,6 +497,10 @@ _NAMES_ONLY = {
     "_node_lockfile_paths", "_output_entries", "_same_settings_path",
     "_tree_bytes", "_vitest_filter_colliders", "_restore_write_bits",
     "_rmtree_owned",
+    # A tree's ignored paths made a copy's own (`_share_ignored_paths`):
+    # listed and opened relative to a directory reached without following a
+    # link, a file's bytes (where it cannot be linked) through `O_NOFOLLOW`.
+    "_link_tree_at", "_link_entry_at",
 }
 
 
