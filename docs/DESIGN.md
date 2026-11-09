@@ -14151,6 +14151,57 @@ afresh on that commit (`falsifier_samples` samples, no leads); a confirmed
 sample makes it unmet again, and its probe is the one the next re-check
 re-runs.
 
+**Every item the tree that ships reports met passed detection's bar on
+it.** The re-check reaches only the items the re-drive routed. Every other
+met item was read after a kept group by the delivery ratchet's judge alone
+(*A repair that regresses met work is rolled back*), whose re-verification
+carries no citation and runs no falsifier, so it is below detection's bar.
+Measured (lane T9 bench 4, navegando 4134b78c sample 1): a group sent for a
+base-form note was kept. While fixing that note it made the password
+input's labels default to hard-coded Spanish. Item 0 had been met at
+detection; one of its parts was "the entire site's user-facing strings are
+present in the messages files". The item was routed nowhere. The ratchet's
+judge ran three samples and kept the item met, its recorded evidence
+repeating the round's own claim ("the component's Spanish defaults aren't
+used on localized pages"). The sample's log has no falsifier line: nothing
+tried the item on the tree that would ship.
+
+**Invariant:** a kept change made after detection voids detection's
+falsification of every item the change can reach. Leerie cannot soundly
+tell which items those are from what it holds. The ratchet judge's
+`evidence_files` are the files its own verdict cited. They sample an item's
+reach, chosen by the judge whose verdict is in question, and a sweep item
+reaches every file that renders a string. A diff names the files that
+moved, not the items that read them. So the rule takes them all. When the
+re-drive ends on a commit other than the one it started on, it collects
+every item that meets three conditions (`_redrive_met_unread`):
+
+- its row reads met, or every part of it other than its test outcome does;
+- the falsifier is asked about it (`_falsifier_item`: never `external`,
+  `test_id_diff` or `untouched_paths`, which code settles on the commit);
+- no re-check read it on that commit.
+
+Each one is re-checked there as a routed item is: re-judged by the cited
+judge, then falsified afresh. A confirmed sample makes it unmet, with the
+probe as its evidence. A judge that crashes leaves it unverified
+(`unknown`, listed for a human, the verdict not re-keyed to that commit),
+never met.
+
+The rule runs once, on the tree that ships, and not after every kept
+group. A falsifier confirm is detection's verdict, not a reason to roll
+back. The ratchet's rollback rule was benched with its judge alone (N5),
+and the falsifier's measured false unmet is 8.1% per item, so making it a
+rollback trigger would need a bench of its own. The cost was measured
+over every recorded run under `~/.leerie/` (2026-11-09). Of 13 runs with a
+re-drive, 10 kept at least one group and ended on a moved commit (12 kept
+groups in all). Those 10 runs hold 23 met items that this rule reads,
+2.3 per run. A met item's falsification at detection took 2.98 samples on
+average (107 recorded rows), and 136 of those 319 samples were re-asked.
+That is about 4.3 falsifier calls per item, or about 10 per affected run.
+The 563 recorded falsifier calls had a median latency of 57 s and a mean of
+107 s. Each affected run also pays one cited judge pass over those items.
+A re-drive that keeps nothing pays nothing.
+
 **An unmet item reaches its owner, or is recorded as reaching none.**
 Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
 is the subtask whose work the item is, and the confirmed finding is the
@@ -16963,7 +17014,12 @@ A confirmed regressed item, or a test confirmed newly failing, resets the
 repair to its own start, using the sha recorded for that round or group.
 In a re-drive, the regressed item then goes to the next groups as a
 `control_regression` note. A kept repair's verdicts become the prior
-evidence of the next one.
+evidence of the next one. The ratchet's read is below detection's bar, since
+its judge carries no citation and no falsifier runs. So the items it keeps
+met after a re-drive group are read again on the tree that ships, by the
+judge and the falsifier (*Every item the tree that ships reports met passed
+detection's bar on it*). An acceptance repair round needs no such read,
+because final detection runs after it.
 
 Measured (bench Q4 N5, frozen design): 49 natural repair rounds and
 cross-run pairs, 517 met items re-verified. 2 runs false-alarmed (4.1%,
