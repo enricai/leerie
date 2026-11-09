@@ -185,7 +185,7 @@ unset _help_arg
 # --- the checkout's leerie configuration is never a link ------------------
 # DESIGN §6 *Leerie never reads through a link a repository holds*. Every
 # host-side read of the checkout's configuration — `leerie.toml`,
-# `.leerie/config.toml`, the derived `.leerie/Dockerfile` — and every write
+# `.leerie/config.toml`, the repository's `.leerie/Dockerfile` — and every write
 # the launcher makes under `.leerie/` names a path in the checkout, whose
 # content a merged run branch may have committed. A link at one of them, or
 # at `.leerie`, would be read or written through: a `leerie.toml` linked to a
@@ -7173,23 +7173,26 @@ _leerie_should_generate_dockerfile() {
   if [ -f "$_repo/go.mod" ] && [ -f "$_repo/go.sum" ]; then
     return 0
   fi
-  local _li_cfg="$_repo/.leerie/config.toml"
-  if [ -f "$_li_cfg" ]; then
-    local _li
-    _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
-                  "$_li_cfg" 2>/dev/null \
-              || true; } \
-            | sed -n 1p \
-            | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
-                      s/[[:space:]]*$//')"
-    # language_installs is a JSON array string in config.toml; "[]" (or
-    # quoted "[]") means empty/absent, anything else non-blank means present.
-    case "$_li" in
-      ""|'""'|"''"|'[]'|'"[]"'|"'[]'") : ;;
-      *) return 0 ;;
-    esac
-  fi
-  return 1
+  _leerie_config_declares_language_installs "$_repo/.leerie/config.toml"
+}
+
+# _leerie_config_declares_language_installs <config.toml> — true when the
+# file's language_installs is non-empty. It is a JSON array string in
+# config.toml; "[]" (or quoted "[]") means empty/absent, anything else
+# non-blank means present.
+_leerie_config_declares_language_installs() {
+  local _li_cfg="$1" _li
+  [ -f "$_li_cfg" ] || return 1
+  _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
+                "$_li_cfg" 2>/dev/null \
+            || true; } \
+          | sed -n 1p \
+          | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
+                    s/[[:space:]]*$//')"
+  case "$_li" in
+    ""|'""'|"''"|'[]'|'"[]"'|"'[]'") return 1 ;;
+  esac
+  return 0
 }
 
 # _leerie_checkout_id — 12 hex characters of the sha256 of $USER_REPO, the
@@ -7507,8 +7510,11 @@ _repo_build_fail() {
   exit 1
 }
 
-# _repo_image_dockerfile <dir> — the repository's .leerie/Dockerfile, as it
-# is, for the first of the repository image's two builds: its bytes, read
+# _repo_image_dockerfile <dir> [<generated>] — the repository's
+# .leerie/Dockerfile, or with <generated> the file leerie generated for this
+# launch (in the build directory; DESIGN §6½ *A generated Dockerfile is
+# leerie's output, never the repository's*), as it is, for the first of the
+# repository image's two builds: its bytes, read
 # beneath the checkout without following a link and bounded, written
 # unchanged to <dir>/repo/Dockerfile (a directory holding nothing else: it
 # is that build's Dockerfile directory). Leerie never edits the file
@@ -7540,6 +7546,9 @@ _repo_image_dockerfile() {
 import hashlib, json, os, re, stat, subprocess, sys
 
 repo, outdir = sys.argv[1:3]
+# A third argument: leerie's own generated file, in the launch's build
+# directory, read in place of the checkout's.
+generated = sys.argv[3] if len(sys.argv) > 3 else None
 LIMIT = 1 << 20
 
 
@@ -7567,9 +7576,13 @@ def read_beneath(root, rel):
 
 
 try:
-    raw = read_beneath(repo, ".leerie/Dockerfile")
+    raw = (read_beneath(os.path.dirname(generated),
+                        os.path.basename(generated)) if generated
+           else read_beneath(repo, ".leerie/Dockerfile"))
 except OSError as e:
-    sys.exit(f"leerie: .leerie/Dockerfile cannot be read as a regular file "
+    sys.exit(f"leerie: the Dockerfile leerie generated cannot be read ({e})"
+             if generated else
+             f"leerie: .leerie/Dockerfile cannot be read as a regular file "
              f"beneath the checkout ({e})")
 lines = raw.decode("utf-8", "surrogateescape").split("\n")
 # BuildKit drops a leading byte-order mark, once.
@@ -8109,8 +8122,10 @@ sys.exit(0 if ok else 1)
   return 1
 }
 
-# _repo_image_prepare — copies the repository's Dockerfile into
-# $_REPO_BUILD_DIR/repo (_repo_image_dockerfile); sets $_REPO_DF_SHA, the
+# _repo_image_prepare — copies the Dockerfile the image builds into
+# $_REPO_BUILD_DIR/repo (_repo_image_dockerfile): the bytes of
+# $_REPO_DF_GEN when this launch generated one, else the repository's
+# own .leerie/Dockerfile; sets $_REPO_DF_SHA, the
 # sha256 of the bytes it read, and makes the build context those bytes read
 # (_repo_build_prepare, $_REPO_CTX_SHA), in place of any made for an
 # earlier Dockerfile.
@@ -8122,8 +8137,15 @@ _repo_image_prepare() {
     _REPO_BUILD_CTX=""
     _REPO_CTX_SHA=""
   fi
-  rm -rf "$_REPO_BUILD_DIR/repo" "$_REPO_BUILD_DIR/wrap" "$_REPO_BUILD_DIR/worker"
-  if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR")" \
+  rm -rf "$_REPO_BUILD_DIR/repo" "$_REPO_BUILD_DIR/wrap" "$_REPO_BUILD_DIR/worker" \
+    "$_REPO_BUILD_DIR/generated.Dockerfile"
+  local _gen=()
+  if [ -n "${_REPO_DF_GEN:-}" ]; then
+    printf '%s\n' "$_REPO_DF_GEN" > "$_REPO_BUILD_DIR/generated.Dockerfile" \
+      || _repo_build_fail "could not write the Dockerfile leerie generated"
+    _gen=("$_REPO_BUILD_DIR/generated.Dockerfile")
+  fi
+  if ! _REPO_DF_SHA="$(_repo_image_dockerfile "$_REPO_BUILD_DIR" ${_gen[@]+"${_gen[@]}"})" \
      || [ -z "$_REPO_DF_SHA" ]; then
     _repo_build_fail "could not prepare the repository image's Dockerfile"
   fi
@@ -8327,47 +8349,56 @@ PY
   [ "$_rc" -ne 3 ]
 }
 
-# Auto-generate a Dockerfile from setup_packages. Runs when no Dockerfile
-# exists OR when the existing one is an UNCOMMITTED prior leerie-generated file
-# (carries the LEERIE_GENERATED_SENTINEL on line 1 AND is not git-tracked) —
-# the latter lets a changed setup_packages / lockfile refresh the generated
-# image in place. A committed Dockerfile ALWAYS takes precedence and is left
-# untouched (DESIGN §6½ "committed Dockerfile is authoritative"), whether or
-# not it carries the sentinel — this matches the git-tracked authority test in
-# capture_repo_deps (leerie.py). The .dockerfile-hash check below still skips
-# the actual build when regenerated bytes are identical, so refresh is free
-# when nothing changed.
+# The repository image's Dockerfile (DESIGN §6½ *A generated Dockerfile is
+# leerie's output, never the repository's*). A `.leerie/Dockerfile` in the
+# checkout is the repository's own ($_REPO_DF_OWN) only when its first line
+# is not leerie's mark, LEERIE_GENERATED_SENTINEL. Otherwise leerie generates
+# the file from .leerie/config.toml and the committed tree on every launch,
+# into the launch's build directory and never into the checkout, and keeps
+# its bytes in $_REPO_DF_GEN, which _repo_image_prepare builds from (locally
+# and for Fly). A checkout file that carries the mark is a copy of an earlier
+# launch's output and is never read: a committed one stops the launch (it
+# froze the image at the configuration it was generated from, and leerie
+# cannot tell a stale copy from lines the operator wrote under the mark); an
+# untracked one, which an earlier leerie rewrote on every launch, is left
+# where it is, with a warning. The .dockerfile-hash check below still skips
+# the build when the generated bytes are the ones last built.
 LEERIE_GENERATED_SENTINEL="# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
-# Decide whether to (re)generate. `read`+compare must be grouped as one unit:
-# `||` and `&&` are left-associative with equal precedence in bash, so an
-# inline `[ ! -f ] || read && [ = sentinel ]` would run the sentinel compare
-# even when the file is absent (against a stale var) — a real bug. Use an
-# explicit boolean instead.
+_REPO_DF_OWN=false
+_REPO_DF_GEN=""
 _leerie_do_gen=false
 _REPO_GEN_FALLBACK=""
-if [ -f "$_leerie_config_toml" ]; then
-  if [ ! -f "$_leerie_dockerfile" ]; then
-    _leerie_do_gen=true
-  elif ! _checkout_file_tracked ".leerie/Dockerfile" && \
-       IFS= read -r _df_first_line < "$_leerie_dockerfile" 2>/dev/null && \
-       [ "$_df_first_line" = "$LEERIE_GENERATED_SENTINEL" ]; then
-    # Uncommitted generated file → safe to refresh in place. (A committed one
-    # — a submodule's included — is authoritative even with the sentinel, so
-    # `_checkout_file_tracked` gates it out first, and a committed file or a
-    # link is never read by path.)
+_sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
+              "$_leerie_config_toml" 2>/dev/null \
+          || true; } \
+        | sed -n 1p \
+        | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
+                  s/[[:space:]]*$//;
+                  s/^"(.*)"$/\1/;
+                  s/^'"'"'(.*)'"'"'$/\1/')"
+if [ -f "$_leerie_dockerfile" ]; then
+  # The first line, bounded; `.leerie/Dockerfile` is never a link here
+  # (_checkout_config_links refused one at the launcher's start).
+  _df_first_line=""
+  IFS= read -r -n 256 _df_first_line < "$_leerie_dockerfile" 2>/dev/null || true
+  if [ "$_df_first_line" != "$LEERIE_GENERATED_SENTINEL" ]; then
+    _REPO_DF_OWN=true
+    if [ -n "$_sp" ] || _leerie_config_declares_language_installs "$_leerie_config_toml"; then
+      remote_log "note: the repository's own .leerie/Dockerfile is built as written; .leerie/config.toml's setup_packages and language_installs are not read while it is there"
+    fi
+  elif _checkout_file_tracked ".leerie/Dockerfile"; then
+    remote_log "error: .leerie/Dockerfile is committed, and its first line is leerie's mark for a file it generated ('$LEERIE_GENERATED_SENTINEL'). Leerie generates that file from .leerie/config.toml on every launch and never reads a copy of it: a committed copy keeps the image at the configuration it was generated from, and leerie cannot tell a stale copy from lines written in it since. Remove it from the repository (git rm .leerie/Dockerfile), and leerie builds what .leerie/config.toml asks for; or, if lines in it are yours, delete its first line, and it is the repository's own Dockerfile (DESIGN §6½ *A generated Dockerfile is leerie's output, never the repository's*)."
+    exit 1
+  else
+    remote_log "warning: .leerie/Dockerfile in $(_terminal_safe "$USER_REPO") is a file an earlier leerie generated; it is not read (leerie generates the file on every launch, outside the checkout) and can be removed"
     _leerie_do_gen=true
   fi
   unset _df_first_line
+else
+  _leerie_do_gen=true
 fi
+[ -f "$_leerie_config_toml" ] || _leerie_do_gen=false
 if [ "$_leerie_do_gen" = "true" ]; then
-  _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
-                "$_leerie_config_toml" 2>/dev/null \
-            || true; } \
-          | sed -n 1p \
-          | sed -E 's/^[[:space:]]*setup_packages[[:space:]]*=[[:space:]]*//;
-                    s/[[:space:]]*$//;
-                    s/^"(.*)"$/\1/;
-                    s/^'"'"'(.*)'"'"'$/\1/')"
   # Bug fix: this used to be `if [ -n "$_sp" ]; then` — the whole generation
   # body (apt layer, language-dep layer, build-verify fallback) skipped
   # entirely for a repo with a lockfile / language_installs but no
@@ -8376,11 +8407,11 @@ if [ "$_leerie_do_gen" = "true" ]; then
   # stays conditional on `$_sp` specifically so a repo with zero system
   # packages gets a Dockerfile with no dangling/empty apt RUN.
   if _leerie_should_generate_dockerfile "$USER_REPO" "$_sp"; then
-    remote_log "auto-generating .leerie/Dockerfile (setup_packages=$(_terminal_safe "${_sp:-<none>}"))"
-    mkdir -p "$USER_REPO/.leerie"
-    # Write to a temp file then move atomically so a half-written file is
-    # never visible to the hash check below.
-    _gen_df_tmp="$USER_REPO/.leerie/.Dockerfile.gen.$$"
+    remote_log "generating the repository image's Dockerfile from .leerie/config.toml (setup_packages=$(_terminal_safe "${_sp:-<none>}"))"
+    # Leerie's own file, in the launch's build directory: nothing of it is
+    # ever written into the checkout.
+    _repo_build_dir
+    _gen_df_tmp="$_REPO_BUILD_DIR/generated.Dockerfile"
     printf '%s\n' "$LEERIE_GENERATED_SENTINEL" > "$_gen_df_tmp"
     printf 'ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n' >> "$_gen_df_tmp"
     if [ -n "$_sp" ]; then
@@ -8980,15 +9011,17 @@ PY
       unset _lang_layer _lang_rc _dep_pyf
     fi
 
-    mv "$_gen_df_tmp" "$_leerie_dockerfile"
+    _REPO_DF_GEN="$(cat "$_gen_df_tmp")"
+    [ -n "$_REPO_DF_GEN" ] || _repo_build_fail "could not read back the Dockerfile leerie generated"
     unset _gen_df_tmp _pkg
   fi
-  unset _sp _sp_packages _sp_list
+  unset _sp_packages _sp_list
 fi
-unset _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAGE_DEPS
+unset _sp _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAGE_DEPS
 
-# Only proceed if a Dockerfile is now present (real or auto-generated).
-if [ -f "$_leerie_dockerfile" ]; then
+# Only proceed when there is a Dockerfile to build: the repository's own, or
+# the one this launch generated.
+if [ "$_REPO_DF_OWN" = "true" ] || [ -n "$_REPO_DF_GEN" ]; then
   REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
   if [ -n "$REPO_IMAGE_TAG" ]; then
     # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>:
@@ -9069,8 +9102,7 @@ if [ -f "$_leerie_dockerfile" ]; then
         # the layer again; the record marks it, and each reuse says so.
         remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake, reused until an input of its key changes (to retry the layer, remove $(_terminal_safe "$_hash_file"))"
         _cur_mark=" apt-only"
-        printf '%s\n' "$_REPO_GEN_FALLBACK" > "$USER_REPO/.leerie/.Dockerfile.gen2.$$"
-        mv "$USER_REPO/.leerie/.Dockerfile.gen2.$$" "$_leerie_dockerfile"
+        _REPO_DF_GEN="$_REPO_GEN_FALLBACK"
         _repo_image_prepare
         build_repo_image "$REPO_IMAGE_TAG"
       fi
@@ -9812,7 +9844,8 @@ _FLY_BASE_TAG=""
 # digest leerie pushed under the tag (set by ensure_image).
 FLY_IMAGE_REF=""
 
-# When .leerie/Dockerfile is present (real or auto-generated), set
+# When the repository image has a Dockerfile (the repository's own, or the
+# one this launch generated: $_REPO_DF_OWN, $_REPO_DF_GEN), set
 # LEERIE_FLY_IMAGE to registry.fly.io/$APP:$VERSION-$REPO_HASH so that
 # resolve_fly_image_tag() returns the per-repo tag. $REPO_HASH is the
 # digest of the repository's Dockerfile bytes and of the build context they
@@ -9822,7 +9855,7 @@ FLY_IMAGE_REF=""
 # again and requires the same bytes and the same context.
 # Idempotent: called once before resolve_fly_image_tag().
 _set_fly_per_repo_image() {
-  if [ ! -f "$USER_REPO/.leerie/Dockerfile" ]; then
+  if [ "${_REPO_DF_OWN:-false}" != "true" ] && [ -z "${_REPO_DF_GEN:-}" ]; then
     return 0
   fi
   local fly_app version base_tag repo_hash per_repo_tag

@@ -104,3 +104,15 @@ def repo_build_functions(launcher: str) -> str:
     `build_repo_image`)."""
     return extract_block(launcher, "# The repository image (DESIGN §6",
                          "# Build the repository image in its two builds")
+
+
+# A harness body that prints the Dockerfile the repository image builds
+# after the launcher's per-repo block ran: the bytes this launch generated
+# (`$_REPO_DF_GEN`, never written into the checkout — DESIGN §6½ *A
+# generated Dockerfile is leerie's output, never the repository's*), else
+# the repository's own `.leerie/Dockerfile`. Prints nothing when there is
+# neither.
+BUILT_DOCKERFILE = (
+    'if [ -n "${_REPO_DF_GEN:-}" ]; then printf \'%s\\n\' "$_REPO_DF_GEN"; '
+    'elif [ "${_REPO_DF_OWN:-false}" = true ]; then '
+    'cat "$USER_REPO/.leerie/Dockerfile"; fi')

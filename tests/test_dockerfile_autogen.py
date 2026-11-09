@@ -22,7 +22,8 @@ from pathlib import Path
 from tests.committed_tree import commit_tree
 from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
 from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
-from tests.repo_image_block_extract import NERDCTL_IMAGE_INSPECT_STUB
+from tests.repo_image_block_extract import (BUILT_DOCKERFILE,
+                                            NERDCTL_IMAGE_INSPECT_STUB)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -110,7 +111,7 @@ def test_autogen_contains_arg_base_image(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -134,7 +135,7 @@ def test_autogen_contains_from_base_image(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -158,7 +159,7 @@ def test_autogen_contains_user_root(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -182,7 +183,7 @@ def test_autogen_contains_apt_get_install(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -206,7 +207,7 @@ def test_autogen_lists_all_declared_packages(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -234,7 +235,7 @@ def test_autogen_does_not_end_with_user_leerie(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -262,7 +263,7 @@ def test_autogen_ends_with_user_root(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -300,7 +301,7 @@ def test_autogen_log_message_emitted(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
-    assert "auto-generating .leerie/Dockerfile" in result.stderr
+    assert "generating the repository image's Dockerfile" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +321,7 @@ def test_existing_dockerfile_preserved_verbatim(tmp_path):
     state_dir.mkdir()
 
     result = _run_harness(
-        'cat "$USER_REPO/.leerie/Dockerfile"',
+        BUILT_DOCKERFILE,
         env={
             "USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
@@ -357,7 +358,7 @@ def test_existing_dockerfile_suppresses_autogen(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
-    assert "auto-generating" not in result.stderr
+    assert "generating the repository image's Dockerfile" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +405,7 @@ def test_no_setup_packages_no_dockerfile_does_not_build(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "building" not in result.stderr
-    assert "auto-generating" not in result.stderr
+    assert "generating the repository image's Dockerfile" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +422,7 @@ def test_coupling_autogen_log_sentinel():
     again.
     """
     launcher = _launcher_text()
-    assert 'remote_log "auto-generating .leerie/Dockerfile (setup_packages=' in launcher
+    assert 'remote_log "generating the repository image\'s Dockerfile from .leerie/config.toml (setup_packages=' in launcher
 
 
 def test_coupling_arg_base_image_in_launcher():

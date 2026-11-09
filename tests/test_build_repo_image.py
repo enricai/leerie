@@ -23,7 +23,8 @@ import pytest
 
 from tests.committed_tree import commit_tree
 from tests.conftest import BUILDCTL_STUB, FRONTEND_SH_SOURCE, LOG_SH_SOURCE
-from tests.repo_image_block_extract import (EMPTY_CONTEXT_SHA,
+from tests.repo_image_block_extract import (BUILT_DOCKERFILE,
+                                            EMPTY_CONTEXT_SHA,
                                             NERDCTL_IMAGE_INSPECT_STUB,
                                             REPO_DIGEST)
 from tests.repo_image_block_extract import extract_block as _extract_block
@@ -588,7 +589,7 @@ def test_base_image_build_error_sentinel_in_launcher():
 # block (not just build_repo_image) via the same _run_harness pattern —
 # `.leerie/config.toml` and dependency-manifest fixtures under USER_REPO
 # trigger the real auto-generation path, and the resulting
-# `.leerie/Dockerfile` content is asserted directly.
+# Dockerfile the launch builds (`_built`, from `$_REPO_DF_GEN`) is asserted directly.
 # ---------------------------------------------------------------------------
 
 def _write_config_toml(leerie_dir: Path, setup_packages: str = "") -> None:
@@ -611,8 +612,17 @@ def _generate_dockerfile(tmp_path, user_repo: Path, state_dir: Path,
     }
     if extra_env:
         env.update(extra_env)
-    result = _run_harness(tmp_path, "echo done", env=env)
+    out = _built(tmp_path)
+    result = _run_harness(
+        tmp_path, f'{{ {BUILT_DOCKERFILE}; }} > "{out}"; '
+        f'[ -s "{out}" ] || rm -f "{out}"', env=env)
     return result
+
+
+def _built(tmp_path: Path) -> Path:
+    """Where `_generate_dockerfile` leaves the Dockerfile the launch's
+    image builds; absent when it builds none."""
+    return tmp_path / "built.Dockerfile"
 
 
 def test_python_bakes_to_opt_venv(tmp_path):
@@ -630,7 +640,7 @@ def test_python_bakes_to_opt_venv(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/python-build" in df, df
     assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
     assert "ENV PATH=/opt/venv/bin:$PATH" in df, df
@@ -660,7 +670,7 @@ def test_poetry_bakes_to_opt_venv_no_active_flag(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/python-build" in df, df
     assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
     assert "RUN /opt/venv/bin/python3 -m pip install poetry" in df, df
@@ -688,7 +698,7 @@ def test_pipenv_bakes_to_opt_venv(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/python-build" in df, df
     assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
     assert "RUN /opt/venv/bin/python3 -m pip install pipenv" in df, df
@@ -710,7 +720,7 @@ def test_rust_bakes_to_opt_cargo_target_with_dummy_source(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/rust-build" in df, df
     assert "ENV CARGO_TARGET_DIR=/opt/cargo-target" in df, df
     assert "src/main.rs" in df, df
@@ -745,7 +755,7 @@ def test_go_bakes_to_opt_go_cache_with_dummy_source(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/go-build" in df, df
     assert "ENV GOCACHE=/opt/go-cache" in df, df
     assert "_leerie_dummy.go" in df, df
@@ -770,7 +780,7 @@ def test_ruby_bakes_to_opt_bundle(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "WORKDIR /opt/ruby-build" in df, df
     env_idx = df.index("ENV BUNDLE_PATH=/opt/bundle")
     config_idx = df.index("ENV BUNDLE_APP_CONFIG=/opt/bundle")
@@ -793,7 +803,7 @@ def test_node_pnpm_still_targets_work_unchanged(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "pnpm install --frozen-lockfile" in df, df
     assert "/opt/" not in df, df
 
@@ -818,7 +828,7 @@ def test_gating_fix_lockfile_without_setup_packages_still_generates(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df_path = leerie_dir / "Dockerfile"
+    df_path = _built(tmp_path)
     assert df_path.exists(), "Dockerfile must be generated for a lockfile-only repo"
     df = df_path.read_text()
     assert "RUN uv sync" in df, df
@@ -840,7 +850,7 @@ def test_gating_fix_bare_requirements_txt_does_not_trigger(tmp_path):
 
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
-    assert not (leerie_dir / "Dockerfile").exists(), (
+    assert not _built(tmp_path).exists(), (
         "bare requirements.txt must not trigger Dockerfile auto-generation"
     )
 
@@ -858,7 +868,7 @@ def test_gating_fix_setup_packages_alone_still_works(tmp_path):
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
 
-    df = (leerie_dir / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "apt-get install" in df, df
     assert "curl" in df and "git" in df, df
 
@@ -875,7 +885,7 @@ def test_gating_fix_neither_setup_packages_nor_lockfile_no_generation(tmp_path):
 
     result = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result.returncode == 0, result.stderr
-    assert not (leerie_dir / "Dockerfile").exists()
+    assert not _built(tmp_path).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -899,13 +909,11 @@ def test_lockfile_bump_still_changes_hash_against_opt_target(tmp_path):
     result1 = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert result1.returncode == 0, result1.stderr
     hash1 = (state_dir / ".dockerfile-hash").read_text()
-    assert "/opt/venv" in (leerie_dir / "Dockerfile").read_text()
+    assert "/opt/venv" in _built(tmp_path).read_text()
 
-    # Remove the leerie-generated Dockerfile so it regenerates (the launcher
-    # only refreshes an uncommitted generated file in place, which requires
-    # `git ls-files` to report it untracked — simplest here is to delete it,
-    # matching the "no Dockerfile exists" trigger).
-    (leerie_dir / "Dockerfile").unlink()
+    # Nothing is removed between launches: the file is generated on every
+    # launch, never kept in the checkout.
+    assert sorted(p.name for p in leerie_dir.iterdir()) == ["config.toml"]
     (user_repo / "uv.lock").write_text("bumped-lockfile-content-changed\n")
 
     result2 = _generate_dockerfile(tmp_path, user_repo, state_dir)
@@ -954,7 +962,7 @@ def test_an_up_to_date_generated_image_runs_no_build(tmp_path):
     user_repo, state_dir = _lang_repo(tmp_path)
     r = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert r.returncode == 0, r.stderr
-    assert "COPY " in (user_repo / ".leerie" / "Dockerfile").read_text()
+    assert "COPY " in _built(tmp_path).read_text()
     assert len(_take_builds(tmp_path)) == 2, r.stderr
     key = (state_dir / ".dockerfile-hash").read_text()
     assert re.fullmatch(r"\S+ sha256:\S+\n", key), key
@@ -988,7 +996,7 @@ def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
     assert f"remove {hash_file}" in r.stderr, r.stderr
     builds = _take_builds(tmp_path)
     assert len(builds) == 3, builds
-    df = (user_repo / ".leerie" / "Dockerfile").read_text()
+    df = _built(tmp_path).read_text()
     assert "COPY " not in df and "apt-get install" in df and " jq " in df, df
     key = hash_file.read_text()
     assert re.fullmatch(r"\S+ sha256:\S+ apt-only\n", key), key
@@ -1002,7 +1010,7 @@ def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
         assert f"remove {hash_file}" in r.stderr, r.stderr
         assert _take_builds(tmp_path) == []
         assert hash_file.read_text() == key
-    assert "COPY " in (user_repo / ".leerie" / "Dockerfile").read_text()
+    assert "COPY " in _built(tmp_path).read_text()
 
 
 
