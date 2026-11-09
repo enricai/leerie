@@ -676,3 +676,85 @@ def test_a_check_timing_out_with_budget_left_is_no_verdict_not_a_cut(
     assert v["budget_exhausted"] is False
     assert v["new"] == [] and v["budget_short"] == []
     assert v["resource_affected"] == ["b"]
+
+
+# ---- a prerequisite runs in the form that needs no root --------------------
+# (DESIGN §9 *A prerequisite runs in the form that needs no root*: a CI
+# runner has root, nothing leerie runs does.)
+
+# Fails like a step that asks for root it does not have, else leaves its
+# marker in the command's own temp directory.
+MARK = ("import os, sys\n"
+        "if '--as-root' in sys.argv: sys.exit('su: Authentication failure')\n"
+        "open(os.path.join(os.environ['TMPDIR'], sys.argv[-1]), 'w').close()\n")
+ROOT_WORKFLOW = """\
+      - run: python3 mark.py NONE
+      - run: python3 mark.py --as-root PART
+      - run: python3 mark.py ALL
+"""
+
+
+def _pre(argv, root=None, rootless=()):
+    p = {"argv": list(argv), "cwd": "."}
+    if root is not None:
+        p.update(root=root, rootless_argv=list(rootless))
+    return p
+
+
+@pytest.mark.parametrize("argv, form, ok", [
+    (["t", "install", "--root-part", "b"], ["t", "install", "b"], True),
+    (["sudo", "t", "install", "b"], ["t", "install", "b"], True),
+    # Not the step's own words: one added, one changed, reordered.
+    (["t", "install", "b"], ["t", "install", "b", "--x"], False),
+    (["t", "install", "--root-part", "b"], ["t", "setup", "b"], False),
+    (["t", "install", "--root-part", "b"], ["t", "b", "install"], False),
+    # Nothing removed is no rootless form; neither is nothing at all.
+    (["t", "install", "b"], ["t", "install", "b"], False),
+    (["t", "install", "b"], [], False),
+])
+def test_a_rootless_form_only_drops_words(leerie, argv, form, ok):
+    pre = _pre(argv, "part", form)
+    assert leerie._ci_rootless_form(pre) == (form if ok else None)
+    assert leerie._ci_prereq_argv(pre) == (form if ok else None)
+
+
+def test_what_each_root_type_runs(leerie):
+    argv = ["t", "install", "--root-part", "b"]
+    assert leerie._ci_prereq_argv(_pre(argv, "none")) == argv
+    assert leerie._ci_prereq_argv(_pre(argv, "all")) is None
+    # A record from before the field runs as written.
+    assert leerie._ci_prereq_argv(_pre(argv)) == argv
+
+
+def test_a_part_without_its_own_words_is_a_provenance_problem(leerie, env):
+    _commit(env, {".github/workflows/ci.yml": WORKFLOW + ROOT_WORKFLOW})
+    good = _check("build", [PY, "build.py"], kind="build")
+    good["prerequisites"] = [_pre([PY, "mark.py", "--as-root", "PART"],
+                                  "part", [PY, "mark.py", "PART"])]
+    assert leerie._ci_check_problems(good, env["staging"]) == []
+    bad = json.loads(json.dumps(good))
+    bad["prerequisites"][0]["rootless_argv"] = [PY, "mark.py", "NONE"]
+    probs = leerie._ci_check_problems(bad, env["staging"])
+    assert any("rootless form" in p for p in probs), probs
+    recs = {r["id"]: r for r in leerie._ci_select([bad], env["staging"])}
+    assert recs["build"]["reason"] == "provenance"
+
+
+def test_the_baseline_runs_each_prerequisite_in_its_rootless_form(
+        leerie, env):
+    _commit(env, {".github/workflows/ci.yml": WORKFLOW + ROOT_WORKFLOW,
+                  "mark.py": MARK})
+    build = _check("build", [PY, "build.py"], kind="build")
+    build["prerequisites"] = [
+        _pre([PY, "mark.py", "NONE"], "none"),
+        _pre([PY, "mark.py", "--as-root", "PART"], "part",
+             [PY, "mark.py", "PART"]),
+        _pre([PY, "mark.py", "ALL"], "all")]
+    env["checks"][:] = [build]
+    recs = _baseline(env)
+    assert recs["build"]["gate"] == "plain", recs["build"]
+    ran = {p.name for name in ("NONE", "PART", "ALL")
+           for p in measured_tmp_files(env["st"].run_dir, name)}
+    # `part` ran without the word that asks for root (with it, it fails and
+    # leaves nothing — what the CI's form did here); `all` never ran.
+    assert ran == {"NONE", "PART"}
