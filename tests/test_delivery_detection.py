@@ -1097,6 +1097,61 @@ def test_without_statements_only_the_quoted_lines_count(leerie, tmp_path):
         msg, AT_REL, AT_PROBE, AT_QUOTE) is False
 
 
+# === finding a parametrised case ==========================================
+
+EACH_PROBE = """describe("m", () => {
+  it.each(["http://x/a", "http://y/a"])("skips %s", (u) => {
+    expect(u).toBe("SKIPS");
+  });
+  it.each([{ a: { b: 1 }, expected: 3 }])("returns $expected for $a.b", (r) => {
+    expect(r.expected).toBe("TABLE");
+  });
+  it.each([5])("is %d%% done", (n) => {
+    expect(n).toBe("PERCENT");
+  });
+  it.each(["a"])("%s is skipped", (x) => {
+    expect(x).toBe("SUFFIX");
+  });
+  for (const n of [1]) {
+    it(`adds ${n} to the total`, () => {
+      expect(n).toBe("TEMPLATE");
+    });
+  }
+});
+"""
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+@pytest.mark.parametrize("full,marker", [
+    # A literal prefix of 6 characters (barnacle e7512406 item 10, which
+    # read `case_not_found` under the old 8-character prefix rule).
+    ("m skips http://[::ffff:127.0.0.1]/a", "SKIPS"),
+    ("m returns 3 for 1", "TABLE"),
+    ("m is 5% done", "PERCENT"),
+    ("m a is skipped", "SUFFIX"),
+    ("m adds 1 to the total", "TEMPLATE"),
+    # Literal text that differs, or text after the template's end: no case.
+    ("m is 5 percent done", None),
+    ("m a is skipped later", None),
+    ("m keeps the sum", None),
+])
+def test_a_parametrised_case_is_found_by_its_whole_template(
+        leerie, tmp_path, full, marker):
+    tree = tmp_path / "tree"
+    (tree / "node_modules").mkdir(parents=True)
+    os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+    probe = tmp_path / "each-src.test.ts"
+    probe.write_text(EACH_PROBE)
+    facts = _placed_facts(leerie, tmp_path, tree, probe, "probe/each.test.ts",
+                          full)
+    if marker is None:
+        assert facts.get("error") == "case_not_found", facts
+    else:
+        assert "error" not in facts, facts
+        assert f'"{marker}"' in facts["case_src"]
+
+
 # === the bundled typescript fallback =======================================
 
 def _ts7_tree(root: Path) -> Path:

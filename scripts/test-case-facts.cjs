@@ -50,13 +50,26 @@ function walk(n, suites) {
   ts.forEachChild(n, c => walk(c, suites));
 }
 walk(sf, []);
+// A parametrised title (`it.each`, `test.each`, a template literal) names
+// every case it generates: its literal text must match exactly and in order,
+// each placeholder any text (vitest/jest's printf `%s %d %i %f %j %o %O %p %c
+// %# %$`, `%%` a literal `%`, a table's `$name` / `$name.path`, a template's
+// `${}`), anchored at the end of the runner's full name as a plain title is.
+// Scored by its literal length, so the most specific title wins.
+const PLACEHOLDER = /%%|%[sdifjoOpc#$]|\$\{\}|\$[A-Za-z_$#][\w$]*(?:\.[\w$]+)*/g;
 function titleMatches(t, full) {
   if (full === t || full.endsWith(' ' + t) ) return t.length;
-  if (t.includes('%') || t.includes('${}') || t.includes('$')) { // parametrised title: compare the literal prefix tagged part
-    const head = t.split(/%[sdifjo#]|\$\{\}|\$[a-zA-Z_]+/)[0];
-    if (head.length > 8 && full.includes(head)) return head.length;
+  let src = ''; let lit = 0; let last = 0; let params = 0;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of t.matchAll(PLACEHOLDER)) {
+    const before = t.slice(last, m.index);
+    src += esc(before); lit += before.length;
+    if (m[0] === '%%') { src += '%'; lit += 1; } else { src += '[\\s\\S]*?'; params += 1; }
+    last = m.index + m[0].length;
   }
-  return 0;
+  if (!params) return 0;
+  src += esc(t.slice(last)); lit += t.length - last;
+  return lit > 0 && new RegExp('(?:^|\\s)' + src + '$').test(full) ? lit : 0;
 }
 let best = null, bl = 0;
 for (const c of cases) { const l = titleMatches(c.title, want); if (l > bl) { bl = l; best = c; } }
