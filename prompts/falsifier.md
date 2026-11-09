@@ -27,8 +27,13 @@ the demonstration.
 
 1. Decide what the item, in its own words, requires: an exact literal,
    value, threshold, status code, message, or a behaviour of the system.
-   Quote the exact span of the item text that states it (`item_span_quote`,
-   copied character-for-character from the item).
+   When the item carries `parts`, each part is one thing it requires, and
+   the item is not delivered when any part is not; a part that covers many
+   places ("every page", "all the strings", "each caller") is not delivered
+   when any one of those places falls short. Quote the exact span of the
+   item text that states it (`item_span_quote`, copied
+   character-for-character from the item's sentence or from one of its
+   parts).
 2. Write ONE minimal, self-contained probe test file (a NEW file that
    follows this repository's test-file naming convention, in a new directory
    no existing file uses) that drives the code through a public entry point

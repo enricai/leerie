@@ -61632,6 +61632,22 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     return ctx, refs
 
 
+def _falsifier_item_parts(item: dict) -> list[str]:
+    """The item's classifier `parts`, in order: what the item requires, as
+    the classifier split it (DESIGN §8 *The falsifier gets the item
+    whole*)."""
+    return [p for p in (item.get("parts") or [])
+            if isinstance(p, str) and p.strip()]
+
+
+def _falsifier_item_text(item: dict) -> str:
+    """The item's words a falsifier may quote and name: its sentence and
+    every part — the text `item_span_quote` must be verbatim in, and the
+    text the coupling check reads for a symbol the item names."""
+    return "\n".join([str(item.get("item", "")),
+                      *_falsifier_item_parts(item)])
+
+
 def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                            stat: str, ctx: list[str], refs: list[str],
                            parts: list[dict]) -> str:
@@ -61645,7 +61661,9 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
              "THE ITEM TO CHECK:",
              json.dumps({"item": item.get("item", ""),
                          "source_ref": (item.get("span")
-                                        or item.get("source_ref") or "")},
+                                        or item.get("source_ref") or ""),
+                         **({"parts": _falsifier_item_parts(item)}
+                            if _falsifier_item_parts(item) else {})},
                         indent=1), ""]
     if own:
         lines += [f"START COMMIT of this run: {own}. Diff stat of the run's "
@@ -61945,7 +61963,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             # (`_falsifier_gates`' section), one at a time.
             rec.update(await _falsifier_gates(
                 st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
-                sha=sha, item_text=item.get("item", ""),
+                sha=sha, item_text=_falsifier_item_text(item),
                 acc_paths=acc_paths, label=f"i{i}-s{n}"))
             if rec.get("confirmed"):
                 saved = _falsifier_save_probe(st, lane, i, res)
@@ -65340,7 +65358,74 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
             cur["evidence"] = (cur["evidence"] + " | " if cur["evidence"]
                                else "") + mine
             cur.setdefault("evidence_by", {})["falsifier"] = mine[:1200]
+    await _redrive_falsify_met(st, caps, models, efforts, staging, out)
     return out
+
+
+async def _redrive_falsify_met(st: "State", caps: dict, models: dict,
+                               efforts: dict, staging: Path,
+                               out: dict[int, dict]) -> None:
+    """The re-checked items `out` now reads met are met only by the bar a
+    met has at detection (DESIGN §8 *A re-check replaces a verdict only on a
+    tree that changed, and only by the vote that made it*): the falsifier,
+    run afresh on staging's HEAD. A confirmed sample makes the item unmet
+    by `falsifier` again, its evidence and samples (`falsifier`, whose
+    saved probe the next re-check re-runs) in its verdict. A falsifier that
+    cannot run leaves the re-check's verdict, as at detection."""
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    todo = [i for i, v in sorted(out.items())
+            if not v.get("unmet") and not v.get("unknown")
+            and not v.get("crashed") and 0 <= i < len(normalized)
+            and normalized[i].get("verifiability") != "external"
+            and not _test_id_diff_item(normalized[i])
+            and not (isinstance(normalized[i].get("untouched_paths"), list)
+                     and normalized[i]["untouched_paths"])]
+    sha = await _branch_head_sha(str(staging)) if todo else None
+    if not sha:
+        return
+    gate = st.data.get("delivery_gate") or {}
+    kept = gate.get("final_progress")
+    progress: dict = {"items": {}}
+    try:
+        meta = await _falsify_items(st, caps, models, efforts, sha=sha,
+                                    normalized=normalized, indices=todo,
+                                    parts_by_idx={}, progress=progress)
+    except Exception as e:
+        log(f"  delivery re-drive: falsifier raised {type(e).__name__}: "
+            f"{e} — the re-check's verdict stands")
+        meta = {"skipped": f"{type(e).__name__}"}
+    finally:
+        # The re-check's samples are its own record, never detection's
+        # resume progress.
+        gate = st.data.get("delivery_gate") or {}
+        if kept is None:
+            gate.pop("final_progress", None)
+        else:
+            gate["final_progress"] = kept
+        st.data["delivery_gate"] = gate
+        st.save()
+    if meta.get("skipped"):
+        log(f"  delivery re-drive: falsifier not run on the re-checked "
+            f"items — {meta['skipped']}")
+    for i in todo:
+        fi = (progress.get("items") or {}).get(str(i))
+        if not isinstance(fi, dict):
+            continue
+        cur = out[i]
+        cur["falsifier"] = fi
+        if not fi.get("confirmed"):
+            continue
+        s_ = next((x for x in fi.get("samples") or []
+                   if x.get("confirmed")), {})
+        mine = ("a falsifier probe of the item's words "
+                f"\"{_scope_norm(str(s_.get('item_span_quote') or ''))}\" "
+                "fails under B* on the re-checked tree")
+        cur["unmet"] = True
+        cur["by"] = [*cur.get("by", []), "falsifier"]
+        cur["evidence"] = (cur["evidence"] + " | " if cur.get("evidence")
+                           else "") + mine
+        cur.setdefault("evidence_by", {})["falsifier"] = mine[:1200]
 
 
 def _resettle_test_outcome_rows(st: "State", tree_sha: str | None) -> None:
@@ -65447,7 +65532,9 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
             r = {**r, "verdict": ("unmet" if v["unmet"] else
                                   "unknown" if v.get("unknown") else "met"),
                  "by": v["by"] if v["unmet"] else [],
-                 "redrive_recheck": {"sha": sha}}
+                 "redrive_recheck": {"sha": sha},
+                 **({"falsifier": v["falsifier"]}
+                    if isinstance(v.get("falsifier"), dict) else {})}
             if isinstance(r.get("test_outcome_part"), dict):
                 # The recheck judged only the other parts: the test-outcome
                 # part's verdict still holds when they are met.

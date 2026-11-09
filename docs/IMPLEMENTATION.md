@@ -3748,7 +3748,7 @@ which are specified in their own sections.)
 | `scope_judge` | `prompts/scope_judge.md` | sonnet | 0, or one per defect file with an own-start-failing case in each valid held-out set, on a report-pointer task only (phase 2, `_acceptance_scope_judge_sets`, after the sets validate; and once more for a set the audit's rewrite replaced) | `{report_ranges[{param, min, max, unit, span_quote}], cases[{case_index, origin: report_example \| report_regression_test \| report_symptom \| other_scenario, params[{range_ref, value, unit}], span_quote, reason}]}` — read-only (`Read`, 3 turns, an empty cwd); code decides which cases count (`_scope_judge_counted`) |
 | `pr_reviewer` | `prompts/pr_reviewer.md` | opus (effort high) | 0 or 1 per run (phase 5, `_run_pr_review`, after the delivery gate's first half and before the final conformance; skipped on resume once recorded or once the final conformance ran) | `{findings[{item_id: string\|null, kind: unmet_requirement\|bug\|regression, path, line_start, line_end, quote, item_span_quote: string\|null, explanation}]}` — in its own checkout of staging's HEAD with staging's ignored paths shared (`_judge_checkout(st, staging, "pr-review", rev=head, share_ignored=True)`; DESIGN §8 *A worker that does not commit never runs in a tree leerie measures*), never in staging (`_pr_review_tools(staging, repo_root)`, `PR_REVIEW_MAX_TURNS` = 150, never autonomous); advisory (DESIGN §9 *An advisory whole-PR review feeds the final conformer*) |
 | `contract_extractor` | `prompts/contract_extractor.md` | sonnet | 0 or 1 per `external_contract_assumption` risk on `risk_register` (phase 5, `_extract_contract_literals`, after integration; cached by `<sid>#<index>`) | `{counterpart_sid: string\|null, literal: string\|null, literal_kind: string_value\|identifier\|route_path\|other, symbol: string\|null}` — `Read`, 4 turns, never autonomous (DESIGN §8 *Typed evidence for the delivery judge*) |
-| `falsifier` | `prompts/falsifier.md` | sonnet | 0, or up to `falsifier_samples` (3) per judge-bound required item — never an `external` or `untouched_paths` item — plus at most one re-ask per sample (phase 5, `_run_delivery_detection` → `_falsify_items`, after the held-out acceptance gate; samples of one item run in order and stop at the first confirmed; 0 when there is no scoped test runner, the final tree's dependencies do not install, or `_ts_resolvable` loads no TypeScript compiler API, from the tree or the bundled copy) | `{verdict: unmet_demonstrated \| could_not_demonstrate, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason}` — acting (`ACT_TOOLS`, 80 turns, `--dangerously-skip-permissions`) in a ref-less checkout of the final commit (`falsifier-lane<n>`); facts only — `_falsifier_gates` decides |
+| `falsifier` | `prompts/falsifier.md` | sonnet | 0, or up to `falsifier_samples` (3) per judge-bound required item — never an `external` or `untouched_paths` item — plus at most one re-ask per sample (phase 5, `_run_delivery_detection` → `_falsify_items`, after the held-out acceptance gate; samples of one item run in order and stop at the first confirmed; 0 when there is no scoped test runner, the final tree's dependencies do not install, or `_ts_resolvable` loads no TypeScript compiler API, from the tree or the bundled copy); and, in each delivery re-drive re-check, the same up to `falsifier_samples` per re-checked item it reads met (`_redrive_falsify_met`) | `{verdict: unmet_demonstrated \| could_not_demonstrate, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason}` — acting (`ACT_TOOLS`, 80 turns, `--dangerously-skip-permissions`) in a ref-less checkout of the final commit (`falsifier-lane<n>`); facts only — `_falsifier_gates` decides |
 | `verifiability_classifier` | `prompts/verifiability_classifier.md` | sonnet | 0 or 1 per run (phase 5, `_ratchet_verifiability`, at the first delivery ratchet with a previously met item not settled in code; a failed call is not cached and is retried at the next ratchet) | `{items[{item_index, verifiability: in_tree\|execution, reason}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `RATCHET_CLASSIFIER_MAX_TURNS` = 6) from an empty `<run_dir>/verifiability-classifier/`; cached in `delivery_ratchet.verifiability` |
 | `forbidden_command_extractor` | `prompts/forbidden_command_extractor.md` | sonnet | `forbidden_command_samples` (3) per `phase_classify` call, concurrent with the classifier (`asyncio.gather`); a crashed sample is no vote and is not redrawn, budget exhaustion propagates | `{forbidden_commands[{command, evidence_quote, scope: any\|whole_suite}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `FORBID_EXTRACTOR_MAX_TURNS` = 8) from `_judgment_cwd`; user prompt `_forbidden_extractor_prompt(sources, units, repo_root)`: the task and each referenced report verbatim, plus `resolve_blt(repo_root)["test"]`. In `NOTICE_FREE_WORKERS`. DESIGN §9 *A command the task forbids* || `delivery_ratchet` | `prompts/delivery_judge.md` + `prompts/delivery_ratchet.md` | sonnet | per acceptance-repair round or delivery re-drive group that committed and survived its own rules, with a previously met `in_tree` item: 1 per pack (`_d1_judge_packs`), 3 when sample 1 flags an item or an item's `evidence_files` meet the diff (`_ratchet_judge`) | the delivery judge's verdicts plus `evidence_files[]`; read-only (`SATISFIED_PROBE_TOOLS`, `min(30 + 6×pack, 90)` turns) in staging |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | sonnet | 0 or 1 per acceptance gate (only when a set still fails after the repair rounds and neither M1/M2 nor the set audit fired) | `{summary, files_changed[]}` — acting (`ACT_TOOLS`, 150 turns, autonomous) in a ref-less clone of the own start; never sees a set (its grant names none, `_worker_grants`) |
@@ -9993,12 +9993,16 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `claude_p(schema_key="falsifier", allowed_tools=ACT_TOOLS,
   max_turns=FALSIFIER_MAX_TURNS (80), autonomous=True,
   sid="falsifier-i<k>-s<n>")` with `_falsifier_user_prompt` (task,
-  referenced files, the item and its anchor, the own start and
+  referenced files, the item, its anchor and — when it has any — its
+  classifier `parts` (`_falsifier_item_parts(item)`: the non-blank string
+  parts, in order, as `"parts"` inside THE ITEM TO CHECK), the own start and
   `git diff --stat=160 <own>..<final>`, the lead files, the item's
-  `unmet_parts`) — the frozen F+ user prompt line for line; the record
-  is not passed (DESIGN §8 *What ships is what was measured*).
-  `prompts/falsifier.md` is the frozen `falsifier_prompt.md` +
-  `fplus_addendum.md` with `.q2ctx/` → `FALSIFIER_LEADS_DIR`. `_falsifier_probe_activity(log_path, lane, repo_root)`
+  `unmet_parts`) — the frozen F+ user prompt line for line but for the
+  parts; the record is not passed (DESIGN §8 *What ships is what was
+  measured*). `prompts/falsifier.md` is the frozen `falsifier_prompt.md` +
+  `fplus_addendum.md` with `.q2ctx/` → `FALSIFIER_LEADS_DIR` and bench
+  SW's step-1 sentence on the item's parts (DESIGN §8 *The falsifier gets
+  the item whole*; `tests/test_falsifier_benched_prompt.py` pins both). `_falsifier_probe_activity(log_path, lane, repo_root)`
   runs after the sample's worker returns and before the next sample's
   `_restore_tree` of that lane. `files` are the lane's own probes: its
   untracked, not-ignored paths (`_untracked_listing(lane)`, git addressed
@@ -10023,7 +10027,9 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   relative path, present in the lane, absent from the final commit),
   `not_a_lead` (not under the leads, not an acceptance path), `runnable`
   (`_acceptance_cmd` renders it), `item_quote` (normalised
-  `item_span_quote`, ≥ 8 non-space characters, inside the normalised item);
+  `item_span_quote`, ≥ 8 non-space characters, inside the normalised
+  `_falsifier_item_text(item)` — the sentence and its parts, one per line,
+  which the coupling check's "the item names the symbol" also reads);
   then the probe — held-out content, its writer read every valid set
   (DESIGN §6 *A held-out evaluation runs alone*) — is copied to a
   `tempfile.mkstemp` file of leerie's own (removed after) and, never
@@ -10620,8 +10626,20 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `_delivery_record`, falsifier-confirmed items by
   re-running their saved probe — `falsifier.samples[].probe_saved` — as a
   one-file set through `_evaluate_acceptance_sets`; unmet if either says
-  so, and a crashed or unmeasured check keeps the item unmet), and
-  `_run_ci_parity_final` re-runs when a check was routed. When the re-drive
+  so, and a crashed or unmeasured check keeps the item unmet; then
+  `_redrive_falsify_met(st, caps, models, efforts, staging, out)` runs
+  `_falsify_items(sha=<HEAD>, indices=<the re-checked items now met and
+  not unknown, crashed, external, test_id_diff or untouched_paths>,
+  parts_by_idx={}, progress={"items": {}})` — a met has detection's bar,
+  DESIGN §8 *A re-check replaces a verdict only on a tree that changed,
+  and only by the vote that made it* — and a confirmed item is unmet again
+  with `by` + `["falsifier"]` and evidence `a falsifier probe of the
+  item's words "<quote>" fails under B* on the re-checked tree`; every
+  item it ran carries its record as `falsifier`, which
+  `_redrive_apply_item_verdicts` writes onto the row, so the next re-check
+  re-runs the new probe; `delivery_gate.final_progress` is restored to
+  what it was, and a falsifier that cannot run leaves the re-check's
+  verdict), and `_run_ci_parity_final` re-runs when a check was routed. When the re-drive
   ends on a HEAD other than its start, every valid set is measured once:
   `acceptance.gate.final` / `final_sha` and `residual`
   (`_acceptance_residual_of`) are rewritten, or kept when nothing measured;

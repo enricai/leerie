@@ -16,11 +16,28 @@ FROZEN_SHA256 = (
     "2e6bbf4db44f68a3132ec1452a6c0e21170914e5d549993e78709586950923df")
 
 
-def test_system_prompt_is_the_frozen_one_but_for_the_leads_dir(leerie):
+# Step 1 as F+ froze it, and as bench SW measured it with the item's parts
+# (DESIGN §8 *The falsifier gets the item whole*).
+F_PLUS_STEP_1_TAIL = """   Quote the exact span of the item text that states it (`item_span_quote`,
+   copied character-for-character from the item)."""
+SW_STEP_1_TAIL = """   When the item carries `parts`, each part is one thing it requires, and
+   the item is not delivered when any part is not; a part that covers many
+   places ("every page", "all the strings", "each caller") is not delivered
+   when any one of those places falls short. Quote the exact span of the
+   item text that states it (`item_span_quote`, copied
+   character-for-character from the item's sentence or from one of its
+   parts)."""
+
+
+def test_system_prompt_is_the_frozen_one_but_for_the_listed_edits(leerie):
+    """The frozen F+ text but for the leads directory and bench SW's step-1
+    sentence on the item's parts — each edit present exactly once."""
     shipped = (ROOT / "prompts" / "falsifier.md").read_text()
     lead = leerie.FALSIFIER_LEADS_DIR + "/"
-    assert shipped.count(lead) == 2         # the only listed edit
-    frozen = shipped.replace(lead, ".q2ctx/")
+    assert shipped.count(lead) == 2
+    assert shipped.count(SW_STEP_1_TAIL) == 1
+    frozen = shipped.replace(lead, ".q2ctx/").replace(SW_STEP_1_TAIL,
+                                                      F_PLUS_STEP_1_TAIL)
     assert hashlib.sha256(frozen.encode()).hexdigest() == FROZEN_SHA256
 
 
@@ -42,6 +59,19 @@ def _benched(task, item, own, stat, ctx, refs, parts):
         "Your working directory is a disposable copy of the FINISHED tree. "
         "Try to demonstrate this item is NOT delivered per your rules, and "
         "return the JSON object per your schema."])
+
+
+def test_an_items_parts_ride_in_the_item_and_nothing_else_moves(leerie):
+    """Bench SW's one input edit: the item's classifier parts, in order,
+    inside THE ITEM TO CHECK; every other line is F+'s."""
+    parts = ["the sum is returned", "every caller gets the sum"]
+    got = leerie._falsifier_user_prompt(
+        "Fix add.", {"item": "add returns the sum", "span": "task ¶2",
+                     "parts": [*parts, 7, " "]},
+        "abc123", "", [], [], [])
+    assert got == _benched(
+        "Fix add.", {"item": "add returns the sum", "source_ref": "task ¶2",
+                     "parts": parts}, "abc123", "", [], [], [])
 
 
 def test_user_prompt_is_the_frozen_one(leerie):
