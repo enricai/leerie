@@ -1,5 +1,5 @@
-// A `typescript` with the JS compiler API, for leerie's two AST scripts
-// (test-case-facts.cjs, redrive-ast-gate.cjs; DESIGN §8 *Delivery
+// A `typescript` with the JS compiler API, for leerie's AST scripts
+// (test-case-facts.cjs, symbol-references.cjs, redrive-ast-gate.cjs; DESIGN §8 *Delivery
 // detection*). Their facts are syntax-only — one file parsed, no type
 // checking — so the compiler's version does not matter, only that it has
 // the API. The tree under test's own `typescript` (resolved from the cwd)

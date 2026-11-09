@@ -61782,7 +61782,9 @@ FALSIFIER_REASK_NOTE = (
     "return the JSON object per your schema.")
 # The AST facts script the coupling check reads (JS/TS only, as benched).
 TEST_CASE_FACTS = ROOT / "scripts" / "test-case-facts.cjs"
-# Both AST scripts load `typescript` through this: the tree's own when it has
+# Whether production code uses a symbol a probe imports, by syntax (R3).
+SYMBOL_REFERENCES = ROOT / "scripts" / "symbol-references.cjs"
+# Every AST script loads `typescript` through this: the tree's own when it has
 # the JS compiler API, else BUNDLED_TYPESCRIPT. Run alone, it is the probe.
 TS_LOADER = ROOT / "scripts" / "load-typescript.cjs"
 # The pinned JS-API `typescript` the image ships (Dockerfile,
@@ -61903,25 +61905,56 @@ async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
 
 
 def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
-                                   sha: str) -> bool:
-    """True when a tracked non-harness file other than `module` names the
-    identifier `name` at `sha` (`git grep -w -F`)."""
+                                   sha: str, *, tree: str | Path,
+                                   grants: WorkerGrants) -> bool | None:
+    """True when production code uses `name` outside its own declaration
+    (DESIGN §8 *Delivery detection*: "no symbol only tests use"). The
+    candidates are the tracked non-harness files that name it at `sha`
+    (`git grep -w -F`), its own `module` among them. A JS/TS file
+    (`_JS_SRC_EXT`) counts by its syntax — `scripts/symbol-references.cjs`
+    over `tree`, an installed copy of `sha`: an identifier `name` in its
+    code, never in a comment, a string or a type, and in `module` never in
+    the symbol's own declaration or its export of it, so a self-recursive
+    call is not a use and a caller in the same module is. A file no JS/TS
+    parse reads (a template, a document) counts by the whole word, as
+    before. None when the script could not run."""
     r = subprocess.run(["git", *_tree_git_args(repo), "grep", "-l", "-w", "-F",
                         "-e", name, sha, "--"],
                        capture_output=True, text=True, check=False)
-    files = [o.split(":", 1)[1] for o in r.stdout.split() if ":" in o]
-    return any(f != module and not _COUPLING_HARNESS_RE.search(f)
-               for f in files)
+    files = sorted({f for f in (o.split(":", 1)[1] for o in
+                                r.stdout.splitlines() if ":" in o)
+                    if not _COUPLING_HARNESS_RE.search(f)})
+    code = [f for f in files if f.endswith(_JS_SRC_EXT)]
+    if any(f not in code for f in files):
+        return True
+    if not code:
+        return False
+    try:
+        q = _ts_script_run(["node", str(SYMBOL_REFERENCES), name, module,
+                            *code], tree=tree, grants=grants, timeout=120,
+                           text=True)
+        got = json.loads(q.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if (not isinstance(got, dict) or got.get("unread")
+            or not isinstance(got.get("referenced"), list)):
+        return None
+    return bool(got["referenced"])
 
 
 def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
-                        sha: str, item_text: str) -> dict:
+                        sha: str, item_text: str, *, tree: str | Path,
+                        grants: WorkerGrants) -> dict:
     """The AST coupling check on one failing probe case (bench n2d, frozen):
     `{"coupled": bool | None, "reasons": [...]}` — None when the facts could
     not be read. Coupled when its reachable code reads a source or document
     file's text (R1), evaluates code text (R2), or imports an in-repo symbol
-    no tracked non-test file other than its own module references and the
-    item does not name, or a deep package path (R3)."""
+    that no production code uses outside its own declaration
+    (`_coupling_referenced_elsewhere`, over `tree`, an installed copy of
+    `sha`) and the item does not name, or a deep package path (R3). When the
+    symbol-use script could not run: `{"coupled": None, "error":
+    "facts_failed: symbol references"}`, an infrastructure miss as a facts
+    read's is."""
     if not isinstance(facts, dict) or facts.get("error"):
         return {"coupled": None, "reasons": [],
                 "error": (facts or {}).get("error") if isinstance(
@@ -61971,7 +62004,12 @@ def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
         if re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])",
                      item_text or ""):
             continue          # the item itself names the symbol
-        if not _coupling_referenced_elsewhere(name, mod, repo, sha):
+        used = _coupling_referenced_elsewhere(name, mod, repo, sha,
+                                              tree=tree, grants=grants)
+        if used is None:
+            return {"coupled": None, "reasons": reasons,
+                    "error": "facts_failed: symbol references"}
+        if not used:
             reasons.append(f"R3 {name} from {mod}")
     return {"coupled": bool(reasons), "reasons": reasons}
 
@@ -62454,8 +62492,24 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                                          (facts.get("reach_src") or [])))
             aq = _scope_norm(str(res.get("assertion_quote") or ""))
             g["assertion_in_case"] = len(aq) >= 6 and aq in reach
-            cp = await asyncio.to_thread(_falsifier_coupling, facts, rel,
-                                         _run_repo(st), sha, item_text)
+            # Its symbol-use script is an AST script on the tree's code: a
+            # confined command that holds the execution lock shared, as
+            # every AST script caller does (inside this evaluation's
+            # exclusive hold, that passes through).
+            async with _exec_lock().shared():
+                cp = await asyncio.to_thread(
+                    _falsifier_coupling, facts, rel, _run_repo(st), sha,
+                    item_text, tree=confirm_tree,
+                    grants=_measurement_grants(st, confirm_tree))
+            if str(cp.get("error") or "").startswith("facts_failed"):
+                # The symbol-use script did not run: the same miss as the
+                # facts read's, never a coupling verdict.
+                g.pop("assertion_in_case", None)
+                g["facts_read"] = False
+                out["facts_error"] = {"error": cp["error"]}
+                log(f"  delivery detection: falsifier {label}: AST "
+                    f"symbol-use script failed; sample not judged")
+                return out
             out["coupling"] = cp
             g["not_coupled"] = cp.get("coupled") is False
             # It failed at its assertion, not in the setup that reaches it

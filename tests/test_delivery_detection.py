@@ -788,15 +788,29 @@ def test_ci_provisions_the_typescript_the_ast_tests_need():
     assert r.returncode == 0, r.stderr
 
 
+def _all_grants(leerie):
+    return leerie.WorkerGrants(("/",), ())
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
 class TestCouplingPolicy:
-    def _repo(self, tmp_path):
+    @pytest.fixture(autouse=True)
+    def _bundled(self, leerie, monkeypatch):
+        # The test repos install no `typescript`: the scripts load the
+        # stand-in bundled copy, as a TypeScript 7 tree does in a run.
+        monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
+
+    def _repo(self, tmp_path, files: dict[str, str] | None = None):
         repo = tmp_path / "r"
         (repo / "src").mkdir(parents=True)
-        (repo / "src" / "lib.ts").write_text(
-            "export function publicFn() {}\n"
-            "export function internalHelper() {}\n")
-        (repo / "src" / "app.ts").write_text(
-            "import { publicFn } from './lib';\npublicFn();\n")
+        for rel, text in (files or {
+                "src/lib.ts": ("export function publicFn() {}\n"
+                               "export function internalHelper() {}\n"),
+                "src/app.ts": ("import { publicFn } from './lib';\n"
+                               "publicFn();\n")}).items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
         _git(repo.parent, "init", "-q", str(repo))
         _git(repo, "add", "-A")
         _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit",
@@ -809,43 +823,123 @@ class TestCouplingPolicy:
         base.update(kw)
         return base
 
+    def _cp(self, leerie, facts, repo, sha, item=""):
+        return _held(leerie, leerie._falsifier_coupling, facts,
+                     "probe/x.test.ts", repo, sha, item, tree=repo,
+                     grants=_all_grants(leerie))
+
+    @staticmethod
+    def _imp(spec, name):
+        return {"spec": spec, "imported": name, "typeOnly": False}
+
     def test_each_rule(self, leerie, tmp_path):
         repo, sha = self._repo(tmp_path)
-        cp = leerie._falsifier_coupling
-        rel = "probe/x.test.ts"
+        imp = self._imp
 
-        def imp(spec, name):
-            return {"spec": spec, "imported": name, "typeOnly": False}
+        def cp(facts, item=""):
+            return self._cp(leerie, facts, repo, sha, item)
         clean = cp(self._facts(imports=[imp("../src/lib", "publicFn"),
                                         imp("node:fs", "readFileSync"),
-                                        imp("vitest", "it")]),
-                   rel, repo, sha, "item")
+                                        imp("vitest", "it")]), "item")
         assert clean == {"coupled": False, "reasons": []}
         r = cp(self._facts(imports=[imp("../src/lib", "internalHelper")]),
-               rel, repo, sha, "the item text")
+               "the item text")
         assert r["coupled"] and r["reasons"] == [
             "R3 internalHelper from src/lib.ts"]
         # The item itself names the symbol: no longer coupling.
         assert cp(self._facts(imports=[imp("../src/lib", "internalHelper")]),
-                  rel, repo, sha, "call internalHelper twice")[
+                  "call internalHelper twice")["coupled"] is False
+        assert cp(self._facts(imports=[imp("pkg/dist/inner", "x")]))[
+            "reasons"] == ["R3 deep-package pkg/dist/inner"]
+        assert cp(self._facts(reads=[{"fn": "readFileSync",
+                                      "lits": ["src/lib.ts"]}]))[
+            "reasons"][0].startswith("R1 readFileSync")
+        assert cp(self._facts(reads=[{"fn": "readFileSync",
+                                      "lits": ["fixtures/a.json"]}]))[
             "coupled"] is False
-        assert cp(self._facts(imports=[imp("pkg/dist/inner", "x")]), rel,
-                  repo, sha, "")["reasons"] == ["R3 deep-package pkg/dist/inner"]
-        assert cp(self._facts(reads=[{"fn": "readFileSync",
-                                      "lits": ["src/lib.ts"]}]), rel, repo,
-                  sha, "")["reasons"][0].startswith("R1 readFileSync")
-        assert cp(self._facts(reads=[{"fn": "readFileSync",
-                                      "lits": ["fixtures/a.json"]}]), rel,
-                  repo, sha, "")["coupled"] is False
         assert cp(self._facts(execs=[{"fn": "execSync",
-                                      "lits": ["grep -r foo src"]}]), rel,
-                  repo, sha, "")["coupled"] is True
-        assert cp(self._facts(evals=["eval"]), rel, repo, sha,
-                  "")["reasons"] == ["R2 eval"]
-        assert cp(self._facts(vm_import=True), rel, repo, sha,
-                  "")["reasons"] == ["R2 vm"]
-        assert cp({"error": "case_not_found"}, rel, repo, sha,
-                  "")["coupled"] is None
+                                      "lits": ["grep -r foo src"]}]))[
+            "coupled"] is True
+        assert cp(self._facts(evals=["eval"]))["reasons"] == ["R2 eval"]
+        assert cp(self._facts(vm_import=True))["reasons"] == ["R2 vm"]
+        assert cp({"error": "case_not_found"})["coupled"] is None
+
+    # What counts as production use of a symbol a probe imports (R3): a
+    # reference in code, its own module included, outside its own
+    # declaration. Each case's `lib.ts` declares `helper`; `app.ts` is the
+    # module production imports. Coupled = only tests use it.
+    USE_CASES = {
+        # Barnacle e7512406's shape: the only production caller shares the
+        # helper's module (`persistReplannedFlow` -> scrubSecretEnvInValues).
+        "a caller in its own module": (
+            "export function helper(x: number) { return x + 1; }\n"
+            "export function run() { return helper(1); }\n", "", False),
+        "a self-recursive call only": (
+            "export function helper(n: number): number {\n"
+            "  return n <= 0 ? 0 : helper(n - 1);\n}\n", "", True),
+        "a recursive arrow const only": (
+            "export const helper = (n: number): number =>\n"
+            "  n <= 0 ? 0 : helper(n - 1);\n", "", True),
+        "its own export list only": (
+            "function helper() { return 1; }\nexport { helper };\n", "",
+            True),
+        "a comment and a string elsewhere": (
+            "export function helper() { return 1; }\n",
+            "// helper is called by the tests\n"
+            "export const name = 'helper';\n", True),
+        "a type position elsewhere": (
+            "export function helper() { return 1; }\n",
+            "import type { helper as H } from './lib';\n"
+            "import * as lib from './lib';\n"
+            "export type R = ReturnType<typeof lib.helper>;\n"
+            "export function wrap(f: typeof lib.helper) { return f; }\n",
+            True),
+        "a namespace access elsewhere": (
+            "export function helper() { return 1; }\n",
+            "import * as lib from './lib';\nexport const v = lib.helper();\n",
+            False),
+        "a class extending it in its own module": (
+            "export class helper {}\nexport class Sub extends helper {}\n",
+            "", False),
+        "a value in its own module's other declaration": (
+            "export const helper = 1;\nexport const total = helper * 2;\n",
+            "", False),
+    }
+
+    @pytest.mark.parametrize("case", sorted(USE_CASES))
+    def test_production_use_is_read_from_syntax(self, leerie, tmp_path,
+                                                case):
+        lib, app, coupled = self.USE_CASES[case]
+        repo, sha = self._repo(tmp_path, {
+            "src/lib.ts": lib, "src/app.ts": app or "export {};\n",
+            "src/lib.test.ts": ("import { helper } from './lib';\n"
+                                "helper();\n")})
+        r = self._cp(leerie, self._facts(
+            imports=[self._imp("../src/lib", "helper")]), repo, sha)
+        assert r["coupled"] is coupled, (case, r)
+        assert (r["reasons"] == ["R3 helper from src/lib.ts"]) is coupled
+
+    def test_a_file_no_js_parse_reads_still_counts_by_name(self, leerie,
+                                                           tmp_path):
+        """A template or a document naming the symbol is not read by any
+        parser here: it counts by the whole word, as before."""
+        repo, sha = self._repo(tmp_path, {
+            "src/lib.ts": "export function helper() { return 1; }\n",
+            "src/View.vue": "<script>helper()</script>\n"})
+        assert self._cp(leerie, self._facts(
+            imports=[self._imp("../src/lib", "helper")]), repo, sha)[
+            "coupled"] is False
+
+    def test_the_script_not_running_is_a_facts_miss(self, leerie, tmp_path,
+                                                    monkeypatch):
+        """No `typescript` with the compiler API: the use check did not run,
+        which is never read as coupling."""
+        repo, sha = self._repo(tmp_path)
+        monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
+        r = self._cp(leerie, self._facts(
+            imports=[self._imp("../src/lib", "internalHelper")]), repo, sha)
+        assert r == {"coupled": None, "reasons": [],
+                     "error": "facts_failed: symbol references"}
 
     @pytest.mark.skipif(_ts_dir() is None,
                         reason="node or the typescript package unavailable")
@@ -1154,6 +1248,29 @@ class TestFalsifierGates:
         assert "coupling" not in out
         # The probe is still removed from the pristine checkout.
         assert not (gate_env.confirm / PROBE_REL).exists()
+
+    def test_a_symbol_use_script_failure_is_a_facts_miss(
+            self, leerie, gate_env, monkeypatch):
+        """R3's symbol-use script could not run: the same infrastructure
+        miss as a facts read's, never a coupling rejection. The check gets
+        the confirm checkout, where production code is read."""
+        seen = {}
+
+        def coupling(facts, rel, repo, sha, item, *, tree, grants):
+            seen["tree"] = tree
+            return {"coupled": None, "reasons": [],
+                    "error": "facts_failed: symbol references"}
+        monkeypatch.setattr(leerie, "_falsifier_coupling", coupling)
+        out = _gates(leerie, gate_env, _claim())
+        assert seen["tree"] == gate_env.confirm
+        assert out["confirmed"] is False
+        assert out["gates"] == {
+            "new_file": True, "not_a_lead": True, "runnable": True,
+            "item_quote": True, "case_fails": True, "fails_under_bstar": True,
+            "facts_read": False}
+        assert out["facts_error"] == {
+            "error": "facts_failed: symbol references"}
+        assert "coupling" not in out
 
     def test_a_case_the_script_cannot_find_is_still_a_rejection(
             self, leerie, gate_env, monkeypatch):

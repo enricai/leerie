@@ -13331,7 +13331,11 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   that case's reachable code; and the AST coupling check is clean —
   the case reads no source or document text, evaluates no code text,
   and imports no symbol only tests use (`_falsifier_coupling`, over
-  the TypeScript AST of the probe, policy in Python). The coupling
+  the TypeScript AST of the probe, policy in Python). A symbol is used by
+  production code when any production code, its own module included,
+  refers to it outside its own declaration — read from syntax, so a call is
+  told from the definition and a self-recursive call is not a use; a helper
+  whose only production caller shares its module is not test-only. The coupling
   check is JS/TS-only, as benched. Its facts are syntax-only — a parse
   of one file, no type checking, no program — so the repository's own
   compiler version does not matter to them, and any TypeScript with the

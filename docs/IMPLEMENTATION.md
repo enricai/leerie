@@ -1300,9 +1300,10 @@ leerie/
 │   ├── finalize.sh                verify the run branch exists and is non-empty; ready for push
 │   ├── host-finalize.sh           host-side push + PR creation block; sourced by the local-runtime post-run path in leerie, decide_teardown's Fly clean-exit branch, `leerie finalize <run-id>` (§7 Host-side finalize), and the launcher's host preflight, for host_prepush_preflight alone
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a descriptor the orchestrator inherits, no socket path; v1+v2); the dropped-privilege orchestrator drives it
-│   ├── load-typescript.cjs        loads a `typescript` with the JS compiler API for the two AST scripts: the tree's own (resolved from the cwd) when `typeof ts.createSourceFile === 'function'`, else the image's pinned copy named by `LEERIE_BUNDLED_TYPESCRIPT`; run directly (`node load-typescript.cjs`) it prints `tree` / `bundled` and exits 0, or exits 1 — `_ts_resolvable`'s probe (DESIGN §8 "Delivery detection")
+│   ├── load-typescript.cjs        loads a `typescript` with the JS compiler API for the AST scripts: the tree's own (resolved from the cwd) when `typeof ts.createSourceFile === 'function'`, else the image's pinned copy named by `LEERIE_BUNDLED_TYPESCRIPT`; run directly (`node load-typescript.cjs`) it prints `tree` / `bundled` and exits 0, or exits 1 — `_ts_resolvable`'s probe (DESIGN §8 "Delivery detection")
 │   ├── redrive-ast-gate.cjs       D1/D2/D3 safety facts of one changed production file, base vs head (TypeScript compiler API), for the delivery re-drive's escalation gate (d+); loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery re-drive")
 │   ├── test-case-facts.cjs        AST facts of one test case (reachable code, file reads, evals, imports) for the falsifier's coupling check; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
+│   ├── symbol-references.cjs      which of the given JS/TS files use one symbol outside its own declaration (TypeScript compiler API), for the coupling check's R3; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
 │   ├── forbidden-command-hook.py  PreToolUse hook wired by `claude_p` through `--settings`: denies a Bash call running a command the task forbids, or killing processes by name; imports leerie's own matcher; fails open (DESIGN §9 "A command the task forbids is denied in every spelling", "A worker never kills a process by name")
 │   ├── dockerfile-frontend.sh     LEERIE_DOCKERFILE_FRONTEND (the one Dockerfile frontend every build is given, pinned by digest), ensure_frontend_in_worker_ns, LEERIE_IMAGE_NS and the BuildKit worker-namespace checks; sourced by the launcher and remote/build-push.sh
 │   ├── forbidden-script-shell.sh  npm/pnpm `script-shell` for a worker whose task forbids a package script: refuses that script at run time (exit 97), runs every other one with the repository's own configured shell (same §9 section)
@@ -10142,9 +10143,30 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `not_coupled` (`_falsifier_coupling` returns `coupled: false`: no
   non-JSON file read or text-tool exec (R1), no eval / Function / vm /
   transpile / non-literal import (R2), no import of an in-repo symbol that
-  no tracked non-harness file besides its module references and the item
-  does not name, resolved with `_ts_path_aliases` / `_js_resolve`, nor a
-  deep package path (R3)). Nothing of the probe is ever in the checkout.
+  no production code uses outside its own declaration and the item does not
+  name, resolved with `_ts_path_aliases` / `_js_resolve`, nor a deep package
+  path (R3)). Whether production code uses it is
+  `_coupling_referenced_elsewhere(name, module, repo, sha, tree=, grants=)`:
+  the candidates are the tracked non-harness files `git grep -w -F` finds
+  naming it at `sha`, its own module among them; a candidate outside
+  `_JS_SRC_EXT` counts by that whole word, as no JS/TS parse reads it; the
+  JS/TS candidates go to `node scripts/symbol-references.cjs <name> <module>
+  <file>...` (`SYMBOL_REFERENCES`, through `_ts_script_run` in the confirm
+  checkout with `_measurement_grants`, its caller in `_falsifier_gates`
+  holding `_exec_lock().shared()` as every AST script caller does), which lists the files whose syntax
+  holds an identifier `name` outside comments, strings and type positions —
+  in its module, outside the symbol's own top-level declaration (name and
+  body, so a self-recursive call is no use) and its own export of it. A
+  caller in the same module is a use: the whole-file match this replaces
+  excluded the module, since text cannot tell the definition from a call,
+  and so read every helper whose only production caller shares its module
+  as test-only (barnacle run e7512406: `scrubSecretEnvInValues`,
+  `selectRateLimitTargets`, `withClearBeforeType`, each called in its own
+  module, rejected four real demonstrations). When the script cannot run
+  (no JSON, an unread file) `_falsifier_coupling` returns `coupled: None`
+  with `error: "facts_failed: symbol references"`, and the sample records
+  `facts_read: false` as for a failed facts read. Nothing of the probe is
+  ever in the checkout.
   A sample is confirmed only when every gate is true. A confirmed sample's
   probe is saved under `acceptance/probes/` (no fixer's grant reaches
   `acceptance/`), re-run only through `_evaluate_acceptance_sets` (placed,
