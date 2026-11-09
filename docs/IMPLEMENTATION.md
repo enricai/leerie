@@ -10132,7 +10132,17 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `scripts/test-case-facts.cjs <tree>/<rel> <case> <report>` through
   `_run_streaming` in the same kind of sandbox, alone, the probe placed,
   env `_ts_script_env()`; the script writes its JSON to its optional
-  third argument, the sandbox's report, and the facts are read from it). When it
+  third argument, the sandbox's report, and the facts are read from it). The
+  script finds the case by its title against the runner's full name (the
+  case ID's part after ` :: `): equal, or ending in it after a space; a
+  parametrised title (`it.each`, `test.each`, a template literal) by its
+  whole template — its literal text exactly and in order, each placeholder
+  (vitest/jest's printf `%s %d %i %f %j %o %O %p %c %# %$`, `%%` a literal
+  `%`, a table's `$name` / `$name.path`, a template's `${}`) any text,
+  anchored the same way — the case with the most literal text winning. A
+  literal prefix alone, the rule this replaces, missed every case whose
+  prefix was 8 characters or shorter (barnacle run e7512406 item 10:
+  `"skips %s"`, `case_not_found`). When it
   returns an error starting `facts_failed` (the script crashed, timed out
   or printed no JSON — an infrastructure miss) the sample records
   `facts_read: false` and `facts_error` and stops there:
