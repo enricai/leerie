@@ -2668,7 +2668,10 @@ and support file — and each entry carries `artifact` (the copy's
 `_UNMET_SOURCE_LINES` lines (each cut to `_UNMET_LINE_MAX` characters)
 centred on the first failing line, and `excerpt_start`; a file it cannot
 read keeps its entry with no excerpt. `cmd` is `_acceptance_cmd(st,
-[file], placed={file: copy})` when it renders. The record is `{dir:
+[file], placed={file: copy})` when it renders — for a falsifier entry,
+through `_unmet_attach(…, suite=_acceptance_set_suite(st, sample))`:
+`_browser_suite_cmd(suite, [file])` for a probe confirmed through the
+browser suite, and no `cmd` when the run has no such channel. The record is `{dir:
 <operator path of the directory>, entries[]}`, or the key is removed when
 no entry is collected; the rendered section is logged and written to
 `run.json` as `unmet_evidence{dir, text}`. Fail-open: an
@@ -5729,19 +5732,34 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   falsifier's confirm runs) or `_probe_case_facts_placed`:
   - `_run_acceptance_file(st, caps, tree, rel, log_path, label, *,
     validating=False, failure_mode="assertion", observed=None,
-    cases_out=None, place: tuple[tuple[str, str], ...] = ())` —
+    cases_out=None, place: tuple[tuple[str, str], ...] = (),
+    suite: dict | None = None)` —
     `HeldOutSandbox(view=tree, place=place, report=<its report path when
     the runner has one>)`; `_acceptance_cmd(st, [rel], tree, placed=
-    {rel: src for src, rel in place})`. Its `env_extra` is gone: the
-    database is the wrapper's (*The per-command database*).
+    {rel: src for src, rel in place})`, or with `suite` (the run's browser
+    channel) `_browser_suite_cmd(suite, [rel])` and `_browser_suite_env(suite)`
+    laid over the run's environment after the path overlay (DESIGN §8 *A
+    probe is re-run through the channel that confirmed it*). Its
+    `env_extra` is gone: the database is the wrapper's (*The per-command
+    database*).
   - `_acceptance_run_placed(st, caps, wt, sets, label, *, confirm=True)`
     — per set, the `place` pairs of every file whose path `wt` does not
     already have by the shim's rule (`_lexists_beneath`: a file there, or a
     link or a non-directory on its way: `path_in_use`, the set
     unmeasured), handed to every run, confirm rerun and
-    discovery rerun (`_acceptance_discover(…, place, note, …)`, the
+    discovery rerun (`_acceptance_discover(…, place, note, …, suite=)`, the
     positional slot `env_extra` had); nothing is copied, no section held
-    across the loop. The writer's validation runs its own files where the
+    across the loop. Each set's channel is `_acceptance_set_suite(st, set)
+    -> dict | None | False`: None (the test command) unless the set has
+    `via_browser_suite`, then `_browser_suite(st)`, or False when that is
+    None — the set is then `{passed: False, unmeasured: True,
+    failing_files: [], unmeasured_reason: "no_browser_suite"}` and nothing
+    runs; the channel is passed as `suite=` to every run, confirm rerun and
+    discovery rerun of the set. `_evaluate_acceptance_sets_inner`, when
+    `_browser_suite(st)` is set and some set's channel is it, runs
+    `_ci_prepare(wt, [_browser_suite_rec(suite)], st, caps,
+    "acceptance-<label>")` in the evaluation worktree after its
+    dependency install. The writer's validation runs its own files where the
     writer wrote them (no `place`), in the same sandbox.
   - `_acceptance_parse_probe` — the probe's source is written to a
     `tempfile.mkstemp` file of leerie's own (removed after) and placed at
@@ -10543,17 +10561,19 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `_evaluate_acceptance_sets` of the shown sets (B*-confirmed). Items:
   `delivery_gate.unmet_final`, minus items every claimer types `process`,
   split by `_redrive_item_notes(unmet_final, claims, n_items, rows, *,
-  shown_idx=(), contested=()) -> (notes, unreproducible)` (`rows` is
+  shown_idx=(), contested=(), suite=None) -> (notes, unreproducible)` (`rows` is
   `delivery_gate.items`; `shown_idx` the indices of the shown sets not
   typed broken; `contested` the item indices of
   `delivery_redrive.contested_probes`, a measured conflict, through
-  `_redrive_contests_by_item`). `_falsifier_shown_probe(row, shown_idx) -> dict |
-  None` reads the row's confirmed sample: `{dir, file, lead_sets,
-  case_name, assertion_quote, reason, item_span_quote}` (texts cut to
-  `_REDRIVE_PROBE_TEXT_MAX = 600`) when its `lead_sets` is a list of
-  integers ⊆ `shown_idx`, `probe_saved.dir/file` is a regular file
-  (not a link, `file` relative without `..`) and the sample has no
-  `via_browser_suite`, else None. An entry's
+  `_redrive_contests_by_item`; `suite`, the run's browser channel,
+  `_browser_suite(st)`). `_falsifier_shown_probe(row, shown_idx,
+  suite=None) -> dict | None` reads the row's confirmed sample: `{dir,
+  file, lead_sets, case_name, assertion_quote, reason, item_span_quote,
+  via_browser_suite?}` (texts cut to `_REDRIVE_PROBE_TEXT_MAX = 600`;
+  `via_browser_suite: true` when the sample has it) when its `lead_sets`
+  is a list of integers ⊆ `shown_idx`, `probe_saved.dir/file` is a
+  regular file (not a link, `file` relative without `..`) and, for a
+  sample with `via_browser_suite`, `suite` is not None; else None. An entry's
   `by` (`["judge"]` when absent) less `_REDRIVE_UNREPRODUCIBLE_BY` —
   keeping `falsifier` when the item is not contested and its probe is
   shown — is its reproducible sources. With none, the item is no note:
@@ -10630,25 +10650,39 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `sets/probe-i<k>/<rel>` for each of `probes` — `_redrive_probe_sets(live)`:
   per item whose note carries a shown `probe`, `{index: "probe-i<k>",
   item_index, dir, defect_files: [file], control_files: [],
-  support_files: []}`; the self-check is prepared (and the implementer
+  support_files: [], via_browser_suite?}` (`via_browser_suite: true` when
+  the probe has it); the self-check is prepared (and the implementer
   given a database) when the group has shown sets or such probes —,
   `config.json` (`{tree,
   repo_root, sets[{index, dir, defect_files, control_files,
-  support_files}] with `dir` the copy, snap_root, env (empty), forbidden,
-  timeout, log}`) and `bin/leerie-selfcheck` (a bash wrapper: `exec python3
+  support_files}] with `dir` the copy, snap_root, env (empty), suite,
+  forbidden, timeout, log}`; `suite` is None, or, when a probe has
+  `via_browser_suite`, `{template, files, env}`: `_browser_suite(st)`'s
+  `template`, those probes' files, and `_browser_suite_env(suite)` less
+  `TEST_DB_ENV_NAMES` when `"database"` is in its `requires` — with no
+  `_browser_suite(st)` it raises `RuntimeError`, a leerie defect, since
+  `_falsifier_shown_probe` shows such a probe only with the channel) and
+  `bin/leerie-selfcheck` (a bash wrapper: `exec python3
   <leerie>/scripts/selfcheck.py <config.json> "$@"`), and returns `{dir,
   bin, command, src, run_files, name_flag, probes{item_index: path}}` —
   `run_files` the shown sets' defect and control files and each probe's
-  file, `probes` each probe's copy, `name_flag` the runner's own test-name flag
-  (`_SELFCHECK_NAME_FLAGS`: vitest/jest `-t`, pytest `-k`; None for any
-  other runner) read off `_acceptance_cmd(st, run_files, staging)`; the
+  file, `probes` each probe's copy, `command` the wrapper when either
+  channel has files, `name_flag` the runners' own test-name flag
+  (`_SELFCHECK_NAME_FLAGS`: vitest/jest `-t`, pytest `-k`, playwright
+  `-g`) when every channel's runner — the one read off
+  `_acceptance_cmd(st, <run_files not on the suite>, staging)`, the
+  suite's `runner` — has the same one, else None; the
   bin directory is put first on the implementer's `PATH` (`env_extra`).
+  Before a group whose `probe_sets` hold a `via_browser_suite` probe, with
+  `_browser_suite(st)` set, the drive runs `_ci_prepare(staging,
+  [_browser_suite_rec(suite)], st, caps, "redrive", done=<one set per
+  pass>)`: the copy shares staging's ignored paths and tree stores.
   `scripts/selfcheck.py` imports the orchestrator and calls
   `selfcheck_main(argv) -> int` (public: its caller is `scripts/selfcheck.py`, a separate process, like `run_rebaser`'s `host-finalize.sh`): `_selfcheck_args(args, run_files)`
   splits the arguments into a subset (each argument naming exactly one
   set test file: its path, its file name or a unique path suffix; one
   naming several is a usage error, exit 2), a name filter
-  (`-t`/`--testNamePattern`/`-k` with a value, `=`-joined or not) and the
+  (`-t`/`--testNamePattern`/`-k`/`-g` with a value, `=`-joined or not) and the
   rest, passed through to the runner (bench I3-3's selection); SIGTERM,
   SIGHUP and SIGINT raise `SystemExit(128 + signum)`, so the copy's
   deletion runs on every exit. `_selfcheck_snapshot(tree, snap)` copies every path of
@@ -10659,14 +10693,27 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   path of `_untracked_listing(tree, which="ignored", directory=True)` into
   the copy except one that is a set file or an ancestor
   of one; a set path already present in the copy is refused (exit 3,
-  listed); `_place_set` places every shown set, files `0444`; the command
-  is `_acceptance_cmd(st, run, snap)` over the subset (else every test
-  file), the name filter and the rest appended by `_append_runner_flags`
-  (exit 2 when they cannot be placed), checked by `_blt_shell_argv`
-  against the config's forbidden specs, and run in the copy under `bash
-  -c` with the config's `env` and `GIT_CEILING_DIRECTORIES=<snap_root>`,
-  bounded by the config's timeout (exit 124). It prints the runner's
-  output, then `SELF-CHECK PASSED|FAILED (exit N) …`, deletes the copy
+  listed); `_place_set` places every shown set, files `0444`; the files
+  to run (the subset, else every test file) split by channel: those not
+  in the config's `suite.files` through `_acceptance_cmd(st, files,
+  snap)`, those in it through `_runner_command(_browser_suite_cmd(suite,
+  files), snap, _RUNNER_REPORTS, files)` with its path overlay and
+  `suite.env` (DESIGN §8 *A probe is re-run through the channel that
+  confirmed it*); for each, the name filter (the channel's runner's
+  `_SELFCHECK_NAME_FLAGS` flag; exit 2 when it has none) and the rest
+  appended by `_append_runner_flags`
+  (exit 2 when they cannot be placed); then, in turn, each is bound
+  through `_blt_shell_argv` against the config's forbidden specs right
+  before its launch — one the task forbids is never launched: `SELF-CHECK
+  UNMEASURED: <files> not run — <reason>`, the call record gains
+  `unmeasured{<file>: "forbidden_by_task"}` and `forbidden` (kept by
+  `_selfcheck_calls`), and the other channel still runs — and run in the
+  copy under `bash -c` with the config's `env`, the channel's and
+  `GIT_CEILING_DIRECTORIES=<snap_root>`, each printed `SELF-CHECK: <cmd>`,
+  all inside one budget, the config's timeout (exit 124, which ends the
+  call). The call's exit is the first non-zero run's, else 2 when a
+  channel was refused (no verdict, never a pass), else 0. It prints
+  the runner's output, then `SELF-CHECK PASSED|FAILED (exit N) …`, deletes the copy
   (`_rmtree_owned`) and appends `{ts,
   args, subset, name_filter, rc, secs_*}` to the config's `log`. After the
   drive the group records the calls (`selfcheck_calls`, first 50) and
@@ -10728,9 +10775,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   the group was handed is re-run on the commit
   (`_redrive_probe_verdicts(st, caps, staging, probe_sets, label, *, rev)
   -> {item_index: pass | fail | unmeasured}`: each probe as
-  `_falsifier_probe_set(item_index, dir, rel)` — `{index: 1000000 +
-  item_index, dir, defect_files: [rel], control_files: [], support_files:
-  [], cases: {}}`, the shape `_redrive_recheck_items` re-runs too —
+  `_falsifier_probe_set(item_index, dir, rel, *, via_browser_suite=False)`
+  — `{index: 1000000 + item_index, dir, defect_files: [rel],
+  control_files: [], support_files: [], cases: {}, via_browser_suite?}`,
+  `via_browser_suite` from the probe, the shape `_redrive_recheck_items`
+  re-runs too, with the sample's —
   through one `_evaluate_acceptance_sets`; recorded as `probes_after
   {"<i>": verdict}`), and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
@@ -10827,8 +10876,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   items>, phase_label="redrive", only=<those indices>,
   full_vote=_judge_majority_items(<unmet_final>))` with
   `_delivery_record`, falsifier-confirmed items by
-  re-running their saved probe — `falsifier.samples[].probe_saved` — as a
-  one-file set through `_evaluate_acceptance_sets`; unmet if either says
+  re-running their saved probe — the first `falsifier.samples[]` with a
+  `probe_saved`, its `via_browser_suite` carried — as a one-file set
+  through `_evaluate_acceptance_sets`; unmet if either says
   so, and a crashed or unmeasured check keeps the item unmet; then
   `_redrive_falsify_met(st, caps, models, efforts, staging, out)` runs
   `_falsify_items(sha=<HEAD>, indices=<the re-checked items now met and
