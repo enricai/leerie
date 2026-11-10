@@ -10135,14 +10135,24 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   third argument, the sandbox's report, and the facts are read from it). The
   script finds the case by its title against the runner's full name (the
   case ID's part after ` :: `): equal, or ending in it after a space; a
-  parametrised title (`it.each`, `test.each`, a template literal) by its
-  whole template — its literal text exactly and in order, each placeholder
-  (vitest/jest's printf `%s %d %i %f %j %o %O %p %c %# %$`, `%%` a literal
-  `%`, a table's `$name` / `$name.path`, a template's `${}`) any text,
-  anchored the same way — the case with the most literal text winning. A
-  literal prefix alone, the rule this replaces, missed every case whose
-  prefix was 8 characters or shorter (barnacle run e7512406 item 10:
-  `"skips %s"`, `case_not_found`). When it
+  parametrised title (`it.each`, `test.each`, a template literal, a `+`
+  concatenation) by its whole template — its literal text exactly and in
+  order, each placeholder (vitest/jest's printf `%s %d %i %f %j %o %O %p %c
+  %# %$`, `%%` a literal `%`, a table's `$name` / `$name.path`, a template's
+  `${}`) any text, anchored the same way — the case with the most literal
+  text winning. A literal prefix alone, the rule this replaces, missed every
+  case whose prefix was 8 characters or shorter (barnacle run e7512406 item
+  10: `"skips %s"`, `case_not_found`). A title built with `+` (`titleOf`) is
+  read as a template literal is: each string or template operand its text,
+  every other operand a `${}` placeholder. The operand is never resolved — a
+  loop variable, a constant or a call, whatever the values it takes, is any
+  text, as a template literal's `${u}` already was — so `for (const u of
+  urls) it("skips " + u, …)` and `urls.forEach((u) => it("skips " + u, …))`
+  name `skips ${}`. Before, such a title was no title at all and its every
+  case read `case_not_found` (lane SD sweep r2, barnacle e7512406
+  bugfix-005-2: a B*-confirmed `::ffff` loopback demonstration rejected by
+  `assertion_in_case`, `not_coupled` and `at_assertion` together). A title
+  with no literal text (`it(name, …)`, `it(a + b, …)`) names no case. When it
   returns an error starting `facts_failed` (the script crashed, timed out
   or printed no JSON — an infrastructure miss) the sample records
   `facts_read: false` and `facts_error` and stops there:
