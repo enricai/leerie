@@ -1404,11 +1404,61 @@ def _no_process_outlives_its_test(monkeypatch):
     parent, so neither is a handle; the environment is, since every child
     inherits it. Started after the session's and module's fixtures, so a
     process one of those keeps across tests is not marked.
+
+    Inheritance alone is not enough: a `Popen` given its own `env` (a test
+    handing its harness `{"PATH": "/usr/bin:/bin", ...}`, as over a hundred
+    files do, or code under test building a scrubbed one) starts a child
+    without the marker, and everything it starts was invisible here. That
+    is how `test_buildkit_isolation.py`'s stub `nerdctl build`, in a process
+    group of its own and blocked on `read -r _ < "$FIFO"`, outlived pytest
+    for hours whenever its test failed mid-build. So every `Popen` the test
+    makes with an explicit `env` gets the marker added to a copy of it
+    (`with_marker`) -- `subprocess.run`, `check_output` and asyncio's
+    subprocesses all start through `Popen.__init__`.
     """
     marker = uuid.uuid4().hex
     monkeypatch.setenv(TEST_PROCESS_ENV, marker)
+    monkeypatch.setattr(subprocess.Popen, "__init__",
+                        _popen_init_marking(marker))
     yield
     kill_marked(marker)
+
+
+# Popen's own `__init__`, bound once: the per-test wrapper calls it, never
+# whatever a previous wrapper left on the class.
+_popen_init = subprocess.Popen.__init__
+# `env`'s position among Popen's positional parameters (after `self`):
+# args, bufsize, executable, stdin, stdout, stderr, preexec_fn, close_fds,
+# shell, cwd, env.
+_POPEN_ENV_POS = 10
+
+
+def with_marker(env, marker: str):
+    """A copy of `env` (a mapping of str, or of bytes as `os.environb`)
+    carrying `TEST_PROCESS_ENV=<marker>`; `env` itself is untouched. A
+    marker `env` already names is kept: a caller that chose its own
+    (`test_no_process_outlives_its_test.py` does) means it."""
+    out = dict(env)
+    if any(isinstance(k, bytes) for k in out):
+        out.setdefault(TEST_PROCESS_ENV.encode(), marker.encode())
+    else:
+        out.setdefault(TEST_PROCESS_ENV, marker)
+    return out
+
+
+def _popen_init_marking(marker: str) -> Callable:
+    """`Popen.__init__` that adds the test's marker to an explicit `env`
+    (None inherits `os.environ`, which already carries it)."""
+    def __init__(self, *args, **kwargs):
+        if len(args) > _POPEN_ENV_POS:
+            if args[_POPEN_ENV_POS] is not None:
+                args = (*args[:_POPEN_ENV_POS],
+                        with_marker(args[_POPEN_ENV_POS], marker),
+                        *args[_POPEN_ENV_POS + 1:])
+        elif kwargs.get("env") is not None:
+            kwargs["env"] = with_marker(kwargs["env"], marker)
+        _popen_init(self, *args, **kwargs)
+    return __init__
 
 
 @pytest.fixture(autouse=True)

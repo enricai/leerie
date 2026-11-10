@@ -8294,8 +8294,32 @@ bound, both measured on the first full local run under `--timeout=600`:
   on the host). `tests/test_no_process_outlives_its_test.py` times a test
   out for real in an inner pytest whose shell started one grandchild in the
   test's session and one under `setsid`: with the fixture both are gone;
-  without it both are alive (its anti-vacuity case). A process a child
-  starts with a fresh environment escapes the marker. Linux only, both
+  without it both are alive (its anti-vacuity case).
+
+  Inheritance alone left a blind spot (issue 20, 2026-11-10): a `Popen`
+  given its own `env` starts a child without the marker. Over a hundred test
+  files hand a harness a fresh `env={"PATH": "/usr/bin:/bin", ...}`, and
+  `tests/test_buildkit_isolation.py::test_a_signal_during_the_build_leaves_no_build_directory`
+  is one: when it fails mid-build its `finally` kills only the launcher's
+  session group, while the stub `nerdctl build` runs in a group of its own
+  (`_build_job`) blocked on `read -r _ < "$FIFO"`, which nothing opens for
+  writing once the test has failed. Reproduced with a failing assertion
+  after the build started: four processes (the job subshell, the stub
+  blocked on the FIFO, the relay and `terminal-text.py`) reparented to
+  init, none carrying the marker; seen on a dev host 15 h and 1.6 h old. The
+  fixture now wraps `subprocess.Popen.__init__` for the test's duration: an
+  explicit `env` (keyword or positional, str or bytes keys) gets the marker
+  added to a copy (`with_marker`; a marker the caller set itself is kept),
+  which covers `subprocess.run`, `check_output` and asyncio's subprocesses,
+  since all start through it. The same failing reproduction then leaves
+  none. `test_a_failed_test_with_a_fresh_env_leaves_no_process` runs that
+  shape -- a fresh `env`, a session of its own, a reader blocked on a FIFO,
+  a failed assertion -- in an inner pytest; without the wrapper the reader
+  stays (falsified 2026-11-10), and
+  `test_without_the_fixture_the_fifo_reader_stays` is its anti-vacuity
+  case. What still escapes is a process started past `Popen` with an
+  environment of its own: `env -i` inside a shell, `os.execve`, or
+  `os.posix_spawn` with `env=`. Linux only, both
   sides: `processes_marked` reads `/proc/<pid>/environ`, so it returns
   nothing where there is no `/proc` (a macOS dev host reads as "nothing
   left behind", as it did before the scan existed) and its test file is
