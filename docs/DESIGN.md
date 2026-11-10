@@ -13389,7 +13389,8 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   final commit (`_confirm_still_failing`, serial runner, so a load
   flake never confirms), the probe placed in a held-out sandbox over that
   copy, never written into it (§6 *A held-out evaluation runs alone*); the failing assertion it quotes lies inside
-  that case's reachable code; and the AST coupling check is clean —
+  that case's reachable code and is an assertion (*The quoted assertion
+  is one the test framework makes*, below); and the AST coupling check is clean —
   the case reads no source or document text, evaluates no code text,
   and imports no symbol only tests use (`_falsifier_coupling`, over
   the TypeScript AST of the probe, policy in Python). A symbol is used by
@@ -13433,6 +13434,38 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   fail to load records that as its own gate (`facts_read: false`), an
   infrastructure miss, never as a failed assertion or coupling check —
   the falsifier did not lose, the check did not run.
+- **The quoted assertion is one the test framework makes.** The sample's
+  `assertion_quote` is the anchor of *it failed at its assertion* (§8 *A
+  repository's browser suite is a channel the run provisions*, point 4):
+  a failure counts when it is at the quoted line or in a statement whose
+  value that line reads. Were any quoted line accepted as the assertion,
+  that gate would check only that the probe failed where the falsifier
+  said it failed, and a falsifier that quotes the line that threw — a
+  setup call, a navigation, a helper — passes it with a failure the item
+  never reached. So a quoted line counts only where it lies in one of the
+  case's assertions, read from the probe's syntax by the facts script,
+  never from the quote's words: a call of the test framework's assertion
+  API in the case's reachable code — `expect(…)` (or `expect.soft(…)`,
+  `expect.poll(…)`) and its matcher chain, `assert(…)` and `assert.<x>(…)`
+  — whose `expect` or `assert` is the global the runner provides, a
+  binding of that name imported from any module (a framework, or a
+  fixture file re-exporting it), or any binding imported from Node's
+  `assert`. A quote with no line in such an assertion fails the quoted
+  assertion's gate, and only its lines that are in one anchor the
+  at-assertion check. The prompt always asked for "the failing assertion
+  line"; code now checks it, and nothing in the prompt changed. Measured,
+  barnacle run e7512406 item 8 sample 0: the probe's helper `runStep`
+  threw ("probe found no candidates on page", a probe the independent
+  audit found unsound), its assertion `expect(dd?.textContent)…` never
+  ran, and the sample quoted the helper's call `const { window,
+  trajectory } = await runStep(…)`. It was rejected only because the
+  innermost probe frame was inside the helper; the same probe with the
+  helper's body written in the case, quoting the call that threw, passed
+  every gate. Of the 127 quotes recorded (one per run, probe and quote) in
+  the 53 run states under `~/.leerie` on 2026-11-10, that quote is the
+  only one holding no `expect(…)` call. An assertion written by hand (`if (…) throw …`) or through
+  an API other than these (node:test's `t.assert`, chai's `should`) is
+  not read as one, so such a probe is not confirmed.
 - **One re-ask.** A sample that answers `could_not_demonstrate`
   without having both left a probe in its checkout and run it is
   resumed once in the same session and tree with a fixed note. Each
@@ -13665,7 +13698,9 @@ The mechanism:
    probe of either channel: *it failed at its assertion*
    (`_falsifier_failed_at_assertion`). A case counts only when some
    failing run's message names no line of the probe (the runner gave no
-   location: as before) or names a line of the quoted assertion — its
+   location: as before) or names a line of the quoted assertion — a quoted
+   line inside one of the case's assertions (*Delivery detection*, *The
+   quoted assertion is one the test framework makes*), its
    statement, or an earlier statement of the same function that binds a
    name the assertion reads, followed through such bindings. A value bound
    to a local first is the same assertion as one computed inside it:

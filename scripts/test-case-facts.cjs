@@ -431,6 +431,50 @@ for (const r of reach) (function v(x, fn) {
   }
   ts.forEachChild(x, c => v(c, fn));
 })(r, -1);
+// The reachable code's assertions, which the quoted assertion must lie in
+// (DESIGN §8 *The quoted assertion is one the test framework makes*;
+// `_falsifier_quoted_assertion_lines`): a call whose callee chain starts at
+// `expect` or `assert` — the runner's global (a name nothing in scope
+// declares), an import of that name from any module (a framework, or a
+// fixture file re-exporting it), or any import of Node's `assert` — and,
+// for `expect`, calls `expect(…)` / `expect.soft(…)` / `expect.poll(…)`
+// itself, so an asymmetric matcher (`expect.any(String)`) is not one. Each
+// is the lines of the outermost call of its chain.
+const ASSERT_MODS = new Set(['assert', 'node:assert', 'assert/strict', 'node:assert/strict']);
+const ASSERT_NAMES = new Set(['expect', 'assert']);
+function assertKind(id) {
+  const k = keyOf(id); const b = modBind.get(k);
+  if (b) return ASSERT_MODS.has(b.spec) ? 'assert' : (ASSERT_NAMES.has(b.imported) ? b.imported : null);
+  return k === 'global:' + id.text && ASSERT_NAMES.has(id.text) ? id.text : null;
+}
+function isAssertion(call) {
+  let e = call; let own = false; let root = null;
+  while (e) {
+    e = unwrap(e);
+    if (ts.isCallExpression(e)) {
+      const c = unwrap(e.expression);
+      if (ts.isIdentifier(c) || (ts.isPropertyAccessExpression(c) && ts.isIdentifier(unwrap(c.expression))
+          && ['soft', 'poll'].includes(c.name.text))) own = true;
+      e = e.expression;
+    } else if (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) e = e.expression;
+    else { root = ts.isIdentifier(e) ? e : null; break; }
+  }
+  const kind = root && assertKind(root);
+  return kind === 'assert' || (kind === 'expect' && own);
+}
+const chainOuter = (x) => { // the call continues a longer chain
+  const p = x.parent;
+  return !(p && ((ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p) || ts.isCallExpression(p)
+    || ts.isNonNullExpression(p)) && p.expression === x));
+};
+const asserts = []; const seenAsserts = new Set();
+for (const r of reach) (function v(x) {
+  if (ts.isCallExpression(x) && !seenAsserts.has(x) && chainOuter(x) && isAssertion(x)) {
+    seenAsserts.add(x);
+    asserts.push({ start: lineOf(x.getStart(sf)), end: lineOf(x.getEnd()) });
+  }
+  ts.forEachChild(x, v);
+})(r);
 const reach_src = [...reach].map(n => n.getText(sf));
-emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, reads, copies, execs, evals, imports: usedImports,
+emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, asserts, reads, copies, execs, evals, imports: usedImports,
   vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports });

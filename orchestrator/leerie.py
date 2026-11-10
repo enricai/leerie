@@ -62863,7 +62863,17 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             reach = _scope_norm(" ".join(str(x) for x in
                                          (facts.get("reach_src") or [])))
             aq = _scope_norm(str(res.get("assertion_quote") or ""))
-            g["assertion_in_case"] = len(aq) >= 6 and aq in reach
+            # The quote is in the case and names one of its assertions, read
+            # from the probe's syntax (DESIGN §8 *The quoted assertion is one
+            # the test framework makes*): the at-assertion gate anchors on
+            # it, so a quoted setup call would make that gate pass at the
+            # line that threw.
+            g["assertion_in_case"] = (
+                len(aq) >= 6 and aq in reach
+                and bool(_falsifier_quoted_assertion_lines(
+                    probe_bytes.decode(errors="replace"),
+                    str(res.get("assertion_quote") or ""),
+                    facts.get("asserts"))))
             # Its symbol-use script is an AST script on the tree's code: a
             # confined command that holds the execution lock shared, as
             # every AST script caller does (inside this evaluation's
@@ -62893,7 +62903,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                 runs_msgs.get(cid) or [], rel,
                 probe_bytes.decode(errors="replace"),
                 str(res.get("assertion_quote") or ""),
-                steps=facts.get("steps"))
+                steps=facts.get("steps"), asserts=facts.get("asserts"))
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(src)
@@ -62940,27 +62950,50 @@ def _falsifier_assertion_slice(steps: list, quoted: Callable[[int], bool]
     return [(x["start"], x["end"]) for x in chosen]
 
 
-def _falsifier_failed_at_assertion(messages: list[str], rel: str,
-                                   source: str, quote: str,
-                                   steps: list | None = None) -> bool:
-    """True when some failing run's message names no line of the probe
-    `rel` (`_evidence_line`, its innermost probe frame; the runner gave no
-    location, as before), or names a line of `source` that is part of the
-    quoted assertion (whitespace-normalised, at least 6 characters), or a
-    line inside the quoted assertion's statement or a statement whose value
-    it reads (`_falsifier_assertion_slice` over the facts' `steps`): a value
-    bound to a local first is the assertion's own. A failure at another
-    line — a navigation or a login that timed out, a setup step that threw
-    — shows the environment, not the item, and B* reruns it under the same
-    conditions. Stack frames are fixed runner output (DESIGN §12)."""
+def _falsifier_quoted_assertion_lines(source: str, quote: str,
+                                      asserts: list | None) -> set[int]:
+    """The lines of `source` the quote names (whitespace-normalised, at
+    least 6 characters: the line inside the quote, or the quote inside the
+    line) that lie in one of the case's assertions (`asserts`, the facts
+    script's `{start, end}` spans of the test framework's assertion calls,
+    read from the probe's syntax): DESIGN §8 *The quoted assertion is one
+    the test framework makes*. A quoted line outside every assertion — a
+    setup call, a helper's call — is not one, and no `asserts` means
+    none."""
     q = _scope_norm(quote)
     lines = source.splitlines()
+    spans = [(x["start"], x["end"]) for x in asserts or []
+             if isinstance(x, dict) and isinstance(x.get("start"), int)
+             and isinstance(x.get("end"), int)]
+    out: set[int] = set()
+    for a, b in spans:
+        for n in range(max(a, 1), min(b, len(lines)) + 1):
+            ln = _scope_norm(lines[n - 1])
+            if len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln)):
+                out.add(n)
+    return out
+
+
+def _falsifier_failed_at_assertion(messages: list[str], rel: str,
+                                   source: str, quote: str,
+                                   steps: list | None = None,
+                                   asserts: list | None = None) -> bool:
+    """True when some failing run's message names no line of the probe
+    `rel` (`_evidence_line`, its innermost probe frame; the runner gave no
+    location, as before), or names a quoted assertion line
+    (`_falsifier_quoted_assertion_lines`: a line of `source` the quote
+    names that lies in one of the case's assertions, `asserts`), or a line
+    inside such a line's statement or a statement whose value it reads
+    (`_falsifier_assertion_slice` over the facts' `steps`): a value bound
+    to a local first is the assertion's own. A failure at another line — a
+    navigation or a login that timed out, a setup step that threw, a setup
+    call the quote names — shows the environment, not the item, and B*
+    reruns it under the same conditions. Stack frames are fixed runner
+    output (DESIGN §12)."""
+    at = _falsifier_quoted_assertion_lines(source, quote, asserts)
 
     def quoted(n: int) -> bool:
-        if not 1 <= n <= len(lines):
-            return False
-        ln = _scope_norm(lines[n - 1])
-        return len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln))
+        return n in at
     spans = _falsifier_assertion_slice(steps or [], quoted)
     for m in messages or [""]:
         n = _evidence_line(m, rel)
