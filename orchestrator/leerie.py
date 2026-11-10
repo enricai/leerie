@@ -51770,23 +51770,40 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
     and 4). The checks are sized by their final-run `durations`
     (`_confirm_sized`, shortest first, so one long check cannot starve
     the rest, and in passes over the budget left); one never rerun is
-    `budget_short_unsettled` and listed in `sized_out`. `base_sha` is the
+    `budget_short_unsettled` and listed in `sized_out`. Sizing chooses
+    which checks a pass reruns, never the order they run in: each rerun
+    runs them in recorded order, and the base worktree is first brought to
+    where the measurement left `final_tree` — every gating check recorded
+    up to the last one the pass reruns has run there once, in recorded
+    order — since a check may read what an earlier one built (DESIGN §9 *A
+    merge check's rerun sees what its measurement saw*). `final_tree` is
+    the measured tree itself. `base_sha` is the
     reference the reruns compare against — the run's base for the final
     pass, a round's start for a kept round (`_ci_round_regressions`);
     `label` prefixes the reruns' log files."""
     by_id = {r["id"]: r for r in recs}
+    # The measurement's order: every gating check, then any check given here
+    # that is not one (a caller's own list), in the order given.
+    gating = _ci_gating_recs(st)
+    order = gating + [r for r in recs
+                      if r["id"] not in {g["id"] for g in gating}]
+    pos = {r["id"]: i for i, r in enumerate(order)}
     # One base worktree for every pass (DESIGN §8 *CI parity*): the base
     # commit is the same each time, and re-creating it per pass repaid the
     # install, the database and the prerequisites outside the budget.
+    # `upto`: how many of `order` have run there once, as set-up.
     base: dict = {"sha": base_sha, "wt": None, "prepared": set(),
-                  "prereqs": set()}
+                  "prereqs": set(), "upto": 0}
 
     async def _pass(units: list[str], cands: list[str], pcaps: dict,
                     gate: dict | None, **pairs: object) -> dict:
+        chosen = sorted(units, key=lambda i: pos[i])
+        last = pos[chosen[-1]] + 1 if chosen else 0
+        setup = order[base["upto"]:last]
         return await _ci_confirm_chosen(st, pcaps, base, final_tree,
-                                        [by_id[i] for i in units],
+                                        [by_id[i] for i in chosen],
                                         prior_gate=gate, label=label,
-                                        **pairs)
+                                        setup=setup, upto=last, **pairs)
     try:
         return await _confirm_sized(
             {r["id"]: r["id"] for r in recs}, dict(durations or {}),
@@ -51801,11 +51818,17 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
                              final_tree: Path, recs: list[dict], *,
                              prior_gate: dict | None = None,
                              label: str = "confirm",
+                             setup: list[dict] | None = None,
+                             upto: int = 0,
                              **pairs: object) -> dict:
-    """`_ci_confirm_red`'s confirm over the checks it chose, in order
-    (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`). `base` is the
-    sized confirm's one base worktree record `{sha, wt, prepared}`: created
-    by the first pass, kept for the rest, torn down by the caller."""
+    """`_ci_confirm_red`'s confirm over the checks it chose, in recorded
+    order (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`). `base` is
+    the sized confirm's one base worktree record `{sha, wt, prepared,
+    prereqs, upto}`: created by the first pass, kept for the rest, torn
+    down by the caller. `setup`: the checks to run once on the base tree,
+    in order, before its reruns (`_ci_measure`, results unread), so it
+    holds what the measurement's tree held; `base["upto"]` becomes `upto`
+    once they ran."""
     cand = [r["id"] for r in recs]
     if base.get("wt") is None and base.get("sha") and not base.get("tried"):
         base["tried"] = True
@@ -51847,11 +51870,20 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
             return failing
         return _run
 
-    fresh = [r for r in recs if r["id"] not in base["prepared"]]
+    setup = list(setup or [])
+    fresh = [r for r in setup + [r for r in recs if r not in setup]
+             if r["id"] not in base["prepared"]]
     if fresh:
         await _ci_prepare(base_wt, fresh, st, caps, f"{label}-base",
                           base["prereqs"])
         base["prepared"].update(r["id"] for r in fresh)
+    if setup:
+        # The base tree as the measurement left the tree it measured: a
+        # check rerun here may read what an earlier one built (DESIGN §9 *A
+        # merge check's rerun sees what its measurement saw*).
+        await _ci_measure(st, caps, base_wt, setup,
+                          label=f"{label}-base-setup")
+    base["upto"] = max(int(base.get("upto") or 0), upto)
     # A gate is one that passed at the baseline, and each candidate
     # failed on the final tree.
     return await _confirm_new_failures(
