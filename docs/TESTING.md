@@ -8541,8 +8541,9 @@ re-checks, and the falsifier's gates with B\* on a pristine checkout. Only
 The group is sent for item 1 and, while fixing it, undoes item 0, which was
 met. The ratchet judge and the delivery judge both say met.
 
-- On the tree that ships, item 0 gets falsifier samples, and its probe is
-  confirmed, so the item is unmet by `falsifier`.
+- On the group's commit, item 0 gets falsifier samples, and its probe is
+  confirmed. The probe passed on the group's start, so the group is rolled
+  back (next section) and item 0 reads met on the tree that ships.
 - When the group keeps item 0, the item still gets 3 samples on that tree,
   stays met, and the verdict is re-keyed.
 - A group that changes nothing costs no falsifier.
@@ -8554,3 +8555,30 @@ Falsified three ways, each turning its tests red: the end-of-re-drive read
 removed, which reproduces the live run with item 0 met and no falsifier
 call on it; the crash marking removed; and the read-commit filter removed,
 which re-reads item 1, already read on that commit.
+
+## A kept group that turns a met item's confirmed probe from passing to failing is rolled back
+
+`tests/test_flipped_probe_rolls_back_its_group.py` replays barnacle
+22a30525's shape on the same harness: the real re-drive, ratchet, re-checks,
+falsifier gates and the flip's B\* reruns on pristine checkouts of each
+commit, over real git and a real pytest repository; only `claude_p` and the
+TS AST facts are stubbed.
+
+- The group that fixes item 1 and undoes met item 0 is rolled back, its
+  `flip_regressed` naming item 0 with B\* `new`; the member's next round is
+  handed the `control_regression` note naming the probe's case, keeps item
+  0, and is kept; both items ship met.
+- With no round left (`subtask_redrive_rounds` 1) the group is rolled back
+  all the same, and the run ships its start with item 1 unmet.
+- A probe that over-reads the item (it fails on the group's start too) is
+  the item's verdict and rolls nothing back (22a30525 item 8's shape).
+- A probe that does not load on the group's start is not a pass there.
+- `_redrive_probe_flips` on the real commits: a flip only through B\*'s
+  pairs; a failing start runs no pairs. Units pin `_redrive_kept_groups`,
+  `_redrive_flip_probe` and `_redrive_flip_note`.
+
+Falsified three ways, each turning its tests red: the culprit never
+returned (4 tests: the rollback, no-round and B\* tests, and the first test
+of the previous section); a one-sided confirm that ignores the start (the
+over-read and B\* tests); and a start that need not record the case as
+passed (the did-not-load test).

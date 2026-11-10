@@ -88,7 +88,8 @@ class Replay:
     `head`; the re-drive drives s1 for item 1, and `edit` is its commit."""
 
     def __init__(self, leerie, tmp_path, monkeypatch, *, edit,
-                 falsify0=True, judge_crash_after_drive=False):
+                 falsify0=True, judge_crash_after_drive=False,
+                 probe0=PROBE_SRC, judge_reads_tree=False):
         self.L = leerie
         repo, base, head = _repo(tmp_path)
         items = [{"item": ITEM0, "span": "S1", "verifiability": "tree"},
@@ -128,7 +129,9 @@ class Replay:
                 replay.staging, "rev-parse", "HEAD")})
             key = kw["schema_key"]
             if key == "implementer":
-                edit(replay.staging)
+                # One edit per call when `edit` is a list: each round's.
+                (edit.pop(0) if isinstance(edit, list) else edit)(
+                    replay.staging)
                 replay.drove = True
                 return {"status": "complete", "summary": "fixed mul; add "
                         "keeps its documented default"}
@@ -151,8 +154,12 @@ class Replay:
                     raise leerie.WorkerError("judge down")
                 asked = sorted({int(x) for x in re.findall(
                     r'"item_index": (\d+)', kw["user_prompt"])})
+                # A judge that reads item 1 off the tree: mul multiplies.
+                now = (replay.staging / "calc.py").read_text()
                 return {"verdicts": [{
-                    "item_index": i, "met": True, "evidence": "read",
+                    "item_index": i, "evidence": "read",
+                    "met": not (judge_reads_tree and i == 1
+                                and FIXED_MUL not in now),
                     "parts": [{"requirement": "r", "kind": "static",
                                "status": "met", "cites": [{
                                    "path": "calc.py", "line_start": 1,
@@ -163,7 +170,7 @@ class Replay:
             if falsify0 and ITEM0 in kw["user_prompt"]:
                 p = Path(kw["cwd"]) / PROBE_REL
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(PROBE_SRC)
+                p.write_text(probe0)
                 return _claim()
             return _claim(verdict="could_not_demonstrate", probe_path="")
         monkeypatch.setattr(leerie, "claude_p", workers)
@@ -197,29 +204,28 @@ def _fix_mul(staging: Path) -> None:
 def test_a_kept_group_that_undoes_a_met_item_is_falsified_on_its_tree(
         leerie, tmp_path, monkeypatch):
     """The replay: the group is kept (its ratchet judge says met), and the
-    tree that ships gets a falsifier pass on item 0, whose probe — `add(2,
-    3) == 5` — is confirmed under B* there: item 0 is unmet, by the
-    falsifier, and the verdict names it."""
+    tree it left gets a falsifier pass on item 0, whose probe — `add(2, 3)
+    == 5` — is confirmed under B* there. The probe passed on the group's
+    start, so the group wrote that failure: it is rolled back (DESIGN §8 *A
+    kept group that turns a met item's confirmed probe from passing to
+    failing is rolled back*, tests/test_flipped_probe_rolls_back_its_group.py),
+    and item 0 is read met again on the tree that ships."""
     r = Replay(leerie, tmp_path, monkeypatch, edit=_fix_mul_undo_add)
     r.run()
-    final = _git(r.staging, "rev-parse", "HEAD")
-    assert final != r.head
     (g,) = r.st.data["delivery_redrive"]["rounds"][0]["groups"]
-    assert not g.get("rolled_back") and g["ratchet"]["regressed"] == []
+    assert g["ratchet"]["regressed"] == []
     assert g["ratchet"]["prior_met"] == [0]
     f0 = r.falsified(0)
-    assert f0 and {c["head"] for c in f0} == {final}
+    assert f0 and f0[0]["head"] == g["post_sha"] != r.head
+    assert g["rolled_back"] is True
+    assert [c["item_index"] for c in g["flip_regressed"]] == [0]
+    final = _git(r.staging, "rev-parse", "HEAD")
+    assert final == r.head
     gate = r.st.data["delivery_gate"]
     row0 = next(x for x in gate["items"] if x["item_index"] == 0)
-    assert row0["verdict"] == "unmet" and row0["by"] == ["falsifier"]
+    assert row0["verdict"] == "met"
     assert row0["redrive_recheck"] == {"sha": final}
-    assert row0["falsifier"]["confirmed"] is True
-    u0 = next(u for u in gate["unmet_final"] if u["item_index"] == 0)
-    assert u0["by"] == ["falsifier"]
-    assert "add(2, 3) returns 5" in u0["evidence_by"]["falsifier"]
-    # The item the group was sent for is met on the same tree.
-    assert [u["item_index"] for u in gate["unmet_final"]] == [0]
-    assert leerie._redrive_met_unread(r.st, final) == []
+    assert 0 not in [u["item_index"] for u in gate["unmet_final"]]
 
 
 def test_a_kept_group_that_keeps_the_met_item_leaves_it_met_on_final(
