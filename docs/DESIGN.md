@@ -14328,10 +14328,11 @@ probe as its evidence. A judge that crashes leaves it unverified
 never met.
 
 The rule runs once, on the tree that ships, and not after every kept
-group. A falsifier confirm is detection's verdict, not a reason to roll
-back. The ratchet's rollback rule was benched with its judge alone (N5),
-and the falsifier's measured false unmet is 8.1% per item, so making it a
-rollback trigger would need a bench of its own. The cost was measured
+group. A confirm on one tree is detection's verdict, not a reason to roll
+back: the ratchet's rollback rule was benched with its judge alone (N5),
+and the falsifier's measured false unmet is 8.1% per item. A confirm that
+one kept group demonstrably wrote is a different measurement, and it does
+roll that group back (next rule). The cost was measured
 over every recorded run under `~/.leerie/` (2026-11-09). Of 13 runs with a
 re-drive, 10 kept at least one group and ended on a moved commit (12 kept
 groups in all). Those 10 runs hold 23 met items that this rule reads,
@@ -14341,6 +14342,84 @@ That is about 4.3 falsifier calls per item, or about 10 per affected run.
 The 563 recorded falsifier calls had a median latency of 57 s and a mean of
 107 s. Each affected run also pays one cited judge pass over those items.
 A re-drive that keeps nothing pays nothing.
+
+**A kept group that turns a met item's confirmed probe from passing to
+failing is rolled back.** *Built 2026-11-10 (lane FL, barnacle 22a30525).*
+**Invariant:** no kept re-drive group ships a failure of a met item that a
+confirmed probe shows passing on the group's start and failing on its
+commit under B\*.
+
+**The rule it revises, and why that rule was right.** The rule above said
+"A falsifier confirm is detection's verdict, not a reason to roll back".
+For a confirm read on one tree that holds: bench Q2 F+ measured 12 of 148
+met control items confirmed unmet (8.1%). The 12 include probes that read
+the item more strictly than its words (two ask a payments route for a
+card's brand and last four digits that the item never names), and rolling
+a group back for one would undo good work for a probe that fails whatever
+the group did.
+
+**Why a flip differs.** A probe that over-reads its item fails on the
+group's start as much as on its commit: the group did not write the
+behaviour it pins. A flip conditions on more than one tree. The confirmed
+case passes every B\* rerun on the group's start and fails every rerun on
+its commit, interleaved (§9 *Which failures are new*: 0 of 88 clean trials
+called new), so the group's own diff moved the behaviour the probe reads.
+That is the ratchet's own question — did this repair regress met work —
+answered by execution instead of a judge.
+
+Measured (lane FL, every confirmed falsifier sample recorded after a kept
+re-drive group or acceptance repair round under `~/.leerie/*/runs`, 15
+probes in 7 runs, each re-run 3 interleaved pairs at every such group's
+start and commit, confined, from the run's repository copy; pre-registered
+`~/.cache/leerie-lanes/FL/PREREG.md`): 25 probe-group rows, 3 flips, 20
+fail on both sides, 1 passes on both, and 1 fails before and passes after
+(navegando 4134b78c item 0: its row kept detection's sample, which the
+group fixed). The
+two probes the audits call false (barnacle 22a30525 and 87580f62 item 8:
+their markup drops what the report shows) fail on both sides of all 4
+group rows. The flips: 22a30525 item 0 across round 1's group (the deleted
+guard, a real regression); 87580f62 item 0 across round 2's group (`::0:5`
+read as loopback, a true behaviour change the audit calls unreachable
+through URL normalisation); 2dcb4cce item 8 across held-out repair round 1
+(a bare `aria-expanded` combobox made a trigger, which broke a layered
+widget of the item's own shape). Each flip names one group.
+
+**The rule.** After the end-of-re-drive read (*Every item the tree that
+ships reports met passed detection's bar on it*), each item it made unmet
+with a confirmed sample is tried against every kept group in the order
+they landed (`_redrive_flip_culprit`). The sample's saved probe runs as the
+falsifier's gates ran it: in a held-out sandbox over a pristine installed
+checkout of the group's commit and of its start, through the channel that
+confirmed it, once each; a start whose report does not record the case as
+passed (the probe does not load there, the case is skipped) is not a pass.
+Only a case failing on the commit and passing on the start goes to B\*,
+with the start as the base side. The first group B\* calls it new for is
+the culprit. Staging goes back to the earliest culprit's start through the
+one restore, which also takes every kept group after it, built on its
+commit. The culprit records the flip (`flip_regressed`) and the reason
+names the item and the probe's case. The item becomes a `control_regression`
+note for the next groups, the ratchet's `met-item-<i>` note naming the case,
+its assertion and its failure, as #355 does for a merge check. Then the
+items that were open at the start, those the rolled-back groups drove and
+the flipped items are read again on the restored commit by detection's
+bar, and the round loop resumes. A member with a round left gets the note
+and tries again; one with none leaves the item it was driving unmet, as it
+was before the re-drive. The end of the pass then runs again, even on the
+start commit, since its verdicts described a tree that no longer ships.
+
+**What it costs.** Both re-drive flips in the replay rolled back a group
+that had also fixed something real: 22a30525's round 1 fixed item 13's
+gap (and round 2, built on it, part of item 10), 87580f62's round 2
+widened item 10's match. In both runs the members had spent their two
+rounds, so the note reaches no fixer and those fixes do not ship; the
+items return to unmet, as on the base, with no regression the run wrote.
+A run with no flip pays one probe run on each side of each kept group per
+newly confirmed met item, plus B\* when one side passes.
+
+**Not covered.** Held-out repair rounds are kept before detection, and
+detection's confirms are routed as unmet items, never tried against the
+round that wrote them. 2dcb4cce item 8 is that shape. It needs its own
+rule: a rollback there also undoes the held-out cases the round fixed.
 
 **An unmet item reaches its owner, or is recorded as reaching none.**
 Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
@@ -17260,7 +17339,10 @@ evidence of the next one. The ratchet's read is below detection's bar, since
 its judge carries no citation and no falsifier runs. So the items it keeps
 met after a re-drive group are read again on the tree that ships, by the
 judge and the falsifier (*Every item the tree that ships reports met passed
-detection's bar on it*). An acceptance repair round needs no such read,
+detection's bar on it*), and a confirm there whose probe passed on a kept
+group's start and fails on its commit rolls that group back (*A kept group
+that turns a met item's confirmed probe from passing to failing is rolled
+back*). An acceptance repair round needs no such read,
 because final detection runs after it.
 
 Measured (bench Q4 N5, frozen design): 49 natural repair rounds and

@@ -1105,7 +1105,7 @@ def test_every_measuring_confirm_says_whether_it_saw_the_failure(leerie):
         "_confirm_final_test_failures", "_ci_confirm_chosen",
         "_acceptance_run_placed", "_falsifier_gates",
         "_redrive_new_failures", "_integration_test_failures",
-        "_base_form_regressions"}, calls
+        "_base_form_regressions", "_redrive_probe_flips"}, calls
 
 
 # --- review round 6 H1: a budget shortfall is unsettled, not `new` ---------

@@ -49669,7 +49669,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
-    `{ids, files, kind}` — or None when the runner has no known report or
+    `{ids, files, kind, passed}` (`passed`: the cases the report records
+    as passed) — or None when the runner has no known report or
     none was written. A separate run on purpose: the axis verdict
     `_measure_blt` records is never measured with altered flags. With
     `serial`, the runner's `_SERIAL_RUNNER_FLAGS` are appended first; a
@@ -49835,14 +49836,14 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             # later rerun (DESIGN §9 *A rerun's cost is measured*).
             _record_rerun_cost(st, len(run_files), run_wall,
                                sum(durations.get(f, 0.0) for f in run_files))
-        messages = {c["id"]: c.get("message", "")
-                    for c in (_runner_report_cases(kind, data or None,
-                                                   str(tree))
-                              or [])
+        cases = _runner_report_cases(kind, data or None, str(tree)) or []
+        messages = {c["id"]: c.get("message", "") for c in cases
                     if ids and c["id"] in ids}
         if ids is not None:
             return {"ids": sorted(ids), "files": ids, "kind": kind,
                     "messages": messages, "durations": durations,
+                    "passed": sorted({c["id"] for c in cases
+                                      if c.get("status") == "passed"}),
                     "wall_sec": round(run_wall, 3)}
     return None
 
@@ -67737,6 +67738,173 @@ def _redrive_met_unread(st: "State", sha: str) -> list[int]:
     return sorted(set(out))
 
 
+def _redrive_kept_groups(rec: dict) -> list[tuple[int, int, dict]]:
+    """`(round, group, entry)` for every re-drive group still in staging's
+    history, in the order they landed: it committed (`post_sha` other than
+    its `pre_sha`) and was not rolled back."""
+    out: list[tuple[int, int, dict]] = []
+    for rd in rec.get("rounds") or []:
+        for ge in (rd.get("groups") or []) if isinstance(rd, dict) else []:
+            if (isinstance(ge, dict) and not ge.get("rolled_back")
+                    and ge.get("pre_sha") and ge.get("post_sha")
+                    and ge["post_sha"] != ge["pre_sha"]):
+                out.append((int(rd.get("round") or 0),
+                            int(ge.get("group") or 0), ge))
+    return out
+
+
+def _redrive_flip_probe(row: dict | None) -> dict | None:
+    """The confirmed falsifier sample a re-check recorded for an item
+    (`{case_id, probe_saved{dir, file}, via_browser_suite?, ...}`), or
+    None: what a flip is measured with (DESIGN §8 *A kept group that turns
+    a met item's confirmed probe from passing to failing is rolled back*)."""
+    fi = (row or {}).get("falsifier") if isinstance(row, dict) else None
+    for s_ in (fi or {}).get("samples") or [] if isinstance(fi, dict) else []:
+        saved = s_.get("probe_saved") if isinstance(s_, dict) else None
+        if (s_.get("confirmed") and s_.get("case_id")
+                and isinstance(saved, dict) and saved.get("dir")
+                and saved.get("file")):
+            return s_
+    return None
+
+
+async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
+                               pre_sha: str, post_sha: str, *,
+                               label: str) -> dict:
+    """Whether one kept group turned a confirmed probe from passing to
+    failing (DESIGN §8 *A kept group that turns a met item's confirmed probe
+    from passing to failing is rolled back*): `{flip, pre, post, b_star?}`.
+    The probe runs as the falsifier's gates ran it — placed in a held-out
+    sandbox over a pristine installed checkout of each commit, never on
+    disk, through the channel that confirmed it — once on `post_sha`, then
+    on `pre_sha`; only a case failing on the group's commit and passing on
+    its start goes to B* (`_confirm_new_failures`, the start as the base
+    side). A start where the case did not run and pass (a probe that does
+    not load there, a skip) is not a pass. `flip` only when B* calls the
+    case new."""
+    saved = smp["probe_saved"]
+    rel, cid = str(saved["file"]), str(smp["case_id"])
+    out: dict = {"flip": False, "pre": "unmeasured", "post": "unmeasured"}
+    suite = _browser_suite(st) if smp.get("via_browser_suite") else None
+    if smp.get("via_browser_suite") and suite is None:
+        return out
+    try:
+        src_bytes = _read_beneath(Path(saved["dir"]),
+                                  Path(saved["dir"]) / rel,
+                                  limit=READ_LIMIT_TEXT)
+    except OSError:
+        return out
+    fd, src = tempfile.mkstemp(prefix="leerie-flip-", suffix=Path(rel).suffix)
+    os.close(fd)
+    Path(src).write_bytes(src_bytes)
+    log_path = _held_out_logs(st.run_dir) / f"flip-{label}.log"
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    trees: dict[str, Path] = {}
+    try:
+        for side, sha in (("post", post_sha), ("pre", pre_sha)):
+            wt = await asyncio.to_thread(_falsifier_checkout, st,
+                                         f"flip-{side}", sha)
+            if wt is None:
+                return out
+            trees[side] = wt
+            if not await _ensure_worktree_deps(
+                    str(wt), st, caps, log_path=log_path, verbosity="quiet",
+                    label_prefix=f"flip-{side}", log_prefix="re-drive flip"):
+                return out
+            if suite is not None:
+                await _ci_prepare(wt, [_browser_suite_rec(suite)], st, caps,
+                                  f"flip-{side}")
+        place = ((src, rel),)
+
+        def runner(side: str):
+            tree = trees[side]
+            cmd = (_browser_suite_cmd(suite, [rel]) if suite is not None
+                   else _acceptance_cmd(st, [rel], str(tree),
+                                        placed={rel: src}))
+
+            async def _run(left: float) -> set[str] | None:
+                if cmd is None:
+                    return None
+                got = await _capture_failing_test_ids(
+                    str(tree), cmd, st, caps, label=f"flip-{label}-{side}",
+                    log_path=log_path, timeout=min(left, timeout),
+                    serial=True, files=[rel], db=True, place=place,
+                    suite=suite)
+                if got is None:
+                    return None
+                failing = {str(x) for x in got.get("ids") or []}
+                if side == "pre" and cid not in set(got.get("passed") or ()):
+                    failing.add(cid)
+                return failing
+            return _run
+        async with _held_out_section(st):
+            for side in ("post", "pre"):
+                got = await runner(side)(timeout)
+                out[side] = ("unmeasured" if got is None
+                             else "fail" if cid in got else "pass")
+            if out["post"] != "fail" or out["pre"] != "pass":
+                return out
+            # The case was seen failing on the commit just above.
+            verdict = await _confirm_new_failures(
+                [cid], runner("pre"), runner("post"), caps,
+                label=f"re-drive flip {label}", seen_failing=True)
+        out["b_star"] = {k: verdict.get(k) for k in (
+            "new", "pre_existing", "resource_affected", "no_verdict",
+            "budget_short_unsettled", "pairs_required", "pairs_run")}
+        out["flip"] = cid in (verdict.get("new") or [])
+        return out
+    finally:
+        for wt in trees.values():
+            _remove_acceptance_checkout(st, wt)
+        with contextlib.suppress(OSError):
+            os.unlink(src)
+
+
+async def _redrive_flip_culprit(st: "State", caps: dict, rec: dict,
+                                item_index: int, smp: dict) -> dict | None:
+    """The first kept group across which `item_index`'s confirmed probe
+    `smp` flips from passing to failing under B* (`_redrive_probe_flips`),
+    as `{item_index, round, group, pre_sha, post_sha, case_id,
+    probe_saved, b_star}`, or
+    None: no kept group did, so the probe's failure is detection's verdict
+    and nothing is rolled back."""
+    for rnd, gi, ge in _redrive_kept_groups(rec):
+        got = await _redrive_probe_flips(
+            st, caps, smp, ge["pre_sha"], ge["post_sha"],
+            label=f"i{item_index}-r{rnd}g{gi}")
+        log(f"  delivery re-drive: item {item_index}'s confirmed probe on "
+            f"r{rnd}g{gi}: {got['pre']} on its start, {got['post']} on its "
+            "commit" + (" — flipped under B*" if got["flip"] else ""))
+        if got["flip"]:
+            return {"item_index": item_index, "round": rnd, "group": gi,
+                    "pre_sha": ge["pre_sha"], "post_sha": ge["post_sha"],
+                    "case_id": smp["case_id"],
+                    "probe_saved": dict(smp["probe_saved"]),
+                    "b_star": got.get("b_star")}
+    return None
+
+
+def _redrive_flip_note(i: int, item: str, smp: dict) -> dict:
+    """The pending `control_regression` note a flip leaves for the next
+    groups (DESIGN §8 *A kept group that turns a met item's confirmed probe
+    from passing to failing is rolled back*): the ratchet's `met-item-<i>`
+    note, its detail naming the probe's case and failure."""
+    detail = ("an earlier re-drive attempt made this required item, met "
+              "before it, unmet: the falsifier's probe case "
+              f"`{smp.get('case_id')}` passed on the tree before the "
+              "attempt and failed on its commit (confirmed under B*), so "
+              "the attempt was reverted. Keep it met: " + item[:400])
+    if smp.get("assertion_quote"):
+        detail += ("\nThe probe's assertion: "
+                   + str(smp["assertion_quote"])[:300])
+    if smp.get("failure_message"):
+        detail += ("\nIts failure on that commit: "
+                   + str(smp["failure_message"])[:400])
+    return {"kind": "control_regression", "key": f"met-item-{i}",
+            "test": f"required item {i}", "detail": detail}
+
+
 def _resettle_test_outcome_rows(st: "State", tree_sha: str | None) -> None:
     """Re-read every `delivery_gate.items` row's test outcome from the
     failing-test-ID diff of `tree_sha` (`_test_outcome_verdict`), so no row
@@ -68370,588 +68538,687 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     # reached no worker (`_redrive_unrouted_items`).
     start_items = sorted({u["item_index"] for u in open_items()
                           + unreproducible_items()})
-    while not rec.get("conflict") and not rec.get("rollback_failed"):
-        if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
-            log("  delivery re-drive: redrive_budget_sec spent — stopping")
-            stopped_on_budget = True
-            break
-        rnd += 1
-        if rnd > max_rounds:
-            # Every driven round spends a member's counter, so this never
-            # binds while the budget check holds; it keeps a broken one
-            # from spinning.
-            log("  delivery re-drive: round ceiling reached — stopping")
-            break
-        held_mode = False
-        H: dict[str, dict] = {}
-        if not F and held and not rec.get("held_round_done"):
-            if H_known is None:
-                H_known, _u = await measure(held, f"redrive-r{rnd}-held")
-            H = dict(H_known)
-            if H:
-                held_mode = True
-                rec["held_round_done"] = True
-        items_open = open_items()
-        seen_keys.update(f"{n['item_index']}:{k}" for n in items_open
-                         for k in n.get("evidence_keys") or ())
-        checks_open = open_checks()
-        defects_open = open_defects()
-        if not held_mode and not (F or items_open or checks_open
-                                  or defects_open):
-            rnd -= 1
-            break
-        if held_mode:
-            notes = [set_note(k, v, "held_" + v["kind"]) for k, v in H.items()]
-            fallback = prior_members or site_claimers
-        else:
-            notes = [set_note(k, v, "defect" if v["kind"] == "defect"
-                              else "control_regression")
-                     for k, v in F.items()]
-            fallback = site_claimers
-        notes += items_open + checks_open + defects_open
-        # The self-check every group is given runs the shown sets: a note
-        # it cannot reproduce is a leerie defect, never handed on (DESIGN §8
-        # *Delivery re-drive* rule 4).
-        bad = _redrive_unreproducible(notes + rec["pending_controls"], shown)
-        if bad:
-            raise RuntimeError(
-                "delivery re-drive: note(s) whose failure the group's fixer "
-                f"cannot reproduce: {', '.join(bad[:10])}")
-        groups = _redrive_route(notes, subfiles, fallback=fallback,
-                                pending=rec["pending_controls"])
-        entry_round = {"round": rnd, "held_mode": held_mode, "groups": []}
-        rec["rounds"].append(entry_round)
-        _save()
-        drove = False
-        routed_items: set[int] = set()
-        routed_checks = False
-        for gi, g in enumerate(groups):
-            ge: dict = {"group": gi, "members": g["members"]}
-            entry_round["groups"].append(ge)
-            if held_mode and gi > 0 and drove:
-                H, _u2 = await measure(held, f"redrive-r{rnd}g{gi}-held-pre")
-                H = _redrive_carry(H_known or {}, H, _u2)
-            live = [n for n in g["notes"] if
-                    (n["kind"] in ("defect",) or (n["kind"] ==
-                                                  "control_regression"
-                                                  and n.get("file")))
-                    and n["key"] in F
-                    or n["kind"].startswith("held_") and n["key"] in H
-                    or n["kind"] in ("unmet_item", "ci_check",
-                                     "solution_defect")]
-            ge["notes"] = sorted({n["kind"] for n in live})
-            if not live:
-                ge["skipped"] = "nothing_left"
-                _save()
+    reread = False
+
+    async def roll_back_flips(culprits: list[tuple[dict, dict]]) -> bool:
+        # The earliest culprit goes, and every kept group after it, which
+        # was built on its commit (one restore: staging back to its start).
+        kept = _redrive_kept_groups(rec)
+        pos = {(r_, g_): n for n, (r_, g_, _ge) in enumerate(kept)}
+        first = min((c for c, _s in culprits),
+                    key=lambda c: pos[(c["round"], c["group"])])
+        at = pos[(first["round"], first["group"])]
+        mine = [c for c, _s in culprits
+                if (c["round"], c["group"]) == (first["round"],
+                                                first["group"])]
+        reason = (
+            "its commit turned the confirmed falsifier probe of met item(s) "
+            "from passing on its start to failing on its commit (B*): "
+            + "; ".join(f"item {c['item_index']} ({c['case_id']})"
+                        for c in mine))
+        label = f"r{first['round']}g{first['group']}"
+        ok = await _roll_back_round(
+            st, staging, first["pre_sha"], worker="delivery re-drive",
+            label=label, reason=reason, where="re-drive rollback",
+            branch=_compute_run_branch(st.run_id))
+        by_group: dict[tuple[int, int], list[dict]] = {}
+        for c, _s in culprits:
+            by_group.setdefault((c["round"], c["group"]), []).append(c)
+        for r_, g_, ge_ in kept[at:]:
+            if by_group.get((r_, g_)):
+                ge_["flip_regressed"] = by_group[(r_, g_)]
+            if not ok:
                 continue
-            members = [m for m in g["members"]
-                       if _redrive_allowed(st, caps, m)]
-            if not members:
-                ge["skipped"] = "budget"
-                rec["items_budget_skipped"] = sorted(
-                    set(rec["items_budget_skipped"])
-                    | {n["item_index"] for n in live
-                       if n["kind"] == "unmet_item"})
-                _save()
-                continue
-            pend = [n for n in rec["pending_controls"]
-                    if n["key"] not in {x["key"] for x in live}]
-            gnotes = live + pend
-            set_idx = {n["set_index"] for n in live if "set_index" in n}
-            escalate = _redrive_escalate(st, caps, members, set_idx,
-                                         by_index, ast_ok)
-            ge["escalated"] = escalate
-            pre_sha = await _branch_head_sha(str(staging))
-            if not pre_sha:
-                ge["skipped"] = "head_unreadable"
-                break
-            ge["pre_sha"] = pre_sha
-            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
-            for m in members:
-                _consume_redrive(st, m)
+            ge_["rolled_back"] = True
+            ge_["rollback_reason"] = (
+                reason if (r_, g_) == (first["round"], first["group"])
+                else f"built on {label}, rolled back: {reason}")
+        rec.setdefault("flip_rollbacks", []).append({
+            "group": label, "pre_sha": first["pre_sha"],
+            "items": [c["item_index"] for c, _s in culprits],
+            "landed": ok})
+        if not ok:
+            kept[at][2]["rollback_failed"] = True
+            rec["rollback_failed"] = True
+            log("  WARNING: delivery re-drive: a flip's rollback did not "
+                "land — stopping with the group's commits on staging")
             _save()
-            t0 = time.monotonic()
-            # The shown sets' source, for the anti-cheat history check
-            # (DESIGN §8 *A held-out set never enters a tree a worker
-            # commits from*); the sets themselves never enter staging.
-            # A shown probe the group holds is a shown file too (rule 4).
-            probe_sets = _redrive_probe_sets(live)
-            staged = [{"dir": s_["dir"], "files": _set_files(s_)}
-                      for s_ in [*shown, *probe_sets] if s_.get("dir")]
-            prints = await asyncio.to_thread(
-                _heldout_fingerprints, staging, staged, pre_sha)
-            sc: dict | None = None
-            label = f"delivery-redrive-r{rnd}-g{gi}"
-            effort = (EFFORT_REDRIVE_ESCALATION if escalate
-                      else efforts.get("implementer"))
-            try:
-                suite = _browser_suite(st)
-                if suite is not None and any(p_.get("via_browser_suite")
-                                             for p_ in probe_sets):
-                    # A probe confirmed through the browser suite runs
-                    # through it in the fixer's self-check, over a copy of
-                    # staging that shares its ignored paths and its tree
-                    # stores: the suite's prerequisites (a code generator,
-                    # the runner's browser) set staging up, as they set up
-                    # the checkout it was confirmed in (DESIGN §8 *A probe
-                    # is re-run through the channel that confirmed it*).
-                    await _ci_prepare(staging, [_browser_suite_rec(suite)],
-                                      st, caps, "redrive", done=suite_prepared)
-                if shown or probe_sets:
-                    sc = _selfcheck_prepare(st, caps, staging, shown,
-                                            label, probes=probe_sets)
-                merged = [{"id": m,
-                           "title": (specs.get(m) or {}).get("title"),
-                           "intent": (specs.get(m) or {}).get("intent")}
-                          for m in members[1:]]
-                held_names = ([{"name": c, "kind": n["kind"][5:]}
-                               for n in live
-                               if n["kind"].startswith("held_")
-                               for c in (n.get("cases")
-                                         or [])[:_REDRIVE_CASES_MAX]]
-                              if held_mode else [])
-                note = _redrive_note(
-                    [n for n in gnotes
-                     if not n["kind"].startswith("held_")],
-                    rnd=rnd, rounds=cap, merged=merged,
-                    held_names=held_names, defect_shape=shape,
-                    selfcheck=sc if sc and sc.get("command") else None)
-                ge["implementer"] = await _redrive_drive(
-                    leerie_dir, st, caps, models, staging, members,
-                    note, effort=effort, label=label,
-                    bin_dir=sc["bin"] if sc else None,
-                    db=bool(shown or probe_sets))
-                # What a worker was handed, by evidence key: an item whose
-                # later evidence no group was handed reached no worker
-                # with it, whatever earlier rounds drove.
-                rec["evidence_handed"] = sorted(
-                    set(rec["evidence_handed"])
-                    | {f"{n['item_index']}:{k}" for n in live
-                       if n["kind"] == "unmet_item"
-                       for k in n.get("evidence_keys") or ()})
-                objs = _redrive_probe_objections(
-                    ge["implementer"].pop("probe_objections", None),
-                    probe_sets)
-                if objs:
-                    # The fixer's words for a person, never an exemption
-                    # (rule 4).
-                    ge["probe_objections"] = objs
-                    rec["probe_objections"] += [
-                        {**o, "round": rnd, "group": gi} for o in objs]
-                    for o in objs:
-                        log(f"  delivery re-drive r{rnd} g{gi}: the fixer "
-                            f"objected to probe {o['probe_test_file']} "
-                            f"({o['kind']}) — recorded unverified; it "
-                            "exempts nothing")
-            finally:
-                if sc:
-                    calls = _selfcheck_calls(sc)
-                    if calls:
-                        ge["selfcheck_calls"] = calls
-                _selfcheck_cleanup(sc)
-            # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing of
-            # leerie's is in staging (its self-check runs outside it), so
-            # this sees exactly what the implementer left. Still dirty after
-            # the re-asks, the group is rolled back like any other and
-            # recorded.
-            unclean = await _clean_tree_gate(
-                staging, caps=caps, label=f"delivery re-drive r{rnd} g{gi}",
-                reask=_clean_tree_reasker(
-                    st, caps, log_sid=label,
-                    cwd=str(staging), schema_key="implementer",
-                    system_prompt=_load_prompt("implementer"),
-                    model=models.get("implementer", MODEL_DEFAULT),
-                    effort=effort, max_turns=120),
-                branch=_compute_run_branch(st.run_id), base=pre_sha)
-            if unclean:
-                ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
-                _record_unclean_tree(st, "delivery re-drive implementer",
-                                     f"r{rnd} g{gi}", unclean)
-                ge["rollback_reason"] = _unclean_reason("its implementer",
-                                                        unclean)
-                ok = await _roll_back_round(
-                    st, staging, pre_sha, worker="delivery re-drive",
-                    label=f"r{rnd}g{gi}", reason=ge["rollback_reason"],
-                    where="re-drive rollback",
-                    branch=_compute_run_branch(st.run_id))
-                ge["rolled_back"] = ok
-                drove = True
-                prior_members += [m for m in members
-                                  if m not in prior_members]
-                _charge_redrive_time(st, time.monotonic() - t0)
-                rec.pop("in_flight", None)
-                if not ok:
-                    ge["rollback_failed"] = True
-                    rec["rollback_failed"] = True
-                    log("  WARNING: delivery re-drive: stopping with the "
-                        "group's commits on staging")
-                    _save()
-                    break
-                _save()
-                continue
-            drove = True
-            prior_members += [m for m in members if m not in prior_members]
-            routed_items |= {n["item_index"] for n in live
-                             if n["kind"] == "unmet_item"}
-            rec["items_driven"] = sorted(set(rec["items_driven"])
-                                         | routed_items)
-            routed_checks = routed_checks or any(n["kind"] == "ci_check"
-                                                 for n in live)
-            post_sha = await _branch_head_sha(str(staging))
-            ge["post_sha"] = post_sha
-            if not post_sha or post_sha == pre_sha:
-                ge["no_change"] = True
+            return False
+        have = {n["key"] for n in rec["pending_controls"]}
+        for c, smp in culprits:
+            i = c["item_index"]
+            if f"met-item-{i}" not in have and 0 <= i < len(normalized):
+                rec["pending_controls"].append(_redrive_flip_note(
+                    i, normalized[i]["item"], smp))
+        log(f"  delivery re-drive: {label} rolled back — {reason}")
+        _save()
+        return True
+
+    while True:
+        while not rec.get("conflict") and not rec.get("rollback_failed"):
+            if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
+                log("  delivery re-drive: redrive_budget_sec spent — stopping")
+                stopped_on_budget = True
+                break
+            rnd += 1
+            if rnd > max_rounds:
+                # Every driven round spends a member's counter, so this never
+                # binds while the budget check holds; it keeps a broken one
+                # from spinning.
+                log("  delivery re-drive: round ceiling reached — stopping")
+                break
+            held_mode = False
+            H: dict[str, dict] = {}
+            if not F and held and not rec.get("held_round_done"):
+                if H_known is None:
+                    H_known, _u = await measure(held, f"redrive-r{rnd}-held")
+                H = dict(H_known)
+                if H:
+                    held_mode = True
+                    rec["held_round_done"] = True
+            items_open = open_items()
+            seen_keys.update(f"{n['item_index']}:{k}" for n in items_open
+                             for k in n.get("evidence_keys") or ())
+            checks_open = open_checks()
+            defects_open = open_defects()
+            if not held_mode and not (F or items_open or checks_open
+                                      or defects_open):
+                rnd -= 1
+                break
+            if held_mode:
+                notes = [set_note(k, v, "held_" + v["kind"]) for k, v in H.items()]
+                fallback = prior_members or site_claimers
             else:
-                # Every commit's files, not the net diff: a set file
-                # committed and then deleted is still in the history.
-                changed = _redrive_git(staging, "log", "--format=",
-                                       "--name-only", "-m",
-                                       f"{pre_sha}..{post_sha}").split()
-                committed = sorted(set(changed) & {
-                    f for s_ in staged for f in s_["files"]})
-                committed = sorted(set(committed) | set(
-                    await asyncio.to_thread(
-                        _history_heldout_hits, staging, pre_sha, post_sha,
-                        staged, prints)))
-                ge["committed_staged"] = committed
-                F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
-                F1 = _redrive_carry(F, F1, unm)
-                # Each shown probe the group was handed, on its commit
-                # (rule 4): a case of its progress, and what a conflict
-                # with an existing test is measured against.
-                probes_after = await _redrive_probe_verdicts(
-                    st, caps, staging, probe_sets,
-                    f"redrive-r{rnd}g{gi}-probes", rev=post_sha)
-                if probes_after:
-                    ge["probes_after"] = {str(i): v for i, v
-                                          in sorted(probes_after.items())}
-                H1 = None
-                if held_mode:
-                    H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
-                    H1 = (None if unm_h and len(unm_h) == len(held)
-                          else _redrive_carry(H, H1, unm_h))
-                # A test an earlier attempt broke is the round's to keep
-                # passing, whatever its distance from this diff.
-                ids_after = None
-                newv = await _near_rejection(
-                    st, caps, staging, pre_sha, post_sha, ids_before,
-                    label=f"redrive-r{rnd}g{gi}",
-                    log_path=st.run_dir / "logs" / _REDRIVE_LOG,
-                    named=[str(n["test"]).split(" :: ")[0]
-                           for n in rec.get("pending_controls") or []
-                           if " :: " in str(n.get("test") or "")])
-                if newv is None:
-                    ids_after = await _redrive_test_ids(
-                        st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
-                    newv = await _ratchet_exec(
-                        st, caps, staging, pre_sha, ids_before, ids_after,
-                        label=f"redrive-r{rnd}g{gi}",
-                        log_path=st.run_dir / "logs" / _REDRIVE_LOG,
-                        base_form=True)
-                ge["new_failures"] = newv["new"]
-                if newv.get("base_form_changed"):
-                    ge["base_form_changed"] = list(newv["base_form_changed"])
-                if newv.get("intermittent_regression"):
-                    ge["intermittent_regression"] = newv[
-                        "intermittent_regression"]
-                # Mixed evidence only; a measurement with no verdict is
-                # `unmeasured`, a base failure `pre_existing` (DESIGN §9
-                # *Which failures are new*, step 3).
-                ge["resource_affected"] = list(
-                    newv.get("resource_affected") or [])
-                ge["pre_existing"] = list(newv.get("pre_existing") or [])
-                ge["unmeasured"] = (
-                    [f"set {i}" for i in unm]
-                    + list(newv.get("no_verdict") or [])
-                    + (["test ids"] if newv["unmeasured"] else []))
-                v = _redrive_verdict(F, F1, newv["new"],
-                                     held=H if held_mode else None,
-                                     held_after=H1)
-                ge.update({k: v[k] for k in ("fixed", "broke", "ctl_new",
-                                             "fixed_cases", "broke_cases",
-                                             "held_fixed",
-                                             "held_fixed_cases", "held_broke",
-                                             "held_broke_cases",
-                                             "worse", "trade")})
-                void = False
-                if committed:
-                    void = True   # a set's source must never reach history
-                # Zero progress: the group had failing set cases it could be
-                # measured on, and fixed none of them — counted in cases,
-                # not files. A change that measurably fixes nothing is
-                # speculative — in a replay two such rounds added defensive
-                # fallbacks the task forbade. A set with no verdict now is
-                # no evidence either way.
-                measured_live = [
-                    n for n in live
-                    if "set_index" in n and (
-                        (n["kind"].startswith("held_") and H1 is not None)
-                        or (not n["kind"].startswith("held_")
-                            and n["set_index"] not in unm))]
-                # A shown probe is a case too: one that passes now is
-                # progress, one that still fails is not, and one with no
-                # verdict is no evidence either way (rule 4).
-                probe_fixed = sorted(i for i, x in probes_after.items()
-                                     if x == "pass")
-                measured_probes = [i for i, x in probes_after.items()
-                                   if x != "unmeasured"]
-                ge["zero_progress"] = bool(
-                    (measured_live or measured_probes)
-                    and not v["fixed_cases"]
-                    and not v["held_fixed_cases"] and not probe_fixed)
-                # A shown probe never forces a change that breaks what an
-                # existing test pins (rule 4): a commit that made a probe
-                # pass and broke such a case contests the probe — measured,
-                # never a worker's say-so.
-                pinned = (_redrive_pinned_breaks(
-                    _run_repo(st), _diff_base(st) or "", post_sha, newv)
-                    if probe_fixed else [])
-                if pinned:
-                    ge["probe_conflict"] = {
-                        "items": probe_fixed,
-                        "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX]}
-                    by_item = {p_["item_index"]: p_ for p_ in probe_sets}
-                    for i in probe_fixed:
-                        rec["contested_probes"].append({
-                            "item_index": i,
-                            "probe_test_file": by_item[i]["defect_files"][0],
-                            "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX],
-                            "round": rnd, "group": gi})
-                        log(f"  delivery re-drive r{rnd} g{gi}: probe of "
-                            f"item {i} contested — making it pass broke "
-                            f"{len(pinned)} case(s) existing tests pin; "
-                            "rolled back, not driven again")
-                # A conflict needs no rule of its own to roll the group
-                # back: each pinned case is a confirmed new failure (worse)
-                # or a base-form change (void).
-                void = (void or ge["zero_progress"]
-                        or bool(ge.get("base_form_changed")))
-                if escalate:
-                    async with _exec_lock().shared():
-                        eg = _redrive_escalation_gate(
-                            staging, pre_sha, post_sha,
-                            grants=_measurement_grants(st, staging))
-                    ge["gate"] = eg
-                    void = void or eg["void"]
-                rat: dict = {}
-                if not (v["worse"] or void):
-                    # The delivery ratchet (DESIGN §8 *A repair that
-                    # regresses met work is rolled back*): the items met
-                    # before this group are re-verified on its tree. Its
-                    # new test failures already made the group worse.
-                    try:
-                        rat = await _delivery_ratchet(
-                            st, caps, models, efforts, staging, pre_sha,
-                            post_sha, exec_result=newv,
-                            label=f"redrive-r{rnd}g{gi}")
-                    except Exception as e:
-                        rat = {"error": f"{type(e).__name__}: {e}"[:300]}
-                        log(f"  delivery re-drive: ratchet raised "
-                            f"{rat['error']} — group kept")
-                    ge["ratchet"] = rat
-                    if rat.get("regressed"):
-                        ge["ratchet_regressed"] = list(rat["regressed"])
-                        void = True
-                    if rat.get("merge_checks_broke"):
-                        ge["merge_checks_broke"] = [
-                            b["id"] for b in rat["merge_checks_broke"]]
-                        void = True
-                if v["worse"] or void:
-                    ge["rollback_reason"] = _redrive_rollback_reason(ge)
+                notes = [set_note(k, v, "defect" if v["kind"] == "defect"
+                                  else "control_regression")
+                         for k, v in F.items()]
+                fallback = site_claimers
+            notes += items_open + checks_open + defects_open
+            # The self-check every group is given runs the shown sets: a note
+            # it cannot reproduce is a leerie defect, never handed on (DESIGN §8
+            # *Delivery re-drive* rule 4).
+            bad = _redrive_unreproducible(notes + rec["pending_controls"], shown)
+            if bad:
+                raise RuntimeError(
+                    "delivery re-drive: note(s) whose failure the group's fixer "
+                    f"cannot reproduce: {', '.join(bad[:10])}")
+            groups = _redrive_route(notes, subfiles, fallback=fallback,
+                                    pending=rec["pending_controls"])
+            entry_round = {"round": rnd, "held_mode": held_mode, "groups": []}
+            rec["rounds"].append(entry_round)
+            _save()
+            drove = False
+            routed_items: set[int] = set()
+            routed_checks = False
+            for gi, g in enumerate(groups):
+                ge: dict = {"group": gi, "members": g["members"]}
+                entry_round["groups"].append(ge)
+                if held_mode and gi > 0 and drove:
+                    H, _u2 = await measure(held, f"redrive-r{rnd}g{gi}-held-pre")
+                    H = _redrive_carry(H_known or {}, H, _u2)
+                live = [n for n in g["notes"] if
+                        (n["kind"] in ("defect",) or (n["kind"] ==
+                                                      "control_regression"
+                                                      and n.get("file")))
+                        and n["key"] in F
+                        or n["kind"].startswith("held_") and n["key"] in H
+                        or n["kind"] in ("unmet_item", "ci_check",
+                                         "solution_defect")]
+                ge["notes"] = sorted({n["kind"] for n in live})
+                if not live:
+                    ge["skipped"] = "nothing_left"
+                    _save()
+                    continue
+                members = [m for m in g["members"]
+                           if _redrive_allowed(st, caps, m)]
+                if not members:
+                    ge["skipped"] = "budget"
+                    rec["items_budget_skipped"] = sorted(
+                        set(rec["items_budget_skipped"])
+                        | {n["item_index"] for n in live
+                           if n["kind"] == "unmet_item"})
+                    _save()
+                    continue
+                pend = [n for n in rec["pending_controls"]
+                        if n["key"] not in {x["key"] for x in live}]
+                gnotes = live + pend
+                set_idx = {n["set_index"] for n in live if "set_index" in n}
+                escalate = _redrive_escalate(st, caps, members, set_idx,
+                                             by_index, ast_ok)
+                ge["escalated"] = escalate
+                pre_sha = await _branch_head_sha(str(staging))
+                if not pre_sha:
+                    ge["skipped"] = "head_unreadable"
+                    break
+                ge["pre_sha"] = pre_sha
+                rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
+                for m in members:
+                    _consume_redrive(st, m)
+                _save()
+                t0 = time.monotonic()
+                # The shown sets' source, for the anti-cheat history check
+                # (DESIGN §8 *A held-out set never enters a tree a worker
+                # commits from*); the sets themselves never enter staging.
+                # A shown probe the group holds is a shown file too (rule 4).
+                probe_sets = _redrive_probe_sets(live)
+                staged = [{"dir": s_["dir"], "files": _set_files(s_)}
+                          for s_ in [*shown, *probe_sets] if s_.get("dir")]
+                prints = await asyncio.to_thread(
+                    _heldout_fingerprints, staging, staged, pre_sha)
+                sc: dict | None = None
+                label = f"delivery-redrive-r{rnd}-g{gi}"
+                effort = (EFFORT_REDRIVE_ESCALATION if escalate
+                          else efforts.get("implementer"))
+                try:
+                    suite = _browser_suite(st)
+                    if suite is not None and any(p_.get("via_browser_suite")
+                                                 for p_ in probe_sets):
+                        # A probe confirmed through the browser suite runs
+                        # through it in the fixer's self-check, over a copy of
+                        # staging that shares its ignored paths and its tree
+                        # stores: the suite's prerequisites (a code generator,
+                        # the runner's browser) set staging up, as they set up
+                        # the checkout it was confirmed in (DESIGN §8 *A probe
+                        # is re-run through the channel that confirmed it*).
+                        await _ci_prepare(staging, [_browser_suite_rec(suite)],
+                                          st, caps, "redrive", done=suite_prepared)
+                    if shown or probe_sets:
+                        sc = _selfcheck_prepare(st, caps, staging, shown,
+                                                label, probes=probe_sets)
+                    merged = [{"id": m,
+                               "title": (specs.get(m) or {}).get("title"),
+                               "intent": (specs.get(m) or {}).get("intent")}
+                              for m in members[1:]]
+                    held_names = ([{"name": c, "kind": n["kind"][5:]}
+                                   for n in live
+                                   if n["kind"].startswith("held_")
+                                   for c in (n.get("cases")
+                                             or [])[:_REDRIVE_CASES_MAX]]
+                                  if held_mode else [])
+                    note = _redrive_note(
+                        [n for n in gnotes
+                         if not n["kind"].startswith("held_")],
+                        rnd=rnd, rounds=cap, merged=merged,
+                        held_names=held_names, defect_shape=shape,
+                        selfcheck=sc if sc and sc.get("command") else None)
+                    ge["implementer"] = await _redrive_drive(
+                        leerie_dir, st, caps, models, staging, members,
+                        note, effort=effort, label=label,
+                        bin_dir=sc["bin"] if sc else None,
+                        db=bool(shown or probe_sets))
+                    # What a worker was handed, by evidence key: an item whose
+                    # later evidence no group was handed reached no worker
+                    # with it, whatever earlier rounds drove.
+                    rec["evidence_handed"] = sorted(
+                        set(rec["evidence_handed"])
+                        | {f"{n['item_index']}:{k}" for n in live
+                           if n["kind"] == "unmet_item"
+                           for k in n.get("evidence_keys") or ()})
+                    objs = _redrive_probe_objections(
+                        ge["implementer"].pop("probe_objections", None),
+                        probe_sets)
+                    if objs:
+                        # The fixer's words for a person, never an exemption
+                        # (rule 4).
+                        ge["probe_objections"] = objs
+                        rec["probe_objections"] += [
+                            {**o, "round": rnd, "group": gi} for o in objs]
+                        for o in objs:
+                            log(f"  delivery re-drive r{rnd} g{gi}: the fixer "
+                                f"objected to probe {o['probe_test_file']} "
+                                f"({o['kind']}) — recorded unverified; it "
+                                "exempts nothing")
+                finally:
+                    if sc:
+                        calls = _selfcheck_calls(sc)
+                        if calls:
+                            ge["selfcheck_calls"] = calls
+                    _selfcheck_cleanup(sc)
+                # I1 (DESIGN §8 *A worker leaves its tree clean*): nothing of
+                # leerie's is in staging (its self-check runs outside it), so
+                # this sees exactly what the implementer left. Still dirty after
+                # the re-asks, the group is rolled back like any other and
+                # recorded.
+                unclean = await _clean_tree_gate(
+                    staging, caps=caps, label=f"delivery re-drive r{rnd} g{gi}",
+                    reask=_clean_tree_reasker(
+                        st, caps, log_sid=label,
+                        cwd=str(staging), schema_key="implementer",
+                        system_prompt=_load_prompt("implementer"),
+                        model=models.get("implementer", MODEL_DEFAULT),
+                        effort=effort, max_turns=120),
+                    branch=_compute_run_branch(st.run_id), base=pre_sha)
+                if unclean:
+                    ge["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
+                    _record_unclean_tree(st, "delivery re-drive implementer",
+                                         f"r{rnd} g{gi}", unclean)
+                    ge["rollback_reason"] = _unclean_reason("its implementer",
+                                                            unclean)
                     ok = await _roll_back_round(
                         st, staging, pre_sha, worker="delivery re-drive",
                         label=f"r{rnd}g{gi}", reason=ge["rollback_reason"],
                         where="re-drive rollback",
                         branch=_compute_run_branch(st.run_id))
                     ge["rolled_back"] = ok
+                    drove = True
+                    prior_members += [m for m in members
+                                      if m not in prior_members]
+                    _charge_redrive_time(st, time.monotonic() - t0)
+                    rec.pop("in_flight", None)
                     if not ok:
                         ge["rollback_failed"] = True
+                        rec["rollback_failed"] = True
                         log("  WARNING: delivery re-drive: stopping with the "
                             "group's commits on staging")
-                        rec["rollback_failed"] = True
-                        rec.pop("in_flight", None)
-                        _charge_redrive_time(st, time.monotonic() - t0)
                         _save()
                         break
-                    have = {n["key"] for n in rec["pending_controls"]}
-                    for k in newv["new"]:
-                        if k not in have:
-                            rec["pending_controls"].append({
-                                "kind": "control_regression", "key": k,
-                                "test": k, "detail": (
-                                    "an earlier re-drive attempt broke this "
-                                    "existing test (confirmed against the tree "
-                                    "before it) and was reverted. Keep it "
-                                    "passing.")})
-                    for k in v["ctl_new"]:
-                        if k not in have:
-                            rec["pending_controls"].append(
-                                set_note(k, F1[k], "control_regression"))
-                    for b in rat.get("merge_checks_broke") or []:
-                        key = f"ci-{b['id']}"
-                        if key in have:
-                            continue
-                        rec["pending_controls"].append(
-                            _redrive_merge_check_note(b))
-                    for i in ge.get("ratchet_regressed") or []:
-                        key = f"met-item-{i}"
-                        if key in have or i >= len(normalized):
-                            continue
-                        rec["pending_controls"].append({
-                            "kind": "control_regression", "key": key,
-                            "test": f"required item {i}", "detail": (
-                                "an earlier re-drive attempt made this "
-                                "required item, verified met before it, "
-                                "unmet again and was reverted. Keep it met: "
-                                + normalized[i]["item"][:400])})
+                    _save()
+                    continue
+                drove = True
+                prior_members += [m for m in members if m not in prior_members]
+                routed_items |= {n["item_index"] for n in live
+                                 if n["kind"] == "unmet_item"}
+                rec["items_driven"] = sorted(set(rec["items_driven"])
+                                             | routed_items)
+                routed_checks = routed_checks or any(n["kind"] == "ci_check"
+                                                     for n in live)
+                post_sha = await _branch_head_sha(str(staging))
+                ge["post_sha"] = post_sha
+                if not post_sha or post_sha == pre_sha:
+                    ge["no_change"] = True
                 else:
-                    F = F1
-                    if rat and not rat.get("error"):
-                        _ratchet_kept(st, rat)
-                    if rat:
-                        _ratchet_mark_unverified(
-                            st, _ratchet_unverified(st, rat), post_sha,
-                            f"re-drive group r{rnd}g{gi}")
-                    if newv.get("budget_short_unsettled"):
-                        # Not a confirmed regression, so the group is kept
-                        # (DESIGN §9 step 4) — but never silently.
-                        ge["kept_unsettled"] = list(
-                            newv["budget_short_unsettled"])
-                        rec.setdefault("kept_unsettled", []).append({
-                            "group": f"r{rnd}g{gi}",
-                            "ids": list(newv["budget_short_unsettled"]),
-                            "sized_out": list(newv.get("sized_out") or []),
-                            "files": dict(newv.get("unsettled_files") or {}),
-                            "unchecked_items": list(
-                                rat.get("exec_unchecked") or [])})
-                        _set_redrive_unsettled_gap(
-                            st, rec["kept_unsettled"], normalized)
-                    if held_mode and H1 is not None:
-                        H = H1
-                        H_known = H1
-                    if ids_after is not None:
-                        ids_before = ids_after
-                if v["trade"]:
-                    pairs = {tuple(p) for p in v["pairs"]}
-                    again = sorted(pairs & trade_pairs)
-                    trade_pairs |= pairs
-                    rec["trade_pairs"] = [list(p) for p in sorted(trade_pairs)]
-                    if again:
-                        a, b = again[0]
-                        reason = (
-                            "the delivery re-drive stopped on a conflict: "
-                            f"fixing {_redrive_key_text(a)} broke "
-                            f"{_redrive_key_text(b)} again after the earlier "
-                            "attempt that broke it was rolled back — both "
-                            "cannot hold with the approaches tried")
-                        rec["conflict"] = {"pairs": [list(p) for p in again],
-                                           "round": rnd, "reason": reason}
-                        own = _acceptance_own_start(st)
-                        files = newv.get("files") or {}
-                        for fa, fb in again:
-                            f = files.get(fb)
-                            if f and own and _redrive_exists_at(
-                                    st.repo_root, own, f):
-                                rec["contradictions"].append(
-                                    {"fixed": fa, "tracked_test": fb,
-                                     "file": f, "round": rnd})
-                        log(f"  WARNING: {reason}")
-            if not ge.get("rolled_back"):
-                rec["defects_driven"] += [
-                    n["key"] for n in live if n["kind"] == "solution_defect"
-                    and n["key"] not in rec["defects_driven"]]
-            _charge_redrive_time(st, time.monotonic() - t0)
-            rec.pop("in_flight", None)
-            _save()
-            if rec.get("conflict"):
+                    # Every commit's files, not the net diff: a set file
+                    # committed and then deleted is still in the history.
+                    changed = _redrive_git(staging, "log", "--format=",
+                                           "--name-only", "-m",
+                                           f"{pre_sha}..{post_sha}").split()
+                    committed = sorted(set(changed) & {
+                        f for s_ in staged for f in s_["files"]})
+                    committed = sorted(set(committed) | set(
+                        await asyncio.to_thread(
+                            _history_heldout_hits, staging, pre_sha, post_sha,
+                            staged, prints)))
+                    ge["committed_staged"] = committed
+                    F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
+                    F1 = _redrive_carry(F, F1, unm)
+                    # Each shown probe the group was handed, on its commit
+                    # (rule 4): a case of its progress, and what a conflict
+                    # with an existing test is measured against.
+                    probes_after = await _redrive_probe_verdicts(
+                        st, caps, staging, probe_sets,
+                        f"redrive-r{rnd}g{gi}-probes", rev=post_sha)
+                    if probes_after:
+                        ge["probes_after"] = {str(i): v for i, v
+                                              in sorted(probes_after.items())}
+                    H1 = None
+                    if held_mode:
+                        H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
+                        H1 = (None if unm_h and len(unm_h) == len(held)
+                              else _redrive_carry(H, H1, unm_h))
+                    # A test an earlier attempt broke is the round's to keep
+                    # passing, whatever its distance from this diff.
+                    ids_after = None
+                    newv = await _near_rejection(
+                        st, caps, staging, pre_sha, post_sha, ids_before,
+                        label=f"redrive-r{rnd}g{gi}",
+                        log_path=st.run_dir / "logs" / _REDRIVE_LOG,
+                        named=[str(n["test"]).split(" :: ")[0]
+                               for n in rec.get("pending_controls") or []
+                               if " :: " in str(n.get("test") or "")])
+                    if newv is None:
+                        ids_after = await _redrive_test_ids(
+                            st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
+                        newv = await _ratchet_exec(
+                            st, caps, staging, pre_sha, ids_before, ids_after,
+                            label=f"redrive-r{rnd}g{gi}",
+                            log_path=st.run_dir / "logs" / _REDRIVE_LOG,
+                            base_form=True)
+                    ge["new_failures"] = newv["new"]
+                    if newv.get("base_form_changed"):
+                        ge["base_form_changed"] = list(newv["base_form_changed"])
+                    if newv.get("intermittent_regression"):
+                        ge["intermittent_regression"] = newv[
+                            "intermittent_regression"]
+                    # Mixed evidence only; a measurement with no verdict is
+                    # `unmeasured`, a base failure `pre_existing` (DESIGN §9
+                    # *Which failures are new*, step 3).
+                    ge["resource_affected"] = list(
+                        newv.get("resource_affected") or [])
+                    ge["pre_existing"] = list(newv.get("pre_existing") or [])
+                    ge["unmeasured"] = (
+                        [f"set {i}" for i in unm]
+                        + list(newv.get("no_verdict") or [])
+                        + (["test ids"] if newv["unmeasured"] else []))
+                    v = _redrive_verdict(F, F1, newv["new"],
+                                         held=H if held_mode else None,
+                                         held_after=H1)
+                    ge.update({k: v[k] for k in ("fixed", "broke", "ctl_new",
+                                                 "fixed_cases", "broke_cases",
+                                                 "held_fixed",
+                                                 "held_fixed_cases", "held_broke",
+                                                 "held_broke_cases",
+                                                 "worse", "trade")})
+                    void = False
+                    if committed:
+                        void = True   # a set's source must never reach history
+                    # Zero progress: the group had failing set cases it could be
+                    # measured on, and fixed none of them — counted in cases,
+                    # not files. A change that measurably fixes nothing is
+                    # speculative — in a replay two such rounds added defensive
+                    # fallbacks the task forbade. A set with no verdict now is
+                    # no evidence either way.
+                    measured_live = [
+                        n for n in live
+                        if "set_index" in n and (
+                            (n["kind"].startswith("held_") and H1 is not None)
+                            or (not n["kind"].startswith("held_")
+                                and n["set_index"] not in unm))]
+                    # A shown probe is a case too: one that passes now is
+                    # progress, one that still fails is not, and one with no
+                    # verdict is no evidence either way (rule 4).
+                    probe_fixed = sorted(i for i, x in probes_after.items()
+                                         if x == "pass")
+                    measured_probes = [i for i, x in probes_after.items()
+                                       if x != "unmeasured"]
+                    ge["zero_progress"] = bool(
+                        (measured_live or measured_probes)
+                        and not v["fixed_cases"]
+                        and not v["held_fixed_cases"] and not probe_fixed)
+                    # A shown probe never forces a change that breaks what an
+                    # existing test pins (rule 4): a commit that made a probe
+                    # pass and broke such a case contests the probe — measured,
+                    # never a worker's say-so.
+                    pinned = (_redrive_pinned_breaks(
+                        _run_repo(st), _diff_base(st) or "", post_sha, newv)
+                        if probe_fixed else [])
+                    if pinned:
+                        ge["probe_conflict"] = {
+                            "items": probe_fixed,
+                            "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX]}
+                        by_item = {p_["item_index"]: p_ for p_ in probe_sets}
+                        for i in probe_fixed:
+                            rec["contested_probes"].append({
+                                "item_index": i,
+                                "probe_test_file": by_item[i]["defect_files"][0],
+                                "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX],
+                                "round": rnd, "group": gi})
+                            log(f"  delivery re-drive r{rnd} g{gi}: probe of "
+                                f"item {i} contested — making it pass broke "
+                                f"{len(pinned)} case(s) existing tests pin; "
+                                "rolled back, not driven again")
+                    # A conflict needs no rule of its own to roll the group
+                    # back: each pinned case is a confirmed new failure (worse)
+                    # or a base-form change (void).
+                    void = (void or ge["zero_progress"]
+                            or bool(ge.get("base_form_changed")))
+                    if escalate:
+                        async with _exec_lock().shared():
+                            eg = _redrive_escalation_gate(
+                                staging, pre_sha, post_sha,
+                                grants=_measurement_grants(st, staging))
+                        ge["gate"] = eg
+                        void = void or eg["void"]
+                    rat: dict = {}
+                    if not (v["worse"] or void):
+                        # The delivery ratchet (DESIGN §8 *A repair that
+                        # regresses met work is rolled back*): the items met
+                        # before this group are re-verified on its tree. Its
+                        # new test failures already made the group worse.
+                        try:
+                            rat = await _delivery_ratchet(
+                                st, caps, models, efforts, staging, pre_sha,
+                                post_sha, exec_result=newv,
+                                label=f"redrive-r{rnd}g{gi}")
+                        except Exception as e:
+                            rat = {"error": f"{type(e).__name__}: {e}"[:300]}
+                            log(f"  delivery re-drive: ratchet raised "
+                                f"{rat['error']} — group kept")
+                        ge["ratchet"] = rat
+                        if rat.get("regressed"):
+                            ge["ratchet_regressed"] = list(rat["regressed"])
+                            void = True
+                        if rat.get("merge_checks_broke"):
+                            ge["merge_checks_broke"] = [
+                                b["id"] for b in rat["merge_checks_broke"]]
+                            void = True
+                    if v["worse"] or void:
+                        ge["rollback_reason"] = _redrive_rollback_reason(ge)
+                        ok = await _roll_back_round(
+                            st, staging, pre_sha, worker="delivery re-drive",
+                            label=f"r{rnd}g{gi}", reason=ge["rollback_reason"],
+                            where="re-drive rollback",
+                            branch=_compute_run_branch(st.run_id))
+                        ge["rolled_back"] = ok
+                        if not ok:
+                            ge["rollback_failed"] = True
+                            log("  WARNING: delivery re-drive: stopping with the "
+                                "group's commits on staging")
+                            rec["rollback_failed"] = True
+                            rec.pop("in_flight", None)
+                            _charge_redrive_time(st, time.monotonic() - t0)
+                            _save()
+                            break
+                        have = {n["key"] for n in rec["pending_controls"]}
+                        for k in newv["new"]:
+                            if k not in have:
+                                rec["pending_controls"].append({
+                                    "kind": "control_regression", "key": k,
+                                    "test": k, "detail": (
+                                        "an earlier re-drive attempt broke this "
+                                        "existing test (confirmed against the tree "
+                                        "before it) and was reverted. Keep it "
+                                        "passing.")})
+                        for k in v["ctl_new"]:
+                            if k not in have:
+                                rec["pending_controls"].append(
+                                    set_note(k, F1[k], "control_regression"))
+                        for b in rat.get("merge_checks_broke") or []:
+                            key = f"ci-{b['id']}"
+                            if key in have:
+                                continue
+                            rec["pending_controls"].append(
+                                _redrive_merge_check_note(b))
+                        for i in ge.get("ratchet_regressed") or []:
+                            key = f"met-item-{i}"
+                            if key in have or i >= len(normalized):
+                                continue
+                            rec["pending_controls"].append({
+                                "kind": "control_regression", "key": key,
+                                "test": f"required item {i}", "detail": (
+                                    "an earlier re-drive attempt made this "
+                                    "required item, verified met before it, "
+                                    "unmet again and was reverted. Keep it met: "
+                                    + normalized[i]["item"][:400])})
+                    else:
+                        F = F1
+                        if rat and not rat.get("error"):
+                            _ratchet_kept(st, rat)
+                        if rat:
+                            _ratchet_mark_unverified(
+                                st, _ratchet_unverified(st, rat), post_sha,
+                                f"re-drive group r{rnd}g{gi}")
+                        if newv.get("budget_short_unsettled"):
+                            # Not a confirmed regression, so the group is kept
+                            # (DESIGN §9 step 4) — but never silently.
+                            ge["kept_unsettled"] = list(
+                                newv["budget_short_unsettled"])
+                            rec.setdefault("kept_unsettled", []).append({
+                                "group": f"r{rnd}g{gi}",
+                                "ids": list(newv["budget_short_unsettled"]),
+                                "sized_out": list(newv.get("sized_out") or []),
+                                "files": dict(newv.get("unsettled_files") or {}),
+                                "unchecked_items": list(
+                                    rat.get("exec_unchecked") or [])})
+                            _set_redrive_unsettled_gap(
+                                st, rec["kept_unsettled"], normalized)
+                        if held_mode and H1 is not None:
+                            H = H1
+                            H_known = H1
+                        if ids_after is not None:
+                            ids_before = ids_after
+                    if v["trade"]:
+                        pairs = {tuple(p) for p in v["pairs"]}
+                        again = sorted(pairs & trade_pairs)
+                        trade_pairs |= pairs
+                        rec["trade_pairs"] = [list(p) for p in sorted(trade_pairs)]
+                        if again:
+                            a, b = again[0]
+                            reason = (
+                                "the delivery re-drive stopped on a conflict: "
+                                f"fixing {_redrive_key_text(a)} broke "
+                                f"{_redrive_key_text(b)} again after the earlier "
+                                "attempt that broke it was rolled back — both "
+                                "cannot hold with the approaches tried")
+                            rec["conflict"] = {"pairs": [list(p) for p in again],
+                                               "round": rnd, "reason": reason}
+                            own = _acceptance_own_start(st)
+                            files = newv.get("files") or {}
+                            for fa, fb in again:
+                                f = files.get(fb)
+                                if f and own and _redrive_exists_at(
+                                        st.repo_root, own, f):
+                                    rec["contradictions"].append(
+                                        {"fixed": fa, "tracked_test": fb,
+                                         "file": f, "round": rnd})
+                            log(f"  WARNING: {reason}")
+                if not ge.get("rolled_back"):
+                    rec["defects_driven"] += [
+                        n["key"] for n in live if n["kind"] == "solution_defect"
+                        and n["key"] not in rec["defects_driven"]]
+                _charge_redrive_time(st, time.monotonic() - t0)
+                rec.pop("in_flight", None)
+                _save()
+                if rec.get("conflict"):
+                    break
+            if not drove:
                 break
-        if not drove:
-            break
-        now = await _branch_head_sha(str(staging))
-        if routed_items and now and now != rechecked_sha:
-            ver = await _redrive_recheck_items(
-                leerie_dir, st, caps, models, efforts, staging,
-                sorted(routed_items))
-            _redrive_apply_item_verdicts(
-                st, ver, now, await _committed_tree_sha(str(staging)))
-            rechecked_sha = rec["items_rechecked_sha"] = now
-            _save()
-        if routed_checks and now:
+            now = await _branch_head_sha(str(staging))
+            if routed_items and now and now != rechecked_sha:
+                ver = await _redrive_recheck_items(
+                    leerie_dir, st, caps, models, efforts, staging,
+                    sorted(routed_items))
+                _redrive_apply_item_verdicts(
+                    st, ver, now, await _committed_tree_sha(str(staging)))
+                rechecked_sha = rec["items_rechecked_sha"] = now
+                _save()
+            if routed_checks and now:
+                await _run_ci_parity_final(leerie_dir, st, caps)
+            if held_mode:
+                # Bench Q3 L1: the held-back round is followed by the verdict on
+                # the whole set, never by a second held-back round.
+                continue
+        final = await _branch_head_sha(str(staging))
+        # After a flip's rollback the verdicts describe a tree that no
+        # longer ships, whatever commit staging is back on.
+        if final and (final != rec["start_sha"] or reread):
+            if all_sets:
+                await _acceptance_remeasure_final(st, caps, str(staging),
+                                                  all_sets, final,
+                                                  "redrive-final")
             await _run_ci_parity_final(leerie_dir, st, caps)
-        if held_mode:
-            # Bench Q3 L1: the held-back round is followed by the verdict on
-            # the whole set, never by a second held-back round.
-            continue
-    final = await _branch_head_sha(str(staging))
-    if final and final != rec["start_sha"]:
-        if all_sets:
-            await _acceptance_remeasure_final(st, caps, str(staging),
-                                              all_sets, final,
-                                              "redrive-final")
-        await _run_ci_parity_final(leerie_dir, st, caps)
-        await _redrive_refresh_test_id_diff(leerie_dir, st, caps, staging)
-        final_tree = await _committed_tree_sha(str(staging))
-        if start_items and rechecked_sha != final:
-            ver = await _redrive_recheck_items(
-                leerie_dir, st, caps, models, efforts, staging, start_items)
-            _redrive_apply_item_verdicts(st, ver, final, final_tree)
-        # A kept group whose ratchet failed left items unverified: they are
-        # read once more on `final`; a read that crashes again leaves them
-        # unknown and listed (review round 13 claims M1).
-        unv = sorted(int(k) for k in (_ratchet_record(st).get("unverified")
-                                      or {}) if str(k).isdigit())
-        if unv:
-            ver = await _redrive_recheck_items(
-                leerie_dir, st, caps, models, efforts, staging, unv)
-            done_ = {i: v for i, v in ver.items() if not v.get("crashed")}
-            _redrive_apply_item_verdicts(st, done_, final, final_tree)
-            rr = _ratchet_record(st)
-            left = {k: v for k, v in (rr.get("unverified") or {}).items()
-                    if not (str(k).isdigit() and int(k) in done_)}
-            if left:
-                rr["unverified"] = left
-            else:
-                rr.pop("unverified", None)
-            st.data["delivery_ratchet"] = rr
-            st.save()
-            _set_ratchet_unverified_gap(st)
-        # Every item `final` reports met has passed detection's bar on it
-        # (DESIGN §8 *Every item the tree that ships reports met passed
-        # detection's bar on it*): a kept group invalidated detection's
-        # falsification of every item it can reach, and its ratchet read
-        # the items no group was sent for with its judge alone.
-        met = _redrive_met_unread(st, final)
-        if met:
-            log(f"  delivery re-drive: {len(met)} met item(s) not read on "
-                f"{final[:12]} since a kept group moved it — judged and "
-                f"falsified there {met}")
-            ver = await _redrive_recheck_items(
-                leerie_dir, st, caps, models, efforts, staging, met)
-            crashed = sorted(i for i, v in ver.items() if v.get("crashed"))
-            _redrive_apply_item_verdicts(
-                st, {i: v for i, v in ver.items() if not v.get("crashed")},
-                final, final_tree)
-            # A judge that crashed read nothing: unknown and listed, never
-            # met, and the verdict is not re-keyed to `final` (below).
-            _ratchet_mark_unverified(st, crashed, final,
-                                     "the delivery re-drive")
-        # The diff may have moved even when no item needed a re-check.
-        _resettle_test_outcome_rows(st, final_tree)
-        rec["items_rechecked_sha"] = final
-        # The detection this pass routed from described the tree it started
-        # on, its routed items are now re-checked on `final` and every kept
-        # group's ratchet re-verified the met ones — unless one failed and
-        # an item it left unverified is still unread: the verdict is of
-        # `final`, so a resume keeps it instead of re-running detection
-        # (DESIGN §8 *A finished verdict is reused only on the commit it was
-        # measured on*). Any other start leaves the key as it was.
-        dg = st.data.get("delivery_gate")
-        if (isinstance(dg, dict) and "unmet_final" in dg and det_sha
-                and det_sha == head
-                and not _ratchet_record(st).get("unverified")):
-            st.data["delivery_gate"] = {**dg, "final_sha": final,
-                                        "final_tree": _shipping_tree(st)}
-            st.save()
+            await _redrive_refresh_test_id_diff(leerie_dir, st, caps, staging)
+            final_tree = await _committed_tree_sha(str(staging))
+            if start_items and rechecked_sha != final:
+                ver = await _redrive_recheck_items(
+                    leerie_dir, st, caps, models, efforts, staging, start_items)
+                _redrive_apply_item_verdicts(st, ver, final, final_tree)
+            # A kept group whose ratchet failed left items unverified: they are
+            # read once more on `final`; a read that crashes again leaves them
+            # unknown and listed (review round 13 claims M1).
+            unv = sorted(int(k) for k in (_ratchet_record(st).get("unverified")
+                                          or {}) if str(k).isdigit())
+            if unv:
+                ver = await _redrive_recheck_items(
+                    leerie_dir, st, caps, models, efforts, staging, unv)
+                done_ = {i: v for i, v in ver.items() if not v.get("crashed")}
+                _redrive_apply_item_verdicts(st, done_, final, final_tree)
+                rr = _ratchet_record(st)
+                left = {k: v for k, v in (rr.get("unverified") or {}).items()
+                        if not (str(k).isdigit() and int(k) in done_)}
+                if left:
+                    rr["unverified"] = left
+                else:
+                    rr.pop("unverified", None)
+                st.data["delivery_ratchet"] = rr
+                st.save()
+                _set_ratchet_unverified_gap(st)
+            # Every item `final` reports met has passed detection's bar on it
+            # (DESIGN §8 *Every item the tree that ships reports met passed
+            # detection's bar on it*): a kept group invalidated detection's
+            # falsification of every item it can reach, and its ratchet read
+            # the items no group was sent for with its judge alone.
+            met = _redrive_met_unread(st, final)
+            if met:
+                log(f"  delivery re-drive: {len(met)} met item(s) not read on "
+                    f"{final[:12]} since a kept group moved it — judged and "
+                    f"falsified there {met}")
+                ver = await _redrive_recheck_items(
+                    leerie_dir, st, caps, models, efforts, staging, met)
+                crashed = sorted(i for i, v in ver.items() if v.get("crashed"))
+                _redrive_apply_item_verdicts(
+                    st, {i: v for i, v in ver.items() if not v.get("crashed")},
+                    final, final_tree)
+                # A judge that crashed read nothing: unknown and listed, never
+                # met, and the verdict is not re-keyed to `final` (below).
+                _ratchet_mark_unverified(st, crashed, final,
+                                         "the delivery re-drive")
+                # A met item whose confirmed probe passed on a kept group's
+                # start and fails on its commit, under B*, was regressed by
+                # that group: it is rolled back, not shipped (DESIGN §8 *A
+                # kept group that turns a met item's confirmed probe from
+                # passing to failing is rolled back*).
+                culprits: list[tuple[dict, dict]] = []
+                for i, v in sorted(ver.items()):
+                    smp = (_redrive_flip_probe({"falsifier": v.get("falsifier")})
+                           if v.get("unmet") and not v.get("crashed") else None)
+                    c = (await _redrive_flip_culprit(st, caps, rec, i, smp)
+                         if smp is not None else None)
+                    if c is not None:
+                        culprits.append((c, smp))
+                if culprits and await roll_back_flips(culprits):
+                    now = await _branch_head_sha(str(staging))
+                    now_tree = await _committed_tree_sha(str(staging))
+                    # What the rolled-back groups had fixed is open again,
+                    # and each flipped item reads met again only by
+                    # detection's bar, on the tree staging is back on.
+                    redo = sorted(set(start_items)
+                                  | set(rec.get("items_driven") or [])
+                                  | {c["item_index"] for c, _s in culprits})
+                    ver2 = await _redrive_recheck_items(
+                        leerie_dir, st, caps, models, efforts, staging, redo)
+                    _redrive_apply_item_verdicts(
+                        st, {i: v for i, v in ver2.items()
+                             if not v.get("crashed")}, now, now_tree)
+                    _ratchet_mark_unverified(
+                        st, sorted(i for i, v in ver2.items()
+                                   if v.get("crashed")), now,
+                        "the delivery re-drive")
+                    rechecked_sha = rec["items_rechecked_sha"] = now
+                    F, _u = await measure(shown, "redrive-flip-rollback")
+                    H_known = None
+                    ids_before = await _redrive_test_ids(
+                        st, caps, staging, "redrive-ids-flip")
+                    reread = True
+                    _save()
+                    continue
+            # The diff may have moved even when no item needed a re-check.
+            _resettle_test_outcome_rows(st, final_tree)
+            rec["items_rechecked_sha"] = final
+            # The detection this pass routed from described the tree it started
+            # on, its routed items are now re-checked on `final` and every kept
+            # group's ratchet re-verified the met ones — unless one failed and
+            # an item it left unverified is still unread: the verdict is of
+            # `final`, so a resume keeps it instead of re-running detection
+            # (DESIGN §8 *A finished verdict is reused only on the commit it was
+            # measured on*). Any other start leaves the key as it was.
+            dg = st.data.get("delivery_gate")
+            if (isinstance(dg, dict) and "unmet_final" in dg and det_sha
+                    and det_sha == head
+                    and not _ratchet_record(st).get("unverified")):
+                st.data["delivery_gate"] = {**dg, "final_sha": final,
+                                            "final_tree": _shipping_tree(st)}
+                st.save()
+        break
     rec["final_sha"] = final
     record_unrouted()
     rec["done"] = True

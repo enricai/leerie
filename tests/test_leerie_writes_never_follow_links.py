@@ -457,6 +457,8 @@ _LEERIE_ONLY = {
     "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",
     "_falsifier_gates", "_drop_lying_index", "_move_view",
+    # The saved probe's copy, a temp file of leerie's own, as the gates'.
+    "_redrive_probe_flips",
     # `<run-dir>/base-form/` (the base forms a held-out run places) and
     # `<run-dir>/.settled-change-index`, which no grant names for writing.
     "_settled_change_landed", "_base_form_place",
