@@ -23,8 +23,9 @@ orchestrator's root is leerie's; a repository's root is only a confined
 process's*), the command then runs in it: `chroot` into the view, every
 ambient capability dropped, the worker stage's environment laid over the
 CLI's. This file and the CLI stay in leerie's root, and so does leerie's
-own PreToolUse hook (`forbidden-command-hook.py` beside this file, run by
-the interpreter running this): it is leerie's code."""
+own PreToolUse hooks (`forbidden-command-hook.py` and `tree-reader-hook.py`
+beside this file, run by the interpreter running this): they are leerie's
+code."""
 import importlib.util
 import os
 import sys
@@ -37,12 +38,16 @@ _B64 = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
 def _is_leeries_hook(words: list[str], here: str) -> bool:
-    """The command is leerie's PreToolUse hook as the orchestrator writes it
-    (`_forbidden_command_hook_settings`): this interpreter, `-I`, the hook
-    beside this file and one base64 payload. Anything else is the
-    worker's."""
+    """The command is one of leerie's PreToolUse hooks as the orchestrator
+    writes it: this interpreter, `-I` and the tree reader's hook beside this
+    file, exactly (`_tree_reader_hook_settings`), or the forbidden-command
+    hook beside this file and one base64 payload
+    (`_forbidden_command_hook_settings`). Anything else is the worker's."""
     if len(words) != 1:
         return False
+    reader = os.path.join(here, "tree-reader-hook.py")
+    if words[0] == f"{sys.executable} -I {reader}":
+        return True
     hook = os.path.join(here, "forbidden-command-hook.py")
     head = f"{sys.executable} -I {hook} "
     rest = words[0][len(head):]

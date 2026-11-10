@@ -416,6 +416,7 @@ def _deny_for(leerie, tmp_path, monkeypatch, allowed_tools, autonomous):
 @pytest.mark.parametrize("tools_name, autonomous", [
     ("INSPECT_TOOLS", False),
     ("SATISFIED_PROBE_TOOLS", False),
+    ("TREE_READER_TOOLS", False),
     ("ACT_TOOLS", True),
     ("SMOKE_TOOLS", False),
 ])
@@ -435,6 +436,7 @@ def test_judgment_tool_profiles_grant_no_blanket_read(leerie):
     while they lack a bare Read/Grep/Glob grant, which the CLI honours on
     any path (measured live: `<run-dir>/state.json` read with it, refused
     without it)."""
-    for tools in (leerie.INSPECT_TOOLS, leerie.SATISFIED_PROBE_TOOLS):
+    for tools in (leerie.INSPECT_TOOLS, leerie.SATISFIED_PROBE_TOOLS,
+                  leerie.TREE_READER_TOOLS):
         names = {t.strip() for t in tools.split(",")}
         assert not names & {"Read", "Grep", "Glob"}

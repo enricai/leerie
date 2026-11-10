@@ -298,6 +298,47 @@ write its cwd|echo x > {wt}/f
                    "write its cwd": False}
 
 
+@pytest.mark.parametrize("schema_key", ["satisfied_probe", "delivery_judge"])
+def test_a_tree_readers_verbs_write_only_its_own_directories(
+        leerie, run, schema_key):
+    """`TREE_READER_TOOLS` grants verbs that can write or run a program —
+    `awk`'s `system()` and `>`, `sed`'s `w`, `sort -o`, `git grep -O` (DESIGN
+    §8 *A base-tree reader has the verbs a reader reaches for*). The grant
+    holds every one of them to the reader's own directories: its tree, its
+    tree's repository and the run's state stay unwritten."""
+    rd, wt = run["run_dir"], run["wts"]["wt-a"]
+    script = f"""
+reads its tree|awk 'NR==1' {wt}/app.py | cut -c1-1 | sort
+git grep|git -C {wt} grep -q X HEAD
+awk system|awk 'BEGIN{{exit system("echo x > {wt}/a")}}'
+awk redirect|awk 'BEGIN{{print 1 > "{wt}/b"; close("{wt}/b")}}' && test -s {wt}/b
+sed w|sed -n 'w {wt}/c' {wt}/app.py && test -s {wt}/c
+sort -o|sort -o {wt}/d {wt}/app.py
+git grep -O|cd {wt} && git grep -O'touch {wt}/e' X; test -e {wt}/e
+run state|sort -o {rd}/state.json {wt}/app.py
+tree repo|awk 'BEGIN{{exit system("echo x > {rd}/tree-repos/wt-a/planted")}}'
+own tmp|sort -o $TMPDIR/s {wt}/app.py
+"""
+    writes = ("awk system", "awk redirect", "sed w", "sort -o",
+              "git grep -O")
+    # The converse first: granted the tree, each form does write it, so a
+    # refusal below is the grant's and not a form that writes nothing.
+    acting = _probe(leerie, _grants(leerie, run), script, run["env"])
+    assert all(acting[w] for w in writes), acting
+    for name in "abcde":
+        (wt / name).unlink()
+    g = leerie._worker_grants(
+        run_dir=rd, state={}, schema_key=schema_key, cwd=wt,
+        allowed_tools=leerie.TREE_READER_TOOLS, env=run["env"])
+    got = _probe(leerie, g, script, run["env"])
+    assert got == {"reads its tree": True, "git grep": True,
+                   "awk system": False, "awk redirect": False,
+                   "sed w": False, "sort -o": False, "git grep -O": False,
+                   "run state": False, "tree repo": False, "own tmp": True}
+    for name in "abcde":
+        assert not (wt / name).exists(), name
+
+
 @pytest.mark.parametrize("kind", ["worker", "measurement"])
 def test_no_confined_process_reads_the_hosts_build_slots(
         leerie, run, tmp_path, monkeypatch, kind):
