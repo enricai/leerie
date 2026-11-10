@@ -212,9 +212,13 @@ def test_env_is_where_the_wrapper_reads_it():
 # The shape `test_buildkit_isolation.py` leaked (issue 20): a harness started
 # with a fresh environment and a session of its own, whose build runs in a
 # group of its own blocked on a FIFO nobody writes once the test has failed.
-FIFO_SPAWN = ("/usr/bin/setsid /bin/bash -c 'read -r _ < \"$FIFO\"' & "
-              "echo $! >> {pids}; /usr/bin/sleep 300 & echo $! >> {pids}; "
-              "wait")
+# The reader writes its own pid once it runs in its new session (second
+# line), not `$!` at fork: killed between the fork and `setsid()`, it would
+# still be in the test's group, die with it, and pass both tests below for
+# the wrong reason (CI, py3.10: the anti-vacuity test found it dead).
+FIFO_SPAWN = ("/usr/bin/sleep 300 & echo $! >> {pids}; "
+              "/usr/bin/setsid /bin/bash -c "
+              "'echo $$ >> \"$0\"; read -r _ < \"$FIFO\"' {pids} & wait")
 
 INNER_FAILING_TEST = """\
 import os
@@ -283,7 +287,7 @@ def test_without_the_fixture_the_fifo_reader_stays(tmp_path):
     FIFO reader running (killed here: it carries no marker of ours)."""
     pids = _run_inner_failing(tmp_path, with_fixture=False)
     try:
-        assert _alive(pids[0])
+        assert _alive(pids[1])
     finally:
         for p in pids:
             with contextlib.suppress(OSError):
