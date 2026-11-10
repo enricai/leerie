@@ -1302,7 +1302,7 @@ leerie/
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a descriptor the orchestrator inherits, no socket path; v1+v2); the dropped-privilege orchestrator drives it
 │   ├── load-typescript.cjs        loads a `typescript` with the JS compiler API for the AST scripts: the tree's own (resolved from the cwd) when `typeof ts.createSourceFile === 'function'`, else the image's pinned copy named by `LEERIE_BUNDLED_TYPESCRIPT`; run directly (`node load-typescript.cjs`) it prints `tree` / `bundled` and exits 0, or exits 1 — `_ts_resolvable`'s probe (DESIGN §8 "Delivery detection")
 │   ├── redrive-ast-gate.cjs       D1/D2/D3 safety facts of one changed production file, base vs head (TypeScript compiler API), for the delivery re-drive's escalation gate (d+); loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery re-drive")
-│   ├── test-case-facts.cjs        AST facts of one test case (reachable code, its statements, file reads, evals, imports) for the falsifier's coupling check; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
+│   ├── test-case-facts.cjs        AST facts of one test case (reachable code, its statements, file reads with whether each is inside a fresh directory, copies, evals, imports) for the falsifier's coupling check; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
 │   ├── symbol-references.cjs      which of the given JS/TS files use one symbol outside its own declaration (TypeScript compiler API), for the coupling check's R3; loads `typescript` through `load-typescript.cjs` (DESIGN §8 "Delivery detection")
 │   ├── forbidden-command-hook.py  PreToolUse hook wired by `claude_p` through `--settings`: denies a Bash call running a command the task forbids, or killing processes by name; imports leerie's own matcher; fails open (DESIGN §9 "A command the task forbids is denied in every spelling", "A worker never kills a process by name")
 │   ├── dockerfile-frontend.sh     LEERIE_DOCKERFILE_FRONTEND (the one Dockerfile frontend every build is given, pinned by digest), ensure_frontend_in_worker_ns, LEERIE_IMAGE_NS and the BuildKit worker-namespace checks; sourced by the launcher and remote/build-push.sh
@@ -10151,11 +10151,32 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `facts_read: true`, then `assertion_in_case` (normalised
   `assertion_quote`, ≥ 6 characters, inside the case's reachable source),
   `not_coupled` (`_falsifier_coupling` returns `coupled: false`: no
-  non-JSON file read or text-tool exec (R1), no eval / Function / vm /
+  file read but of a JSON path or a fresh one, and no text-tool exec (R1),
+  no eval / Function / vm /
   transpile / non-literal import (R2), no import of an in-repo symbol that
   no production code uses outside its own declaration and the item does not
   name, resolved with `_ts_path_aliases` / `_js_resolve`, nor a deep package
-  path (R3)). Whether production code uses it is
+  path (R3)). A read is fresh when the facts mark it `fresh: true` and no
+  copy makes the directory unsafe. The facts script marks a read `fresh`
+  when its first argument is a path inside a fresh directory: a
+  `mkdtemp`/`mkdtempSync` result from `fs` or `fs/promises`, extended by
+  `path` `join`/`resolve`, a template or `+` only with plain segments. A
+  plain segment is a literal that is not absolute and has no `..`
+  segment, or a `readdir` entry or its `.name`. Arrays of such paths are
+  followed through `filter`/`slice`/`sort`/`map`/`flatMap`/`find`/`at`,
+  `for … of` and index access. Each identifier is resolved to its
+  declaration by lexical scope. Every value that binding is given must be
+  such a path: initialisers, `=` assignments, `push`, a named function's
+  call-site arguments, and an array callback's elements. These are
+  computed as a greatest fixed point, so a recursive directory walk
+  keeps its paths. Anything not followed is not fresh. The facts also
+  list `copies`: each `copyFile`/`cp`/`link`/`symlink`/`rename` call,
+  sync or not, in reachable code, with `fresh_src`. One whose source is
+  not fresh, or an exec whose literal command names a copying tool
+  (`_COUPLING_COPY_TOOLS_RE`: `cp`, `ln`, `mv`, `rsync`, `install`,
+  `tar`, `ditto`, `dd`, `tee`, `cpio`, `unzip`), makes every read count
+  again. Facts without `fresh`, from an older script, count every read as
+  before. Whether production code uses an imported symbol (R3) is
   `_coupling_referenced_elsewhere(name, module, repo, sha, tree=, grants=)`:
   the candidates are the tracked non-harness files `git grep -w -F` finds
   naming it at `sha`, its own module among them; a candidate outside

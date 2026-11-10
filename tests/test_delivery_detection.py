@@ -980,6 +980,139 @@ class TestCouplingPolicy:
                             tmp_path / "no-bundle")
         assert _held(leerie, leerie._ts_resolvable, tmp_path / "probe-less", grants=leerie.WorkerGrants(("/",), ())) is False
 
+    # R1 and a file the run wrote (barnacle 87580f62 item 9): a read inside
+    # a directory the probe made fresh observes behaviour; a read the trace
+    # cannot place there, or a fresh directory something copied the tree's
+    # text into, still counts. Each case: the reads' `fresh` marks and
+    # whether the whole case is coupled.
+    FRESH_PROBE = (
+        "import { copyFileSync, mkdtempSync, readdirSync, readFileSync,"
+        " statSync } from 'node:fs';\n"
+        "import { execSync } from 'node:child_process';\n"
+        "import { tmpdir } from 'node:os';\n"
+        "import { join, resolve } from 'node:path';\n"
+        "function walk(d: string): string[] {\n"
+        "  return readdirSync(d).flatMap((n) => {\n"
+        "    const p = join(d, n);\n"
+        "    return statSync(p).isDirectory() ? walk(p) : [p];\n"
+        "  });\n"
+        "}\n"
+        "describe('r', () => {\n"
+        "  let runs: string;\n"
+        "  let flowFile: string;\n"
+        "  beforeEach(() => {\n"
+        "    runs = mkdtempSync(join(tmpdir(), 'runs-'));\n"
+        "    flowFile = join(mkdtempSync(join(tmpdir(), 'flow-')),"
+        " 'flow.txt');\n"
+        "  });\n"
+        "  it('reads what the run wrote', async () => {\n"
+        "    let n = 0;\n"
+        "    n++;\n"
+        "    expect(readFileSync(flowFile, 'utf8')).toBe('x');\n"
+        "    for (const f of walk(runs).filter((f) => f.endsWith('.ts')))\n"
+        "      expect(readFileSync(f, 'utf8')).not.toContain('s');\n"
+        "    const names = readdirSync(runs).map((e) => join(runs, e));\n"
+        "    copyFileSync(names[0], join(runs, 'copy.txt'));\n"
+        "    expect(readFileSync(`${runs}/copy.txt`)).toBeTruthy();\n"
+        "  });\n"
+        "  it('reads the source', () => {\n"
+        "    expect(readFileSync(join(__dirname, '..', 'src', 'lib.ts'),"
+        " 'utf8')).toContain('x');\n"
+        "  });\n"
+        "  it('climbs out', () => {\n"
+        "    expect(readFileSync(join(runs, '..', '..', 'src/lib.ts'),"
+        " 'utf8')).toContain('x');\n"
+        "  });\n"
+        "  it('rebinds', () => {\n"
+        "    let p = join(runs, 'out.ts');\n"
+        "    p = process.argv[1];\n"
+        "    expect(readFileSync(p, 'utf8')).toContain('x');\n"
+        "  });\n"
+        "  it('copies the source in', () => {\n"
+        "    const d = mkdtempSync(join(tmpdir(), 'c-'));\n"
+        "    copyFileSync(join(__dirname, '../src/lib.ts'), join(d, 'l.ts'));\n"
+        "    expect(readFileSync(join(d, 'l.ts'), 'utf8')).toContain('x');\n"
+        "  });\n"
+        "  it('copies by shell', () => {\n"
+        "    const d = mkdtempSync(join(tmpdir(), 'c-'));\n"
+        "    execSync(`cp src/lib.ts ${d}`);\n"
+        "    expect(readFileSync(join(d, 'lib.ts'), 'utf8')).toContain('x');\n"
+        "  });\n"
+        "  it('shadows join', () => {\n"
+        "    const at = (join: (...a: string[]) => string) =>\n"
+        "      readFileSync(join(runs, 'a.ts'), 'utf8');\n"
+        "    expect(at(() => 'src/lib.ts')).toContain('x');\n"
+        "  });\n"
+        "  it('resolves to an absolute path', () => {\n"
+        "    expect(readFileSync(resolve(runs, '/w/src/lib.ts'))).toBeTruthy();\n"
+        "  });\n"
+        "  it('reads under the temp dir itself', () => {\n"
+        "    expect(readFileSync(join(tmpdir(), 'out.txt'))).toBeTruthy();\n"
+        "  });\n"
+        "  it('lets a helper escape', () => {\n"
+        "    let at = () => join(runs, 'a.ts');\n"
+        "    at = () => 'src/lib.ts';\n"
+        "    expect(readFileSync(at(), 'utf8')).toContain('x');\n"
+        "  });\n"
+        "});\n")
+    FRESH_CASES = {
+        "reads what the run wrote": ([True, True, True], False),
+        "reads the source": ([False], True),
+        "climbs out": ([False], True),
+        "rebinds": ([False], True),
+        "copies the source in": ([True], True),
+        "copies by shell": ([True], True),
+        "shadows join": ([False], True),
+        "resolves to an absolute path": ([False], True),
+        "reads under the temp dir itself": ([False], True),
+        "lets a helper escape": ([False], True),
+    }
+
+    @pytest.mark.parametrize("case", sorted(FRESH_CASES))
+    def test_a_read_of_what_the_run_wrote_is_not_coupling(self, leerie,
+                                                          tmp_path, case):
+        """The real facts script, in the held-out sandbox as a run reads
+        it, then the real policy."""
+        tree = tmp_path / "tree"
+        (tree / "node_modules").mkdir(parents=True)
+        os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+        probe = tmp_path / "probe-src.test.ts"
+        probe.write_text(self.FRESH_PROBE)
+        facts = _placed_facts(leerie, tmp_path, tree, probe,
+                              "probe/x.test.ts", f"r {case}")
+        assert facts.get("title") == case, facts
+        fresh, coupled = self.FRESH_CASES[case]
+        assert [r["fresh"] for r in facts["reads"]] == fresh, facts["reads"]
+        crepo, sha = self._repo(tmp_path / "c")
+        r = self._cp(leerie, facts, crepo, sha)
+        assert r["coupled"] is coupled, r
+        assert all(x.startswith("R1 ") for x in r["reasons"]), r
+
+    def test_fresh_reads_policy(self, leerie, tmp_path):
+        """The policy over facts alone: a fresh read is skipped, unless a
+        copy or a shell copy may have put the tree's text in its place;
+        facts from an older script (no `fresh`) count every read."""
+        repo, sha = self._repo(tmp_path)
+
+        def cp(**kw):
+            return self._cp(leerie, self._facts(**kw), repo, sha)
+        read = {"fn": "readFileSync", "lits": ["out.ts"], "fresh": True}
+        assert cp(reads=[read])["coupled"] is False
+        assert cp(reads=[dict(read, fresh=False)])["reasons"] == [
+            "R1 readFileSync(out.ts)"]
+        assert cp(reads=[{"fn": "readFileSync", "lits": []}])["coupled"]
+        assert cp(reads=[read], copies=[{"fn": "copyFileSync",
+                                         "fresh_src": True}])[
+            "coupled"] is False
+        assert cp(reads=[read], copies=[{"fn": "copyFileSync",
+                                         "fresh_src": False}])["coupled"]
+        assert cp(reads=[read], execs=[{"fn": "execSync",
+                                        "lits": ["rsync -a src/ /x"]}])[
+            "coupled"]
+        assert cp(reads=[read], execs=[{"fn": "spawnSync",
+                                        "lits": ["tsx", "src/a.ts"]}])[
+            "coupled"] is False
+
     def test_facts_failure_is_an_error_not_a_crash(self, leerie, tmp_path):
         tree = tmp_path / "tree"
         tree.mkdir()
