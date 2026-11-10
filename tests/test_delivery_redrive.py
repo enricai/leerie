@@ -908,6 +908,10 @@ def test_items_go_to_every_claimer_process_items_never(
     assert judged == [["a does X"]]
     left = w.st.data["delivery_gate"]["unmet_final"]
     assert [u["item_index"] for u in left] == [1]
+    # A process item unmet on a judge's prose names no code to hand on:
+    # recorded as reaching no worker, never silently dropped.
+    assert w.st.data["delivery_redrive"]["unrouted_items"] == [
+        {"item_index": 1, "item": "run lint", "reason": "no_code_target"}]
 
 
 @pytest.mark.parametrize("detected_on_start", [True, False])

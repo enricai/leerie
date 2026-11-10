@@ -95,23 +95,57 @@ def test_the_next_run_is_handed_the_unrouted_item(leerie, tmp_path, reason):
     assert got["unrouted_items"] == [{"item": "a does X", "reason": reason}]
 
 
+def _open(i, item, keys, drivable=None, reason="unreproducible",
+          probed=""):
+    return {"item_index": i, "item": item, "keys": keys,
+            "drivable": keys if drivable is None else drivable,
+            "reason": reason, "probed": probed}
+
+
 def test_unrouted_items_is_pure_and_typed(leerie):
-    notes = [{"item_index": 0, "item": "x"}, {"item_index": 1, "item": "y"},
-             {"item_index": 2, "item": "z"}]
-    assert leerie._redrive_unrouted_items(notes, [1], [2], False) == [
+    items = [_open(0, "x", ["judge"]), _open(1, "y", ["judge"]),
+             _open(2, "z", ["judge"])]
+    assert leerie._redrive_unrouted_items(items, ["1:judge"], [2],
+                                          False) == [
         {"item_index": 0, "item": "x", "reason": "no_owner"},
         {"item_index": 2, "item": "z", "reason": "budget"}]
     assert [u["reason"] for u in leerie._redrive_unrouted_items(
-        notes[:1], [], [], True)] == ["budget"]
+        items[:1], [], [], True)] == ["budget"]
 
 
-def test_unrouted_items_records_unreproducible_last(leerie):
-    notes = [{"item_index": 0, "item": "x"}]
-    unrepro = [{"item_index": 3, "item": "w", "probed": "w does V"}]
-    assert leerie._redrive_unrouted_items(notes, [0], [], False,
-                                          unreproducible=unrepro) == [
+def test_unrouted_items_records_an_undrivable_part_with_its_own_reason(
+        leerie):
+    items = [_open(0, "x", ["judge"]),
+             _open(3, "w", ["falsifier:aa"], drivable=[],
+                   probed="w does V"),
+             _open(4, "v", ["judge"], drivable=[], reason="no_code_target"),
+             # Driven on its judge part; its probe no fixer may be shown.
+             _open(5, "u", ["falsifier:bb", "judge"], drivable=["judge"],
+                   probed="u does T")]
+    assert leerie._redrive_unrouted_items(
+        items, ["0:judge", "5:judge"], [], False) == [
         {"item_index": 3, "item": "w", "reason": "unreproducible",
-         "probed": "w does V"}]
+         "probed": "w does V"},
+        {"item_index": 4, "item": "v", "reason": "no_code_target"},
+        {"item_index": 5, "item": "u", "reason": "unreproducible",
+         "probed": "u does T"}]
+
+
+def test_a_later_probe_than_the_one_handed_is_unrouted(leerie):
+    """Barnacle 87580f62 item 8: driven in two rounds on earlier probes, its
+    latest confirmed probe held by a group with no member left a round."""
+    items = [_open(8, "x", ["falsifier:new"])]
+    handed = ["8:falsifier:old1", "8:falsifier:old2"]
+    assert leerie._redrive_unrouted_items(
+        items, handed, [8], False, seen=["8:falsifier:new"]) == [
+        {"item_index": 8, "item": "x", "reason": "budget"}]
+    # The same probe handed once is reached, whatever came after.
+    assert leerie._redrive_unrouted_items(
+        items, handed + ["8:falsifier:new"], [8], False) == []
+    # Confirmed after the last round (never open at a round's start).
+    assert leerie._redrive_unrouted_items(
+        items, handed, [], False, seen=["8:falsifier:old2"]) == [
+        {"item_index": 8, "item": "x", "reason": "after_last_round"}]
 
 
 # === rule 4 over item notes: the 4b5c564d shape =============================
@@ -240,7 +274,20 @@ def test_a_mixed_item_is_driven_on_its_judge_part_alone(
                          "evidence": JUDGE_EVIDENCE}]
         assert QUOTE not in c["prompt"]
         assert "falsifier" not in c["prompt"]
-    assert "unrouted_items" not in w.st.data["delivery_redrive"]
+    # The probe part reached no worker, and the record says so: every
+    # confirmed finding is handed on or recorded, never silently neither.
+    rec = w.st.data["delivery_redrive"]
+    assert rec["items_driven"] == [0]
+    assert rec["unrouted_items"] == [
+        {"item_index": 0, "item": "a does X", "reason": "unreproducible",
+         "probed": QUOTE}]
+    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
+    why = [r for r in w.st.data["outcome_reasons"]
+           if r.startswith("item 0 is unmet on a confirmed falsifier probe")]
+    assert len(why) == 1
+    # Its judge part was driven, so the reason never says no round was.
+    assert why[0].endswith("no re-drive worker was handed it (the item's "
+                           "other evidence was driven)")
 
 
 def test_a_mixed_item_without_evidence_by_carries_no_evidence(leerie):

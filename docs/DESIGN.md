@@ -519,9 +519,11 @@ subtask it tests). Three mechanisms reconcile that coupling:
   delivers, each typed `deliverable` (a change the tree must carry) or
   `process` (a constraint on how to work). The claim is the routing key
   of the delivery re-drive (§8 *Delivery re-drive*), which hands an
-  unmet deliverable item back to every subtask that claimed it, and
-  never routes a process item. Split children inherit it with the site
-  claims, and a merge of two subtasks keeps both subtasks' item claims.
+  unmet deliverable item back to every subtask that claimed it. A process
+  item is routed by its evidence, never by its claim: a confirmed probe
+  that it fails names code, and goes to whoever changed that code. Split
+  children inherit it with the site claims, and a merge of two subtasks
+  keeps both subtasks' item claims.
 
   Before execution every required item is claimed by a subtask that can
   change the tree. The one exclusion is the plan's `items_not_needed`
@@ -13850,8 +13852,27 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    in the outcome's reasons.
 2. *Who owns it.* The planner types, per subtask, the required items it
    delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
-   An unmet deliverable item re-drives **every** claimer; a process item
-   (how to work, never a tree change) is not routed. A failing defect file
+   An unmet deliverable item re-drives **every** claimer. A process item
+   (a constraint over the whole change: root causes only, no regressions)
+   is no one subtask's deliverable, so its claimers are not its owners;
+   but a confirmed probe that it fails is a concrete defect in specific
+   code. It is driven on such a probe alone, when the probe is shown, to
+   the subtasks whose diff touches a production module the probe imports
+   (the import graph, as for a defect file): a subtask's diff is its
+   `leerie: integrate <sid>` merge and every kept re-drive group it was a
+   member of, since a group's commit is its members' change too. With no
+   shown probe, or no subtask whose diff it reaches, it is recorded as
+   reaching none (*An unmet item reaches its owner, or is recorded as
+   reaching none*, below), reason `no_code_target`: a judge's verdict on
+   "no band-aids" is prose, and code does not read a target out of it.
+   Before this, a process item was never routed and never recorded. In
+   barnacle 87580f62 (leerie 0.55.2) both subtasks claimed item 0 ("…
+   root cause … Introduce no regressions in existing behavior …")
+   `process`; the shipping-tree falsification confirmed a regression
+   re-drive round 2 wrote (`isLoopbackOrLinkLocalHost("::0:5")` true,
+   false at the start), and the item got no group and no record. Its probe
+   imports `src/scripts/recon-http.ts`, which no integrate merge touched
+   and both members' kept groups did. A failing defect file
    goes to the subtasks whose production diff — the files their
    `leerie: integrate <sid>` merge changed — touches a file that test file
    imports (the import graph, mechanical); with none, to the audited fix
@@ -13906,7 +13927,8 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `unreproducible` (*An unmet item reaches its owner, or is recorded as
    reaching none*, below), stays unmet, and spends no round. An item
    unmet on such a probe and on reproducible evidence too is driven on
-   the reproducible part alone: its note carries only that evidence,
+   the reproducible part alone, and its probe recorded as reaching no
+   worker, reason `unreproducible`: its note carries only that evidence,
    never the probe's, and the re-check after the drive still re-runs the
    saved probe, so the item leaves `unmet_final` only when both are met.
    Code decides this from the item's typed `by`, the evidence each
@@ -14212,7 +14234,7 @@ An item no group drives — no subtask the re-drive may drive can take it,
 or every group holding it was out of its members' re-drive rounds, or the
 re-drive's time budget ran out first — is recorded as a typed
 `unrouted_item` (`{item_index, item, reason: no_owner | budget |
-unreproducible}`). So is an item rule 4 does not drive, with reason
+unreproducible | no_code_target | after_last_round}`). So is an item rule 4 does not drive, with reason
 `unreproducible` and the item words its probe tested (`probed`); the
 outcome's reasons say for it that a confirmed falsifier probe of those
 words fails under B\* and that the probe is held-out content no fixer
@@ -14234,6 +14256,38 @@ evidence was a falsifier probe whose sample read every valid set, so
 under rule 4 it is recorded with reason `unreproducible` before any
 routing. A probe from shown-only leads would be shown, and the item
 routed to feat-001 like any other.
+
+**Invariant:** every confirmed finding on the tree that ships either was
+handed to a worker who could act on it, or is recorded as an
+`unrouted_item` with why, and the outcome's reasons, which the PR's draft
+section lists, say it. Never silently neither. "Handed" is per finding,
+not per item: an item is many findings over a run, because each re-check
+confirms its own. Each source of an item's unmet evidence is a key: a
+confirmed probe is the digest of its saved path and source, so a probe
+confirmed later is another finding than one a group was handed, and the
+same probe confirmed again is the same; any other source is its name (a
+judge re-reading the item unmet again is the same finding). The re-drive
+records every key a driven group's note carried
+(`delivery_redrive.evidence_handed`), and at the end an open item with a
+key never handed is recorded, with the first reason that holds: for a key
+its note carries, `budget` (a group held it with no member left a round,
+or the time budget stopped the re-drive), else `after_last_round` (the
+key was confirmed after the last round began — by the re-check of the
+tree that ships — so no round followed it), else `no_owner`; for a key no
+note may carry, `unreproducible` (a probe no fixer may be shown) or
+`no_code_target` (a process item's evidence that names no code a subtask
+changed). Before this, an item counted as reached once any round had
+driven it, whatever it was driven on. In 87580f62, item 8 was driven in
+rounds 1 and 2, each on another probe; the re-check after round 2
+confirmed a third, round 3's group was skipped for budget, and the item
+was recorded only in `items_budget_skipped`, so neither the outcome nor
+the next run said that its latest probe reached nobody. Across the 21
+recorded runs with a re-drive (52 state files under `~/.leerie/`,
+2026-11-10), six open items in four runs had a finding that reached no
+worker and was recorded nowhere: four process items (two judge-only, two with a probe,
+one of them shown) and two driven items whose latest probe never reached a
+fixer (87580f62 item 8, and a2a825c2 item 4, whose probe read held-back
+sets). Each is now an `unrouted_item`.
 
 The diff is re-measured because nothing else is. Before review round 6
 the re-drive re-applied the test-outcome verdict recorded at detection,
