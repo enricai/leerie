@@ -20054,7 +20054,12 @@ on the final tree:
    cites; a strict form's non-flag tokens must appear in that file or a
    manifest beside it; a coverage threshold's glob, metric and minimum must
    appear in the config file it cites. A check that fails provenance, or
-   still carries a CI expression placeholder, never runs. Each
+   still carries a CI expression placeholder, never runs. A strict form
+   is optional, so it is judged apart: one that fails its rule (or runs a
+   command the task forbids) is dropped by itself, its typed reason
+   recorded, and the check runs on its plain argv — a strict form never
+   takes the plain check down with it (*A strict form that fails
+   provenance drops alone*, below). Each
    prerequisite is also typed by what of it needs root, and runs in the
    form that needs none (*A prerequisite runs in the form that needs no
    root*, below).
@@ -20147,6 +20152,23 @@ dropped a 95% branch threshold (91.62% → 91.53%, fixed by the next PR);
 the base against a rerun of the base fired 0 times.
 The same check runs gave identical exit codes under rootless and rootful
 containers, with no file left unowned or unwritable.
+
+**A strict form that fails provenance drops alone.** *Built 2026-11-10
+(lane PV).* **Root cause.** The strict form's provenance rule was one more
+line of the check's own problem list, so a strict form leerie could not
+trace dropped the whole check as `provenance`. On barnacle run 87580f62
+`ci_checks` typed lint as `pnpm run lint` (every token in the workflow)
+with the strict form `pnpm exec biome check src --error-on-warnings`, whose
+`exec` appears in neither the workflow nor `package.json`. Lint was never
+run: green on the base, it went red on the final tree with three errors
+the run's own commits introduced, and the pull request's lint job failed.
+The strict form only ever adds to the plain check (it replaces it when
+green at the baseline, and ratchets per diagnostic otherwise), so losing
+it can never justify losing the plain check. **Invariant:** a check whose
+plain command passes provenance is selected and judged at the baseline as
+any other; a strict form that fails provenance is dropped by itself
+(`strict_argv` null, its problems recorded as `strict_problems`), exactly
+as a strict form the task forbids already was.
 
 **A prerequisite runs in the form that needs no root.** *Built 2026-11-09
 (lane BP).* **Root cause.** CI parity turns a CI step into a command leerie
