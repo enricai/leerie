@@ -180,10 +180,12 @@ def test_overlap_judge_call_site_uses_inspect_tools():
     assert "allowed_tools=RUN_TOOLS" not in body
 
 
-def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
+def test_satisfied_probe_call_site_uses_tree_reader_tools():
     """The satisfied_probe worker (DESIGN §8 *Already-satisfied subtask
-    elimination*) must pass allowed_tools=SATISFIED_PROBE_TOOLS — the
-    base-tree-only bucket. A regression to INSPECT_TOOLS would re-grant
+    elimination*) must pass allowed_tools=TREE_READER_TOOLS — the
+    base-tree-only bucket with the read-only verbs, whose hook holds
+    `git grep` to the tree or HEAD (*A base-tree reader has the verbs a
+    reader reaches for*). A regression to INSPECT_TOOLS would re-grant
     history-spanning git (`git log --all`, non-HEAD `git show <ref>:`),
     which lets the probe find a deliverable on some OTHER branch and
     report satisfied=true — silently deleting real work (calibration
@@ -213,9 +215,9 @@ def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
         "_filter_satisfied_subtasks body no longer contains the claude_p "
         "call — this test's boundary or the worker wiring changed"
     )
-    assert "allowed_tools=SATISFIED_PROBE_TOOLS" in body, (
+    assert "allowed_tools=TREE_READER_TOOLS" in body, (
         "_filter_satisfied_subtasks must pass "
-        "allowed_tools=SATISFIED_PROBE_TOOLS to claude_p"
+        "allowed_tools=TREE_READER_TOOLS to claude_p"
     )
     assert "allowed_tools=INSPECT_TOOLS" not in body
     assert "allowed_tools=ACT_TOOLS" not in body

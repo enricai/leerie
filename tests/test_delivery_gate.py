@@ -145,7 +145,7 @@ def test_clean_first_pass_costs_one_sample(leerie, tmp_path, monkeypatch):
     assert gate["unmet_before"] == [] and gate["samples_before"] == 1
     # Judge scope pins: read-only tools, a checkout of staging's HEAD as
     # cwd (`_judge_checkout`, DESIGN §8), non-autonomous.
-    assert calls[0]["allowed_tools"] == leerie.SATISFIED_PROBE_TOOLS
+    assert calls[0]["allowed_tools"] == leerie.TREE_READER_TOOLS
     assert calls[0]["cwd"] == str(leerie._helper_worktree_path(
         st, "delivery-judge"))
     assert calls[0]["autonomous"] is False

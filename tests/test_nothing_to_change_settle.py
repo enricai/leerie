@@ -180,7 +180,7 @@ def test_sibling_delivered_noop_settles_complete_in_one_pass(
     assert ran == [str(env["worktree"])], "verify ran on the subtask's HEAD"
     assert len(seen) == 1 and seen[0]["cwd"] == str(env["worktree"])
     assert seen[0]["schema"] == "satisfied_probe"
-    assert seen[0]["tools"] == env["leerie"].SATISFIED_PROBE_TOOLS
+    assert seen[0]["tools"] == env["leerie"].TREE_READER_TOOLS
     # The probe judges the subtask's own criteria, not only the seed.
     payload = json.loads(seen[0]["prompt"].split("SUBTASK:\n", 1)[1]
                          .split("\n\nReturn only", 1)[0])

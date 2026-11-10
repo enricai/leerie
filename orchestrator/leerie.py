@@ -1297,8 +1297,9 @@ ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit,TaskStop"
 PAYLOAD_ONLY_TOOLS = "Read"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
-# INSPECT_TOOLS for the phase-3 satisfied-probe (DESIGN §8 *Already-
-# satisfied subtask elimination*). It must NOT include history-spanning
+# INSPECT_TOOLS for the readers of one tree; the phase-3 satisfied-probe
+# (DESIGN §8 *Already-satisfied subtask elimination*) and the delivery judge
+# run on TREE_READER_TOOLS, this list widened below. It must NOT include history-spanning
 # git verbs (`git log:*`, `git show:*` with an arbitrary ref, `git
 # branch`): a git worktree shares the main repo's full ref/object DB, so
 # a probe that can reach other branches / later commits will "find" a
@@ -1324,6 +1325,25 @@ SATISFIED_PROBE_TOOLS = (
     "Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*),Bash(grep:*),"
     "Bash(rg:*),Bash(file:*),Bash(stat:*),Bash(pwd),Bash(echo:*),"
     "Bash(git show HEAD:*),Bash(git diff:*),Bash(git status:*)"
+)
+# TREE_READER_TOOLS — SATISFIED_PROBE_TOOLS plus the read-only verbs a reader
+# of the tree reaches for, for the two base-tree readers whose refusals were
+# measured: the satisfied probe and the delivery judge (DESIGN §8 *A
+# base-tree reader has the verbs a reader reaches for*). Never without the
+# PreToolUse hook `_worker_guard` gives this exact list
+# (`_tree_reader_hook_settings`): it holds `git grep` to the working tree,
+# the index or HEAD — discipline (1) above — and drops a leading `cd` into
+# the worker's own cwd, which the CLI otherwise refuses as a compound.
+# Measured (bench LB re-run 3, this list and hook against the list above):
+# the judge's unread item-samples 69 -> 17 of 276, its refusals 53 -> 30,
+# the hook denied no call. The verbs write nothing these workers could not
+# write already: their grants write only their own directories
+# (`_worker_grants`), so `awk`'s `system()`, `sed`'s `w`, `sort -o` and
+# `git grep -O` reach no tree and no run state.
+TREE_READER_TOOLS = (
+    f"{SATISFIED_PROBE_TOOLS},"
+    "Bash(git grep:*),Bash(sed -n:*),Bash(awk:*),Bash(sort:*),Bash(cut:*),"
+    "Bash(git ls-files:*)"
 )
 
 # DISALLOWED_TOOLS is the hard-deny list passed via --disallowedTools to
@@ -1414,6 +1434,7 @@ KNOWN_TOOLS: frozenset[str] = frozenset(
     _bare_tool_names(INSPECT_TOOLS)
     | _bare_tool_names(ACT_TOOLS)
     | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    | _bare_tool_names(TREE_READER_TOOLS)
     # Inert today — SMOKE_TOOLS is "Read", which _READ_BASE already supplies —
     # and kept so that widening SMOKE_TOOLS cannot silently drop a name out of
     # this set. Measured: with and without this term the union is identical.
@@ -18759,7 +18780,7 @@ async def _filter_satisfied_subtasks(
                 out = await claude_p(
                     user_prompt=user_prompt, system_prompt=sys_prompt,
                     schema_key="satisfied_probe", cwd=_judgment_cwd(st),
-                    allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
+                    allowed_tools=TREE_READER_TOOLS, max_turns=20,
                     autonomous=False, caps=caps, st=st,
                     model=models["satisfied_probe"],
                     effort=efforts["satisfied_probe"],
@@ -18983,7 +19004,7 @@ async def _probe_criteria_satisfied_on_head(
             # and at worst fail-safe-keeps the subtask, whose no-op then
             # lands back on this larger-capped site (DESIGN §8 *The
             # judge's turn budget scales with the item count*).
-            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=40,
+            allowed_tools=TREE_READER_TOOLS, max_turns=40,
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
             effort=efforts["satisfied_probe"],
@@ -30913,6 +30934,24 @@ def _forbidden_command_hook_settings(forbidden: list[str | dict],
     }]}}, separators=(",", ":"))
 
 
+TREE_READER_HOOK = ROOT / "scripts" / "tree-reader-hook.py"
+
+
+def _tree_reader_hook_settings() -> str:
+    """The `--settings` JSON carrying the tree reader's PreToolUse hook
+    (DESIGN §8 *A base-tree reader has the verbs a reader reaches for*):
+    `git grep` held to the working tree, the index or HEAD, and a leading
+    `cd` into the worker's own cwd dropped. Run by the orchestrator's own
+    interpreter, as the forbidden-command hook is, and recognised by
+    `worker-shell.py` as leerie's: it runs in leerie's root."""
+    command = " ".join(shlex.quote(w) for w in (
+        sys.executable, "-I", str(TREE_READER_HOOK)))
+    return json.dumps({"hooks": {"PreToolUse": [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": command}],
+    }]}}, separators=(",", ":"))
+
+
 
 def _merge_settings(low: dict, high: dict) -> dict:
     """`high` laid over `low` the way the CLI merges its settings scopes:
@@ -31480,11 +31519,19 @@ def _worker_guard(allowed_tools: str, repo_root: str | Path,
         n for n in (suite_notice, forbidden_notice,
                     PROCESS_KILL_NOTICE if deny_kills else None,
                     db_notice) if n]
+    settings = _forbidden_command_hook_settings(forbidden, deny_kills)
+    # The tree reader's hook goes with its tools (DESIGN §8 *A base-tree
+    # reader has the verbs a reader reaches for*), merged over the
+    # forbidden-command hook, never replacing it.
+    if allowed_tools == TREE_READER_TOOLS:
+        settings = json.dumps(_merge_settings(
+            json.loads(settings) if settings else {},
+            json.loads(_tree_reader_hook_settings())), separators=(",", ":"))
     return {
         "deny": ",".join(d for d in (suite_deny, db_deny, forbidden_deny,
                                      kill_deny) if d),
         "notices": notices,
-        "settings": _forbidden_command_hook_settings(forbidden, deny_kills),
+        "settings": settings,
         # The runtime layer: a forbidden package script refused by the
         # package manager's own script shell, wherever the run came from.
         "env": _forbidden_script_shell_env(forbidden) or {},
@@ -53860,7 +53907,7 @@ async def _delivery_judge_unmet(
                 user_prompt=prompt,
                 system_prompt=_load_prompt("delivery_judge"),
                 schema_key="delivery_judge", cwd=str(judge_cwd[0]),
-                allowed_tools=SATISFIED_PROBE_TOOLS,
+                allowed_tools=TREE_READER_TOOLS,
                 max_turns=turns,
                 autonomous=False, caps=caps, st=st,
                 model=models.get("delivery_judge", MODEL_DEFAULT),

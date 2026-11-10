@@ -3321,8 +3321,9 @@ they are confined.
   and hook runs through, nests its Landlock domain first, then `chroot`s
   the command into the view, drops every ambient capability and lays the
   worker stage's environment over the CLI's (`enter_worker_view`). Leerie's
-  own PreToolUse hook, recognised exactly as
-  `_forbidden_command_hook_settings` writes it, runs in leerie's root. The
+  own PreToolUse hooks, recognised exactly as
+  `_forbidden_command_hook_settings` and `_tree_reader_hook_settings` write
+  them, run in leerie's root. The
   capability gives a process no reach: `no_new_privs` is set, so no set-id
   program in a root a worker shaped gains anything, and Landlock's rules
   are on inodes, so a `chroot` widens no grant.
@@ -12743,7 +12744,7 @@ extra run per violation.
 
 So the same standard runs at finalize, in the run that ships. After the
 last wave integrates and before the final-conformer pass, a
-**`delivery_judge`** (read-only, SATISFIED_PROBE_TOOLS, cwd = the
+**`delivery_judge`** (read-only, TREE_READER_TOOLS, cwd = the
 integrated staging worktree — the exact tree the PR will carry)
 verifies each required item and returns one typed verdict per item,
 aligned by integer `item_index` — mechanical alignment, never prose
@@ -13130,7 +13131,7 @@ at the recorded gap instead of rediscovering it.
 Measured on three of the gate's completed outings: the dominant
 unmet item was "no regressions", with evidence citing the sandbox's
 command-approval gate — the judge is deliberately read-only
-(SATISFIED_PROBE_TOOLS), so an item demanding an executed suite is
+(TREE_READER_TOOLS), so an item demanding an executed suite is
 unverifiable *by construction* from inside the gate, and every such
 run paid the 3-sample dispute vote plus conformer routing for a
 verdict that could never change. The evidence already exists: every
@@ -15818,6 +15819,34 @@ history-spanning probe "finds" the deliverable on an unrelated branch; (2)
 the probe defaults to *not satisfied* on any uncertainty, since a false
 "already done" silently deletes real work, strictly worse than a false
 "still needed."
+
+**A base-tree reader has the verbs a reader reaches for.** The probe and
+the delivery judge (*The delivery gate*) read one tree, and a reader
+searches and slices it: `git grep`, `git ls-files`, `sed -n`, `awk`,
+`sort` and `cut`, beside the base list (`TREE_READER_TOOLS`). Without them
+the CLI refused the command at its permission prompt and the judge left
+the item unread. Two rules ride with the verbs, in leerie's PreToolUse
+hook for these two workers (`scripts/tree-reader-hook.py`):
+
+- `git grep` searches the working tree, the index or HEAD only. A
+  positional argument naming any other commit or tree is denied, so the
+  verb keeps discipline (1).
+- A leading `cd` into the worker's own working directory is not a
+  different command. The hook drops it, and the CLI matches what remains
+  against the allow list; without that, the CLI refuses the compound.
+
+Measured (bench LB re-run 3: three recorded judge calls and seven recorded
+probes replayed, 6 samples per arm, this list and hook against the base
+list): the judge's unread item-samples fell from 69 to 17 of 276 and its
+refusals from 53 to 30; the hook denied no call; the probe's agreement
+with the audited verdicts went from 18 to 17 of 24. The verbs write
+nothing a reader could not write before: its grant writes only its own
+directories (§6 *A worker writes only where it is granted (I5)*), so
+`awk`'s `system()`, `sed`'s `w`, `sort -o` and `git grep -O` reach no tree
+and no run state. They do run programs, and a program a reader starts can
+read another ref of the run's repository, which its grant reads: the
+residual `git diff <ref>` already left, held by the probe's prompt, not by
+code.
 
 **A "not satisfied" verdict carries a typed reason.** Measured across one
 repo's full run corpus, 58% of all not-satisfied probe verdicts (433/753 on
