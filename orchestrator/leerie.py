@@ -50720,12 +50720,13 @@ def _ci_prereq_argv(pre: dict) -> list[str] | None:
 
 
 def _ci_check_problems(check: dict, tree: Path) -> list[str]:
-    """Provenance and shape, checked in code (DESIGN §9): every argv,
-    prerequisite and env token must appear verbatim (whitespace-collapsed)
-    in the CI file the check cites; a strict variant's non-flag tokens in
-    that file or a manifest beside the check / at the root; a coverage
+    """Provenance and shape of the check itself, checked in code (DESIGN
+    §9): every argv, prerequisite and env token must appear verbatim
+    (whitespace-collapsed) in the CI file the check cites; a coverage
     threshold's glob, metric and minimum in the config file it cites. Empty
-    list = the check may run."""
+    list = the check may run. Its optional strict form is judged apart
+    (`_ci_strict_problems`): a strict form that fails drops alone and never
+    takes the check down with it."""
     probs: list[str] = []
     src = _ci_safe_rel(tree, ((check.get("source") or {}).get("file") or ""))
     if src is None or not _regular_file_beneath(tree, src):
@@ -50759,19 +50760,6 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
             probs.append(f"token {t!r} does not appear in {src.name}")
         if _CI_PLACEHOLDER in t:
             probs.append(f"token {t!r} is an unresolved CI placeholder")
-    strict = [str(a) for a in (check.get("strict_argv") or [])]
-    if strict:
-        texts = [flat]
-        for base in {cwd or tree, tree}:
-            for m in CI_STRICT_MANIFESTS:
-                with contextlib.suppress(OSError):
-                    texts.append(_ci_flat(_read_text_beneath(tree, base / m, limit=READ_LIMIT_CONFIG)))
-        for t in strict:
-            ft = _ci_flat(t)
-            if ft and not t.startswith("-") and not any(
-                    ft in x for x in texts):
-                probs.append(f"strict token {t!r} appears in neither the "
-                             "CI file nor a manifest")
     if check.get("kind") == "coverage":
         cov = check.get("coverage") or {}
         cfg = _ci_safe_rel(tree, cov.get("config_file") or "")
@@ -50801,6 +50789,38 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     return probs
 
 
+def _ci_strict_problems(check: dict, tree: Path) -> list[str]:
+    """Provenance of a check's optional strict form (DESIGN §9): every
+    non-flag `strict_argv` token must appear (whitespace-collapsed) in the
+    CI file the check cites or a `CI_STRICT_MANIFESTS` file in its cwd or
+    at the root. Empty list = the strict form may run. A failure here drops
+    the strict form only; the plain check is `_ci_check_problems`'."""
+    strict = [str(a) for a in (check.get("strict_argv") or [])]
+    if not strict:
+        return []
+    src = _ci_safe_rel(tree, ((check.get("source") or {}).get("file") or ""))
+    if src is None or not _regular_file_beneath(tree, src):
+        return ["source file missing or outside the repo"]
+    try:
+        texts = [_ci_flat(_read_text_beneath(tree, src,
+                                             limit=READ_LIMIT_CONFIG))]
+    except OSError:
+        return ["source file unreadable"]
+    cwd = _ci_safe_rel(tree, check.get("cwd") or ".")
+    for base in {cwd or tree, tree}:
+        for m in CI_STRICT_MANIFESTS:
+            with contextlib.suppress(OSError):
+                texts.append(_ci_flat(_read_text_beneath(
+                    tree, base / m, limit=READ_LIMIT_CONFIG)))
+    probs: list[str] = []
+    for t in strict:
+        ft = _ci_flat(t)
+        if ft and not t.startswith("-") and not any(ft in x for x in texts):
+            probs.append(f"strict token {t!r} appears in neither the CI "
+                         "file nor a manifest")
+    return probs
+
+
 def _ci_select(checks: list[dict], tree: Path,
                forbidden: list[str | dict] | tuple = ()) -> list[dict]:
     """One record per discovered check, with `selected` and, when not, the
@@ -50809,7 +50829,9 @@ def _ci_select(checks: list[dict], tree: Path,
     database — `_ci_runs_db_reset`), `forbidden_by_task` (its argv runs a
     command the task forbids — never run, so never judged), `provenance`
     (with `problems`). A forbidden `strict_argv` is dropped
-    (`strict_forbidden`) and the check judged on its plain argv."""
+    (`strict_forbidden`), and so is one that fails its own provenance
+    (`strict_problems`); either way the check is judged on its plain argv —
+    a strict form never takes the plain check down with it."""
     forbidden = list(forbidden)
 
     def _hit(argv: object) -> str | None:
@@ -50851,6 +50873,10 @@ def _ci_select(checks: list[dict], tree: Path,
                 rec["problems"] = probs[:10]
             else:
                 rec["selected"] = True
+                sprobs = _ci_strict_problems(rec, tree)
+                if sprobs:
+                    rec["strict_problems"] = sprobs[:10]
+                    rec["strict_argv"] = None
         out.append(rec)
     return out
 
@@ -51417,6 +51443,12 @@ async def _capture_ci_parity_baseline(
             log(f"  ci parity: {r['id']} not run — {r['reason']}"
                 + (f" ({'; '.join(r.get('problems') or [])[:200]})"
                    if r.get("problems") else ""))
+        elif r.get("strict_forbidden") or r.get("strict_problems"):
+            why = (f"forbidden by the task ({r['strict_forbidden']})"
+                   if r.get("strict_forbidden") else
+                   f"provenance ({'; '.join(r['strict_problems'])[:200]})")
+            log(f"  ci parity: {r['id']} runs on its plain argv — its strict "
+                f"form is dropped: {why}")
     wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
     if sel and wt is None:
         for r in sel:

@@ -205,9 +205,14 @@ def test_provenance_checks_env_cwd_strict_and_source(leerie, env):
     ok = _check("lint", [PY, "lint.py", "src"], strict=[PY, "lint.py",
                                                         "--max-warnings=0"])
     assert leerie._ci_check_problems(ok, tree) == []
-    # A strict NON-flag token from nowhere is refused; flags are free.
+    assert leerie._ci_strict_problems(ok, tree) == []
+    # A strict NON-flag token from nowhere is refused; flags are free. The
+    # refusal is the strict form's own: the check itself has no problem.
     bad_strict = dict(ok, strict_argv=[PY, "other_tool.py", "--strict"])
-    assert leerie._ci_check_problems(bad_strict, tree)
+    assert leerie._ci_strict_problems(bad_strict, tree) == [
+        "strict token 'other_tool.py' appears in neither the CI file nor a "
+        "manifest"]
+    assert leerie._ci_check_problems(bad_strict, tree) == []
     assert leerie._ci_check_problems(dict(ok, env=[{"name": "SECRET",
                                                     "value": "x"}]), tree)
     assert leerie._ci_check_problems(dict(ok, cwd="../.."), tree)
@@ -399,6 +404,74 @@ def test_new_diagnostic_in_an_untouched_file_is_not_this_runs(leerie, env):
     assert _final(env) == []
     res = env["st"].data["ci_parity"]["final"]["results"]["lint"]
     assert res["strict_rc"] == 1
+
+
+# ---- a strict form that fails provenance drops alone (lane PV) -------------
+# barnacle 87580f62: plain `pnpm run lint` traced to the workflow, strict
+# `pnpm exec biome check src --error-on-warnings` did not (`exec` is in
+# neither the workflow nor a manifest), and the whole lint check was dropped
+# as `provenance` — never run while the run's commits turned it red.
+
+UNTRACED_STRICT = [PY, "exec", "lint.py", "src", "--strict"]
+
+
+def test_a_strict_form_failing_provenance_drops_alone(leerie, env):
+    assert "exec" not in (env["staging"] / ".github" / "workflows"
+                          / "ci.yml").read_text()
+    recs = {r["id"]: r for r in leerie._ci_select([
+        _check("lint", [PY, "lint.py", "src"], strict=UNTRACED_STRICT),
+        # The plain form still governs: an untraceable plain argv is
+        # deselected whatever its strict form is.
+        _check("invented", [PY, "lint.py", "--fix"],
+               strict=[PY, "lint.py", "src", "--strict"]),
+    ], env["staging"])}
+    lint = recs["lint"]
+    assert lint["selected"] is True
+    assert "reason" not in lint and "problems" not in lint
+    assert lint["strict_argv"] is None
+    assert lint["strict_problems"] == [
+        "strict token 'exec' appears in neither the CI file nor a manifest"]
+    assert lint["argv"] == [PY, "lint.py", "src"]
+    assert recs["invented"]["selected"] is False
+    assert recs["invented"]["reason"] == "provenance"
+
+
+def test_a_strict_form_traced_by_a_manifest_is_kept(leerie, env):
+    # The other half of the rule, so the split cannot pass by dropping every
+    # strict form: `exec` traced through a manifest beside the check keeps it.
+    _commit(env, {"package.json": '{"scripts": {"x": "exec lint"}}\n'})
+    recs = {r["id"]: r for r in leerie._ci_select([
+        _check("lint", [PY, "lint.py", "src"], strict=UNTRACED_STRICT)],
+        env["staging"])}
+    assert recs["lint"]["selected"] is True
+    assert recs["lint"]["strict_argv"] == UNTRACED_STRICT
+    assert "strict_problems" not in recs["lint"]
+
+
+def test_the_plain_check_gates_when_its_strict_form_is_untraced(
+        leerie, env, capsys):
+    env["checks"][:] = [_check("lint", [PY, "lint.py", "src"],
+                               strict=UNTRACED_STRICT)]
+    recs = _baseline(env)
+    lint = recs["lint"]
+    # Green on the base, judged on its plain argv; the strict form was
+    # never run (it cannot be traced to anything the CI runs).
+    assert lint["selected"] is True
+    assert lint["gate"] == "plain"
+    assert lint["base"] == {"rc": 0, "dirty": False}
+    assert "ratchet" not in lint
+    out = capsys.readouterr()
+    assert ("lint runs on its plain argv — its strict form is dropped: "
+            "provenance (strict token 'exec'") in out.out + out.err
+    # The run's commits add a lint error: red on the final tree, confirmed
+    # against the base, and the run is not delivered.
+    _commit(env, {"src/a.txt": "fine\nERROR new\n"})
+    unmet = _final(env)
+    assert [(u["id"], u["why"], u["argv"]) for u in unmet] == [
+        ("lint", "red", [PY, "lint.py", "src"])]
+    st = env["st"]
+    assert st.data["ci_parity"]["final"]["b_star"]["new"] == ["lint"]
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
 
 
 def test_check_that_writes_tracked_files_is_dropped(leerie, env):
