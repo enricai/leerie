@@ -17193,6 +17193,8 @@ that commits and survives its own rules, the ratchet runs every gating
 check and ratchet on the round's commit, in a fresh worktree of it
 (`_ci_round_regressions`). It runs them in their recorded order, in one
 tree, as the final pass does: a check may read what an earlier one built.
+B\*'s reruns keep that order (§9 *A merge check's rerun sees what its
+measurement saw*).
 A gate red there is confirmed by the final pass's B\* (interleaved reruns,
 same budget), against the round's start instead of the run's base. Only
 a gate that fails every rerun on the commit and passes every rerun on the
@@ -19851,6 +19853,10 @@ failure new / does this set still fail" verdict uses:
    the rerun is the whole command and nothing is sized. CI parity sizes
    its red checks the same way by their final-run times, shortest first,
    so a long check first in CI order no longer starves the checks after it.
+   That chooses which checks a pass reruns, never the order they run in:
+   each rerun runs them in recorded order, on a base tree where every
+   check recorded before them has run (§9 *A merge check's rerun sees what
+   its measurement saw*).
    Review round 7 drove the cost of sizing for `k` on a real suite: a
    final run failing a 30 s file (a load flake) and a 290 s file (a real
    regression) sized the long file out at the defaults, (30 + 290 + 10) ×
@@ -20317,7 +20323,9 @@ on the final tree:
    cgroup at the worker caps and holds a host build slot (§6 *Enrollment
    holds the spawn*, *A host-wide build semaphore*). The reruns are bounded
    like every other B\* rerun (§9 *Which failures are new*, steps 2 and 4):
-   one rerun runs each red check in turn, and each check's timeout is what
+   one rerun runs each red check in turn, in recorded order (*A merge
+   check's rerun sees what its measurement saw*, below), and each check's
+   timeout is what
    is left of `confirm_budget_sec`, never its own `worker_timeout_sec`
    alone. A rerun the budget cuts — a check timed out on what was left, or
    no budget left to start the next check — is not a run: it ends the
@@ -20346,7 +20354,43 @@ on the final tree:
    each later pass runs only the prerequisites of checks no earlier pass
    prepared — and removed when the confirm ends, so the uncharged setup
    is what a single-pass confirm pays: one checkout, one install, one
-   database, and each distinct prerequisite once.
+   database, each distinct prerequisite once, and each gating check
+   recorded up to the last red one once (*A merge check's rerun sees what
+   its measurement saw*, below).
+
+**A merge check's rerun sees what its measurement saw.** *Built 2026-11-10
+(lane B38; found by lane CK).* **Invariant:** every B\* rerun of a merge
+check runs it in a tree where the gating checks recorded before it have
+already run, in recorded order, as in the measurement that found it red.
+Sizing chooses which red checks a pass reruns, shortest first; it never
+chooses the order they run in.
+
+**Root cause.** A measurement runs the gating checks once each, in
+recorded order, in one tree, because a check may read what an earlier one
+built: barnacle's `smoke-load-dist` runs `node -e "require('./dist/server.js')"`
+on the `dist/` its `build` wrote. B\* then reran only the red checks, in
+the order `_confirm_sized` sized them (shortest first), on a fresh
+worktree of the reference commit where no check had run. That broke the
+rerun two ways. With every check red (87580f62's shape), the smoke check,
+the shortest, ran before build on the base's first rerun and failed (no
+`dist/` yet), then passed on the second, after build wrote it: mixed,
+`resource_affected`, never the round's. With build green and the smoke
+check red on what build wrote, only the smoke check was rerun, and on the
+base build never ran at all: the smoke check failed every base rerun, read
+`pre_existing`, and the regression shipped. 87580f62 itself escaped both
+only because `ci_checks` had also typed `pnpm run build` as the smoke
+check's prerequisite; a CI job whose steps depend on each other by order
+alone carries no such prerequisite.
+
+**The rule.** Before a pass's reruns, the base worktree runs once, as
+set-up, every gating check recorded up to the last one the pass reruns
+that has not already run there, in recorded order (`_ci_measure`, results
+unread): the base tree then holds what the measured tree holds. The
+final side needs nothing: it is the measured tree. Each rerun then runs
+its chosen checks in recorded order, on both sides. The set-up is the
+measurement's own cost, paid once per confirm on the base tree and
+outside the budget, like the install and the prerequisites; a check
+recorded after every red one never runs.
 
 A red final check makes delivery unmet: the run's outcome is `unconverged`
 (§6 *The run outcome is decided once*) and the next same-task run's planners

@@ -10389,12 +10389,24 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   unit per check, no overhead, shortest first); a check never rerun is
   `budget_short_unsettled` (and `sized_out`, kept on `final.sized_out`),
   and `_ci_confirm_chosen(st, caps, base, final_tree, recs, *,
-  prior_gate=None, **pairs)` confirms each pass's checks in that order.
-  `base` is `_ci_confirm_red`'s one `{"sha", "wt", "prepared", "prereqs"}` record
+  prior_gate=None, label="confirm", setup=None, upto=0, **pairs)` confirms
+  each pass's checks. Sizing chooses a pass's checks, not their order
+  (DESIGN §9 *A merge check's rerun sees what its measurement saw*):
+  `_ci_confirm_red` orders the measurement's checks as `_ci_gating_recs(st)`
+  then any check of `recs` not among them, hands each pass its checks in
+  that order, and as `setup` the checks of that order from `base["upto"]`
+  up to the pass's last one (`upto` its index plus one). Before the reruns
+  `_ci_confirm_chosen` runs `setup` once on the base tree,
+  `_ci_measure(…, label="<label>-base-setup")`, results unread, after
+  `_ci_prepare` over `setup` and the pass's checks; then `base["upto"] =
+  upto`. Each rerun runs the pass's checks in that order; `final_tree` is
+  the measured tree, so it needs no set-up.
+  `base` is `_ci_confirm_red`'s one `{"sha", "wt", "prepared", "prereqs",
+  "upto"}` record
   for the whole sized confirm: the first pass creates `ci-confirm-base`
   (`_ci_worktree`, tried once; `wt` stays None when that fails, and every pass is then
   `_confirm_new_failures` over no-verdict runners), each pass runs
-  `_ci_prepare(…, done=base["prereqs"])` over only the checks whose ids are not yet in `prepared`
+  `_ci_prepare(…, done=base["prereqs"])` over only the checks (`setup` and the pass's) whose ids are not yet in `prepared`
   (deps install once — `_DEPS_INSTALLED` — and the throwaway database
   only when the tree has none), and `_ci_confirm_red` tears it down
   (`_ci_teardown`) when the confirm ends. One rerun runs

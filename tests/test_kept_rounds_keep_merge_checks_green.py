@@ -144,12 +144,11 @@ def test_a_round_that_turns_the_merge_checks_red_is_rolled_back_named(
     # Round 1's commit is rolled back, every check it broke named, with
     # the compiler's first error line.
     assert g1["rolled_back"] is True
-    # (smoke-load-dist reads build's `dist/`; B*'s reruns go shortest
-    # first, so on the start's reruns it can run before build and read as
-    # mixed — resource_affected, never the round's. The three that do not
-    # depend on another are enough to roll the round back.)
-    assert {"typecheck", "prepush-typecheck", "build"} <= set(
-        g1["merge_checks_broke"])
+    # smoke-load-dist reads build's `dist/`: B*'s reruns see what the
+    # measurement saw, so it is the round's too (DESIGN §9 *A merge check's
+    # rerun sees what its measurement saw*).
+    assert sorted(g1["merge_checks_broke"]) == sorted(
+        ["typecheck", "prepush-typecheck", "build", "smoke-load-dist"])
     assert "turned the repository's merge check(s) red" in \
         g1["rollback_reason"]
     assert "error TS2345" in g1["rollback_reason"]
