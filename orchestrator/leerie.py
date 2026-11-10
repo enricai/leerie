@@ -42135,17 +42135,35 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
             # Why no worker was handed it, said where the reader looks
             # (DESIGN §8 *Delivery re-drive* rule 4): the probe is
             # held-out content, so only the item words it tested are named.
+            driven = set((st.data.get("delivery_redrive") or {})
+                         .get("items_driven") or [])
             for u in unrouted:
-                if u.get("reason") != "unreproducible":
-                    continue
-                probed = _normalize_risk_text(u.get("probed") or "", 120)
-                reasons.append(
-                    f"item {u['item_index']} is unmet on a confirmed "
-                    "falsifier probe"
-                    + (f" of its words \"{probed}\"" if probed else "")
-                    + ", which fails under B*; the probe is held-out "
-                    "content no fixer could see, so no re-drive round was "
-                    "spent on it")
+                i = u["item_index"]
+                if u.get("reason") == "unreproducible":
+                    probed = _normalize_risk_text(u.get("probed") or "", 120)
+                    reasons.append(
+                        f"item {i} is unmet on a confirmed falsifier probe"
+                        + (f" of its words \"{probed}\"" if probed else "")
+                        + ", which fails under B*; the probe is held-out "
+                        "content no fixer could see, so "
+                        + ("no re-drive worker was handed it (the item's "
+                           "other evidence was driven)" if i in driven
+                           else "no re-drive round was spent on it"))
+                elif u.get("reason") == "no_code_target":
+                    reasons.append(
+                        f"item {i} is a constraint over the whole change "
+                        "whose unmet evidence names no code a subtask "
+                        "changed, so no re-drive worker could be handed it")
+                elif u.get("reason") == "after_last_round":
+                    reasons.append(
+                        f"item {i}'s unmet evidence was confirmed on the "
+                        "tree that ships after the re-drive's last round, "
+                        "so no re-drive worker was handed it")
+                elif i in driven:
+                    reasons.append(
+                        f"item {i} was driven on earlier evidence; its "
+                        "latest confirmed evidence reached no re-drive "
+                        f"worker ({u.get('reason')})")
             # A probe a measured conflict contested, for a person to decide
             # (rule 4): the item stays unmet, and the tests it conflicts
             # with are named. A fixer's objection is named as its words.
@@ -63400,6 +63418,36 @@ def _redrive_subtask_files(staging: Path, sid: str, spec: dict) -> list[str]:
                    and "node_modules/" not in f})
 
 
+def _redrive_kept_files(staging: Path, rec: dict,
+                        sids: Iterable[str]) -> dict[str, set[str]]:
+    """sid -> the source files the kept re-drive groups it was a member of
+    changed (`git diff --name-only <pre_sha> <post_sha>` of every group
+    with both, not rolled back), filtered as `_redrive_subtask_files`
+    filters a merge's. A group's commit is its members' diff as much as
+    their integrated merge is."""
+    want = set(sids)
+    out: dict[str, set[str]] = {}
+    for rd in rec.get("rounds") or []:
+        for ge in (rd.get("groups") or []) if isinstance(rd, dict) else []:
+            if not isinstance(ge, dict) or ge.get("rolled_back"):
+                continue
+            pre, post = ge.get("pre_sha"), ge.get("post_sha")
+            if not pre or not post or pre == post:
+                continue
+            r = subprocess.run(["git", *_tree_git_args(staging), "diff",
+                                "--name-only", str(pre), str(post)],
+                               capture_output=True, text=True, check=False)
+            if r.returncode != 0:
+                continue
+            files = {f for f in r.stdout.splitlines()
+                     if f.strip() and _CONTRACT_CODE_FILE_RE.search(f)
+                     and not _is_test_file(f) and "node_modules/" not in f}
+            for m in ge.get("members") or []:
+                if str(m) in want:
+                    out.setdefault(str(m), set()).update(files)
+    return out
+
+
 def _redrive_exercised(g: dict, set_: dict, rel: str) -> list[str]:
     """The in-repo production modules one set file imports or mocks
     (rule 3's "files that control exercises"; JS/TS only)."""
@@ -63515,39 +63563,159 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     return groups
 
 
-def _redrive_unrouted_items(open_items: list[dict], driven: Iterable[int],
+def _redrive_unrouted_items(open_items: list[dict], handed: Iterable[str],
                             budget_skipped: Iterable[int],
                             stopped_on_budget: bool,
-                            unreproducible: Iterable[dict] = ()
+                            seen: Iterable[str] | None = None
                             ) -> list[dict]:
-    """The still-open unmet items no re-drive group drove, typed
-    `unrouted_item` (DESIGN §8 *An unmet item reaches its owner, or is
-    recorded as reaching none*): `{item_index, item, reason}`, `reason`
-    `budget` when a group held it but none of its members had a re-drive
-    round left, or the re-drive stopped on its time budget first, else
-    `no_owner` — no subtask the re-drive may drive claimed it or could take
-    it. Then each `unreproducible` record (`_redrive_item_notes`): an item
-    whose only evidence no fixer can reproduce, never driven (rule 4),
-    with reason `unreproducible` and the item words its probe tested
-    (`probed`)."""
-    done, skipped = set(driven), set(budget_skipped)
+    """The still-open unmet items whose latest evidence reached no re-drive
+    worker, typed `unrouted_item` (DESIGN §8 *An unmet item reaches its
+    owner, or is recorded as reaching none*): `{item_index, item, reason,
+    probed?}`. `open_items` are `_redrive_open_evidence` entries, `handed`
+    the `"<i>:<key>"` evidence keys a group that drove was handed. An item
+    every evidence key of which was handed reached a worker. Otherwise, when
+    a key its note carries was not handed, `reason` is `budget` when a group
+    held it with no member left a round (`budget_skipped`) or the re-drive
+    stopped on its time budget, else `after_last_round` when that key was
+    confirmed after the re-drive's last round (not in `seen`, the keys open
+    at a round's start; None: all of them), else `no_owner`. When every
+    key it misses is one no note may carry, `reason` is the entry's own:
+    `unreproducible` (a probe no fixer may be shown, with `probed`) or
+    `no_code_target` (a process item's evidence that names no code a
+    subtask changed)."""
+    handed, skipped = set(handed), set(budget_skipped)
+    seen_ = None if seen is None else set(seen)
     out: list[dict] = []
-    for n in open_items:
-        i = n.get("item_index")
-        if not isinstance(i, int) or i in done:
+    for e in sorted((e for e in open_items
+                     if isinstance(e.get("item_index"), int)),
+                    key=lambda e: e["item_index"]):
+        i = e["item_index"]
+        missing = [k for k in e.get("keys") or ()
+                   if f"{i}:{k}" not in handed]
+        if not missing:
             continue
-        out.append({"item_index": i, "item": str(n.get("item") or "")[:400],
-                    "reason": ("budget" if i in skipped or stopped_on_budget
-                               else "no_owner")})
-    have = {u["item_index"] for u in out}
-    for n in unreproducible:
-        i = n.get("item_index")
-        if not isinstance(i, int) or i in have:
-            continue
-        out.append({"item_index": i, "item": str(n.get("item") or "")[:400],
-                    "reason": "unreproducible",
-                    "probed": str(n.get("probed") or "")[:400]})
+        drivable = [k for k in missing if k in set(e.get("drivable") or ())]
+        row = {"item_index": i, "item": str(e.get("item") or "")[:400]}
+        if drivable:
+            row["reason"] = (
+                "budget" if i in skipped or stopped_on_budget
+                else "after_last_round" if seen_ is not None and any(
+                    f"{i}:{k}" not in seen_ for k in drivable)
+                else "no_owner")
+        else:
+            row["reason"] = str(e.get("reason") or "unreproducible")
+        if row["reason"] == "unreproducible":
+            row["probed"] = str(e.get("probed") or "")[:400]
+        out.append(row)
     return out
+
+
+# How much of a saved probe's source its evidence key reads.
+_REDRIVE_PROBE_KEY_MAX = 1 << 20
+
+
+def _redrive_probe_key(row: object) -> str:
+    """The evidence key of a row's confirmed falsifier probe: `falsifier:`
+    and a digest of the saved probe's path and source, so a probe confirmed
+    later is another key than the one a group was handed, and the same
+    probe confirmed again is the same; plain `falsifier` when no saved
+    probe can be read."""
+    fi = row.get("falsifier") if isinstance(row, dict) else None
+    s_ = next((x for x in ((fi.get("samples") or [])
+                           if isinstance(fi, dict) else [])
+               if isinstance(x, dict) and x.get("confirmed")), None)
+    saved = s_.get("probe_saved") if isinstance(s_, dict) else None
+    if not isinstance(saved, dict) or not saved.get("dir") or not saved.get(
+            "file"):
+        return "falsifier"
+    rel = str(saved["file"])
+    if os.path.isabs(rel) or ".." in Path(rel).parts:
+        return "falsifier"
+    d = Path(str(saved["dir"]))
+    try:
+        body = _read_beneath(d, d / rel, limit=_REDRIVE_PROBE_KEY_MAX)
+    except OSError:
+        return "falsifier"
+    return "falsifier:" + hashlib.sha256(
+        rel.encode() + b"\0" + body).hexdigest()[:16]
+
+
+def _redrive_evidence_keys(u: dict, row: object, *,
+                           contested: bool = False) -> list[str]:
+    """The keys of an `unmet_final` entry's evidence, one per source of its
+    `by` (`["judge"]` when absent): a falsifier source is its confirmed
+    probe (`_redrive_probe_key`); a contested one is none — a measured
+    conflict already decided it is not handed on again, and the outcome
+    says why (rule 4). Any other source is its name: a judge re-reading
+    the item unmet again is the same finding."""
+    by = ([str(b) for b in u["by"]] if isinstance(u.get("by"), list)
+          else ["judge"])
+    out: set[str] = set()
+    for b in by:
+        if b == "falsifier":
+            if not contested:
+                out.add(_redrive_probe_key(row))
+        else:
+            out.add(b)
+    return sorted(out)
+
+
+def _redrive_open_evidence(unmet_final: list, n_items: int, rows: list,
+                           notes: Iterable[dict], records: Iterable[dict],
+                           *, contested: Iterable[int] = ()) -> list[dict]:
+    """Per still-open item, what `_redrive_unrouted_items` accounts:
+    `{item_index, item, keys, drivable, reason, probed}` — `keys` every
+    evidence key of the item (`_redrive_evidence_keys`), `drivable` those
+    its note carries (`evidence_keys`), `reason` why the rest reach no
+    fixer: a whole-item record's own reason (`_redrive_item_notes`), else
+    `unreproducible` for a probe no fixer may be shown, else
+    `no_code_target` (a process item's evidence other than a probe with a
+    code target). An item that is neither a note nor a record (its probe
+    contested, nothing else open) is not listed."""
+    by_row = {r.get("item_index"): r for r in rows or []
+              if isinstance(r, dict)}
+    note_by = {n.get("item_index"): n for n in notes}
+    rec_by = {r.get("item_index"): r for r in records}
+    contested = set(contested)
+    out: list[dict] = []
+    done: set[int] = set()
+    for u in unmet_final or []:
+        i = u.get("item_index") if isinstance(u, dict) else None
+        if (not isinstance(i, int) or i >= n_items or i in done
+                or (i not in note_by and i not in rec_by)):
+            continue
+        done.add(i)
+        keys = _redrive_evidence_keys(u, by_row.get(i),
+                                      contested=i in contested)
+        n = note_by.get(i)
+        r = rec_by.get(i)
+        drivable = list(n.get("evidence_keys") or []) if n else []
+        probed = ""
+        if r is not None:
+            reason = str(r.get("reason") or "unreproducible")
+            probed = str(r.get("probed") or "")
+        else:
+            rest = [k for k in keys if k not in drivable]
+            reason = ("unreproducible" if any(
+                k.startswith("falsifier") for k in rest)
+                and n.get("probe") is None else "no_code_target"
+                if n.get("process") else "unreproducible")
+            if reason == "unreproducible":
+                probed = _redrive_probed(by_row.get(i))
+        out.append({"item_index": i, "item": u.get("item", ""),
+                    "keys": keys, "drivable": drivable, "reason": reason,
+                    "probed": probed})
+    return out
+
+
+def _redrive_probed(row: object) -> str:
+    """The item words a row's confirmed falsifier sample tested
+    (`item_span_quote`, `_scope_norm`ed), or `""`."""
+    fi = row.get("falsifier") if isinstance(row, dict) else None
+    s_ = next((x for x in ((fi.get("samples") or [])
+                           if isinstance(fi, dict) else [])
+               if isinstance(x, dict) and x.get("confirmed")), {})
+    return _scope_norm(str(s_.get("item_span_quote") or ""))
 
 
 # The unmet-item evidence sources no re-drive fixer can reproduce or read
@@ -63633,23 +63801,36 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
                         n_items: int, rows: list, *,
                         shown_idx: Iterable = (),
                         contested: Iterable[int] = (),
-                        suite: dict | None = None
+                        suite: dict | None = None,
+                        probe_owners: Callable[[dict], list[str]] | None
+                        = None
                         ) -> tuple[list[dict], list[dict]]:
-    """(notes, unreproducible) for the open unmet items (DESIGN §8 *Delivery
-    re-drive* rules 2 and 4), from typed fields only. An item every claimer
-    types `process` is neither. A falsifier source is reproducible when its
-    row's confirmed probe is shown (`_falsifier_shown_probe(row,
-    shown_idx, suite)`, `suite` the run's browser channel) and no measured conflict with an existing test contested
-    it (`contested`, item indices); the other sources of
+    """(notes, records) for the open unmet items (DESIGN §8 *Delivery
+    re-drive* rules 2 and 4), from typed fields only. A falsifier source is
+    reproducible when its row's confirmed probe is shown
+    (`_falsifier_shown_probe(row, shown_idx, suite)`, `suite` the run's
+    browser channel) and no measured conflict with an existing test
+    contested it (`contested`, item indices); the other sources of
     `_REDRIVE_UNREPRODUCIBLE_BY` never are. An item whose sources (`by`;
     `["judge"]` when absent) less the unreproducible ones are none is no
-    note: an `unreproducible` record `{item_index, item,
-    probed}` — or nothing, when its probe was contested (it was driven).
-    Any other is an `unmet_item` note carrying those sources alone and only
-    their evidence (`evidence_by`), plus the shown `probe` when the
+    note: a record `{item_index, item, reason: "unreproducible", probed}`
+    — or nothing, when its probe was contested (it was driven).
+
+    An item every claimer types `process` (a constraint over the whole
+    change, never one subtask's deliverable) is driven only on a shown
+    probe, to the subtasks whose diff touches the code it exercises
+    (`probe_owners(probe)`): a confirmed probe names the failing code, and
+    the diff names who changed it. With no such probe, or no owner, it is
+    a record `{item_index, item, reason: "no_code_target"}` — or
+    `unreproducible`, with `probed`, when its only evidence is a probe no
+    fixer may be shown. Its note carries the probe alone, `process: true`.
+
+    Any other is an `unmet_item` note carrying those sources alone and
+    only their evidence (`evidence_by`), plus the shown `probe` when the
     falsifier is one of them; an entry without `evidence_by` whose sources
     are not all reproducible carries no evidence, since its joined prose
-    is never split by code."""
+    is never split by code. Every note carries `evidence_keys`, the
+    `_redrive_evidence_keys` of the evidence it hands on."""
     by_row = {r.get("item_index"): r for r in rows or []
               if isinstance(r, dict)}
     shown_idx = set(shown_idx)
@@ -63661,24 +63842,32 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
         if not isinstance(i, int) or i >= n_items:
             continue
         cl = claims.get(i) or {}
-        if cl.get("kind") == "process":
-            continue   # rule 2: a process constraint is not routed
+        process = cl.get("kind") == "process"
         by = ([str(b) for b in u["by"]] if isinstance(u.get("by"), list)
               else ["judge"])
         probe = (_falsifier_shown_probe(by_row.get(i), shown_idx, suite)
                  if "falsifier" in by and i not in contested else None)
-        repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY
-                 or (b == "falsifier" and probe is not None)]
+        owners: list[str] = []
+        if process:
+            owners = (list(probe_owners(probe))
+                      if probe is not None and probe_owners else [])
+            repro = ["falsifier"] if owners else []
+        else:
+            repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY
+                     or (b == "falsifier" and probe is not None)]
         if not repro:
-            if i in contested:
+            if i in contested and not (process and set(by) - {"falsifier"}):
                 continue
-            fi = (by_row.get(i) or {}).get("falsifier")
-            s_ = next((x for x in (fi.get("samples") or []
-                                   if isinstance(fi, dict) else [])
-                       if isinstance(x, dict) and x.get("confirmed")), {})
+            unrepro_only = (probe is None and set(by) == {"falsifier"}
+                            and i not in contested)
+            if process and not unrepro_only:
+                unrepro.append({"item_index": i, "item": u.get("item", ""),
+                                "reason": "no_code_target"})
+                continue
             unrepro.append({
                 "item_index": i, "item": u.get("item", ""),
-                "probed": _scope_norm(str(s_.get("item_span_quote") or ""))})
+                "reason": "unreproducible",
+                "probed": _redrive_probed(by_row.get(i))})
             continue
         eb = u.get("evidence_by")
         if isinstance(eb, dict):
@@ -63690,7 +63879,12 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
         note = {"kind": "unmet_item", "key": f"item-{i}",
                 "item_index": i, "item": u.get("item", ""),
                 "evidence": evidence, "by": repro,
-                "claimed_by": list(cl.get("claimed_by") or [])}
+                "claimed_by": (owners if process
+                               else list(cl.get("claimed_by") or [])),
+                "evidence_keys": _redrive_evidence_keys(
+                    {"by": repro}, by_row.get(i))}
+        if process:
+            note["process"] = True
         if probe is not None and "falsifier" in repro:
             note["probe"] = probe
         notes.append(note)
@@ -67387,6 +67581,26 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     items = st.data.get("required_items") or []
     normalized = [_delivery_norm_item(it) for it in items]
 
+    def probe_owners(p_: dict) -> list[str]:
+        # A process item's probe names the failing code: its owners are the
+        # subtasks whose diff touches what it exercises (DESIGN §8 *Delivery
+        # re-drive* rule 2) — their integrated merge's files and every kept
+        # re-drive group's they were members of.
+        r = subprocess.run(["git", *_tree_git_args(staging), "rev-parse",
+                            "HEAD"], capture_output=True, text=True,
+                           check=False)
+        sha = r.stdout.strip() if r.returncode == 0 else ""
+        if not sha:
+            return []
+        ex = set(_redrive_exercised(
+            _js_source_graph(_run_repo(st), sha),
+            {"dir": p_["dir"], "defect_files": [p_["file"]]}, p_["file"]))
+        if not ex:
+            return []
+        touched = _redrive_kept_files(staging, rec, list(subfiles))
+        return [sid for sid in subfiles
+                if ex & (set(subfiles[sid]) | touched.get(sid, set()))]
+
     def item_split() -> tuple[list[dict], list[dict]]:
         dg = st.data.get("delivery_gate") or {}
         # A probe is shown only when its sample read the sets every group's
@@ -67398,7 +67612,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             shown_idx={s_.get("index") for s_ in shown},
             contested=set(_redrive_contests_by_item(
                 rec["contested_probes"])),
-            suite=_browser_suite(st))
+            suite=_browser_suite(st), probe_owners=probe_owners)
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).
@@ -67407,10 +67621,21 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     def unreproducible_items() -> list[dict]:
         return item_split()[1]
 
+    # The evidence keys open at some round's start: a key outside them was
+    # confirmed after the last round (`_redrive_unrouted_items`).
+    seen_keys: set[str] = set()
+
     def record_unrouted() -> None:
+        dg = st.data.get("delivery_gate") or {}
+        notes, records = item_split()
         unrouted = _redrive_unrouted_items(
-            open_items(), rec["items_driven"], rec["items_budget_skipped"],
-            stopped_on_budget, unreproducible=unreproducible_items())
+            _redrive_open_evidence(
+                dg.get("unmet_final") or [], len(normalized),
+                dg.get("items") or [], notes, records,
+                contested=set(_redrive_contests_by_item(
+                    rec["contested_probes"]))),
+            rec["evidence_handed"], rec["items_budget_skipped"],
+            stopped_on_budget, seen=seen_keys)
         if unrouted:
             rec["unrouted_items"] = unrouted
             log("  WARNING: delivery re-drive: "
@@ -67475,6 +67700,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         F, H_known = {}, {}
     rec.setdefault("items_driven", [])
     rec.setdefault("items_budget_skipped", [])
+    rec.setdefault("evidence_handed", [])
     stopped_on_budget = False
     if not (F or (held and H_known is None) or H_known or open_items()
             or open_checks() or open_defects()):
@@ -67487,9 +67713,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         f"{len(F)} failing shown set file(s), {len(open_items())} unmet "
         f"item(s), {len(open_checks())} red merge check(s), "
         f"{len(open_defects())} unfixed solution defect(s)"
-        + (f"; {len(unreproducible_items())} unmet item(s) only a held-out "
-           "falsifier probe shows — not driven (unreproducible)"
-           if unreproducible_items() else ""))
+        + "".join(
+            f"; {n} unmet item(s) {why} — not driven ({reason})"
+            for reason, why in (
+                ("unreproducible", "only a held-out falsifier probe shows"),
+                ("no_code_target", "a process constraint with no evidence "
+                                   "naming code a subtask changed"))
+            for n in [sum(1 for u in unreproducible_items()
+                          if u.get("reason") == reason)] if n))
     cap = int(caps.get("subtask_redrive_rounds",
                        DEFAULT_CAPS["subtask_redrive_rounds"]))
     budget = float(caps.get("redrive_budget_sec",
@@ -67551,6 +67782,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 held_mode = True
                 rec["held_round_done"] = True
         items_open = open_items()
+        seen_keys.update(f"{n['item_index']}:{k}" for n in items_open
+                         for k in n.get("evidence_keys") or ())
         checks_open = open_checks()
         defects_open = open_defects()
         if not held_mode and not (F or items_open or checks_open
@@ -67678,6 +67911,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     note, effort=effort, label=label,
                     bin_dir=sc["bin"] if sc else None,
                     db=bool(shown or probe_sets))
+                # What a worker was handed, by evidence key: an item whose
+                # later evidence no group was handed reached no worker
+                # with it, whatever earlier rounds drove.
+                rec["evidence_handed"] = sorted(
+                    set(rec["evidence_handed"])
+                    | {f"{n['item_index']}:{k}" for n in live
+                       if n["kind"] == "unmet_item"
+                       for k in n.get("evidence_keys") or ()})
                 objs = _redrive_probe_objections(
                     ge["implementer"].pop("probe_objections", None),
                     probe_sets)

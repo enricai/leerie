@@ -10611,9 +10611,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `_run_phases` logs it as advisory). The start verdict is `acceptance.gate.final`
   when `gate.final_sha` is the staging HEAD, else one
   `_evaluate_acceptance_sets` of the shown sets (B*-confirmed). Items:
-  `delivery_gate.unmet_final`, minus items every claimer types `process`,
-  split by `_redrive_item_notes(unmet_final, claims, n_items, rows, *,
-  shown_idx=(), contested=(), suite=None) -> (notes, unreproducible)` (`rows` is
+  `delivery_gate.unmet_final`, split by `_redrive_item_notes(unmet_final,
+  claims, n_items, rows, *, shown_idx=(), contested=(), suite=None,
+  probe_owners=None) -> (notes, records)` (`rows` is
   `delivery_gate.items`; `shown_idx` the indices of the shown sets not
   typed broken; `contested` the item indices of
   `delivery_redrive.contested_probes`, a measured conflict, through
@@ -10629,20 +10629,47 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `by` (`["judge"]` when absent) less `_REDRIVE_UNREPRODUCIBLE_BY` —
   keeping `falsifier` when the item is not contested and its probe is
   shown — is its reproducible sources. With none, the item is no note:
-  it is an `unreproducible` record `{item_index, item, probed}`
-  (`probed`: the confirmed falsifier sample's `item_span_quote`,
-  `_scope_norm`ed, from its `items[]` row; `""` when none), or nothing
-  when it is contested (it was driven). Otherwise the note is `{kind:
-  "unmet_item", key: "item-<i>", item_index, item, evidence, by:
-  <reproducible sources>, claimed_by[], probe?}` (`probe` the shown
-  probe when `falsifier` is among them), its `evidence` the `" | "` join
+  it is a record `{item_index, item, reason: "unreproducible", probed}`
+  (`probed`, `_redrive_probed(row)`: the confirmed falsifier sample's
+  `item_span_quote`, `_scope_norm`ed, from its `items[]` row; `""` when
+  none), or nothing when it is contested (it was driven). An item every
+  claimer types `process` (`_item_claims`) has one reproducible source at
+  most: `falsifier`, when its probe is shown, not contested, and
+  `probe_owners(probe)` is non-empty — in `_run_delivery_redrive`, the
+  subtasks (`subfiles` order) whose `subfiles` files or
+  `_redrive_kept_files(staging, rec, sids)` files (sid -> the source files
+  `git diff --name-only <pre_sha> <post_sha>` of every group in
+  `rec.rounds` with both, not `rolled_back`, that it was a member of,
+  filtered as `_redrive_subtask_files` filters) meet
+  `_redrive_exercised(_js_source_graph(run repo, staging HEAD), {dir,
+  defect_files: [file]}, file)`; its note's `claimed_by` is those owners
+  and it carries `process: true`. With none, it is a record `{item_index,
+  item, reason: "no_code_target"}` — `unreproducible` with `probed` when
+  its only source is a falsifier whose probe is not shown — or nothing
+  when its only source is a contested falsifier. Otherwise the note is
+  `{kind: "unmet_item", key: "item-<i>", item_index, item, evidence, by:
+  <reproducible sources>, claimed_by[], evidence_keys[], process?,
+  probe?}` (`probe` the shown probe when `falsifier` is among them;
+  `evidence_keys` the `_redrive_evidence_keys({by: <its sources>}, row)`),
+  its `evidence` the `" | "` join
   of `evidence_by[<source>]` over those sources; an entry with no
   `evidence_by` keeps its `evidence` when every source is reproducible,
-  else `""` (code does not split the joined prose). The unreproducible
-  items are never routed or driven, are re-checked with the rest at the
-  end (`start_items` holds them), and are recorded through
-  `_redrive_unrouted_items(…, unreproducible=)` — also when they are the
-  only open work, where the re-drive ends before any round.
+  else `""` (code does not split the joined prose). The records are never
+  routed or driven, are re-checked with the rest at the end
+  (`start_items` holds them), and are accounted by
+  `_redrive_unrouted_items` — also when they are the only open work,
+  where the re-drive ends before any round. Evidence keys
+  (`_redrive_evidence_keys(u, row, *, contested=False) -> list[str]`): one
+  per source of the entry's `by` (`["judge"]` when not a list); a
+  falsifier source is `_redrive_probe_key(row)` — `"falsifier:"` + the
+  first 16 hex of the SHA-256 of the confirmed sample's `probe_saved.file`,
+  a NUL and the file's bytes (`_read_beneath`, at most
+  `_REDRIVE_PROBE_KEY_MAX = 1 MiB`), else `"falsifier"` when no saved
+  probe can be read — and none when the item is contested; any other
+  source is its name. Right after a group's implementer returns, the keys
+  of every `unmet_item` note it held join `evidence_handed` as
+  `"<i>:<key>"`; at each round's start the open notes' keys join an
+  in-memory `seen`.
   Merge checks: `_ci_parity_unmet(st)`. Residual solution defects:
   `conformance._final.residual_defects`, each a note `{kind:
   "solution_defect", key: "solution-defect-<j>", defect_kind, where,
@@ -10671,7 +10698,8 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `solution_defect` by its `where` file) goes to the
   subtasks it touches, else the defect claimers, else every subtask. An
   item goes to every claimer (`_item_claims(plan_subtasks)` over
-  `claims.items`), else the defect claimers, else every subtask. Subtasks
+  `claims.items`; for a `process` note, its `claimed_by`, the owners of its
+  probe), else the defect claimers, else every subtask. Subtasks
   sharing a file are unioned into one group; groups and members keep plan
   order; every group also carries the pending `control_regression` notes.
 - **Rounds.** At most as many as the members' shared counters allow, and
@@ -14059,7 +14087,7 @@ command line overrides it.
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[], unverified?{item_index: {sha, label}}}` (`unverified`: items a failed ratchet did not read on the commit it kept, `_ratchet_mark_unverified`) — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
 | `round_rollbacks` | list[dict] \| absent | every worker round rolled back (`_record_round_rollback`, DESIGN §8 *A rollback says why*): `[{site, worker, label, reason, pre_sha, post_sha, rolled_back}]`; `rolled_back` false when the reset did not land. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), rollback_reason? (why a group was rolled back, in words: `_redrive_rollback_reason`, or the unclean tree), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], items_driven[item indices a group drove], items_budget_skipped[item indices a group held with no member left a re-drive round], unrouted_items?[{item_index, item, reason: no_owner | budget | unreproducible, probed?}] (`_redrive_unrouted_items(open_items, driven, budget_skipped, stopped_on_budget, unreproducible=())` at the end: still-open items no group drove, then each still-open `unreproducible` record with reason `unreproducible` and its `probed`; read by `_decide_outcome`'s reasons — one line naming every unrouted item and reason, then per `unreproducible` one saying a confirmed falsifier probe of the item's words `probed` fails under B\* and the probe is held-out content no fixer could see, so no re-drive round was spent on it — and `_prior_delivery_residual`'s `unrouted_items`), kept_unsettled?[], probes_after?{"<item>": pass \| fail \| unmeasured} (`_redrive_probe_verdicts`), probe_conflict?{items[], tests[{id, file}]} (`_redrive_pinned_breaks`), probe_objections?[] (`_redrive_probe_objections`), rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], contested_probes[{item_index, probe_test_file, tests[{id, file}], round, group}] (a measured conflict: a group's commit made the probe pass and broke a case an existing test pins; the item is passed to `_redrive_item_notes(contested=)`, so its probe is never handed on again; `_decide_outcome` adds, per still-unmet item, `_redrive_contest_text` of its first record — "item <i>: its falsifier probe <file> conflicts with existing tests — the re-drive change that made it pass (round <r>, group <g>) broke <n> case(s) they pin: <ids> …; the change was rolled back and the probe is not driven again — a person decides; the item stays unmet" — and `_collect_unmet_evidence` its `conflicts_with`), probe_objections[{item_index, probe_test_file, kind, reason, round, group}] (every kept objection, unverified; `_decide_outcome` adds, per still-unmet item, `_redrive_objection_text` of each of its first 3 — "item <i>: a re-drive fixer objected to its falsifier probe <file> (<kind>): "<reason>" — its own words, not verified by leerie; it exempts nothing" — and `_collect_unmet_evidence` its `objections`), held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), selfcheck_calls?[{args[], subset[], name_filter, rc, secs_total}] (the group's self-check calls, first 50), unclean_tree?[] (the porcelain lines a group's implementer left past `clean_tree_reasks`; the group is then `rolled_back`), rollback_reason? (why a group was rolled back, in words: `_redrive_rollback_reason`, or the unclean tree), committed_staged[] (shown set paths a commit names — `git log --name-only -m pre..post` — and paths whose committed blob holds a span of a shown set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], items_driven[item indices a group drove], items_budget_skipped[item indices a group held with no member left a re-drive round], evidence_handed["<item index>:<evidence key>" a driven group's notes carried, `_redrive_evidence_keys`], unrouted_items?[{item_index, item, reason: no_owner | budget | unreproducible | no_code_target | after_last_round, probed?}] (at the end, `_redrive_unrouted_items(open_items, handed, budget_skipped, stopped_on_budget, seen=None)` over `_redrive_open_evidence(unmet_final, n_items, rows, notes, records, *, contested=())` — per still-open note or record `{item_index, item, keys, drivable, reason, probed}`: `keys` every evidence key of the item, `drivable` its note's `evidence_keys`, `reason` a record's own, else `unreproducible` when a key outside the note is a falsifier's and the note has no `probe`, else `no_code_target` for a `process` note, else `unreproducible`; `probed` the record's, or `_redrive_probed(row)` when `unreproducible` — in item order: an item with every key in `handed` (`evidence_handed`) is not listed; else, when a missing key is `drivable`, `budget` if the item is in `budget_skipped` or `stopped_on_budget`, else `after_last_round` if `seen` is not None and a missing drivable key is not in it, else `no_owner`; else the entry's `reason`, with `probed` when `unreproducible`; read by `_decide_outcome`'s reasons — one line naming every unrouted item and reason, then per item: `unreproducible`, that a confirmed falsifier probe of the item's words `probed` fails under B\* and the probe is held-out content no fixer could see, so no re-drive round was spent on it, or, for an item in `items_driven`, so no re-drive worker was handed it (the item's other evidence was driven); `no_code_target`, "item <i> is a constraint over the whole change whose unmet evidence names no code a subtask changed, so no re-drive worker could be handed it"; `after_last_round`, "item <i>'s unmet evidence was confirmed on the tree that ships after the re-drive's last round, so no re-drive worker was handed it"; any other reason for an item in `items_driven`, "item <i> was driven on earlier evidence; its latest confirmed evidence reached no re-drive worker (<reason>)" — and `_prior_delivery_residual`'s `unrouted_items`), kept_unsettled?[], probes_after?{"<item>": pass \| fail \| unmeasured} (`_redrive_probe_verdicts`), probe_conflict?{items[], tests[{id, file}]} (`_redrive_pinned_breaks`), probe_objections?[] (`_redrive_probe_objections`), rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], contested_probes[{item_index, probe_test_file, tests[{id, file}], round, group}] (a measured conflict: a group's commit made the probe pass and broke a case an existing test pins; the item is passed to `_redrive_item_notes(contested=)`, so its probe is never handed on again; `_decide_outcome` adds, per still-unmet item, `_redrive_contest_text` of its first record — "item <i>: its falsifier probe <file> conflicts with existing tests — the re-drive change that made it pass (round <r>, group <g>) broke <n> case(s) they pin: <ids> …; the change was rolled back and the probe is not driven again — a person decides; the item stays unmet" — and `_collect_unmet_evidence` its `conflicts_with`), probe_objections[{item_index, probe_test_file, kind, reason, round, group}] (every kept objection, unverified; `_decide_outcome` adds, per still-unmet item, `_redrive_objection_text` of each of its first 3 — "item <i>: a re-drive fixer objected to its falsifier probe <file> (<kind>): "<reason>" — its own words, not verified by leerie; it exempts nothing" — and `_collect_unmet_evidence` its `objections`), held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½), plus `gate` (`skipped` \| `degraded` \| `passed`, `_record_provision_gate`) once `phase_provision_gate` has a result. `_run_phases` runs both after the `plans_after_classify` block, keyed on `recipe` and on `gate` (DESIGN §6 *Resumable planning*). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution`, `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*) or `satisfied_on_base` (`executed?`, `claimed_locations?`). |
