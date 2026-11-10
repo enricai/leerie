@@ -1359,7 +1359,11 @@ def test_every_nerdctl_command_names_leeries_namespace():
     # 22: `_remove_launch_container`'s bounded `rm -f`, for a runtime that
     # stopped answering after the run ended (DESIGN §6 *A launch's
     # host-side work starts when its run has ended*), is a site of its own.
-    assert len(own) == 22, own
+    # 23: `_base_archive_bytes`' read of the base's blob sizes, which the
+    # base's copy is sized by (DESIGN §6 *The base a repository's build
+    # reads is where BuildKit reads it, with the base's id, or the launch
+    # stops*).
+    assert len(own) == 23, own
     # The run's quoted forms (macOS `script`) name it too.
     assert leerie.count(
         '_nerdctl_run_quoted="nerdctl --namespace $LEERIE_IMAGE_NS run"') == 2

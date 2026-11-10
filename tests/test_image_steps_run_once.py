@@ -53,6 +53,7 @@ nerdctl() {
       case "$*" in
         *RepoDigests*) [ -e "$STUB_DIR/repo" ] || return 1
                        echo "leerie-repo/x@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;
+        *Manifest.Layers*) echo 1000 2000 300 ;;
         *RootFS.Layers*) case "$*" in *"$IMAGE_TAG") echo '["sha256:b"]' ;;
                          *) echo '["sha256:b","sha256:w"]' ;; esac ;;
         *Config*) echo '{"Entrypoint":["/e"],"Image":"x"}' ;;
@@ -69,9 +70,9 @@ nerdctl() {
     pull:default)
       echo pull >> "$STUB_DIR/steps"; /usr/bin/sleep 0.5
       : > "$STUB_DIR/frontend" ;;
-    save:leerie) echo image-bytes ;;
+    save:leerie) [ "${1:-}" = -o ] || return 1; echo image-bytes > "$2" ;;
     load:default)
-      while IFS= read -r _a; do :; done
+      [ "${1:-}" = -i ] && [ -f "$2" ] || return 1
       echo load >> "$STUB_DIR/steps"; /usr/bin/sleep 0.5
       : > "$STUB_DIR/worker-base" ;;
     build:leerie)
@@ -151,7 +152,8 @@ def test_concurrent_launches_build_leeries_base_once(tmp_path):
 def test_concurrent_launches_on_one_checkout_copy_and_build_once(tmp_path):
     """N launches at once on one checkout whose repository image is not
     built, the base present only in leerie's namespace: the base is copied
-    into the worker's namespace once, streamed with no file in TMPDIR, the
+    into the worker's namespace once, through the build directory's file
+    and none in TMPDIR, the
     frontend pulled once, the repository image built once (its two builds),
     and every launch ends with the image recorded. Falsified live
     (2026-11-03): the checkout's lock dropped (several repository builds,

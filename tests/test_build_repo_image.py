@@ -74,12 +74,20 @@ nerdctl() {{
       # every query (the base absent there), STUB_WORKER_BASE_ID (if set) is
       # the id of the base copy there.
       if [ "$ns" = "${{STUB_WORKER_NS:-default}}" ]; then
+        # A base `load` put there: the id it loaded.
+        if [ -f "$NERDCTL_LOG.worker-base" ]; then
+          echo "$(< "$NERDCTL_LOG.worker-base")"; return 0
+        fi
         if [ -n "${{NERDCTL_WORKER_INSPECT_RC:-}}" ]; then
           return "$NERDCTL_WORKER_INSPECT_RC"
         fi
         if [ -n "${{STUB_WORKER_BASE_ID:-}}" ]; then
           echo "$STUB_WORKER_BASE_ID"; return 0
         fi
+      fi
+      # STUB_NO_BASE_ID: leerie's namespace has no base to give an id for.
+      if [ "$ns" = leerie ] && [ -n "${{STUB_NO_BASE_ID:-}}" ]; then
+        case "$*" in *.Id*) return 1 ;; esac
       fi
       # `image rm <name>`: fails for a name a container still uses.
       if [ "${{1:-}}" = rm ]; then
@@ -122,6 +130,11 @@ nerdctl() {{
         printf ' DOCKER_AUTH_CONFIG=%s' "${{DOCKER_AUTH_CONFIG-unset}}"
         echo
       }} >> "$NERDCTL_LOG.env"
+      # A base archive still on disk while a build runs.
+      local _bt
+      for _bt in "$LEERIE_STATE_HOST_DIR"/.image-build/*/base.tar; do
+        [ -e "$_bt" ] && echo "$_bt" >> "$NERDCTL_LOG.tar-at-build"
+      done
       # NERDCTL_FAIL_LANG_LAYER: a build whose -f file holds a language-dep
       # layer (its `# copy-input-shas:` line) fails, as a layer that does not
       # build would (builtins only).
@@ -136,6 +149,24 @@ nerdctl() {{
       fi
       _stub_build_done "$@"
       return "${{NERDCTL_BUILD_RC:-0}}"
+      ;;
+    save)
+      # `save -o <file> <tag>`: writes the archive to <file>, or fails with
+      # STUB_SAVE_ERR on stderr (builtins only).
+      if [ -n "${{STUB_SAVE_ERR:-}}" ]; then echo "$STUB_SAVE_ERR" >&2; return 1; fi
+      [ "${{1:-}}" = -o ] || {{ echo "save without -o" >&2; return 1; }}
+      echo image-bytes > "$2"
+      return 0
+      ;;
+    load)
+      # `load -i <file>`: records what the file held and its directory's
+      # mode, then fails with STUB_LOAD_ERR, or puts STUB_LOADED_ID (the
+      # base's id by default) in the worker's namespace.
+      [ "${{1:-}}" = -i ] || {{ echo "load without -i" >&2; return 1; }}
+      echo "$(< "$2") dirmode=$(/usr/bin/stat -c %a "${{2%/*}}")" >> "$NERDCTL_LOG.loaded"
+      if [ -n "${{STUB_LOAD_ERR:-}}" ]; then echo "$STUB_LOAD_ERR" >&2; return 1; fi
+      echo "${{STUB_LOADED_ID:-sha256:base-id}}" > "$NERDCTL_LOG.worker-base"
+      return 0
       ;;
     *)
       return 0
@@ -294,8 +325,9 @@ def test_base_copied_into_the_workers_namespace_before_build(tmp_path):
     *No build consumes what another build left in BuildKit*); without this
     copy `FROM $BASE_IMAGE` 401s against the registry. Assert the launcher
     probes the worker's namespace (`default` here, from `buildctl debug
-    workers`) and (when absent) runs `nerdctl --namespace leerie save |
-    nerdctl --namespace default load`, before the `nerdctl build`."""
+    workers`) and (when absent) runs `nerdctl --namespace leerie save -o
+    <file>` and `nerdctl --namespace default load -i <file>`, before the
+    `nerdctl build`."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -321,11 +353,13 @@ def test_base_copied_into_the_workers_namespace_before_build(tmp_path):
 
     log_content = (tmp_path / "nerdctl.log").read_text()
     lines = log_content.splitlines()
-    # The copy path, streamed: `--namespace leerie save leerie:1.2.3` into
-    # `--namespace default load`, through no file (DESIGN §6 *A host-wide
-    # image step runs once, under a host lock*).
-    assert "--namespace leerie save leerie:1.2.3" in lines, log_content
-    assert "--namespace default load" in lines, log_content
+    # The copy path, through a file (DESIGN §6 *The base a repository's
+    # build reads is where BuildKit reads it, with the base's id, or the
+    # launch stops*).
+    assert any(re.fullmatch(r"--namespace leerie save -o \S+/base\.tar leerie:1\.2\.3", l)
+               for l in lines), log_content
+    assert any(re.fullmatch(r"--namespace default load -i \S+/base\.tar", l)
+               for l in lines), log_content
     # The probe is `--namespace default image inspect -f {{.Id}} leerie:1.2.3`.
     assert any(l.startswith("--namespace default image inspect ")
                and l.endswith(" leerie:1.2.3") for l in lines), log_content
@@ -395,8 +429,8 @@ def test_base_copied_again_when_the_workers_copy_is_another_image(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     lines = (tmp_path / "nerdctl.log").read_text().splitlines()
-    assert any(l.startswith("--namespace leerie save ") for l in lines), lines
-    assert "--namespace default load" in lines, lines
+    assert any(l.startswith("--namespace leerie save -o ") for l in lines), lines
+    assert any(l.startswith("--namespace default load -i ") for l in lines), lines
 
 
 @pytest.mark.parametrize("in_use", ["", "leerie-repo/enricai-barnacle:0.43.0"])
@@ -1014,15 +1048,7 @@ def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
 
 
 
-@pytest.mark.parametrize("failing", ["save", "load"])
-def test_save_load_streams_and_logs_stderr_on_failure(tmp_path, failing):
-    """ensure_base_in_worker_ns streams `nerdctl save` into `nerdctl load`
-    through no file (DESIGN §6 *A host-wide image step runs once, under a
-    host lock*: five launches each wrote a 2.4 GB tarball to /tmp), and a
-    failure of either side is detected through `PIPESTATUS`, its stderr
-    logged via remote_log. Falsified live (2026-11-03): the status taken
-    from the pipeline alone, without `PIPESTATUS[0]` (a failed save passes
-    silently); the tempfile form restored (a file in `TMPDIR`)."""
+def _copy_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -1031,59 +1057,109 @@ def test_save_load_streams_and_logs_stderr_on_failure(tmp_path, failing):
     state_dir.mkdir()
     tmpdir = tmp_path / "tmp"
     tmpdir.mkdir()
+    return user_repo, state_dir, tmpdir
 
-    # A nerdctl stub whose `save` or `load` prints a diagnostic to stderr
-    # and fails; `load` reads what it is given (builtins only).
-    body = r"""
-nerdctl() {
-  echo "$*" >> "$NERDCTL_LOG"
-  local ns=""
-  if [ "${1:-}" = "--namespace" ]; then ns="${2:-}"; shift 2 || true; fi
-  local cmd="${1:-}"; shift || true
-  case "$cmd" in
-    image) [ "$ns" = "default" ] && return 1; _stub_image_inspect "$@" && return 0; return "${NERDCTL_INSPECT_RC:-0}" ;;
-    save)
-      [ "$FAILING" = save ] && { echo "nerdctl-save-failure: disk quota exceeded" >&2; return 1; }
-      echo "image-bytes"; return 0 ;;
-    load)
-      local _l
-      while IFS= read -r _l; do echo "$_l" >> "$NERDCTL_LOG.loaded"; done
-      [ "$FAILING" = load ] && { echo "nerdctl-load-failure: no space left" >&2; return 1; }
-      return 0 ;;
-    build) return "${NERDCTL_BUILD_RC:-0}" ;;
-    *) return 0 ;;
-  esac
-}
-leerie_buildkit_resolve
-ensure_base_in_worker_ns
-"""
-    result = _run_harness(
-        tmp_path,
-        body,
-        env={
-            "USER_REPO": str(user_repo),
+
+def _copy_env(user_repo: Path, state_dir: Path, tmpdir: Path,
+              **extra: str) -> dict[str, str]:
+    return {"USER_REPO": str(user_repo),
             "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",           # repository image absent
+            "NERDCTL_WORKER_INSPECT_RC": "1",    # base absent where BuildKit reads
             "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
             "LEERIE_VERSION": "1.2.3",
             "IMAGE_TAG": "leerie:1.2.3",
-            "FAILING": failing,
             "TMPDIR": str(tmpdir),
-        },
-    )
-    assert result.returncode == 0, result.stderr
+            **extra}
 
+
+def test_the_base_is_copied_through_a_private_file_and_checked_by_id(tmp_path):
+    """The base goes into BuildKit's namespace through a file in the
+    launch's own build directory under the state root, mode 0700, never
+    `save | load` and never in TMPDIR: nerdctl 2.3.5's `save` exits before a
+    slow reader has the archive's tail (DESIGN §6 *The base a repository's
+    build reads is where BuildKit reads it, with the base's id, or the launch
+    stops*; the operator's 0.55.2 launches). The file is removed once loaded,
+    the id there is read again after the load, and only then the build runs.
+    Falsified live (2026-11-09), each restored: the streamed form restored
+    (`save` without `-o`); the file's `rm` after the load dropped (left in
+    the build directory)."""
+    user_repo, state_dir, tmpdir = _copy_repo(tmp_path)
+    result = _run_harness(
+        tmp_path, 'echo "done"',
+        env=_copy_env(user_repo, state_dir, tmpdir))
+    assert result.returncode == 0, result.stderr
     lines = (tmp_path / "nerdctl.log").read_text().splitlines()
-    # Streamed: no `-o`/`-i` file argument, and nothing left in TMPDIR.
-    assert "--namespace leerie save leerie:1.2.3" in lines, lines
-    assert "--namespace default load" in lines, lines
+    save = [l for l in lines if " save " in l]
+    load = [l for l in lines if " load " in l]
+    assert len(save) == 1 and len(load) == 1, lines
+    f = save[0].split()[4]
+    assert save[0] == f"--namespace leerie save -o {f} leerie:1.2.3", save
+    assert load[0] == f"--namespace default load -i {f}", load
+    assert re.fullmatch(re.escape(str(state_dir))
+                        + r"/\.image-build/b\.\d+\.\w+/base\.tar", f), f
+    # The file held the export while `load` read it, in a 0700 directory.
+    assert (tmp_path / "nerdctl.log.loaded").read_text() \
+        == "image-bytes dirmode=700\n"
+    assert not (tmp_path / "nerdctl.log.tar-at-build").exists()
     assert not list(tmpdir.iterdir())
-    if failing == "load":
-        assert (tmp_path / "nerdctl.log.loaded").read_text() == "image-bytes\n"
-    diag = {"save": "nerdctl-save-failure: disk quota exceeded",
-            "load": "nerdctl-load-failure: no space left"}[failing]
-    assert "warning: could not copy base image into default" in result.stderr, \
-        result.stderr
-    assert diag in result.stderr, result.stderr
+    i_load = lines.index(load[0])
+    after = lines[i_load + 1:]
+    i_check = next(i for i, l in enumerate(after)
+                   if l == "--namespace default image inspect -f {{.Id}} leerie:1.2.3")
+    assert any(l.startswith("--namespace leerie build ")
+               for l in after[i_check:]), lines
+
+
+@pytest.mark.parametrize("case", ["save", "load", "id", "disk", "size", "no-base"])
+def test_a_base_copy_that_fails_stops_the_launch_with_its_error(tmp_path, case):
+    """Every way the copy can fail stops the launch, before any build, with
+    what failed: nerdctl's own message for a failed export or load, the two
+    ids when the worker's copy is not the base, the bytes needed and free
+    when the disk is too small. It never warns and goes on into a build that
+    can only fail, naming the registry ("pull access denied"; the operator's
+    0.55.2 launches). No file is left. Falsified live (2026-11-09), each
+    restored: the warn-and-continue form (`save` and `load` build anyway);
+    the id check after the load dropped (`id` builds); the free-space
+    comparison dropped (`disk` builds); the size's digit check dropped
+    (`size` copies, `1+1` evaluated as arithmetic); the base-id check
+    dropped (`no-base` builds, the two empty ids matching)."""
+    user_repo, state_dir, tmpdir = _copy_repo(tmp_path)
+    extra, want = {
+        "save": ({"STUB_SAVE_ERR": "nerdctl-save-failure: disk quota exceeded"},
+                 "could not export the base image leerie:1.2.3 to copy it into"
+                 " default: nerdctl-save-failure: disk quota exceeded"),
+        "load": ({"STUB_LOAD_ERR": 'failed to ingest "blobs/sha256/e60af5": short read'},
+                 "could not load the base image leerie:1.2.3 into default, the"
+                 " namespace BuildKit's worker reads: failed to ingest"
+                 ' "blobs/sha256/e60af5": short read'),
+        "id": ({"STUB_LOADED_ID": "sha256:another"},
+               "the base image leerie:1.2.3 in default has id sha256:another"
+               " after its copy, not the base's sha256:base-id"),
+        "disk": ({"STUB_BASE_BLOB_SIZES": "999999999999999999"},
+                 "copying the base image into default needs"
+                 " 1000000000001048575 bytes in "),
+        # Text that bash arithmetic would evaluate (`1+1`), never a size.
+        "size": ({"STUB_BASE_BLOB_SIZES": "12 1+1"},
+                 "could not read the size of the base image leerie:1.2.3 to"
+                 " copy it into default"),
+        "no-base": ({"STUB_NO_BASE_ID": "1"},
+                    "the base image leerie:1.2.3 has no id in the leerie"
+                    " namespace"),
+    }[case]
+    result = _run_harness(tmp_path, 'echo "reached-after-copy"',
+                          env=_copy_env(user_repo, state_dir, tmpdir, **extra))
+    assert result.returncode == 1, result.stderr
+    assert "reached-after-copy" not in result.stdout
+    assert f"error: {want}" in result.stderr, result.stderr
+    lines = (tmp_path / "nerdctl.log").read_text().splitlines()
+    assert not any(l.startswith("--namespace leerie build ") for l in lines), lines
+    assert not list(state_dir.glob(".image-build/*/base.tar"))
+    assert not list(tmpdir.iterdir())
+    if case in ("disk", "size", "no-base"):
+        assert not any(" save " in l for l in lines), lines
+
+
 # must point at /opt/bundle only when the Dockerfile actually baked there,
 # else keep the pre-existing cache-mount fallback path.
 # ---------------------------------------------------------------------------

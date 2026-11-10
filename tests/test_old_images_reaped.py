@@ -475,7 +475,7 @@ def test_older_base_copies_leave_the_worker_namespace_before_the_copy(
     assert "leerie:0.0.1 in default (1.4GB)" in r.stderr, r.stderr
     assert "docker.io/library/leerie:0.0.2 in default (2.4GB)" in r.stderr
     load = next(i for i, c in enumerate(calls)
-                if c == "--namespace default load")
+                if c.startswith("--namespace default load -i "))
     assert max(calls.index(c) for c in rms) < load, calls
 
 

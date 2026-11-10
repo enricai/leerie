@@ -85,6 +85,9 @@ _stub_image_inspect() {
       else
         return 1
       fi ;;
+    # The base's blob sizes (`_base_archive_bytes`), before *Config*, which
+    # its template also names.
+    *Manifest.Layers*) echo "${STUB_BASE_BLOB_SIZES:-1000 2000 300}" ;;
     *RootFS.Layers*)
       if [ "$_tag" = "${IMAGE_TAG:-}" ]; then echo '["sha256:b"]'
       else echo '["sha256:b","sha256:w"]'; fi ;;

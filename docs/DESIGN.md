@@ -3665,13 +3665,72 @@ they are confined.
   launcher's shell, which every program it starts would inherit (Colima's
   SSH ControlMaster keeps what it inherited); that process lets go when
   the step ends or within half a second of its launch's end, however it
-  ends. The base's copy streams `nerdctl save` into `nerdctl load` and
-  writes no file. *Designed 2026-11-03 (the operator's live 0.44.0
+  ends. *Designed 2026-11-03 (the operator's live 0.44.0
   launches):* five launches started within about two minutes on one
   checkout each exported the base to its own tarball in `/tmp` and loaded
   it at once, about 2.4 GB each; nothing serialised them. *Cost:* a launch
   waits for another's base build, copy or repository build instead of
   repeating it, and says once that it waits.
+- *The base a repository's build reads is where BuildKit reads it, with
+  the base's id, or the launch stops.* Before a repository's first build
+  the namespace each BuildKit worker reads holds leerie's base under its
+  tag with the id the base has in `leerie` (`ensure_base_in_worker_ns`).
+  When a copy is needed, it goes through a file: `nerdctl save -o` into the
+  launch's own build directory (`<state root>/.image-build/b.<pid>.<random>`,
+  mode 0700, removed when the launch ends however it ends, and by the next
+  launch's sweep after a SIGKILL; *A repository image's build directory
+  lives only as long as its launch*), then `nerdctl load -i` from it; the
+  file is removed as soon as the load returns. Before the export the
+  launcher compares the free space of that directory's disk with the size
+  of the base's blobs, its manifest's layers and configuration, which is
+  what the archive holds, and stops when they do not fit. After the load it
+  reads the image's id in the worker's namespace and stops unless it is the
+  base's id. A failed export, a failed load, a different id or a full disk
+  each stop the launch with what failed, before any build: a repository
+  build on a base that is not there can only fail, and fails naming the
+  registry ("pull access denied"), not the copy. Nothing is retried; the
+  stop says what failed.
+  Why a file, where the copy used to be a stream (`save | load`) so that no
+  copy of the base landed on disk: that rule answered five launches each
+  writing a tarball of the base to `/tmp` at once (above). The copy now
+  runs under the host's image lock, so the host holds one such file at a
+  time, in a directory of the launch's own under the state root, never in
+  `/tmp`, after a check that it fits.
+  The stream was not whole. nerdctl 2.3.5's `save` hands the export to
+  containerd's transfer service, whose client copies the archive to
+  `save`'s output in a goroutine nothing waits for (containerd 2.2.2,
+  `ImageExportStream.MarshalAny`): `save` exits when the server has sent
+  the last bytes, whether or not they were written. A reader slower than
+  the export loses the archive's tail. `nerdctl load` is such a reader:
+  it ingests as it reads. `load` itself reads a pipe whole: the same
+  archive, saved to a file and piped into it with `cat`, loaded twice.
+  A file is the fastest reader leerie has, not a guarantee, so the launch
+  trusts the load and the id it reads afterwards, never the export: a short
+  file fails the load, and the launch stops with nerdctl's message.
+  containerd and nerdctl offer no copy between namespaces that is not an
+  archive: nerdctl has none, and `ctr` would have to enter rootlesskit's
+  namespaces on Linux and run inside Colima's VM on macOS.
+  *Rootless, rootful, Fly and EC2.* On rootless containerd nerdctl runs as
+  the host user and writes the file as that user. On Colima the launcher's
+  `nerdctl` is a shim that runs nerdctl as root in the VM, where `-o` and
+  `-i` name the same path through Colima's mount of the home directory:
+  the directory the repository image's first build already writes its OCI
+  layout to, and the free-space check on the macOS host reads the disk that
+  mount writes to. Fly and EC2 machines never run the copy; a launcher of
+  those runtimes that reaches it runs it against its own host's containerd,
+  one of the two above.
+  *Designed 2026-11-09 (the operator's launches of 0.55.2, twice):* the
+  streamed copy failed on every launch ("failed to ingest
+  blobs/sha256/e60af5…: short read: expected 275497 bytes but got 159744",
+  122,368 bytes before the archive's end); the launcher only warned, and
+  both builds then failed as "pull access denied …
+  docker.io/library/leerie:0.55.2". Measured on rootless nerdctl 2.3.5,
+  BuildKit 0.31.2, containerd 2.2.2: `save | load` of the base into a
+  namespace of its own failed the same way, at the same byte, in each of
+  3 runs (`save` exited 0 in both whose status was kept); a reader of `save`'s pipe that sleeps
+  5 ms per 16 KiB got 11,776 bytes short of the base's 1,035,197,952, and
+  a short archive in 6 of 10 runs of a 3.3 MB image; to a file, the
+  3.3 MB export was whole in 30 of 30 runs.
 - *An image no launch can use any more is removed by leerie.* Every image
   leerie makes in its own namespace is named for the version that made it:
   its base `leerie:<version>`, each repository image

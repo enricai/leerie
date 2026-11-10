@@ -291,7 +291,13 @@ The local per-repo image surface — `resolve_repo_image_tag`,
 worker reads, `default` in the harness's `buildctl` stub, before the derived
 build so `FROM $BASE_IMAGE` resolves locally; `tests/test_build_repo_image.py`
 pins that the copy fires and precedes the build, the skip when the copy
-there has the base's id, and the copy again when its id differs) — is
+there has the base's id, and the copy again when its id differs; and,
+for DESIGN §6 *The base a repository's build reads is where BuildKit reads
+it, with the base's id, or the launch stops*, that the copy goes through
+`base.tar` in the launch's 0700 build directory, is gone before the build,
+and is checked by id after the load, and that a failed export, a failed
+load, a different id, a disk too small, an unreadable size or a base with
+no id each stop the launch before any build with what failed, 6 cases) — is
 tested via bash-harness subprocess tests with stubbed `git`, `nerdctl` and
 `buildctl`.
 
@@ -8095,8 +8101,8 @@ sample's probe never counts for the next.
   launches on one checkout each exported the base to /tmp and loaded it at
   once). The launcher's own text, 5 launches at once against one stub
   image store kept in files: with no base, one base build and one frontend
-  pull; on one checkout, one copy of the base (streamed, nothing in
-  `TMPDIR`), one pull and one repository build, every launch ending with
+  pull; on one checkout, one copy of the base (through the build
+  directory's file, nothing in `TMPDIR`), one pull and one repository build, every launch ending with
   the image's digest and one warning of a shared content store; on five
   checkouts, one copy and one pull. `leerie_lock`: a second taker waits for
   the first's release and says so once; a launch SIGKILLed while holding it
@@ -8104,9 +8110,10 @@ sample's probe never counts for the next.
   no ready file. Falsified live (2026-11-03), each restored: the lock
   dropped from the base build (more than one build), from the per-repo host steps (5
   loads on five checkouts), the checkout's lock dropped, the holder's
-  liveness check removed. In `tests/test_build_repo_image.py`, the copy
-  streams `save` into `load` and a failure of either side is logged with
-  its stderr (2); falsified with `PIPESTATUS[0]` dropped.
+  liveness check removed. The streamed copy's own test in
+  `tests/test_build_repo_image.py` was replaced on 2026-11-09 by the
+  through-a-file copy's (above, *The local per-repo image surface*):
+  `save | load` lost the archive's tail on the operator's 0.55.2 launches.
 - `tests/test_command_line_refused_before_images.py` (6 functions, 7
   cases) — a command line is refused before any image step (DESIGN §6 *A
   command line is refused before any image step*; the live `leerie
