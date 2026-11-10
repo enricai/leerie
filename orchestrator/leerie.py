@@ -51517,19 +51517,130 @@ def _ci_gate_argv(rec: dict) -> list[str]:
                 else rec.get("argv") or [])
 
 
+def _ci_gating_recs(st: "State") -> list[dict]:
+    """The checks the baseline made gates or ratchets — the ones every
+    measurement of a later tree runs, in their recorded order."""
+    ci = st.data.get("ci_parity")
+    if not isinstance(ci, dict):
+        return []
+    return [r for r in ci.get("checks") or []
+            if isinstance(r, dict) and r.get("selected")
+            and (r.get("gate") or r.get("ratchet"))]
+
+
+async def _ci_measure(st: "State", caps: dict, wt: Path, recs: list[dict],
+                      *, label: str) -> dict[str, dict]:
+    """Run `recs` once each, in order, in the prepared worktree `wt` — in
+    one tree, since a check may read what an earlier one built (barnacle's
+    `smoke-load-dist` loads the `dist/` its `build` wrote). Per check id the
+    raw result, read against nothing: a gate's `{rc, passed, dirty,
+    timed_out, duration_sec, log}`, a diagnostic ratchet's `strict_rc` and
+    its `diagnostics` keys, a coverage ratchet's `rc` and `coverage`
+    percentages. Log files are `logs/ci/<label>-<id>[-strict].log`."""
+    out: dict[str, dict] = {}
+    for r in recs:
+        res: dict = {}
+        if r.get("gate"):
+            t_gate = time.monotonic()
+            run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r, st=st,
+                                caps=caps, label=f"{label}-{r['id']}")
+            res.update({"rc": run["rc"], "passed": bool(run["passed"]),
+                        "dirty": run["dirty"],
+                        "timed_out": bool(run.get("timed_out")),
+                        "duration_sec": round(time.monotonic() - t_gate, 3),
+                        "log": run.get("log")})
+        if r.get("ratchet") == "diagnostic":
+            srun = await _ci_run(r["strict_argv"], tree=wt, rec=r, st=st,
+                                 caps=caps, label=f"{label}-{r['id']}-strict")
+            res["strict_rc"] = srun["rc"]
+            res["diagnostics"] = _ci_diagnostic_keys(
+                _ci_log_text(srun), wt, r.get("cwd") or ".")
+        if r.get("ratchet") == "coverage":
+            run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                caps=caps, label=f"{label}-{r['id']}")
+            cov = r.get("coverage") or {}
+            res["rc"] = run["rc"]
+            res["coverage"] = _ci_coverage_pcts(
+                wt / (r.get("cwd") or ".") / cov.get("summary_path", ""),
+                wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+        out[r["id"]] = res
+    return out
+
+
+# A commit's raw measurement is kept for this many commits (`ci_parity.
+# measured`): the round's start and its commit, and the commit before.
+_CI_MEASURED_KEEP = 4
+
+
+def _ci_remember(st: "State", sha: str, raw: dict[str, dict],
+                 label: str) -> None:
+    """Keep `raw` (`_ci_measure`'s result on commit `sha`) as that commit's
+    measurement: the next round starts from it and the final pass reuses
+    it (DESIGN §8 *A kept repair keeps the repository's merge checks
+    green*). Saved by the caller."""
+    ci = st.data.get("ci_parity")
+    if not isinstance(ci, dict) or not sha:
+        return
+    memo = dict(ci.get("measured") or {})
+    memo.pop(sha, None)
+    memo[sha] = {"label": label, "results": {
+        i: {k: v for k, v in r.items() if k != "log"}
+        for i, r in raw.items()}}
+    while len(memo) > _CI_MEASURED_KEEP:
+        memo.pop(next(iter(memo)))
+    ci["measured"] = memo
+
+
+def _ci_remembered(st: "State", sha: str,
+                   recs: list[dict]) -> dict[str, dict] | None:
+    """The kept raw measurement of commit `sha` over every one of `recs`,
+    else None."""
+    ci = st.data.get("ci_parity")
+    memo = ci.get("measured") if isinstance(ci, dict) else None
+    got = memo.get(sha) if isinstance(memo, dict) and sha else None
+    res = got.get("results") if isinstance(got, dict) else None
+    if not isinstance(res, dict) or any(r["id"] not in res for r in recs):
+        return None
+    return res
+
+
+def _ci_new_diagnostics(rec: dict, keys: dict, ref: dict,
+                        touched: Iterable[str]) -> list[str]:
+    """A diagnostic ratchet's keys whose count on the measured tree exceeds
+    the reference's (`ref`), in a file of `touched` (repo-relative paths,
+    read relative to the check's cwd)."""
+    cwd = (rec.get("cwd") or ".").strip().rstrip("/")
+    pre = "" if cwd in ("", ".") else cwd.removeprefix("./") + "/"
+    rel_touched = {t[len(pre):] for t in touched if t.startswith(pre)}
+    return sorted(k for k, n in keys.items()
+                  if n > ref.get(k, 0)
+                  and k.split("\t", 1)[0] in rel_touched)
+
+
+async def _ci_touched(staging: Path, a: str, b: str) -> list[str]:
+    """The paths `git diff --name-only a..b` names; [] when either is
+    unknown."""
+    if not a or not b:
+        return []
+    d = await run_proc(["git", *_tree_git_args(staging), "diff",
+                        "--name-only", f"{a}..{b}"], cwd=str(staging))
+    return [x for x in d.stdout.splitlines() if x.strip()]
+
+
 async def _run_ci_parity_final(leerie_dir: Path, st: State,
                                caps: dict) -> list[dict]:
     """Run the gating checks and ratchets on the final tree (DESIGN §9).
     A gate red here is confirmed under B* against the base (interleaved
     reruns, `_confirm_new_failures`); only a confirmed one, a new
     diagnostic in a file the run changed, or a fired coverage threshold is
-    `unmet`. Persists `ci_parity.final` and returns the unmet list.
-    Advisory; idempotent per final commit."""
+    `unmet`. A commit a kept repair round already measured with every gate
+    green is read from that measurement (`_ci_remembered`), not run again.
+    Persists `ci_parity.final` and returns the unmet list. Advisory;
+    idempotent per final commit."""
     ci = st.data.get("ci_parity")
     if not isinstance(ci, dict) or not ci.get("checks"):
         return []
-    recs = [r for r in ci["checks"]
-            if r.get("selected") and (r.get("gate") or r.get("ratchet"))]
+    recs = _ci_gating_recs(st)
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not recs or not staging.is_dir():
         return []
@@ -51539,54 +51650,50 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
         return list(prior.get("unmet") or [])
     log(f"phase 5: CI parity — {len(recs)} merge check(s) on the final tree")
     base_sha = ci.get("base_sha") or ""
-    touched: list[str] = []
-    if base_sha and sha:
-        d = await run_proc(["git", *_tree_git_args(staging), "diff", "--name-only",
-                            f"{base_sha}..{sha}"], cwd=str(staging))
-        touched = [x for x in d.stdout.splitlines() if x.strip()]
+    touched = await _ci_touched(staging, base_sha, sha)
     eps = float(caps.get("ci_coverage_epsilon_pct",
                          DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
     final: dict = {"sha": sha, "results": {}, "unmet": [],
                    "resource_affected": [], "pre_existing": [],
                    "no_verdict": []}
-    wt = await _ci_worktree(st, "ci-final", sha)
-    if wt is None:
-        final["skipped"] = "no final worktree"
-        ci["final"] = final
-        st.save()
-        return []
+    # The same commit, measured whole by a kept round: green on every gate,
+    # nothing there needs B*, so the measurement is the final tree's.
+    raw = _ci_remembered(st, sha, recs)
+    if raw is not None and not all(
+            raw[r["id"]].get("passed") for r in recs if r.get("gate")):
+        raw = None
+    wt: Path | None = None
+    if raw is not None:
+        final["reused"] = (ci.get("measured") or {}).get(sha, {}).get(
+            "label")
+        log(f"  ci parity: {sha[:12]} was measured by {final['reused']}, "
+            "every gate green — reused, not run again")
+    else:
+        wt = await _ci_worktree(st, "ci-final", sha)
+        if wt is None:
+            final["skipped"] = "no final worktree"
+            ci["final"] = final
+            st.save()
+            return []
     red: list[str] = []
     try:
-        await _ci_prepare(wt, recs, st, caps, "final")
+        if wt is not None:
+            await _ci_prepare(wt, recs, st, caps, "final")
+            raw = await _ci_measure(st, caps, wt, recs, label="final")
+            _ci_remember(st, sha, raw, "the final pass")
         for r in recs:
+            got = (raw or {}).get(r["id"]) or {}
             res: dict = {}
             if r.get("gate"):
-                t_gate = time.monotonic()
-                run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r,
-                                    st=st,
-                                    caps=caps, label=f"final-{r['id']}")
-                res.update({"rc": run["rc"], "dirty": run["dirty"],
-                            "duration_sec": round(
-                                time.monotonic() - t_gate, 3)})
-                if not run["passed"]:
+                res.update({k: got.get(k) for k in ("rc", "dirty",
+                                                    "duration_sec")})
+                if not got.get("passed"):
                     red.append(r["id"])
             if r.get("ratchet") == "diagnostic":
-                srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
-                                     st=st,
-                                     caps=caps,
-                                     label=f"final-{r['id']}-strict")
-                keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
-                                           r.get("cwd") or ".")
-                base = (r.get("base") or {}).get("diagnostics") or {}
-                cwd = (r.get("cwd") or ".").strip().rstrip("/")
-                pre = ("" if cwd in ("", ".")
-                       else cwd.removeprefix("./") + "/")
-                rel_touched = {t[len(pre):] for t in touched
-                               if t.startswith(pre)}
-                new = sorted(k for k, n in keys.items()
-                             if n > base.get(k, 0)
-                             and k.split("\t", 1)[0] in rel_touched)
-                res["strict_rc"] = srun["rc"]
+                new = _ci_new_diagnostics(
+                    r, got.get("diagnostics") or {},
+                    (r.get("base") or {}).get("diagnostics") or {}, touched)
+                res["strict_rc"] = got.get("strict_rc")
                 res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
                 if new:
                     final["unmet"].append({
@@ -51595,15 +51702,9 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                         "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
                         "diagnostics": new[:_CI_DIAG_LIMIT]})
             if r.get("ratchet") == "coverage":
-                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
-                                    caps=caps, label=f"final-{r['id']}")
-                cov = r.get("coverage") or {}
-                pcts = _ci_coverage_pcts(
-                    wt / (r.get("cwd") or ".")
-                    / cov.get("summary_path", ""),
-                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                pcts = got.get("coverage") or {}
                 fired = _ci_coverage_fired(r, pcts, touched, eps)
-                res.update({"rc": run["rc"], "coverage": pcts,
+                res.update({"rc": got.get("rc"), "coverage": pcts,
                             "fired": fired})
                 if fired:
                     final["unmet"].append({
@@ -51611,13 +51712,13 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                         "why": "coverage_ratchet", "argv": r.get("argv"),
                         "cwd": r.get("cwd"), "thresholds": fired})
             final["results"][r["id"]] = res
-        if red:
+        if red and wt is not None:
             verdict = await _ci_confirm_red(
                 st, caps, base_sha, wt,
                 [x for x in recs if x["id"] in red],
                 durations={i: final["results"][i]["duration_sec"]
-                           for i in red if "duration_sec"
-                           in final["results"].get(i, {})})
+                           for i in red if final["results"].get(i, {})
+                           .get("duration_sec") is not None})
             final["b_star"] = verdict
             final["budget_short_unsettled"] = list(
                 verdict.get("budget_short_unsettled") or [])
@@ -51636,7 +51737,8 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                     "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
                     "rc": final["results"][cid].get("rc")})
     finally:
-        _ci_teardown(st, wt)
+        if wt is not None:
+            _ci_teardown(st, wt)
     ci["final"] = final
     st.save()
     _ci_sized = list(final.get("sized_out") or [])
@@ -51658,8 +51760,8 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
 
 async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
                           final_tree: Path, recs: list[dict], *,
-                          durations: dict[str, float] | None = None
-                          ) -> dict:
+                          durations: dict[str, float] | None = None,
+                          label: str = "confirm") -> dict:
     """B* for gates red on the final tree: interleaved base/final reruns of
     just those checks; a check is red only if it failed every final rerun
     and passed every base rerun. Every check run of one rerun shares the
@@ -51668,7 +51770,10 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
     and 4). The checks are sized by their final-run `durations`
     (`_confirm_sized`, shortest first, so one long check cannot starve
     the rest, and in passes over the budget left); one never rerun is
-    `budget_short_unsettled` and listed in `sized_out`."""
+    `budget_short_unsettled` and listed in `sized_out`. `base_sha` is the
+    reference the reruns compare against — the run's base for the final
+    pass, a round's start for a kept round (`_ci_round_regressions`);
+    `label` prefixes the reruns' log files."""
     by_id = {r["id"]: r for r in recs}
     # One base worktree for every pass (DESIGN §8 *CI parity*): the base
     # commit is the same each time, and re-creating it per pass repaid the
@@ -51680,7 +51785,8 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
                     gate: dict | None, **pairs: object) -> dict:
         return await _ci_confirm_chosen(st, pcaps, base, final_tree,
                                         [by_id[i] for i in units],
-                                        prior_gate=gate, **pairs)
+                                        prior_gate=gate, label=label,
+                                        **pairs)
     try:
         return await _confirm_sized(
             {r["id"]: r["id"] for r in recs}, dict(durations or {}),
@@ -51694,6 +51800,7 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
 async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
                              final_tree: Path, recs: list[dict], *,
                              prior_gate: dict | None = None,
+                             label: str = "confirm",
                              **pairs: object) -> dict:
     """`_ci_confirm_red`'s confirm over the checks it chose, in order
     (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`). `base` is the
@@ -51726,7 +51833,7 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
                     return _RerunCut(frozenset(failing), frozenset(done))
                 run = await _ci_run(_ci_gate_argv(r), tree=tree, rec=r,
                                     st=st, caps=_budget_caps(caps, rem),
-                                    label=f"confirm-{side}{n['i']}-{r['id']}")
+                                    label=f"{label}-{side}{n['i']}-{r['id']}")
                 if run["timed_out"]:
                     # Past the budget, the budget cut it: not a run, and
                     # never "the red went away" (DESIGN §9 step 4).
@@ -51742,7 +51849,7 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
 
     fresh = [r for r in recs if r["id"] not in base["prepared"]]
     if fresh:
-        await _ci_prepare(base_wt, fresh, st, caps, "confirm-base",
+        await _ci_prepare(base_wt, fresh, st, caps, f"{label}-base",
                           base["prereqs"])
         base["prepared"].update(r["id"] for r in fresh)
     # A gate is one that passed at the baseline, and each candidate
@@ -51751,6 +51858,160 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
         cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
         caps, label="ci parity", seen_failing=True,
         prior_gate=prior_gate, **pairs)
+
+
+_CI_ERROR_LINE_RE = re.compile(r"\berror\b", re.IGNORECASE)
+_CI_ERROR_LINES = 5
+_CI_ERROR_LINE_MAX = 300
+
+
+def _ci_first_error_lines(text: str) -> list[str]:
+    """The first lines of a red check's log a person or a fixer reads first:
+    up to `_CI_ERROR_LINES` lines naming an error (fixed tool output, read
+    mechanically), else its last non-empty lines. The log's own header
+    (`=== ci <label>: … ===`) is never one."""
+    lines = [_CI_ANSI_RE.sub("", ln).rstrip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln.strip() and not ln.startswith("=== ci ")]
+    hits = [ln for ln in lines if _CI_ERROR_LINE_RE.search(ln)]
+    pick = hits[:_CI_ERROR_LINES] or lines[-_CI_ERROR_LINES:]
+    return [ln[:_CI_ERROR_LINE_MAX] for ln in pick]
+
+
+async def _ci_round_regressions(st: "State", caps: dict, staging: Path,
+                                pre_sha: str, post_sha: str, *,
+                                label: str) -> dict:
+    """The repository's merge checks a repair round turned red (DESIGN §8 *A
+    kept repair keeps the repository's merge checks green*): every gating
+    check and ratchet runs on the round's commit `post_sha` in a fresh
+    worktree. A gate red there is confirmed under B* against the round's
+    start `pre_sha` (`_ci_confirm_red`): only one failing every rerun on
+    the commit and passing every rerun on the start is the round's — red on
+    the start too is `pre_existing`, not the round's. A diagnostic ratchet
+    breaks on a key whose count rose from `pre_sha` in a file the round
+    changed; a coverage ratchet on a threshold that fires on the commit and
+    did not on the start (`_ci_coverage_fired`, against the base, as at the
+    final pass). The start's ratchet values come from its kept measurement
+    (`_ci_remembered`), else are measured. `broke[]` holds `{id, kind, why,
+    argv, cwd, rc?, diagnostics?, thresholds?, lines[]}` — `lines` the first
+    error lines of the red run (`_ci_first_error_lines`). The commit's
+    measurement is kept for the next round and the final pass. `{}` when
+    no check gates or the round moved nothing."""
+    recs = _ci_gating_recs(st)
+    if not recs or not pre_sha or not post_sha or pre_sha == post_sha:
+        return {}
+    ci = st.data["ci_parity"]
+    out: dict = {"pre_sha": pre_sha, "post_sha": post_sha,
+                 "checks": [r["id"] for r in recs], "broke": [],
+                 "pre_existing": [], "resource_affected": [],
+                 "no_verdict": [], "budget_short_unsettled": []}
+    wt = await _ci_worktree(st, "ci-round", post_sha)
+    if wt is None:
+        out["unmeasured"] = "no worktree of the round's commit"
+        return out
+    by_id = {r["id"]: r for r in recs}
+    try:
+        await _ci_prepare(wt, recs, st, caps, f"{label}-post")
+        raw = await _ci_measure(st, caps, wt, recs, label=f"{label}-post")
+        red = [r["id"] for r in recs
+               if r.get("gate") and not raw[r["id"]].get("passed")]
+        if red:
+            verdict = await _ci_confirm_red(
+                st, caps, pre_sha, wt, [by_id[i] for i in red],
+                durations={i: raw[i]["duration_sec"] for i in red
+                           if raw[i].get("duration_sec") is not None},
+                label=f"{label}-confirm")
+            out["b_star"] = verdict
+            for k in ("pre_existing", "resource_affected", "no_verdict",
+                      "budget_short_unsettled"):
+                out[k] = list(verdict.get(k) or [])
+            for cid in verdict.get("new") or []:
+                r = by_id[cid]
+                out["broke"].append({
+                    "id": cid, "kind": r.get("kind"), "why": "red",
+                    "argv": _ci_gate_argv(r), "cwd": r.get("cwd"),
+                    "rc": raw[cid].get("rc"),
+                    "lines": _ci_first_error_lines(
+                        _ci_log_text(raw[cid]))})
+        ratchets = [r for r in recs if r.get("ratchet")]
+        if ratchets:
+            ref = _ci_remembered(st, pre_sha, ratchets)
+            if ref is None:
+                pwt = await _ci_worktree(st, "ci-round-pre", pre_sha)
+                if pwt is not None:
+                    try:
+                        await _ci_prepare(pwt, ratchets, st, caps,
+                                          f"{label}-pre")
+                        ref = await _ci_measure(st, caps, pwt, ratchets,
+                                                label=f"{label}-pre")
+                    finally:
+                        _ci_teardown(st, pwt)
+            if ref is None:
+                out["ratchets_unmeasured"] = [r["id"] for r in ratchets]
+            else:
+                round_touched = await _ci_touched(staging, pre_sha, post_sha)
+                base_sha = ci.get("base_sha") or ""
+                eps = float(caps.get("ci_coverage_epsilon_pct",
+                                     DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
+                for r in ratchets:
+                    got, was = raw[r["id"]], ref.get(r["id"]) or {}
+                    if r["ratchet"] == "diagnostic":
+                        new = _ci_new_diagnostics(
+                            r, got.get("diagnostics") or {},
+                            was.get("diagnostics") or {}, round_touched)
+                        if new:
+                            out["broke"].append({
+                                "id": r["id"], "kind": r.get("kind"),
+                                "why": "new_diagnostics",
+                                "argv": r.get("strict_argv"),
+                                "cwd": r.get("cwd"),
+                                "diagnostics": new[:_CI_DIAG_LIMIT],
+                                "lines": [k.replace("\t", ": ") for k
+                                          in new[:_CI_ERROR_LINES]]})
+                    else:
+                        now = _ci_coverage_fired(
+                            r, got.get("coverage") or {},
+                            await _ci_touched(staging, base_sha, post_sha),
+                            eps)
+                        then = {(f["glob"], f["metric"]) for f in
+                                _ci_coverage_fired(
+                                    r, was.get("coverage") or {},
+                                    await _ci_touched(staging, base_sha,
+                                                      pre_sha), eps)}
+                        fired = [f for f in now
+                                 if (f["glob"], f["metric"]) not in then]
+                        if fired:
+                            out["broke"].append({
+                                "id": r["id"], "kind": "coverage",
+                                "why": "coverage_ratchet",
+                                "argv": r.get("argv"), "cwd": r.get("cwd"),
+                                "thresholds": fired,
+                                "lines": [f"{f['glob']} {f['metric']}: "
+                                          f"{f['final']}% (min {f['min']}%,"
+                                          f" {f['base']}% at the base)"
+                                          for f in fired[:_CI_ERROR_LINES]]})
+        _ci_remember(st, post_sha, raw, f"repair {label}")
+        st.save()
+    finally:
+        _ci_teardown(st, wt)
+    if out["broke"]:
+        log(f"  {label}: {len(out['broke'])} merge check(s) the round turned "
+            "red: " + "; ".join(
+                f"{b['id']} ({b['why']}"
+                + (f": {b['lines'][0]}" if b.get("lines") else "") + ")"
+                for b in out["broke"]))
+    else:
+        log(f"  {label}: the repository's merge checks hold on its commit"
+            + (f" ({len(out['pre_existing'])} red on its start too)"
+               if out["pre_existing"] else ""))
+    return out
+
+
+def _ci_broke_text(broke: list[dict]) -> str:
+    """The merge checks a round turned red, each with its first error
+    line, for a rollback reason."""
+    return "; ".join(
+        f"{b.get('id')}" + (f" ({b['lines'][0][:200]})" if b.get("lines")
+                            else "") for b in broke)
 
 
 def _format_unmet_required_items_section(
@@ -65548,6 +65809,25 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
                                            or []),
                  "intermittent_regression": list(
                      ex.get("intermittent_regression") or [])}
+    if not (out["new_failures"] or out["base_form_changed"]):
+        # The repository's merge checks gate a kept round as its tests do
+        # (DESIGN §8 *A kept repair keeps the repository's merge checks
+        # green*); a round its tests already reject pays for none.
+        try:
+            mc = await _ci_round_regressions(st, caps, staging, pre_sha,
+                                             post_sha, label=label)
+        except Exception as e:
+            mc = {"error": f"{type(e).__name__}: {e}"[:300]}
+            log(f"  delivery ratchet {label}: the merge checks raised "
+                f"{mc['error']} — not measured on this round; the tree that "
+                "ships is measured again before the outcome")
+        if mc:
+            out["merge_checks"] = mc
+        if mc.get("broke"):
+            # Rolled back on this alone: the met items of a tree that will
+            # not stand need no read.
+            out["merge_checks_broke"] = [dict(b) for b in mc["broke"]]
+            return out
     prior = _ratchet_prior_met(st)
     out["prior_met"] = sorted(prior)
     if not prior:
@@ -65746,6 +66026,9 @@ def _ratchet_mark_unverified(st: "State", items: list[int], sha: str,
 
 def _ratchet_rollback_reason(rat: dict) -> str | None:
     """The rollback reason a ratchet verdict gives, or None."""
+    if rat.get("merge_checks_broke"):
+        return ("turned the repository's merge check(s) red: "
+                + _ci_broke_text(rat["merge_checks_broke"]))
     if rat.get("regressed"):
         return "regressed a previously met required item"
     if rat.get("new_failures"):
@@ -67489,6 +67772,29 @@ def _redrive_key_text(key: str) -> str:
     return f"existing test `{key}`"
 
 
+def _redrive_merge_check_note(b: dict) -> dict:
+    """The pending note a group rolled back for turning merge check `b`
+    red leaves every later group (DESIGN §8 *A kept repair keeps the
+    repository's merge checks green*): a `control_regression` — behaviour
+    an earlier attempt broke and was reverted — naming the check, its
+    command and the first error lines of its red run."""
+    argv = b.get("argv")
+    cmd = (shlex.join(str(a) for a in argv) if isinstance(argv, list)
+           else "")
+    lines = [str(x) for x in b.get("lines") or []]
+    return {"kind": "control_regression", "key": f"ci-{b.get('id')}",
+            "test": f"merge check `{b.get('id')}`"
+                    + (f" ({cmd})" if cmd else ""),
+            "detail": (
+                "an earlier re-drive attempt turned this merge check of the "
+                "repository red (confirmed against the tree before it) and "
+                "was reverted. Keep it passing. Its first error lines:\n"
+                + "\n".join(lines) if lines else
+                "an earlier re-drive attempt turned this merge check of the "
+                "repository red (confirmed against the tree before it) and "
+                "was reverted. Keep it passing.")}
+
+
 def _redrive_rollback_reason(ge: dict) -> str:
     """Every condition of a group's record that rolls it back, in words
     (DESIGN §8 *A rollback says why*). `_run_delivery_redrive` reaches this
@@ -67532,6 +67838,10 @@ def _redrive_rollback_reason(ge: dict) -> str:
     if ge.get("ratchet_regressed"):
         why.append("it made required item(s) "
                    f"{ge['ratchet_regressed']}, met before it, unmet")
+    broke = (ge.get("ratchet") or {}).get("merge_checks_broke") or []
+    if broke:
+        why.append("it turned the repository's merge check(s) red: "
+                   + _ci_broke_text(broke))
     return "; ".join(why) or ("its verdict was worse: a held-back round that "
                               "fixed no held-back case or broke a control")
 
@@ -68192,6 +68502,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     if rat.get("regressed"):
                         ge["ratchet_regressed"] = list(rat["regressed"])
                         void = True
+                    if rat.get("merge_checks_broke"):
+                        ge["merge_checks_broke"] = [
+                            b["id"] for b in rat["merge_checks_broke"]]
+                        void = True
                 if v["worse"] or void:
                     ge["rollback_reason"] = _redrive_rollback_reason(ge)
                     ok = await _roll_back_round(
@@ -68223,6 +68537,12 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         if k not in have:
                             rec["pending_controls"].append(
                                 set_note(k, F1[k], "control_regression"))
+                    for b in rat.get("merge_checks_broke") or []:
+                        key = f"ci-{b['id']}"
+                        if key in have:
+                            continue
+                        rec["pending_controls"].append(
+                            _redrive_merge_check_note(b))
                     for i in ge.get("ratchet_regressed") or []:
                         key = f"met-item-{i}"
                         if key in have or i >= len(normalized):

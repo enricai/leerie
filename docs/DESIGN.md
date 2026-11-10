@@ -14176,7 +14176,9 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    zero-progress, and a commit that left its probe failing was kept. A group
    that survives all of that still goes through the delivery ratchet
    (*A repair that regresses met work is rolled back*): when it made an
-   item that was met before it unmet, it is rolled back too. The item then
+   item that was met before it unmet, or turned a merge check that was
+   green before it red (*A kept repair keeps the repository's merge
+   checks green*), it is rolled back too. The item then
    goes to the remaining groups as a `control_regression` note, so a fix
    cannot hedge or remove what an earlier pass had already verified.
 5. *A trade is not progress.* A group that fixes a case only by breaking a
@@ -14219,7 +14221,8 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `redrive_budget_sec`, the hard stop.
 
 After the last round the sets are measured once more on the tree that
-ships, the merge checks re-run when the tree moved, the failing-test-ID
+ships, the merge checks re-run when the tree moved (read from the last
+kept group's measurement when it holds every gate green), the failing-test-ID
 diff (§9 *Which failures are new*) is measured again on that tree, and
 each routed item is re-checked: re-judged by the cited judge, and an item
 a falsifier proved unmet by re-running its saved probe on the new tree.
@@ -17164,6 +17167,85 @@ ground truth by execution, the ratchet caught all 3 rounds that regressed
 an item and raised nothing on the other 14. The judge confirmed 5 of their
 7 regressed items. The execution route caught the third round, whose 2 items
 only a test showed.
+
+**A kept repair keeps the repository's merge checks green.** *Built
+2026-11-10 (lane CK, barnacle 87580f62).* **Invariant:** a kept repair
+round never makes a gating merge check red that was green before it. The
+merge checks (§9 *The repository's own merge checks run too*) gate every
+round the ratchet gates, as the tests do: measured on the round's commit,
+confirmed under B\* against the round's start, and rolled back with the
+round.
+
+**Root cause.** The rollback rules read new test failures, base-form
+changes and met items that regressed, never a merge check. Inside the
+re-drive the checks re-ran only after a round that was routed a red
+check's note. In barnacle 87580f62 (leerie 0.55.2) all four gates (build,
+typecheck, prepush-typecheck, smoke-load-dist) were green at the base and
+on the tree the re-drive started from (04:35). Re-drive round 1's
+commit `5c0f667` introduced `TS2345` at `recon-http.ts:536`: its fixer
+self-checked with the test runner only. No rule measured the checks, so
+the round was kept. Round 2 was built on it. The checks were next run after
+the loop (05:47), red 3 of 3 against the base's 0 of 3, and the run
+shipped red and ended `unconverged`.
+
+**The rule.** After every acceptance-repair round and every re-drive group
+that commits and survives its own rules, the ratchet runs every gating
+check and ratchet on the round's commit, in a fresh worktree of it
+(`_ci_round_regressions`). It runs them in their recorded order, in one
+tree, as the final pass does: a check may read what an earlier one built.
+A gate red there is confirmed by the final pass's B\* (interleaved reruns,
+same budget), against the round's start instead of the run's base. Only
+a gate that fails every rerun on the commit and passes every rerun on the
+start is the round's. A gate red on the start too is `pre_existing` and
+not the round's, so a round sent for something else is not rolled back for
+a check that was already red. A strict lint that ratchets per diagnostic
+is the round's when a diagnostic's count rose from the start in a file the
+round changed. A coverage threshold is the round's when it fires on the
+commit and did not fire on the start. Either way the start's values come
+from its kept measurement, or are measured when none is kept. A check
+the round broke resets the round to its own start through the one
+restore, with a reason naming each check and its first error line.
+In a re-drive the group's later groups get a typed `control_regression`
+note: the check, its command, and the first error lines of its red run.
+That is the kind for behaviour an earlier attempt broke and was reverted,
+so the note says to keep the check passing. A round its tests already
+reject runs no check, and a round rolled back for a check runs no item
+judge, since the tree will not stand. A measurement that raises, or a
+worktree that cannot be made, decides nothing and the round is kept, as an
+unsettled test candidate is kept (§9 *Which failures are new*, step 4).
+The tree that ships is still measured before the outcome.
+
+The rule sits in the ratchet, so the two callers that keep rounds share
+it: the acceptance gate's repair rounds and the re-drive's groups. The
+acceptance rounds had the same gap. 87580f62's kept acceptance round 2
+happened to leave the checks green, and nothing measured them until the
+final pass at 04:35. The
+other places a commit lands are not kept rounds. Per-subtask integration
+and the final conformer have no rollback rule that reads tests either, and
+the final pass measures the tree they leave. A check they broke is red
+there and goes to the re-drive as a `ci_check` note (§9). That is
+measured once and routed, as before.
+
+**Cost, and what makes it cheaper.** Each commit's raw measurement is kept
+(`ci_parity.measured`, the last four commits). The next round's start and
+the final pass read it. When the final pass's commit was measured by the
+last kept round with every gate green, nothing runs again: green is green
+against any reference. Only a red gate needs the base reruns. Measured
+over the 22 recorded runs with gating checks (barnacle, navegando, web;
+`~/.cache/leerie-lanes/CK/cost/`), there were 24 kept rounds and 23 green
+final-pass measurements. Their median wall was 217 s (39 s to 722 s,
+install included). At each run's own median, measuring every kept round
+would cost 8,190 s across the 22 runs. With the final pass reading the
+last kept round's measurement, 1,680 s are added, in 3 runs: 87580f62
+41 s, navegando a70fb4a6 1,292 s, web 6f147a0c 348 s. The rest pay nothing
+extra. B\* runs only on a red gate, which is when the round is rolled
+back.
+
+Running only the checks a round's diff can reach was not adopted, because
+it cannot be decided soundly. A typecheck's or a build's reach is the
+whole program. Barnacle's `smoke-load-dist` loads the `dist/` that its
+`build` writes, so it has no files of its own. A check names no inputs,
+and its reach would be guessed.
 
 **A set that keeps failing is audited, and rewritten once.** A held-out
 set can be wrong in ways validity at the own start cannot see: it fails
@@ -20270,7 +20352,10 @@ A red final check makes delivery unmet: the run's outcome is `unconverged`
 (§6 *The run outcome is decided once*) and the next same-task run's planners
 are handed the red checks as part of the prior delivery residual. Re-driving
 the subtasks that broke a check is the delivery re-drive's job, not this
-section's; the record it reads is `ci_parity.final.unmet`.
+section's; the record it reads is `ci_parity.final.unmet`. A repair round
+that turns a check red after this measurement is not left for it: every
+kept round is gated by the same checks, on its own commit (§8 *A kept
+repair keeps the repository's merge checks green*).
 
 Benched (N6, N6b). Discovery: 12 worker runs (4 repos × 3 samples) found
 92/92 checks with the right kind, requirements and gate selection (78/78

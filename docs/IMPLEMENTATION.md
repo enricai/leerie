@@ -10365,10 +10365,26 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
 - **Final** — `_run_ci_parity_final(leerie_dir, st, caps) -> list[dict]`,
   called in `_run_phases` after `_run_acceptance_gate` and before
   `phase_finalize`, in a detached `worktrees/ci-final` worktree at the
-  staging HEAD. A gate (`_ci_gate_argv`) that fails is confirmed by
-  `_ci_confirm_red` — `_confirm_new_failures` with base reruns in a fresh
+  staging HEAD. The checks it runs are `_ci_gating_recs(st)` (selected,
+  with a `gate` or a `ratchet`, in recorded order), measured by
+  `_ci_measure(st, caps, wt, recs, *, label) -> {id: raw}` — every check
+  once, in order, in the one prepared tree; a gate's raw `{rc, passed,
+  dirty, timed_out, duration_sec, log}`, a diagnostic ratchet's
+  `{strict_rc, diagnostics}`, a coverage ratchet's `{rc, coverage}`; logs
+  `logs/ci/<label>-<id>[-strict].log` (`label` `final` here). Each commit's
+  raw result is kept by `_ci_remember(st, sha, raw, label)` in
+  `ci_parity.measured[sha] = {label, results}` (logs dropped; the last
+  `_CI_MEASURED_KEEP = 4` commits). When `_ci_remembered(st, sha, recs)`
+  holds the HEAD's measurement with every gate `passed` (a kept repair
+  round measured it, below), no worktree is made and nothing runs:
+  `final.reused` names that measurement's label and the ratchets are read
+  from it. A gate (`_ci_gate_argv`) that fails is confirmed by
+  `_ci_confirm_red(st, caps, base_sha, final_tree, recs, *, durations=None,
+  label="confirm")` — `_confirm_new_failures` with base reruns in a fresh
   `ci-confirm-base` worktree and final reruns in `ci-final`, with
-  `seen_failing=True`. The red checks are sized by `_confirm_sized` over
+  `seen_failing=True`; `label` prefixes the reruns' logs
+  (`<label>-base<n>-<id>`, `<label>-final<n>-<id>`) and the base's
+  prerequisites (`<label>-base`). The red checks are sized by `_confirm_sized` over
   their final-run `duration_sec` (recorded on `final.results[id]`; one
   unit per check, no overhead, shortest first); a check never rerun is
   `budget_short_unsettled` (and `sized_out`, kept on `final.sized_out`),
@@ -10395,8 +10411,10 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   (`_set_confirm_budget_gap(st, "CI parity", <not sized out>,
   sized_out=final.sized_out)`). A diagnostic
   ratchet is `unmet` (`why: new_diagnostics`) when a key's final count
-  exceeds the base's in a file the run changed (`git diff --name-only
-  <base_sha>..<final_sha>`, relative to the check's cwd). A coverage ratchet
+  exceeds the base's in a file the run changed
+  (`_ci_new_diagnostics(rec, keys, ref, touched)` over `_ci_touched(staging,
+  base_sha, final_sha)` — `git diff --name-only` — relative to the check's
+  cwd). A coverage ratchet
   is `unmet` (`why: coverage_ratchet`) per `_ci_coverage_fired`: final <
   `min`, final < base − `ci_coverage_epsilon_pct`, and the glob matches a
   changed file.
@@ -10433,6 +10451,43 @@ keeping only paths that exist under the check's cwd and dropping positions.
 `ci_unmet` (`{id, why, argv, cwd, diagnostics[≤5], thresholds[≤5]}`, at most
 5).
 
+### A kept round's merge checks — `_ci_round_regressions`
+
+DESIGN §8 *A kept repair keeps the repository's merge checks green*.
+`_ci_round_regressions(st, caps, staging, pre_sha, post_sha, *, label) ->
+dict`, called by `_delivery_ratchet` (below) for every round it gates,
+first, unless `exec_result` already carries `new` or `base_form_changed`.
+`{}` when `_ci_gating_recs(st)` is empty, either sha is missing, or
+`pre_sha == post_sha`. Otherwise, in a fresh `worktrees/ci-round` at
+`post_sha` (`_ci_worktree`; none → `unmeasured: "no worktree of the
+round's commit"`, nothing broke): `_ci_prepare(…, "<label>-post")`,
+`_ci_measure(…, label="<label>-post")`; the gates not `passed` go to
+`_ci_confirm_red(st, caps, pre_sha, wt, <those>, durations=…,
+label="<label>-confirm")`, and each `new` id is broke `{id, kind, why:
+"red", argv: _ci_gate_argv, cwd, rc, lines}`; `pre_existing`,
+`resource_affected`, `no_verdict`, `budget_short_unsettled` and `b_star`
+are recorded as B\* split them, none a rollback. Ratchets read the start's
+raw values from `_ci_remembered(st, pre_sha, <ratchets>)`, else measure
+them in `worktrees/ci-round-pre` at `pre_sha` (label `<label>-pre`;
+neither → `ratchets_unmeasured[]`): a diagnostic ratchet broke `{…, why:
+"new_diagnostics", argv: strict_argv, diagnostics[≤_CI_DIAG_LIMIT],
+lines}` on `_ci_new_diagnostics(rec, post keys, pre keys,
+_ci_touched(staging, pre_sha, post_sha))`; a coverage ratchet broke `{…,
+why: "coverage_ratchet", thresholds, lines}` on the `_ci_coverage_fired`
+thresholds (against the base, `_ci_touched(base_sha, post_sha)`) whose
+`(glob, metric)` did not fire on the start's percentages
+(`_ci_touched(base_sha, pre_sha)`). `lines` is
+`_ci_first_error_lines(log text)` for a gate — up to `_CI_ERROR_LINES = 5`
+non-empty lines matching `_CI_ERROR_LINE_RE` (`\berror\b`, any case),
+else the last 5, the `=== ci ` header never one, each cut at
+`_CI_ERROR_LINE_MAX = 300` — the new keys for a diagnostic ratchet, a line
+per threshold for coverage. The commit's raw measurement is kept
+(`_ci_remember(st, post_sha, raw, "repair <label>")`). Returns `{pre_sha,
+post_sha, checks[], broke[], pre_existing[], resource_affected[],
+no_verdict[], budget_short_unsettled[], b_star?, unmeasured?,
+ratchets_unmeasured?}`. `_ci_broke_text(broke)` is each id with its first
+line in parentheses, `; `-joined.
+
 ### Per-round rollback of acceptance repair rounds
 
 DESIGN §8 *A repair round that fixes nothing is rolled back*. In
@@ -10461,7 +10516,8 @@ A moved round that fixed a case and has a readable `sha` then goes through
 the delivery ratchet (below) before it is recorded: `_round_ratchet(entry)`
 runs `_ratchet_exec` with the test IDs at `pre_sha` and at `sha`, then
 `_delivery_ratchet`, and stores the result as `entry.ratchet`. A
-`_ratchet_rollback_reason` (`"regressed a previously met required item"`,
+`_ratchet_rollback_reason` (`"turned the repository's merge check(s) red:
+<_ci_broke_text>"`, else `"regressed a previously met required item"`,
 else `"broke an existing test"`) becomes the round's `rollback_reason` and
 `_undo_round` resets it like a no-gain round; a kept round calls
 `_ratchet_kept` (unless the ratchet raised) and then
@@ -10482,6 +10538,13 @@ frozen config C + vote change V; its execution route on B\*). Called by
 `_run_delivery_redrive` per group that committed and is neither `worse`
 nor void.
 
+- **Merge checks first.** Unless `exec_result` has `new` or
+  `base_form_changed`, `_ci_round_regressions(st, caps, staging, pre_sha,
+  post_sha, label=label)` runs before any item route; a non-empty result is
+  `merge_checks`, one that raises is `merge_checks: {error}` (logged, the
+  round not rolled back for it). A non-empty `broke` sets
+  `merge_checks_broke` (the broke rows) and the ratchet returns there, no
+  item read (`prior_met` empty): it is a rollback.
 - **Previously met** (`_ratchet_prior_met(st) -> {item_index: evidence}`,
   `_ratchet_prior_met_all(st, items)` less every index in
   `delivery_ratchet.unverified`):
@@ -10575,7 +10638,8 @@ nor void.
   The `final_sha` re-key requires `unverified` to be empty.
 - **Result.** `{pre_sha, post_sha, prior_met[], untouched[], execution[],
   exec_flagged[], exec_unchecked[], judge, regressed[], unverified[],
-  new_failures[], intermittent_regression[]}`. `exec_unchecked` lists the `execution`
+  new_failures[], intermittent_regression[], merge_checks?,
+  merge_checks_broke?[]}`. `exec_unchecked` lists the `execution`
   items when `exec_result` was `unmeasured` (no ID diff on either side) or
   carries `budget_short_unsettled` candidates — not a rollback, but logged, so an unmeasured execution route never reads
   as the items holding (DESIGN §8 *A held case that fails again*).
@@ -10592,7 +10656,15 @@ nor void.
 - **Re-drive.** A group whose ratchet regressed an item records
   `ratchet_regressed`, is void and rolled back, and each such item becomes
   a pending note `{kind: control_regression, key: met-item-<i>, test:
-  "required item <i>", detail}`.
+  "required item <i>", detail}`. A group whose ratchet has
+  `merge_checks_broke` records their ids as `merge_checks_broke`, is void
+  and rolled back (`_redrive_rollback_reason` adds "it turned the
+  repository's merge check(s) red: <_ci_broke_text>"), and each check not
+  already pending becomes `_redrive_merge_check_note(b)`: `{kind:
+  control_regression, key: ci-<id>, test: "merge check `<id>` (<command>)",
+  detail}` — the detail says an earlier attempt turned it red, confirmed
+  against the tree before it, and was reverted, "Keep it passing.", then
+  "Its first error lines:" and `b.lines`, one per line.
 
 ### Delivery re-drive — `_run_delivery_redrive`
 
@@ -10949,7 +11021,7 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   counts as one)" when the group has `probes_after`. A group that is none of the below then
   runs `_delivery_ratchet` (`ratchet`). A group that is worse, zero-progress,
   committed staged material (`committed_staged`), fails the escalation gate, or whose ratchet
-  regressed a previously met item is
+  regressed a previously met item or turned a merge check red is
   rolled back (`_roll_back_round(st, staging, pre_sha, ...)`, *A rollback says why*); the controls it broke become pending `control_regression`
   notes. A `trade` (something fixed and something broken) records its
   `(fixed, broken)` pairs in `trade_pairs`; a pair seen before is a
@@ -14062,7 +14134,7 @@ command line overrides it.
 | `acceptance_dispute` | dict | `{failing_sets, total_sets, cases[], accepted?, unacted?, redispute?}` written when held-out sets fail on HEAD — as a new dispute when the previous completed same-task run had NOT already disputed, and again with `accepted: true` when it had (the carry-forward); `_prior_acceptance_dispute` reads it from that sibling on the next run, which then accepts no work instead of disputing again. `unacted: true` is set by `_mark_dispute_unacted` when the disputing run still ended as no work by another exit (empty plans, or the satisfied-probe sweep emptying the plan); `_prior_acceptance_dispute` does not count such a dispute unless it also carries `redispute: true` — written when the dispute was raised because the previous run's dispute was unacted (`_prior_acceptance_dispute_record`), so a second unacted dispute counts and the wrong-tests loop stays bounded at two extra runs (DESIGN §8 *A dispute counts only once it is acted on*). |
 | `declared_unrun_warnings` | dict | per-sid list of `DECLARED_CMD_UNRUN` issues on an `empty_handoff`-rescued subtask that settled `complete` without running them. No longer written — such a rescue is now settled by execution or re-driven (DESIGN §8 *Settled by execution*) — but still read by `phase_finalize`, so a run recorded before the change keeps surfacing it. |
 | `settled_by_execution` | dict[str, dict] | per-sid record of `_settle_by_execution` (DESIGN §8 *Settled by execution*): `{verdict, why, commands: [{argv, rc, attempts, passed, resource_affected, environment_limit, tail}], dirty, removed_untracked?, forbidden?}` (`forbidden[{argv, forbidden}]` only when a verify argv runs a command the task forbids — then nothing ran), written on every execution whatever the verdict; `no_op: true` when `_settle_nothing_to_change` ran it for a no-op claim (the one-re-drive rule). |
-| `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, forbidden?, strict_forbidden?, strict_problems?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `db_reset`, `forbidden_by_task` (with `forbidden`, the entry the argv hits), `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`; `strict_forbidden` is the entry a selected check's `strict_argv` hit, and `strict_problems` the `_ci_strict_problems` of one that failed provenance (that `strict_argv` then `null`; the check stays selected). `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], pre_existing[], no_verdict[], budget_short_unsettled[], sized_out?[], b_star?, skipped?}`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. `browser_suite` (present only when `_browser_suite_candidate` found one, DESIGN §8 *A repository's browser suite is a channel the run provisions*): `{check_id, argv, runner, template, env[{name, value}], prerequisites[], requires[], source, viable, base{rc, timed_out, passed, failed, skipped, load_error, why?} | {why}}`, written by `_establish_browser_suite` before `ci_parity` is saved; `_browser_suite(st)` returns it only when `viable`. |
+| `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, forbidden?, strict_forbidden?, strict_problems?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `db_reset`, `forbidden_by_task` (with `forbidden`, the entry the argv hits), `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`; `strict_forbidden` is the entry a selected check's `strict_argv` hit, and `strict_problems` the `_ci_strict_problems` of one that failed provenance (that `strict_argv` then `null`; the check stays selected). `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], pre_existing[], no_verdict[], budget_short_unsettled[], sized_out?[], b_star?, skipped?}, reused?}` (`reused`: the label of the kept measurement it was read from). `measured` `{<commit sha>: {label, results{id: raw}}}` — `_ci_measure`'s raw results per commit, the last `_CI_MEASURED_KEEP`, written by `_ci_remember` from the final pass and `_ci_round_regressions`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. `browser_suite` (present only when `_browser_suite_candidate` found one, DESIGN §8 *A repository's browser suite is a channel the run provisions*): `{check_id, argv, runner, template, env[{name, value}], prerequisites[], requires[], source, viable, base{rc, timed_out, passed, failed, skipped, load_error, why?} | {why}}`, written by `_establish_browser_suite` before `ci_parity` is saved; `_browser_suite(st)` returns it only when `viable`. |
 | `blt_peak` | dict \| absent | the base-health baseline's measured peak (DESIGN §6 *The repo's own build peak*): `{memory_bytes, pids, axis, slots, worker_memory_max_bytes, worker_pids_max}` — the largest `memory.peak` / `pids.peak` across the measured axes, the host build-semaphore slot count sized from it, and the raised caps `_apply_blt_peak` applied. Re-applied on resume. |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `artifact_registry` | list[dict] | shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*). |
