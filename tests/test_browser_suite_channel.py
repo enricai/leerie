@@ -462,9 +462,11 @@ test("header fits", async ({ page }) => {
 ])
 def test_a_failure_counts_only_at_the_quoted_assertion(leerie, messages,
                                                        ok):
+    # The facts script's assertion span for line 6, the probe's `expect`.
     assert leerie._falsifier_failed_at_assertion(
         messages, "e2e/p.spec.ts", PROBE,
-        "expect(off).toEqual([]);") is ok
+        "expect(off).toEqual([]);",
+        asserts=[{"start": 6, "end": 6}]) is ok
 
 
 def test_a_playwright_case_message_leads_with_where_it_failed(leerie,

@@ -1214,7 +1214,8 @@ def test_a_failure_counts_in_the_assertions_binding_slice(
     facts = _at_facts(leerie, tmp_path)
     msg = [f"Error: boom\n    at /t/{AT_REL}:{line}:9"]
     assert leerie._falsifier_failed_at_assertion(
-        msg, AT_REL, AT_PROBE, quote, steps=facts["steps"]) is ok
+        msg, AT_REL, AT_PROBE, quote, steps=facts["steps"],
+        asserts=facts["asserts"]) is ok
 
 
 @pytest.mark.skipif(_ts_dir() is None,
@@ -1225,9 +1226,10 @@ def test_without_statements_only_the_quoted_lines_count(leerie, tmp_path):
     facts = _at_facts(leerie, tmp_path)
     msg = [f"at /t/{AT_REL}:14:9"]
     assert leerie._falsifier_failed_at_assertion(
-        msg, AT_REL, AT_PROBE, AT_QUOTE, steps=facts["steps"]) is True
+        msg, AT_REL, AT_PROBE, AT_QUOTE, steps=facts["steps"],
+        asserts=facts["asserts"]) is True
     assert leerie._falsifier_failed_at_assertion(
-        msg, AT_REL, AT_PROBE, AT_QUOTE) is False
+        msg, AT_REL, AT_PROBE, AT_QUOTE, asserts=facts["asserts"]) is False
 
 
 # === finding a parametrised case ==========================================
@@ -1372,9 +1374,15 @@ def test_the_image_ships_the_bundled_typescript_where_leerie_looks(leerie):
 
 def _facts_for(path_text: str) -> dict:
     """What the TS facts script would report for a clean probe: its whole
-    text reachable, nothing read or evaluated, no in-repo import."""
+    text reachable, nothing read or evaluated, no in-repo import, and its
+    assertions where the probe's are (these probes are pytest's: an
+    `assert` statement is its framework's assertion)."""
+    asserts = [{"start": n, "end": n} for n, ln in
+               enumerate(path_text.splitlines(), 1)
+               if ln.lstrip().startswith("assert ")]
     return {"reach_src": [path_text], "reads": [], "execs": [], "evals": [],
-            "imports": [], "vm_import": False, "title": "t"}
+            "imports": [], "vm_import": False, "title": "t",
+            "asserts": asserts}
 
 
 def _placed(fn):
