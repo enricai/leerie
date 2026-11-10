@@ -18602,6 +18602,92 @@ def _probe_drop_reason(verdict: dict) -> str | None:
     return None
 
 
+def _satisfied_falsifier_item(s: dict) -> dict:
+    """The item the base-tree falsifier checks for subtask `s` (DESIGN §8
+    *A subtask is dropped as already satisfied only when the falsifier
+    cannot show its criterion unmet on the base*): its `intent` as the
+    item and its `success_criteria_seed` as the item's one part — the
+    seed alone is often "these tests pass", which cannot show the gap —
+    or the seed alone when the intent is blank."""
+    intent = str(s.get("intent") or "").strip()
+    seed = str(s.get("success_criteria_seed") or "").strip()
+    ref = f"subtask {s.get('id', '?')}"
+    if not intent:
+        return {"item": seed, "source_ref": ref}
+    return {"item": intent, "parts": [seed] if seed else [],
+            "source_ref": ref}
+
+
+async def _falsify_satisfied_drops(
+        st: "State", caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None], base_sha: str,
+        subtasks: dict[str, dict], dropped: dict[str, dict],
+        cache: dict[str, dict]) -> None:
+    """Take out of `dropped` every `already_satisfied` drop whose criterion
+    the falsifier shows unmet on the base tree `base_sha` (DESIGN §8 *A
+    subtask is dropped as already satisfied only when the falsifier cannot
+    show its criterion unmet on the base*). A subtask whose cache entry
+    already records the falsifier's outcome is decided from it; the rest
+    go to one `_falsify_items` call, and each outcome is cached under the
+    verdict's base sha. A falsifier that cannot run, or records nothing for
+    a subtask, leaves its drop as the probe decided, uncached."""
+    todo: list[str] = []
+    for sid in sorted(dropped):
+        if dropped[sid].get("reason") != "already_satisfied":
+            continue
+        rec = (cache.get(sid) or {}).get("falsifier")
+        if isinstance(rec, dict) and "confirmed" in rec:
+            if rec["confirmed"]:
+                dropped.pop(sid)
+                log(f"  satisfied-probe {sid}: kept — the falsifier showed "
+                    "its criterion unmet on the base (cached)")
+            continue
+        if sid in subtasks:
+            todo.append(sid)
+    if not todo:
+        return
+    log(f"phase 3: falsifier on {len(todo)} subtask(s) the satisfied-probe "
+        "found already met — a drop stands only when no probe shows the "
+        "criterion unmet on the base (DESIGN §8)")
+    normalized = [_delivery_norm_item(_satisfied_falsifier_item(subtasks[sid]))
+                  for sid in todo]
+    progress: dict = {"items": {}}
+    try:
+        meta = await _falsify_items(
+            st, caps, models, efforts, sha=base_sha, normalized=normalized,
+            indices=list(range(len(todo))), parts_by_idx={},
+            progress=progress, base_claim=True,
+            names={i: f"base-{sid}" for i, sid in enumerate(todo)},
+            probes_root=st.run_dir / "satisfied-probe" / "probes",
+            persist=None)
+    except WorkerError:
+        # Budget exhaustion is the hard backstop: it stops the run.
+        raise
+    except Exception as e:
+        log(f"  satisfied-probe: falsifier raised {type(e).__name__}: {e} — "
+            "the probe's drops stand")
+        return
+    if meta.get("skipped"):
+        log(f"  satisfied-probe: falsifier not run — {meta['skipped']}; the "
+            "probe's drops stand")
+    for i, sid in enumerate(todo):
+        fi = (progress.get("items") or {}).get(str(i))
+        if not isinstance(fi, dict):
+            continue
+        confirmed = bool(fi.get("confirmed"))
+        if sid in cache:
+            cache[sid]["falsifier"] = {"confirmed": confirmed,
+                                       "samples": fi.get("samples") or []}
+        if confirmed:
+            dropped.pop(sid, None)
+            s_ = next((x for x in fi.get("samples") or []
+                       if isinstance(x, dict) and x.get("confirmed")), {})
+            log(f"  satisfied-probe {sid}: kept — a falsifier probe of "
+                f"\"{_scope_norm(str(s_.get('item_span_quote') or ''))[:160]}\" "
+                "fails under B* on the base")
+    st.save()
+
+
 async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
@@ -18615,7 +18701,10 @@ async def _filter_satisfied_subtasks(
     soft-drops the ones the probe marks `satisfied`. Recorded in
     `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
     the probe's evidence — the same audit shape as
-    `_filter_offtree_subtasks`. A not-satisfied verdict whose typed
+    `_filter_offtree_subtasks` — unless the falsifier shows its criterion
+    unmet on the base first (`_falsify_satisfied_drops`, DESIGN §8 *A
+    subtask is dropped as already satisfied only when the falsifier cannot
+    show its criterion unmet on the base*). A not-satisfied verdict whose typed
     fields agree (`unsatisfied_reason == "artifact_missing"`,
     `equivalent_coverage_exists`, and an explicit
     `sibling_invalidation_risk: false`) drops the same way with
@@ -18837,6 +18926,11 @@ async def _filter_satisfied_subtasks(
 
     await _gather_or_cancel(*(probe_one(s) for s in probeable))
     st.save()
+
+    if dropped and base_sha:
+        await _falsify_satisfied_drops(
+            st, caps, models, efforts, base_sha,
+            {s.get("id", "?"): s for s in probeable}, dropped, cache)
 
     if not dropped:
         return None
@@ -62735,16 +62829,34 @@ def _browser_suite_payload(suite: dict) -> str:
           "viewport, hover and touch.")
 
 
+# The base-tree falsifier's lines (DESIGN §8 *A subtask is dropped as
+# already satisfied only when the falsifier cannot show its criterion unmet
+# on the base*): the tree is the run's start, not a finished one.
+_FALSIFIER_BASE_START = (
+    "START COMMIT of this run: the tree in your working directory. The run "
+    "has changed nothing yet: there is no diff of its own.")
+_FALSIFIER_BASE_CLOSE = (
+    "Your working directory is a disposable copy of the tree this run STARTS "
+    "from: no work has been done on it yet. A reader judged this item "
+    "already delivered on this tree, so the run would not work on it. Try "
+    "to demonstrate this item is NOT delivered per your rules, and return "
+    "the JSON object per your schema.")
+
+
 def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                            stat: str, ctx: list[str], refs: list[str],
                            parts: list[dict],
-                           suite: dict | None = None) -> str:
+                           suite: dict | None = None, *,
+                           base_claim: bool = False) -> str:
     """The falsifier's payload: the frozen F+ user prompt line for line
     (DESIGN §8 *What ships is what was measured* — the only differences
     are an unknown start commit and the item's span as its
     `source_ref`). With the run's browser channel (`suite`), its section
     follows the reviewer's parts, and a probe may be written for it; with
-    none the payload is unchanged."""
+    none the payload is unchanged. With `base_claim` the tree is the run's
+    start, where a reader judged the item already delivered: the start
+    commit lines and the closing line say so (`_FALSIFIER_BASE_START`,
+    `_FALSIFIER_BASE_CLOSE`), the rest is unchanged."""
     lines = ["TASK:", task, "",
              "Files the task references:",
              *[f"- {r}" for r in refs], "",
@@ -62755,7 +62867,9 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                          **({"parts": _falsifier_item_parts(item)}
                             if _falsifier_item_parts(item) else {})},
                         indent=1), ""]
-    if own:
+    if base_claim:
+        lines += [_FALSIFIER_BASE_START, ""]
+    elif own:
         lines += [f"START COMMIT of this run: {own}. Diff stat of the run's "
                   f"own changes (`git diff {own}..HEAD`):",
                   stat[-12000:] or "(empty)", ""]
@@ -62782,6 +62896,7 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                     "The held-out files and a reviewer's parts say where to "
                     "look, not how to observe it.", ""]
     lines.append(
+        _FALSIFIER_BASE_CLOSE if base_claim else
         "Your working directory is a disposable copy of the FINISHED tree. "
         "Try to demonstrate this item is NOT delivered per your rules, and "
         "return the JSON object per your schema.")
@@ -63052,16 +63167,19 @@ def _falsifier_failed_at_assertion(messages: list[str], rel: str,
 
 
 def _falsifier_save_probe(st: "State", lane: Path, i: int,
-                          res: dict) -> dict | None:
+                          res: dict, *, name: str | None = None,
+                          root: Path | None = None) -> dict | None:
     """Keep a confirmed sample's probe beside the held-out sets, under
     `<run_dir>/acceptance/probes/i<k>/` (outside every fixer's grant,
     `_worker_grants`), so the delivery re-drive can re-run it on a
-    later tree (DESIGN §8 *Delivery re-drive*). `{dir, file}`, or None when
-    it cannot be copied."""
+    later tree (DESIGN §8 *Delivery re-drive*); under `root/<name>` when
+    given. `{dir, file}`, or None when it cannot be copied."""
     rel = _delivery_cite_rel(str(res.get("probe_path") or ""), lane)
     if not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
         return None
-    dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
+    dst_dir = ((root if root is not None
+                else st.run_dir / "acceptance" / "probes")
+               / (name or f"i{i}"))
     try:
         _rmtree_owned(dst_dir)
         _copy_beneath(lane / rel, st.run_dir, dst_dir / rel, src_anchor=lane, limit=READ_LIMIT_TEXT)
@@ -63083,14 +63201,31 @@ def _ts_resolvable(tree: str | Path, *, grants: WorkerGrants) -> bool:
     return r.returncode == 0
 
 
+def _falsifier_persist_final(st: "State", progress: dict) -> None:
+    """Detection's record of the falsifier's finished items:
+    `delivery_gate.final_progress`, saved, so a resume skips them."""
+    gate = st.data.get("delivery_gate") or {}
+    gate["final_progress"] = progress
+    st.data["delivery_gate"] = gate
+    st.save()
+
+
 async def _falsify_items(st: "State", caps: dict, models: dict,
                          efforts: dict, *, sha: str, normalized: list[dict],
                          indices: list[int], parts_by_idx: dict[int, list],
-                         progress: dict) -> dict:
+                         progress: dict, base_claim: bool = False,
+                         names: dict[int, str] | None = None,
+                         probes_root: Path | None = None,
+                         persist: Callable[["State", dict], None] | None
+                         = _falsifier_persist_final) -> dict:
     """Run up to `falsifier_samples` falsifier samples per item in
-    `indices` on the final commit `sha`; record each item's samples into
-    `progress["items"]` (saved as they finish, so a resume skips them).
-    Returns the falsifier meta `{enabled, skipped?, lanes?}`."""
+    `indices` on the commit `sha` — the final commit, or with `base_claim`
+    the tree the run starts from (`_falsify_satisfied_drops`); record each
+    item's samples into `progress["items"]` and hand `progress` to
+    `persist` as each item finishes (by default detection's record, so a
+    resume skips them). `names` names an item's samples and saved probe
+    (`i<k>` by default), under `probes_root`. Returns the falsifier meta
+    `{enabled, skipped?, lanes?}`."""
     k = int(caps.get("falsifier_samples", DEFAULT_CAPS["falsifier_samples"]))
     if k <= 0:
         return {"enabled": False, "skipped": "falsifier_samples is 0"}
@@ -63141,7 +63276,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                                  + (s_.get("control_files") or [])
                                  + (s_.get("support_files") or []))}
         task = st.data.get("task", "")
-        own = _acceptance_own_start(st)
+        own = None if base_claim else _acceptance_own_start(st)
         n_lanes = max(1, min(int(caps.get("max_parallel") or 1), len(todo)))
         lanes: asyncio.Queue = asyncio.Queue()
         for n in range(n_lanes):
@@ -63168,6 +63303,9 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 ["git", "--git-dir", str(_run_repo(st)), "diff", "--stat=160",
                  f"{own}..{sha}"], capture_output=True, text=True,
                 check=False).stdout
+        def _name(i: int) -> str:
+            return (names or {}).get(i) or f"i{i}"
+
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
             # Back to the pristine final commit between samples. Each
@@ -63183,8 +63321,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             ctx, refs = _falsifier_place_leads(st, lane, sets, task)
             user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
                                           parts_by_idx.get(i) or [],
-                                          suite=suite)
-            sid = f"falsifier-i{i}-s{n}"
+                                          suite=suite, base_claim=base_claim)
+            sid = f"falsifier-{_name(i)}-s{n}"
             common = dict(system_prompt=_load_prompt("falsifier"),
                           schema_key="falsifier", cwd=str(lane),
                           allowed_tools=ACT_TOOLS,
@@ -63236,9 +63374,11 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             rec.update(await _falsifier_gates(
                 st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
                 sha=sha, item_text=_falsifier_item_text(item),
-                acc_paths=acc_paths, label=f"i{i}-s{n}", suite=via))
+                acc_paths=acc_paths, label=f"{_name(i)}-s{n}", suite=via))
             if rec.get("confirmed"):
-                saved = _falsifier_save_probe(st, lane, i, res)
+                saved = _falsifier_save_probe(st, lane, i, res,
+                                              name=_name(i),
+                                              root=probes_root)
                 if saved:
                     rec["probe_saved"] = saved
             return rec
@@ -63256,8 +63396,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 except Exception as e:
                     # One sample's local failure (a copy, a git call) is no
                     # evidence either way; the item's other samples still run.
-                    log(f"  delivery detection: falsifier sample i{i}-s{n} "
-                        f"raised {type(e).__name__}: {e}")
+                    log(f"  delivery detection: falsifier sample "
+                        f"{_name(i)}-s{n} raised {type(e).__name__}: {e}")
                     rec = {"sample": n, "error": f"{type(e).__name__}: {e}",
                            "confirmed": False}
                 finally:
@@ -63269,10 +63409,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                     break
             done[str(i)] = {"item_index": i, "confirmed": confirmed,
                             "samples": samples}
-            gate = st.data.get("delivery_gate") or {}
-            gate["final_progress"] = progress
-            st.data["delivery_gate"] = gate
-            st.save()
+            if persist is not None:
+                persist(st, progress)
         log(f"  delivery detection: falsifier on {len(todo)} item(s), up to "
             f"{k} sample(s) each, {lanes.qsize()} checkout(s)")
         await _gather_or_cancel(*[_item(i) for i in todo])

@@ -15848,6 +15848,41 @@ read another ref of the run's repository, which its grant reads: the
 residual `git diff <ref>` already left, held by the probe's prompt, not by
 code.
 
+**A subtask is dropped as already satisfied only when the falsifier cannot
+show its criterion unmet on the base.** The probe *reads*; a reading is not
+a measurement, and the default-to-not-satisfied discipline above is a
+prompt, which a model can drift from. Measured on barnacle run e7512406: the
+probe dropped 5 of 8 subtasks, saying of one (`bugfix-005-2`, "skips
+loopback and link-local addresses") that the code covers `::ffff`-mapped
+forms — false: the WHATWG URL parser rewrites a mapped address to hex, so
+that branch can never match — while also saying it had run no test. Replayed
+6 times in each of three tool arms, it dropped that subtask 6 of 6 every
+time, even when allowed to run the repository's tests: the subtask's own
+verify tests pass without the behaviour, so running them confirms the wrong
+answer. Nor does the verdict's typed field say when the probe was unsure:
+with `--dangerously-force-strict-output` every field is required, the
+prompt prescribes `cannot_verify` as the inert value on a satisfied verdict,
+and 62 of 62 recorded satisfied verdicts carry it. So the drop is checked by
+the mechanism that already decides whether a *finished* tree delivers an
+item (*Delivery detection*): before a subtask the probe marks `satisfied` is
+dropped, the falsifier is asked about it on the base tree — the tree its
+implementer would start from. The item it gets is the subtask's own words:
+its `intent` as the item, its `success_criteria_seed` as the item's part
+(the criterion alone is often "these tests pass", which is exactly what
+cannot show the gap). Its payload names the tree for what it is — the
+run's start, where nothing has been done yet and a reader judged the item
+delivered — and is otherwise detection's, with the same samples
+(`falsifier_samples`, any-of-k), the same gates and the same B* confirm. A
+sample code confirms keeps the subtask, and the subtask runs; no confirmed
+sample, and the drop stands. When the falsifier cannot run (no scoped test
+runner, no checkout or install of the base, no compiler API for the AST
+checks) nothing was measured either way and the drop stands as the probe
+decided, the same advisory standing as detection's. The outcome is kept in
+the subtask's `satisfied_probe_cache` entry, under the same base sha, so a
+resume neither re-asks nor loses it. Only the `already_satisfied` drop is
+checked this way; the `equivalent_coverage` drop and the mid-run probes on
+the run branch's HEAD are not, and are measured separately before they are.
+
 **A "not satisfied" verdict carries a typed reason.** Measured across one
 repo's full run corpus, 58% of all not-satisfied probe verdicts (433/753 on
 the two most recent versions) rested solely on "the exact file the planner
