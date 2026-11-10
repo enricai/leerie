@@ -23,7 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import TEST_PROCESS_ENV, kill_marked, processes_marked
+from tests.conftest import (_POPEN_ENV_POS, TEST_PROCESS_ENV, _popen_init,
+                            kill_marked, processes_marked)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -174,6 +175,115 @@ def test_without_the_fixture_the_timed_out_test_leaves_both(tmp_path):
     pids = _run_inner(tmp_path, with_fixture=False)
     try:
         assert all(_alive(p) for p in pids)
+    finally:
+        for p in pids:
+            with contextlib.suppress(OSError):
+                os.kill(p, 9)
+
+
+# --- a child given an environment of its own (an explicit `env`) ------------
+
+def test_an_explicit_env_still_carries_the_marker():
+    """A `Popen` handed its own `env` -- by keyword, by position, or as
+    bytes -- starts a child that carries this test's marker, and the
+    caller's mapping is left as it was. Falsified: the `Popen.__init__`
+    wrapper dropped from the fixture (the child prints an empty line)."""
+    marker = os.environ[TEST_PROCESS_ENV]
+    argv = ["/bin/bash", "-c", 'printf %s "$' + TEST_PROCESS_ENV + '"']
+    env = {"PATH": "/usr/bin:/bin"}
+    assert subprocess.run(argv, env=env, capture_output=True,
+                          text=True).stdout == marker
+    assert subprocess.check_output(
+        argv, env={b"PATH": b"/usr/bin:/bin"}) == marker.encode()
+    p = subprocess.Popen(argv, -1, None, None, subprocess.PIPE, None, None,
+                         True, False, None, env)
+    assert p.communicate()[0] == marker.encode()
+    assert env == {"PATH": "/usr/bin:/bin"}
+
+
+def test_env_is_where_the_wrapper_reads_it():
+    """The wrapper finds a positional `env` by index; pin that index to
+    Popen's own signature on this Python."""
+    import inspect
+    names = list(inspect.signature(_popen_init).parameters)
+    assert names[_POPEN_ENV_POS + 1] == "env", names
+
+
+# The shape `test_buildkit_isolation.py` leaked (issue 20): a harness started
+# with a fresh environment and a session of its own, whose build runs in a
+# group of its own blocked on a FIFO nobody writes once the test has failed.
+FIFO_SPAWN = ("/usr/bin/setsid /bin/bash -c 'read -r _ < \"$FIFO\"' & "
+              "echo $! >> {pids}; /usr/bin/sleep 300 & echo $! >> {pids}; "
+              "wait")
+
+INNER_FAILING_TEST = """\
+import os
+import subprocess
+import time
+
+
+def test_fails_mid_build(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    p = subprocess.Popen(["/bin/bash", "-c", {spawn!r}],
+                         start_new_session=True,
+                         env={{"PATH": "/usr/bin:/bin", "FIFO": str(fifo)}})
+    try:
+        end = time.monotonic() + 10
+        while time.monotonic() < end and not (
+                os.path.exists({pids!r})
+                and len(open({pids!r}).read().split()) == 2):
+            time.sleep(0.05)
+        assert False, "a failing assertion mid-build"
+    finally:
+        os.killpg(p.pid, 9)
+        p.wait(timeout=10)
+"""
+
+
+def _run_inner_failing(tmp_path: Path, *, with_fixture: bool) -> list[int]:
+    d = tmp_path / ("with" if with_fixture else "without")
+    d.mkdir()
+    pidfile = d / "pids"
+    (d / "conftest.py").write_text(INNER_CONFTEST.format(
+        import_line=("from tests.conftest import "
+                     "_no_process_outlives_its_test  # noqa: F401"
+                     if with_fixture else "")))
+    (d / "test_inner.py").write_text(INNER_FAILING_TEST.format(
+        spawn=FIFO_SPAWN.format(pids=pidfile), pids=str(pidfile)))
+    env = {**os.environ,
+           "PYTHONPATH": os.pathsep.join(
+               [str(REPO_ROOT), *filter(None, [os.environ.get("PYTHONPATH")])])}
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-p", "no:xdist", "-o", "addopts=",
+         "--rootdir", str(d), str(d / "test_inner.py")],
+        cwd=d, env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "a failing assertion mid-build" in r.stdout, r.stdout
+    return _pids(pidfile)
+
+
+def test_a_failed_test_with_a_fresh_env_leaves_no_process(tmp_path):
+    """The FIFO reader in a session of its own, started with an environment
+    the test wrote itself, is gone once the failed test is torn down.
+    Falsified: the `Popen.__init__` wrapper dropped from the fixture (the
+    reader stays, blocked on the FIFO, reparented to init)."""
+    pids = _run_inner_failing(tmp_path, with_fixture=True)
+    try:
+        assert _gone(pids), [p for p in pids if _alive(p)]
+    finally:
+        for p in pids:
+            with contextlib.suppress(OSError):
+                os.kill(p, 9)
+
+
+def test_without_the_fixture_the_fifo_reader_stays(tmp_path):
+    """Anti-vacuity: without the fixture the same failed test leaves the
+    FIFO reader running (killed here: it carries no marker of ours)."""
+    pids = _run_inner_failing(tmp_path, with_fixture=False)
+    try:
+        assert _alive(pids[0])
     finally:
         for p in pids:
             with contextlib.suppress(OSError):
