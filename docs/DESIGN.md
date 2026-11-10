@@ -15879,7 +15879,14 @@ runner, no checkout or install of the base, no compiler API for the AST
 checks) nothing was measured either way and the drop stands as the probe
 decided, the same advisory standing as detection's. The outcome is kept in
 the subtask's `satisfied_probe_cache` entry, under the same base sha, so a
-resume neither re-asks nor loses it. Only the `already_satisfied` drop is
+resume neither re-asks nor loses it. Measured (6 production phase-3
+sweeps of e7512406 on its base, sonnet, strict output on): `bugfix-005-2` is
+kept 6 of 6, each by a confirmed probe of the dead mapped-address branch,
+and the four audited-satisfied subtasks are still dropped 6, 6, 5 and 5 of
+6, at 19 to 24 falsifier calls and 14 to 16 minutes added to the sweep. A
+first bench on the gates before a loop-built test title could be read
+(§8 *Delivery detection*) kept it 4 of 6: one real demonstration was
+refused because its case was not found. Only the `already_satisfied` drop is
 checked this way; the `equivalent_coverage` drop and the mid-run probes on
 the run branch's HEAD are not, and are measured separately before they are.
 
