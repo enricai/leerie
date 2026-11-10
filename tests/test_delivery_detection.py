@@ -1287,6 +1287,103 @@ def test_a_parametrised_case_is_found_by_its_whole_template(
         assert f'"{marker}"' in facts["case_src"]
 
 
+# A probe that builds its titles at run time: lane SD sweep r2 on barnacle
+# e7512406 bugfix-005-2 (the `::ffff` loopback demonstration, B*-confirmed,
+# rejected for `case_not_found`) wrote `for (const u of [...]) it("skips " +
+# u, ...)`, its assertion on line 9.
+LOOP_PROBE = """import { describe, expect, it } from "vitest";
+import { selectRateLimitTargets } from "@/scripts/recon-http";
+const r = (url: string) => ({ url, method: "GET" });
+describe("probe", () => {
+  for (const u of ["http://[::ffff:127.0.0.1]/a", "http://[fe90::1]/a"]) {
+    it("skips " + u, () => {
+      const host = new URL(u).hostname;
+      const out = selectRateLimitTargets([r(u)], [host], null);
+      expect([...out.targets.keys()]).toEqual(["CONCAT"]);
+    });
+  }
+  ["http://[febf::1]/a"].forEach((u) => it("drops " + (u + " from") + " targets", () => {
+    expect(u).toBe("FOREACH");
+  }));
+  for (const u of ["http://127.1/a"]) {
+    it(`keeps ${u}`, () => {
+      expect(u).toBe("TEMPLATE");
+    });
+  }
+  it("keeps public hosts", () => {
+    expect(1).toBe("LITERAL");
+  });
+});
+"""
+LOOP_QUOTE = "expect([...out.targets.keys()]).toEqual([\"CONCAT\"]);"
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+@pytest.mark.parametrize("full,marker", [
+    # The SD r2 shape: a loop's `"skips " + u`.
+    ("probe skips http://[::ffff:127.0.0.1]/a", "CONCAT"),
+    ("probe skips http://[fe90::1]/a", "CONCAT"),
+    # `.forEach` over a value, the concatenation nested in parentheses.
+    ("probe drops http://[febf::1]/a from targets", "FOREACH"),
+    # A template literal in a loop.
+    ("probe keeps http://127.1/a", "TEMPLATE"),
+    # A different case of the same file is its own, not a template's.
+    ("probe keeps public hosts", "LITERAL"),
+    # Literal text that differs, or text after the end: no case.
+    ("probe drops http://[febf::1]/a", None),
+    ("probe drops http://[febf::1]/a from targets now", None),
+    ("probe rejects http://[fe90::1]/a", None),
+])
+def test_a_loop_built_case_is_found_by_its_title_template(
+        leerie, tmp_path, full, marker):
+    tree = tmp_path / "tree"
+    (tree / "node_modules").mkdir(parents=True)
+    os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+    probe = tmp_path / "loop-src.test.ts"
+    probe.write_text(LOOP_PROBE)
+    facts = _placed_facts(leerie, tmp_path, tree, probe,
+                          "src/scripts/probe-loop/recon-http.probe.test.ts",
+                          full)
+    if marker is None:
+        assert facts.get("error") == "case_not_found", facts
+    else:
+        assert "error" not in facts, facts
+        assert f'"{marker}"' in facts["case_src"]
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+def test_a_loop_built_case_passes_the_gates_that_read_its_facts(
+        leerie, tmp_path):
+    """The SD r2 sample read `case_not_found`, which failed
+    `assertion_in_case`, `not_coupled` and `at_assertion` together. Found,
+    its facts decide each: the quote is one of its assertions, the failure
+    at line 9 is at it, and the coupling check reads the case's code."""
+    tree = tmp_path / "tree"
+    (tree / "node_modules").mkdir(parents=True)
+    os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+    probe = tmp_path / "loop-src.test.ts"
+    probe.write_text(LOOP_PROBE)
+    rel = "src/scripts/probe-loop/recon-http.probe.test.ts"
+    facts = _placed_facts(leerie, tmp_path, tree, probe, rel,
+                          "probe skips http://[::ffff:127.0.0.1]/a")
+    assert "error" not in facts, facts
+    assert facts["title"] == "skips ${}"
+    assert leerie._scope_norm(LOOP_QUOTE) in leerie._scope_norm(
+        " ".join(facts["reach_src"]))
+    assert leerie._falsifier_quoted_assertion_lines(
+        LOOP_PROBE, LOOP_QUOTE, facts["asserts"]) == {9}
+    msg = [f"AssertionError: expected [ 'http://[::ffff:7f00:1]/a' ]\n"
+           f"    at /t/{rel}:9:39"]
+    assert leerie._falsifier_failed_at_assertion(
+        msg, rel, LOOP_PROBE, LOOP_QUOTE, steps=facts["steps"],
+        asserts=facts["asserts"]) is True
+    cp = leerie._falsifier_coupling(facts, rel, tmp_path, "HEAD", "",
+                                    tree=tree, grants=_all_grants(leerie))
+    assert cp.get("coupled") is not None and "error" not in cp, cp
+
+
 # === the bundled typescript fallback =======================================
 
 def _ts7_tree(root: Path) -> Path:

@@ -37,6 +37,16 @@ function strOf(n) {
   if (ts.isTemplateExpression(n)) return n.head.text + n.templateSpans.map(s => '${}' + s.literal.text).join('');
   return null;
 }
+// A case's title as a template: one built with `+` is a template as a
+// template literal is, its string operands literal text and every other
+// operand a `${}` hole (a loop variable, a constant, a call: never resolved).
+function titleOf(n) {
+  const s = strOf(n); if (s != null) return s;
+  if (n && ts.isParenthesizedExpression(n)) return titleOf(n.expression);
+  if (n && ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken)
+    return (titleOf(n.left) ?? '${}') + (titleOf(n.right) ?? '${}');
+  return null;
+}
 function lastFn(args) { for (let i = args.length - 1; i >= 0; i--) if (ts.isArrowFunction(args[i]) || ts.isFunctionExpression(args[i])) return args[i]; return null; }
 
 // collect cases with their ancestor suites
@@ -44,17 +54,17 @@ const cases = [];
 function walk(n, suites) {
   if (ts.isCallExpression(n)) {
     const r = calleeRoot(n.expression);
-    if (CASE_FNS.has(r)) { const t = strOf(n.arguments[0]); if (t != null) cases.push({ title: t, node: n, suites: suites.slice() }); }
+    if (CASE_FNS.has(r)) { const t = titleOf(n.arguments[0]); if (t != null) cases.push({ title: t, node: n, suites: suites.slice() }); }
     if (SUITE_FNS.has(r)) { const fn = lastFn(n.arguments); if (fn) { suites.push(fn); ts.forEachChild(fn.body, c => walk(c, suites)); suites.pop(); return; } }
   }
   ts.forEachChild(n, c => walk(c, suites));
 }
 walk(sf, []);
-// A parametrised title (`it.each`, `test.each`, a template literal) names
-// every case it generates: its literal text must match exactly and in order,
-// each placeholder any text (vitest/jest's printf `%s %d %i %f %j %o %O %p %c
-// %# %$`, `%%` a literal `%`, a table's `$name` / `$name.path`, a template's
-// `${}`), anchored at the end of the runner's full name as a plain title is.
+// A parametrised title (`it.each`, `test.each`, a template literal, a `+`
+// concatenation) names every case it generates: its literal text must match
+// exactly and in order, each placeholder any text (vitest/jest's printf `%s
+// %d %i %f %j %o %O %p %c %# %$`, `%%` a literal `%`, a table's `$name` /
+// `$name.path`, a template's or a concatenation's `${}`), anchored at the end of the runner's full name as a plain title is.
 // Scored by its literal length, so the most specific title wins.
 const PLACEHOLDER = /%%|%[sdifjoOpc#$]|\$\{\}|\$[A-Za-z_$#][\w$]*(?:\.[\w$]+)*/g;
 function titleMatches(t, full) {
