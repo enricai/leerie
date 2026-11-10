@@ -61843,6 +61843,10 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
 _COUPLING_TEXT_TOOLS_RE = re.compile(
     r"(^|[\s;&|(])(grep|rg|egrep|cat|sed|awk|head|tail|wc)\b"
     r"|\bgit\s+(grep|show|log\s+-p|diff)\b")
+# Shell tools that put one file's text at another path: with one in the
+# probe's commands, a fresh directory may hold the tree's text (R1).
+_COUPLING_COPY_TOOLS_RE = re.compile(
+    r"(^|[\s;&|(])(cp|ln|mv|rsync|install|tar|ditto|dd|tee|cpio|unzip)\b")
 _COUPLING_HARNESS_RE = re.compile(
     r"(\.test-helper\.|\.test\.|\.spec\.|(^|/)(__tests__|__mocks__|test-utils"
     r"|testing|fixtures?)(/|$)|(^|/)tests?/|setup-tests|vitest\.setup"
@@ -61959,7 +61963,10 @@ def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
     """The AST coupling check on one failing probe case (bench n2d, frozen):
     `{"coupled": bool | None, "reasons": [...]}` — None when the facts could
     not be read. Coupled when its reachable code reads a source or document
-    file's text (R1), evaluates code text (R2), or imports an in-repo symbol
+    file's text (R1: any read but of a JSON path or of a path inside a
+    directory the probe made fresh, `fresh` in the facts, with nothing
+    copied, linked or moved in from elsewhere), evaluates code text (R2), or
+    imports an in-repo symbol
     that no production code uses outside its own declaration
     (`_coupling_referenced_elsewhere`, over `tree`, an installed copy of
     `sha`) and the item does not name, or a deep package path (R3). When the
@@ -61971,7 +61978,18 @@ def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
                 "error": (facts or {}).get("error") if isinstance(
                     facts, dict) else "no facts"}
     reasons: list[str] = []
+    # A read inside a directory the probe made fresh reads what the run
+    # produced, unless something put another file's text there: a copy,
+    # link or move whose source is not itself fresh, or a shell copy.
+    copied_in = any(
+        not (isinstance(c, dict) and c.get("fresh_src") is True)
+        for c in facts.get("copies") or []) or any(
+        _COUPLING_COPY_TOOLS_RE.search(
+            " ".join(str(x) for x in (e.get("lits") or [])))
+        for e in facts.get("execs") or [])
     for r in facts.get("reads") or []:
+        if r.get("fresh") is True and not copied_in:
+            continue
         lits = [str(x) for x in (r.get("lits") or [])]
         pathy = [x for x in lits if _COUPLING_PATHY_RE.search(x)]
         if pathy and all(x.endswith(".json") for x in pathy):

@@ -13335,7 +13335,27 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   production code when any production code, its own module included,
   refers to it outside its own declaration — read from syntax, so a call is
   told from the definition and a self-recursive call is not a use; a helper
-  whose only production caller shares its module is not test-only. The coupling
+  whose only production caller shares its module is not test-only. A
+  file read is of the tree's text unless the file cannot be one of the
+  tree's: a JSON path, or a path inside a directory the case made fresh
+  (`mkdtemp`) joined only with plain segments — traced from syntax
+  through the probe's own bindings, each name to its declaration, every
+  value a binding is given having to be such a path — when nothing the
+  case runs copies, links or moves another file in. Such a file was
+  written while the probe ran, by the code it exercises, so asserting on
+  it observes behaviour, not the tree's source. Every other read, a path
+  the trace cannot follow included, still counts. Measured: barnacle run
+  87580f62 item 9 ("… no literal secrets are written back"). Its sample 2
+  ran the script on a flow file in a fresh directory, walked the run
+  directory the script wrote and found the literal secret in the written
+  flow record. The old rule, which counted every read whose path is not a
+  JSON literal, rejected it because the path is a variable. The item
+  shipped `met`, shown unmet in 5 of 6 samples, and an independent audit
+  reproduced the leak 3 of 3 times. Replayed under this rule it confirms.
+  A probe that runs a generator writing into the tree and reads what it
+  wrote still counts as a read (a2a825c2 item 19): the trace sees a path
+  under the tree, and syntax cannot tell a new file there from an old
+  one. The coupling
   check is JS/TS-only, as benched. Its facts are syntax-only — a parse
   of one file, no type checking, no program — so the repository's own
   compiler version does not matter to them, and any TypeScript with the

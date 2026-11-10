@@ -122,13 +122,252 @@ function litsIn(n, depth = 0) { // string literals in an expression, resolving c
   })(n);
   return out;
 }
+// Where a path the case reads comes from (DESIGN §8 *Delivery detection*,
+// R1): `P` when it names a file inside a directory the probe made fresh
+// (`mkdtemp`/`mkdtempSync` from `fs`) joined only with plain segments, so
+// the file was produced while the probe ran and was never one of the
+// tree's. Traced through the probe's own bindings, each identifier resolved
+// to its declaration by lexical scope, every value a binding is given having
+// to agree (a greatest fixed point, so a recursive directory walk keeps its
+// paths). Kinds: `A` an array of such paths, `N` one plain segment (a
+// literal neither absolute nor holding `..`, or a directory entry's name),
+// `NA` an array of segments (`readdir`), `T` not yet known, `B` anything
+// else — whatever the trace does not follow, and a `B` read is judged as
+// before.
+const FS_MODS = new Set(['fs', 'node:fs', 'fs/promises', 'node:fs/promises']);
+const PATH_MODS = new Set(['path', 'node:path', 'path/posix', 'node:path/posix']);
+const unwrap = (e) => { while (e && (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)
+  || ts.isTypeAssertionExpression(e) || ts.isAwaitExpression(e) || (ts.isSatisfiesExpression && ts.isSatisfiesExpression(e)))) e = e.expression; return e; };
+// --- lexical scopes: an identifier's binding is `<scope id>:<name>` ---
+const isFnScope = (x) => ts.isFunctionLike(x) && !ts.isTypeNode(x) && !!x.body;
+const scopeIds = new Map(); const scopeNames = new Map();
+function patNames(b, into) {
+  if (!b) return into;
+  if (ts.isIdentifier(b)) into.push(b.text);
+  else if (b.elements) b.elements.forEach(e => e.name && patNames(e.name, into));
+  return into;
+}
+function varNames(body, into) { // `var` declarations hoisted to a function (or the file)
+  (function v(y) {
+    if (y !== body && isFnScope(y)) return;
+    if (ts.isVariableDeclarationList(y) && !(y.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) y.declarations.forEach(d => patNames(d.name, into));
+    ts.forEachChild(y, v);
+  })(body);
+  return into;
+}
+function declared(s) {
+  if (scopeNames.has(s)) return scopeNames.get(s);
+  const out = [];
+  const stmts = ts.isSourceFile(s) || ts.isBlock(s) || ts.isModuleBlock(s) ? s.statements
+    : ts.isCaseBlock(s) ? s.clauses.flatMap(c => [...c.statements]) : null;
+  if (stmts) for (const st of stmts) {
+    if (ts.isVariableStatement(st) && (st.declarationList.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) st.declarationList.declarations.forEach(d => patNames(d.name, out));
+    else if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) out.push(st.name.text);
+    else if (ts.isImportDeclaration(st) && st.importClause) {
+      const cl = st.importClause; if (cl.name) out.push(cl.name.text);
+      const nb = cl.namedBindings; if (nb && ts.isNamespaceImport(nb)) out.push(nb.name.text);
+      if (nb && ts.isNamedImports(nb)) nb.elements.forEach(e => out.push(e.name.text));
+    }
+  }
+  if (ts.isSourceFile(s)) varNames(s, out);
+  if (isFnScope(s)) { s.parameters.forEach(p => patNames(p.name, out)); varNames(s.body, out); if (!ts.isFunctionDeclaration(s) && s.name && ts.isIdentifier(s.name)) out.push(s.name.text); }
+  if ((ts.isForStatement(s) || ts.isForOfStatement(s) || ts.isForInStatement(s)) && s.initializer && ts.isVariableDeclarationList(s.initializer)
+      && (s.initializer.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) s.initializer.declarations.forEach(d => patNames(d.name, out));
+  if (ts.isCatchClause(s) && s.variableDeclaration) patNames(s.variableDeclaration.name, out);
+  const set = new Set(out); scopeNames.set(s, set); return set;
+}
+function keyOf(id) {
+  for (let a = id.parent; a; a = a.parent) {
+    if (declared(a).size && declared(a).has(id.text)) {
+      if (!scopeIds.has(a)) scopeIds.set(a, scopeIds.size);
+      return scopeIds.get(a) + ':' + id.text;
+    }
+  }
+  return 'global:' + id.text;
+}
+// A module binding: an import (or a top-level `require`) of the file.
+const modBind = new Map(); // key -> {spec, imported}
+for (const [local, b] of importBind) for (const st of sf.statements) if (ts.isImportDeclaration(st)) {
+  modBind.set(keyOf(Object.assign(ts.factory.createIdentifier(local), { parent: sf })), b); break;
+}
+for (const st of sf.statements) if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) {
+  const i = d.initializer && unwrap(d.initializer);
+  if (ts.isIdentifier(d.name) && i && ts.isCallExpression(i) && ts.isIdentifier(i.expression) && i.expression.text === 'require') {
+    const s = strOf(i.arguments[0]); if (s != null) modBind.set(keyOf(d.name), { spec: s, imported: '*' });
+  }
+}
+// The module function a callee names: `fn` imported from `mods`, or
+// `ns.fn` / `ns.promises.fn` / `ns.posix.fn` over a namespace or default
+// import of one.
+function modFn(callee, mods) {
+  callee = unwrap(callee);
+  if (ts.isIdentifier(callee)) { const b = modBind.get(keyOf(callee)); return b && mods.has(b.spec) && !['*', 'default', 'promises', 'posix'].includes(b.imported) ? b.imported : null; }
+  if (!ts.isPropertyAccessExpression(callee)) return null;
+  let r = unwrap(callee.expression); let sub = false;
+  if (ts.isPropertyAccessExpression(r) && ['promises', 'posix'].includes(r.name.text)) { r = unwrap(r.expression); sub = true; }
+  if (!ts.isIdentifier(r)) return null;
+  const b = modBind.get(keyOf(r));
+  return b && mods.has(b.spec) && (b.imported === '*' || b.imported === 'default' || (!sub && ['promises', 'posix'].includes(b.imported))) ? callee.name.text : null;
+}
+// --- the kinds ---
+const T = 'T', B = 'B';
+const meet = (a, b) => (a === T ? b : b === T ? a : a === b ? a : B);
+const elemOf = (k) => (k === 'A' ? 'P' : k === 'NA' ? 'N' : k === T ? T : B);
+const arrOf = (k) => (k === 'P' ? 'A' : k === 'N' ? 'NA' : k === T ? T : B);
+const isArr = (k) => k === 'A' || k === 'NA' || k === T;
+const safeSeg = (s) => !s.startsWith('/') && !s.split(/[\\/]/).includes('..');
+const bindKind = new Map(); const bindSrc = new Map(); // binding key -> [thunk]
+const retKind = new Map(); const retSrc = new Map(); // function node -> [expr | null]
+const fnByKey = new Map(); // binding key -> function node (null when bound twice)
+const bottom = () => B;
+const addSrc = (id, s) => { const k = keyOf(id); if (!bindSrc.has(k)) bindSrc.set(k, []); bindSrc.get(k).push(s); };
+function bindAll(b, s) { // every name a pattern binds gets `s`
+  if (!b) return;
+  if (ts.isIdentifier(b)) addSrc(b, s);
+  else if (b.elements) b.elements.forEach(e => ts.isOmittedExpression(e) ? null : bindAll(e.name || (ts.isSpreadElement(e) ? e.expression : e), bottom));
+  else if (b.properties) b.properties.forEach(p => bindAll(p.initializer || p.name || p.expression, bottom));
+  else if (ts.isBinaryExpression(b)) bindAll(b.left, bottom);
+}
+const fnNameId = (f) => (ts.isFunctionDeclaration(f) && f.name ? f.name
+  : f.parent && ts.isVariableDeclaration(f.parent) && f.parent.initializer === f && ts.isIdentifier(f.parent.name) ? f.parent.name : null);
+const ARRAY_CB = new Set(['map', 'flatMap', 'filter', 'forEach', 'find', 'findLast', 'findIndex', 'some', 'every', 'sort', 'toSorted']);
+(function v(x) {
+  if (ts.isVariableDeclaration(x)) {
+    const fo = x.parent && x.parent.parent;
+    if (fo && ts.isForOfStatement(fo) && fo.initializer === x.parent) bindAll(x.name, ts.isIdentifier(x.name) ? () => elemOf(kind(fo.expression)) : bottom);
+    else if (fo && ts.isForInStatement(fo) && fo.initializer === x.parent) bindAll(x.name, bottom);
+    else if (ts.isIdentifier(x.name)) { if (x.initializer) addSrc(x.name, () => kind(x.initializer)); }
+    else bindAll(x.name, bottom);
+  } else if (ts.isBinaryExpression(x) && x.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && x.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+    const l = unwrap(x.left); const plain = x.operatorToken.kind === ts.SyntaxKind.EqualsToken;
+    if (ts.isIdentifier(l)) addSrc(l, plain ? () => kind(x.right) : bottom);
+    else if (ts.isElementAccessExpression(l) && ts.isIdentifier(unwrap(l.expression))) addSrc(unwrap(l.expression), plain ? () => arrOf(kind(x.right)) : bottom);
+    else if (ts.isObjectLiteralExpression(l) || ts.isArrayLiteralExpression(l)) bindAll(l, bottom);
+  } else if ((ts.isForOfStatement(x) || ts.isForInStatement(x)) && !ts.isVariableDeclarationList(x.initializer)) {
+    const l = unwrap(x.initializer);
+    if (ts.isIdentifier(l)) addSrc(l, ts.isForOfStatement(x) ? () => elemOf(kind(x.expression)) : bottom);
+    else bindAll(l, bottom);
+  } else if ((ts.isPrefixUnaryExpression(x) || ts.isPostfixUnaryExpression(x)) && ts.isIdentifier(unwrap(x.operand))) {
+    addSrc(unwrap(x.operand), bottom);
+  } else if (ts.isCatchClause(x) && x.variableDeclaration) {
+    bindAll(x.variableDeclaration.name, bottom);
+  } else if (ts.isCallExpression(x) && ts.isPropertyAccessExpression(x.expression) && ts.isIdentifier(unwrap(x.expression.expression))) {
+    const n = unwrap(x.expression.expression); const m = x.expression.name.text;
+    if (m === 'push' || m === 'unshift') x.arguments.forEach(a => addSrc(n, ts.isSpreadElement(a) ? () => kind(a.expression) : () => arrOf(kind(a))));
+    else if (['splice', 'fill', 'copyWithin'].includes(m)) addSrc(n, bottom);
+  }
+  if (isFnScope(x)) {
+    const nm = fnNameId(x);
+    if (nm) { const k = keyOf(nm); fnByKey.set(k, fnByKey.has(k) ? null : x); }
+    const rs = []; retSrc.set(x, rs);
+    if (!ts.isBlock(x.body)) rs.push(x.body);
+    else (function r(y) { if (ts.isReturnStatement(y)) { rs.push(y.expression || null); return; } if (isFnScope(y)) return; ts.forEachChild(y, r); })(x.body);
+  }
+  ts.forEachChild(x, v);
+})(sf);
+// A named function's parameters take its call sites' arguments; any other
+// use of its name (passed, reassigned, `.call`) lets it escape: B. An array
+// callback's first parameter (a comparator's two) takes its receiver's
+// elements. Every other parameter is B.
+const callSites = new Map(); const escaped = new Set();
+(function v(x) {
+  if (ts.isIdentifier(x) && fnByKey.has(keyOf(x))) {
+    const k = keyOf(x); const p = x.parent;
+    if (p && ts.isCallExpression(p) && p.expression === x) { if (!callSites.has(k)) callSites.set(k, []); callSites.get(k).push(p); }
+    else if (!(p && (ts.isFunctionDeclaration(p) || ts.isVariableDeclaration(p)) && p.name === x)) escaped.add(k);
+  }
+  ts.forEachChild(x, v);
+})(sf);
+for (const f of retSrc.keys()) {
+  const nm = fnNameId(f); const k = nm && keyOf(nm); const named = k && fnByKey.get(k) === f && !escaped.has(k);
+  const p = f.parent; const cbOf = p && ts.isCallExpression(p) && p.arguments[0] === f && ts.isPropertyAccessExpression(p.expression)
+    && ARRAY_CB.has(p.expression.name.text) ? p.expression.expression : null;
+  f.parameters.forEach((prm, i) => {
+    if (!ts.isIdentifier(prm.name) || prm.dotDotDotToken) return bindAll(prm.name, bottom);
+    if (prm.initializer) addSrc(prm.name, () => kind(prm.initializer));
+    if (named) for (const c of callSites.get(k) || []) { const a = c.arguments[i]; if (a) addSrc(prm.name, ts.isSpreadElement(a) ? bottom : () => kind(a)); }
+    else if (cbOf && (i === 0 || (i === 1 && /sort/i.test(p.expression.name.text)))) addSrc(prm.name, () => elemOf(kind(cbOf)));
+    else addSrc(prm.name, bottom);
+  });
+}
+function fnOf(e) { e = e && unwrap(e); if (e && ts.isIdentifier(e)) { const k = keyOf(e); return escaped.has(k) ? null : fnByKey.get(k); } return e; }
+function retOf(e) { const f = fnOf(e); return f && retKind.has(f) ? retKind.get(f) : B; }
+function kind(e) {
+  e = unwrap(e);
+  if (!e) return B;
+  if (ts.isIdentifier(e)) { const k = keyOf(e); return bindKind.has(k) ? bindKind.get(k) : B; }
+  if (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) return safeSeg(e.text) ? 'N' : B;
+  if (ts.isTemplateExpression(e)) { // `${dir}/a/${name}`: a fresh path first, then plain segments
+    if (e.head.text !== '') return B;
+    let k = kind(e.templateSpans[0].expression);
+    if (k !== 'P' && k !== T) return B;
+    for (const [i, s] of e.templateSpans.entries()) {
+      if (s.literal.text.split('/').includes('..')) return B;
+      if (i) { const j = kind(s.expression); if (meet(j, 'N') === B) return B; if (j === T) k = T; }
+    }
+    return k;
+  }
+  if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const l = kind(e.left), r = kind(e.right);
+    if ((l !== 'P' && l !== T) || meet(r, 'N') === B) return B;
+    return l === T || r === T ? T : 'P';
+  }
+  if (ts.isConditionalExpression(e)) return meet(kind(e.whenTrue), kind(e.whenFalse));
+  if (ts.isArrayLiteralExpression(e)) {
+    let k = T;
+    for (const el of e.elements) k = meet(k, ts.isSpreadElement(el) ? kind(el.expression) : arrOf(kind(el)));
+    return k;
+  }
+  if (ts.isElementAccessExpression(e)) return elemOf(kind(e.expression));
+  if (ts.isPropertyAccessExpression(e)) { const r = kind(e.expression); return e.name.text === 'name' && (r === 'N' || r === T) ? r : B; } // a Dirent's name
+  if (ts.isCallExpression(e)) {
+    const fsf = modFn(e.expression, FS_MODS); const pf = modFn(e.expression, PATH_MODS);
+    if (fsf === 'mkdtempSync' || fsf === 'mkdtemp') return 'P';
+    if (fsf === 'readdirSync' || fsf === 'readdir') return 'NA';
+    if (pf === 'join' || pf === 'resolve') {
+      if (!e.arguments.length) return B;
+      let k = kind(e.arguments[0]); if (k !== 'P' && k !== T) return B;
+      for (const a of e.arguments.slice(1)) { const s = ts.isSpreadElement(a) ? B : kind(a); if (meet(s, 'N') === B) return B; if (s === T) k = T; }
+      return k;
+    }
+    if (fsf || pf) return B;
+    if (ts.isPropertyAccessExpression(e.expression)) {
+      const m = e.expression.name.text; const rk = kind(e.expression.expression);
+      if (!isArr(rk)) return B;
+      if (['filter', 'slice', 'sort', 'reverse', 'toSorted', 'toReversed'].includes(m)) return rk;
+      if (m === 'concat') return e.arguments.reduce((k, a) => meet(k, kind(a)), rk);
+      if (['find', 'findLast', 'at', 'pop', 'shift'].includes(m)) return elemOf(rk);
+      if (m === 'map') return arrOf(retOf(e.arguments[0]));
+      if (m === 'flatMap') { const r = retOf(e.arguments[0]); return r === 'P' || r === 'N' ? arrOf(r) : r; }
+      return B;
+    }
+    if (ts.isIdentifier(e.expression)) return retOf(e.expression);
+    return B;
+  }
+  return B;
+}
+for (const k of bindSrc.keys()) bindKind.set(k, T);
+for (const f of retSrc.keys()) retKind.set(f, T);
+let settled = true;
+for (let changed = true, i = 0; changed; i++) {
+  if (i >= 200) { settled = false; break; }
+  changed = false;
+  for (const [k, ss] of bindSrc) { const v = ss.reduce((a, s) => meet(a, s()), T); if (v !== bindKind.get(k)) { bindKind.set(k, v); changed = true; } }
+  for (const [f, rs] of retSrc) { const v = rs.length ? rs.reduce((a, r) => meet(a, r ? kind(r) : B), T) : B; if (v !== retKind.get(f)) { retKind.set(f, v); changed = true; } }
+}
+const fresh = (e) => settled && kind(e) === 'P';
 const READ_FNS = new Set(['readFileSync', 'readFile', 'createReadStream']);
+// Calls that put a file's text at another path: a fresh directory holding
+// one whose source is not itself fresh may hold the tree's text.
+const COPY_FNS = new Set(['copyFileSync', 'copyFile', 'cpSync', 'cp', 'linkSync', 'link', 'symlinkSync', 'symlink', 'renameSync', 'rename']);
+const copies = [];
 const EXEC_FNS = new Set(['execSync', 'exec', 'execFileSync', 'execFile', 'spawnSync', 'spawn', 'execa', '$']);
 for (const r of reach) (function v(x) {
   if (ts.isCallExpression(x) || ts.isNewExpression(x)) {
     const e = x.expression; const name = ts.isIdentifier(e) ? e.text : (ts.isPropertyAccessExpression(e) ? e.name.text : null);
     const args = x.arguments || [];
-    if (name && READ_FNS.has(name)) reads.push({ fn: name, lits: args.length ? litsIn(args[0]) : [], line: sf.getLineAndCharacterOfPosition(x.getStart()).line + 1 });
+    if (name && READ_FNS.has(name)) reads.push({ fn: name, lits: args.length ? litsIn(args[0]) : [], line: sf.getLineAndCharacterOfPosition(x.getStart()).line + 1, fresh: args.length ? fresh(args[0]) : false });
+    if (name && COPY_FNS.has(name)) copies.push({ fn: name, fresh_src: args.length ? fresh(args[0]) : false });
     if (name === 'file' && ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === 'Bun') reads.push({ fn: 'Bun.file', lits: args.length ? litsIn(args[0]) : [] });
     if (name && EXEC_FNS.has(name)) execs.push({ fn: name, lits: args.flatMap(a => litsIn(a)) });
     if (name === 'eval' || (name === 'Function' && (ts.isNewExpression(x) || ts.isIdentifier(e)))) evals.push(name);
@@ -193,5 +432,5 @@ for (const r of reach) (function v(x, fn) {
   ts.forEachChild(x, c => v(c, fn));
 })(r, -1);
 const reach_src = [...reach].map(n => n.getText(sf));
-emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, reads, execs, evals, imports: usedImports,
+emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, reads, copies, execs, evals, imports: usedImports,
   vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports });
