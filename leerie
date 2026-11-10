@@ -7261,24 +7261,74 @@ resolve_repo_image_tag() {
 # repository may not read. Skipped when the copy there has the base's id; a
 # base rebuilt under the same tag is copied again, or the repository image
 # would be built on a base other than the one _check_repo_image compares it
-# with. Best-effort and non-fatal — if the copy fails, the build still
-# attempts and surfaces its own error.
+# with. The copy ends with the base's id there, or the launch stops: a build
+# on a base that is not there fails anyway, naming the registry instead of
+# the copy (DESIGN §6 *The base a repository's build reads is where BuildKit
+# reads it, with the base's id, or the launch stops*).
+#
+# Through a file in the launch's build directory, never `save | load`:
+# nerdctl 2.3.5's `save` exits once containerd has sent the archive's last
+# bytes, written or not, so a reader as slow as `load` lost the tail
+# ("short read: expected 275497 bytes but got 159744"). The host's image
+# lock makes it one such file per host at a time; it is sized against the
+# disk first and removed as soon as the load returns.
+BASE_ARCHIVE_SLACK_BYTES=1048576
+
+# _base_archive_bytes — the bytes `nerdctl save` writes for $IMAGE_TAG, near
+# enough: its manifest's layers and configuration, plus
+# BASE_ARCHIVE_SLACK_BYTES for the archive's headers, index and manifests.
+# Prints nothing and returns 1 when the sizes cannot be read.
+_base_archive_bytes() {
+  local _sizes _n _sum=0
+  _sizes="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect --mode native \
+              -f '{{range .Manifest.Layers}}{{.Size}} {{end}}{{.Manifest.Config.Size}}' \
+              "$IMAGE_TAG" 2>/dev/null)" || return 1
+  [ -n "$_sizes" ] || return 1
+  for _n in $_sizes; do
+    # Digits only: bash arithmetic evaluates what it is given (`1+1`,
+    # `a[$(…)]`), and this is nerdctl's output.
+    case "$_n" in ''|*[!0-9]*) return 1 ;; esac
+    _sum=$((_sum + _n))
+  done
+  echo "$((_sum + BASE_ARCHIVE_SLACK_BYTES))"
+}
+
+# _free_bytes <dir> — the bytes free to the launcher on <dir>'s disk, as
+# `df -Pk` reports them; prints nothing and returns 1 when it cannot say.
+_free_bytes() {
+  local _kb
+  _kb="$(df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }')" || return 1
+  case "$_kb" in ''|*[!0-9]*) return 1 ;; esac
+  echo "$((_kb * 1024))"
+}
+
 ensure_base_in_worker_ns() {
-  local _w _id _wid _err _rc
+  local _w _id _wid _err _tar _need _free
   _id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _id=""
+  [ -n "$_id" ] \
+    || _repo_build_fail "the base image $IMAGE_TAG has no id in the $LEERIE_IMAGE_NS namespace, so it cannot be copied where BuildKit reads"
   for _w in $LEERIE_BUILDKIT_WORKER_NS; do
     _wid="$(nerdctl --namespace "$_w" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _wid=""
-    if [ -n "$_id" ] && [ "$_wid" = "$_id" ]; then
-      continue
-    fi
+    [ "$_wid" = "$_id" ] && continue
     remote_log "copying base image into $_w, the namespace BuildKit's worker reads (once per base; minutes for its 2.4 GB)..."
-    # Streamed, never through a file: no copy of the base lands on disk.
-    _err="$( { nerdctl --namespace "$LEERIE_IMAGE_NS" save "$IMAGE_TAG" \
-               | nerdctl --namespace "$_w" load >/dev/null; \
-               _rc="${PIPESTATUS[0]}${PIPESTATUS[1]}"; \
-               [ "$_rc" = 00 ]; } 2>&1)" \
-      || { remote_log "warning: could not copy base image into $_w — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
-           remote_log "warning: save/load error output: $(_terminal_safe "$_err")"; }
+    _repo_build_dir
+    _tar="$_REPO_BUILD_DIR/base.tar"
+    _need="$(_base_archive_bytes)" \
+      || _repo_build_fail "could not read the size of the base image $IMAGE_TAG to copy it into $_w"
+    _free="$(_free_bytes "$_REPO_BUILD_DIR")" \
+      || _repo_build_fail "could not read the free disk space of $(_terminal_safe "$_REPO_BUILD_DIR")"
+    [ "$_free" -ge "$_need" ] \
+      || _repo_build_fail "copying the base image into $_w needs $_need bytes in $(_terminal_safe "$_REPO_BUILD_DIR"); its disk has $_free free"
+    _err="$(nerdctl --namespace "$LEERIE_IMAGE_NS" save -o "$_tar" "$IMAGE_TAG" 2>&1 >/dev/null)" \
+      || { rm -f "$_tar"
+           _repo_build_fail "could not export the base image $IMAGE_TAG to copy it into $_w: $(_terminal_safe "$_err")"; }
+    _err="$(nerdctl --namespace "$_w" load -i "$_tar" 2>&1 >/dev/null)" \
+      || { rm -f "$_tar"
+           _repo_build_fail "could not load the base image $IMAGE_TAG into $_w, the namespace BuildKit's worker reads: $(_terminal_safe "$_err")"; }
+    rm -f "$_tar"
+    _wid="$(nerdctl --namespace "$_w" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null)" || _wid=""
+    [ "$_wid" = "$_id" ] \
+      || _repo_build_fail "the base image $IMAGE_TAG in $_w has id $(_terminal_safe "${_wid:-(none)}") after its copy, not the base's $_id"
   done
 }
 
