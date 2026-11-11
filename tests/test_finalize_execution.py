@@ -75,7 +75,7 @@ def test_compose_pr_via_llm_happy_path(leerie, monkeypatch, st, repo, tmp_path):
                 "rule_violations_residual": [{"rule": "x", "why_not_fixed": "y"}],
                 "build": {"ran": True, "passed": False, "command": "make",
                           "summary": "broke"},
-            }, "warnings": ["a warning"]},
+            }, "warnings": ["a warning"], "tree_sha": "f" * 40},
             "_baseline": {"axes": {
                 "build": {"ran": True, "measured": True, "passed": True},
                 "lint": {"ran": True, "measured": True, "passed": True},
@@ -98,6 +98,9 @@ def test_compose_pr_via_llm_happy_path(leerie, monkeypatch, st, repo, tmp_path):
                 "used_template": None}
 
     monkeypatch.setattr(leerie, "claude_p", _fake_claude_p)
+    # The record is of the tree that ships (this fixture has no run branch;
+    # tests/test_pr_states_only_shipped_tree_outcomes.py reads a real one).
+    monkeypatch.setattr(leerie, "_shipping_tree", lambda _st: "f" * 40)
 
     asyncio.run(leerie._compose_pr_via_llm(
         st, _caps(leerie), {}, {}, None))
@@ -247,8 +250,9 @@ def test_final_conformance_payload_trims_both_lists_when_oversized(leerie):
             ],
         },
         "warnings": [f"warning {i}: " + ("y" * 500) for i in range(30)],
+        "tree_sha": "t" * 40,
     }}})
-    out = leerie._final_conformance_payload(st_stub)
+    out = leerie._final_conformance_payload(st_stub, "t" * 40)
     assert out is not None
     assert out["truncated"] is True
     # Both lists were trimmed from their original length of 30.

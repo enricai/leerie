@@ -2741,7 +2741,14 @@ produced a result, `_compose_pr_via_llm` reads
 `final_conformance` object with `{residuals, failed_axes, warnings}`
 (plus an optional `truncated: true` marker). Omitted when the final
 pass was skipped, crashed, or returned a fully clean result — absence
-of the field is the cue that there's nothing advisory to say. Bounded
+of the field is the cue that there's nothing advisory to say. Omitted
+too when the record is not of the tree that ships:
+`_final_conformance_payload(st, shipping_tree)` returns None unless
+`_final.tree_sha` equals `shipping_tree` (`_shipping_tree(st)`, read by
+`_compose_pr_via_llm`), both non-empty, and logs
+`pr_writer: final conformance notes left out — measured on tree <a>, the
+run ships <b>` (DESIGN §9 final-tree pass, *Every test outcome the PR
+states was measured on the tree that ships*). Bounded
 by `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` (8 KB), enforced in
 `_final_conformance_payload` by trimming `warnings` (then `residuals`)
 from the tail until it fits; at least one of each is preserved and the

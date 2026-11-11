@@ -75664,12 +75664,20 @@ def _record_run_health(st: "State") -> None:
     _write_run_json(st.run_dir, health=health)
 
 
-def _final_conformance_payload(st: "State") -> dict | None:
+def _final_conformance_payload(st: "State",
+                               shipping_tree: str) -> dict | None:
     """Compact view of the final-tree conformer pass for the pr_writer
     payload. Returns None when there is nothing advisory to say —
     pass was skipped, crashed without recording, or returned a fully
     clean result with no warnings — so the field is simply absent
     from the payload (the prompt treats absence as "nothing to add").
+
+    None too when the record is not of `shipping_tree`, the tree the run
+    branch holds (DESIGN §9 final-tree pass, *Every test outcome the PR
+    states was measured on the tree that ships*): an acceptance repair
+    round or a re-drive group committed after the pass, so its failed
+    axes, residuals and warnings describe a tree the PR does not ship. An
+    unknown tree on either side is not shown to be the shipping one.
 
     The serialized JSON is bounded by
     `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES`. A pathological run that
@@ -75697,6 +75705,12 @@ def _final_conformance_payload(st: "State") -> dict | None:
             })
     warnings = [w for w in (block.get("warnings") or []) if w]
     if not residuals and not failed_axes and not warnings:
+        return None
+    measured_on = str(block.get("tree_sha") or "")
+    if not measured_on or measured_on != shipping_tree:
+        log("pr_writer: final conformance notes left out — measured on "
+            f"tree {measured_on[:12] or '(unrecorded)'}, the run ships "
+            f"{shipping_tree[:12] or '(unreadable)'}")
         return None
     out = {"residuals": residuals,
            "failed_axes": failed_axes,
@@ -75850,7 +75864,7 @@ async def _compose_pr_via_llm(st: "State",
             "diff_sample": diff_sample,
             "diff_sample_truncated": diff_truncated,
         }
-        fc = _final_conformance_payload(st)
+        fc = _final_conformance_payload(st, _shipping_tree(st))
         if fc is not None:
             payload["final_conformance"] = fc
         bh = _base_health_payload(st)
