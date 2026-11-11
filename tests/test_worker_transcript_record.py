@@ -278,17 +278,20 @@ LINE_JSON_READERS = {
 
 
 def _line_json_parsers(tree) -> set[str]:
-    """Innermost functions that `json.loads` a LINE: the target of a loop
-    over `.splitlines()` / `.readlines()`, a process stream, an `open()`
-    handle or a name bound to one of those — or a name assigned from such a
-    line (`line = raw.decode()`)."""
+    """Innermost functions that `json.loads` a LINE: inside a loop over
+    `.splitlines()` / `.readlines()`, a process stream, an `open()` handle or
+    a name bound to one of those, the loop's target — or a name assigned
+    from it in that loop's body (`line = raw.decode()`). A loop target is a
+    line only inside its own loop: the same name reused elsewhere in the
+    function for something else (a path whose whole file is parsed) is not
+    a line there."""
     import ast
     found: set[str] = set()
 
     def names(expr) -> set[str]:
         return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
 
-    def fn_lines(fn) -> set[str]:
+    def line_sources(fn) -> set[str]:
         bound: set[str] = set()   # names holding lines or a line source
         for n in ast.walk(fn):
             if isinstance(n, ast.Assign) and any(
@@ -298,35 +301,47 @@ def _line_json_parsers(tree) -> set[str]:
             if (isinstance(n, ast.withitem) and "open(" in ast.unparse(
                     n.context_expr) and isinstance(n.optional_vars, ast.Name)):
                 bound.add(n.optional_vars.id)
-        lines: set[str] = set()
-        for n in ast.walk(fn):
-            if isinstance(n, (ast.For, ast.AsyncFor)):
-                src = ast.unparse(n.iter)
-                # A process stream itself, not text split out of its output
-                # (`ls.stdout.split("\0")` yields paths, not lines).
-                if (any(k in src for k in ("splitlines", "readlines"))
-                        or src.endswith((".stdout", ".stderr"))
-                        or (isinstance(n.iter, ast.Name)
-                            and n.iter.id in bound)):
-                    lines |= names(n.target)
+        return bound
+
+    def over_lines(loop, bound) -> bool:
+        src = ast.unparse(loop.iter)
+        # A process stream itself, not text split out of its output
+        # (`ls.stdout.split("\0")` yields paths, not lines).
+        return (any(k in src for k in ("splitlines", "readlines"))
+                or src.endswith((".stdout", ".stderr"))
+                or (isinstance(loop.iter, ast.Name)
+                    and loop.iter.id in bound))
+
+    def derived(body, seed: set[str]) -> set[str]:
+        lines = set(seed)
         for _ in range(3):        # names derived from a line, transitively
-            for n in ast.walk(fn):
-                if isinstance(n, ast.Assign) and names(n.value) & lines:
-                    lines |= {t.id for t in n.targets
-                              if isinstance(t, ast.Name)}
+            for st in body:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Assign) and names(n.value) & lines:
+                        lines |= {t.id for t in n.targets
+                                  if isinstance(t, ast.Name)}
         return lines
 
-    def visit(node, fn, lines):
+    def visit(node, fn, bound, lines):
         for ch in ast.iter_child_nodes(node):
-            f, ls = fn, lines
             if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                f, ls = ch.name, fn_lines(ch)
+                visit(ch, ch.name, line_sources(ch), set())
+                continue
             if (isinstance(ch, ast.Call) and ast.unparse(ch.func) ==
-                    "json.loads" and ch.args and names(ch.args[0]) & ls):
-                found.add(f)
-            visit(ch, f, ls)
+                    "json.loads" and ch.args and names(ch.args[0]) & lines):
+                found.add(fn)
+            if (isinstance(ch, (ast.For, ast.AsyncFor))
+                    and over_lines(ch, bound)):
+                inner = derived(ch.body, lines | names(ch.target))
+                for part in (ch.target, ch.iter, *ch.orelse):
+                    visit(part, fn, bound, lines)
+                for st in ch.body:
+                    visit(ast.Module(body=[st], type_ignores=[]), fn,
+                          bound, inner)
+                continue
+            visit(ch, fn, bound, lines)
 
-    visit(tree, None, set())
+    visit(tree, None, set(), set())
     return found
 
 
@@ -334,6 +349,25 @@ def test_one_reader_parses_events_out_of_line_text(leerie):
     import ast
     tree = ast.parse(Path(leerie.__file__).read_text())
     assert _line_json_parsers(tree) == set(LINE_JSON_READERS)
+
+
+def test_the_rule_scopes_a_line_to_its_loop():
+    """A name that is a loop's line only inside that loop: `f` is a path
+    whose whole message file is parsed in the first loop and a source line
+    in the second (`_moved_literal_evidence`'s shape), so the first parse is
+    not of a line. The same parse inside the line loop still is."""
+    import ast
+    src = ('def _evidence(repo, names, found):\n'
+           '    for f in names:\n'
+           '        doc = json.loads(show(repo, f))\n'
+           '    prod = sorted({ln for ln in found.splitlines()})\n'
+           '    for f in prod:\n'
+           '        use(f)\n'
+           'def _reader(found):\n'
+           '    prod = found.splitlines()\n'
+           '    for f in prod:\n'
+           '        rec = json.loads(f)\n')
+    assert _line_json_parsers(ast.parse(src)) == {"_reader"}
 
 
 def test_the_rule_sees_a_second_transcript_reader(leerie):
