@@ -10908,8 +10908,17 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   held-back round has not run: the held-back sets are measured and their
   failing files become names-only notes (`HELD-BACK ACCEPTANCE FAILURES`).
   Per group, in order: the notes still open are kept (a set note only when
-  its file still fails; items and checks always), and a group with none is
-  skipped (`skipped: nothing_left`); members whose `_redrive_allowed` is
+  its file still fails; a `ci_check` note only when
+  `_redrive_checks_cleared(st, caps, notes, head, touched) -> set[str]` does not
+  name its key — `head` the group's start, read from staging; the keys of
+  the checks whose kept measurement of `head` (`_ci_remembered`) reads
+  them green: a gate `passed`, a diagnostic ratchet with no
+  `_ci_new_diagnostics` key against the base over `touched` (`_ci_touched`
+  base..`head`, read only when such a note is open), a coverage ratchet
+  with no `_ci_coverage_fired` threshold; no kept measurement clears
+  nothing, and nothing is run; recorded as the group's `checks_cleared`
+  and logged; items always), and a group with none is
+  skipped (`skipped: nothing_left`, no counter consumed); members whose `_redrive_allowed` is
   false are dropped (`skipped: budget` when none is left, its unmet items
   added to `items_budget_skipped`); a group that drives adds its items to
   `items_driven`; each member's
