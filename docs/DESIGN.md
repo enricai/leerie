@@ -14451,6 +14451,9 @@ newly confirmed met item, plus B\* when one side passes.
 detection's confirms are routed as unmet items, never tried against the
 round that wrote them. 2dcb4cce item 8 is that shape. It needs its own
 rule: a rollback there also undoes the held-out cases the round fixed.
+(The final conformer, the other committing site before detection, is now
+held to the held-out sets it can break: §8 *A final-conformer round that
+turns a passing held-out case failing is rolled back*.)
 
 **An unmet item reaches its owner, or is recorded as reaching none.**
 Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
@@ -17424,6 +17427,67 @@ set the audit below would type broken), a correct repair fixes no case and
 is reset too. With several valid sets a correct fix shows up as progress on
 the sound ones; the set audit and rewrite after the rounds then deal with
 the broken one, and its residual reaches the next run.
+
+**A final-conformer round that turns a passing held-out case failing is
+rolled back.** *Built 2026-11-11 (lane FC, barnacle 39c4c5ad).*
+**Invariant:** no final-conformer round ships a held-out case that passes
+on the round's start and fails, confirmed, on its commit. The final
+conformer commits to staging before the gate's first measurement, so the
+rule above, which compares each repair round with the verdict before it,
+had no verdict before the conformer: its `initial` was measured on the
+conformer's commit, and a case the conformer broke was read as a case the
+run never fixed. In barnacle 39c4c5ad (leerie 0.60.0) the conformer's
+round 0 (`9712d56`, "keep replay success as transport verdict") turned
+held-out sets 2–5 from passing on its start (`7be9b18`) to failing; the
+gate recorded "5 of 5 measured held-out set(s) fail on the integrated
+tree" and spent its repair rounds getting back what the conformer had
+taken (repair round 1 restored sets 2–5).
+
+The rule is the repair round's, with the conformer's rounds as the rounds:
+the same worker writing to the same tree, read by the same measurement.
+`_run_final_conformance` records each round's start and the pass's end
+(`_final.round_starts`, `_final.end_sha`). When the gate's `initial` is of
+that end, still staging's HEAD, and fails a case, the sets are evaluated on
+the pass's start; a case failing on the end that passed there
+(`_acceptance_broken_cases`, the repair round's count) makes the pass a
+suspect. Its rounds that committed are then tried in order, each round's
+commit evaluated against its start, and the first one that broke a case is
+the culprit (`_conformer_flip_culprit`); with no step showing it (a set
+unmeasured on an intermediate commit), the pass's first committing round
+is. Staging goes back to the culprit's start through the one restore,
+which also takes every round after it, built on its commit — #365's
+"earliest culprit" shape. The decision (`acceptance.gate.conformer_flip`)
+is on disk before the reset, so a resume finishes it; the culprit's start
+verdict becomes the gate's `initial`, and the repair rounds then start from
+the tree the conformer started from. A failing case is already confirmed
+under B\* by the evaluation itself (every rerun failed); passing on the
+start is a pass, as in the repair round's rule.
+
+It is a rollback, not a note handed back, because nothing after the
+conformer could take a note: its loop has ended, and the next fixer is the
+gate's own repair, which is shown only the shown sets' failing names, never
+what broke them (I3). Rolled back, the cases pass again on the tree the
+repair starts from, and only what still fails is repaired. What it costs:
+the culprit's other work in that round and the rounds after it — fixes to
+merge checks, or to the unmet items and solution defects it was handed.
+Those come back to the run through the routes that already own them: the
+delivery re-drive drives the conformer's `residual_defects` and every unmet
+item detection confirms on the tree that ships. A pass whose failing cases
+also fail on its start pays one more evaluation, on the start; a culprit
+search pays one per committing round after the first; a pass whose sets
+all pass at its end pays nothing.
+
+Held-out repair rounds that regress a met item (the falsifier's probe,
+#365's "Not covered") are a different rule and stay open: the probe does
+not exist when the round runs — detection writes it afterwards — so a flip
+there is found only by trying a later probe against an earlier round: a
+measurement of another kind (a falsifier's probe, not a held-out set) at
+another time (after detection, not before the repair). And a rollback
+there trades a met item against the held-out cases the round was shown
+and fixed, verdicts of different standing, which needs its own rule and
+bench; here both sides of the trade are held-out cases, already ranked by
+the repair round's rule (a round that fixed one case by breaking another
+is not progress).
 
 **A repair that regresses met work is rolled back (the delivery ratchet).**
 A repair writer runs after the judges that verified the run's required
