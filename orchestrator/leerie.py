@@ -67428,25 +67428,25 @@ def _moved_literal_evidence(repo: str | Path, base: str, head: str,
                              base, "--")
         prod = sorted({ln.split(":", 1)[1] for ln in found.splitlines()
                        if ":" in ln} - {""})
-        prod = [f for f in prod if f.endswith(_JS_SRC_EXT)
-                and not _is_test_file(f, globs)
-                and not _MESSAGE_FILE_RE.search(f)]
+        prod = [p for p in prod if p.endswith(_JS_SRC_EXT)
+                and not _is_test_file(p, globs)
+                and not _MESSAGE_FILE_RE.search(p)]
 
-        def holds(rev: str, f: str) -> bool:
+        def holds(rev: str, path: str) -> bool:
             # In the code, never in a comment (`_tt_mask`'s blanked
             # comments): a doc comment naming the old text is not the text.
-            if not _redrive_exists_at(repo, rev, f):
+            if not _redrive_exists_at(repo, rev, path):
                 return False
-            code, _mask = _tt_mask(_redrive_git(repo, "show", f"{rev}:{f}"),
-                                   False)
+            code, _mask = _tt_mask(
+                _redrive_git(repo, "show", f"{rev}:{path}"), False)
             return bool(rx.search(code))
-        for f in prod:
-            if not holds(base, f):
+        for src in prod:
+            if not holds(base, src):
                 continue
-            still = holds(head, f)
+            still = holds(head, src)
             if not still:
                 out.append({"literal": text, "kind": lit.get("kind"),
-                            "file": f, "message_file": hit[0],
+                            "file": src, "message_file": hit[0],
                             "key": hit[1]})
                 break
     return out
