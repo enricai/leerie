@@ -195,6 +195,14 @@ EFFORT_ACCEPTANCE_REPAIR = "high"
 # and AST gates. Bench Q3-FRESH2: 9 of 10 fair sets closed at high.
 EFFORT_REDRIVE_ESCALATION = "high"
 
+# The model and effort of the one escalation round an existing test's case
+# gets when it still fails in its base form after the implementer's own
+# re-drive round (DESIGN §8 *A fix that keeps both, on opus when sonnet
+# could not*): a per-call override of that round only, never a worker's
+# default. Bench T9-3.
+MODEL_BASE_FORM_ESCALATION = "opus"
+EFFORT_BASE_FORM_ESCALATION = "high"
+
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
@@ -7731,6 +7739,8 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
     # (DESIGN §8 *What an existing test pins on the base holds on the tree
     # that ships*): measured, so listed first.
     behaviour = state.get("existing_behaviour")
+    moved = (behaviour.get("moved_literal") or {}) if isinstance(
+        behaviour, dict) else {}
     failed: dict[str, list[str]] = {}
     for r in ((behaviour.get("changed") or []) if isinstance(behaviour, dict)
               else []):
@@ -7739,9 +7749,23 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
     for rec in files:
         if not isinstance(rec, dict) or not _pr_entry(rec.get("file")):
             continue
-        entries: list[str] = [
-            f"- fails in its base form on this tree: {_pr_code(i)}"
-            for i in failed.get(rec["file"], []) if i.strip()]
+        entries: list[str] = []
+        for i in failed.get(rec["file"], []):
+            if not i.strip():
+                continue
+            ev = moved.get(i) if isinstance(moved, dict) else None
+            if ev:
+                # DESIGN §8 *A case pinning a moved literal gets no round*.
+                entries.append(
+                    "- existing test pins text the run moved to the message "
+                    f"files: {_pr_code(i)} — " + "; ".join(
+                        f"{_pr_code(str(e.get('literal')))} -> "
+                        f"{_pr_code(str(e.get('key')))} in "
+                        f"{_pr_code(str(e.get('message_file')))}"
+                        for e in ev[:3] if isinstance(e, dict)))
+            else:
+                entries.append(
+                    f"- fails in its base form on this tree: {_pr_code(i)}")
         if rec.get("deleted") is True:
             entries.append("- file deleted")
         for key, label in (("removed", "removed assertion"),
@@ -49844,7 +49868,10 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                     "messages": messages, "durations": durations,
                     "passed": sorted({c["id"] for c in cases
                                       if c.get("status") == "passed"}),
-                    "wall_sec": round(run_wall, 3)}
+                    "wall_sec": round(run_wall, 3),
+                    # Every case the report records, with its status: what
+                    # a check that a case still exists reads.
+                    "cases": {c["id"]: c["status"] for c in cases}}
     return None
 
 
@@ -64056,7 +64083,8 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     in plan order (`subfiles`' order). Defect notes go together to the
     subtasks whose files meet any defect file's `exercised` files, else
     `fallback`, else everyone; a control-shaped note (`control_regression`,
-    `held_control`, `ci_check`, `solution_defect`) to the subtasks its
+    `held_control`, `ci_check`, `solution_defect`, `base_form_case`) to
+    the subtasks its
     `exercised` files
     touch, else the defect claimers, else everyone; an item to every
     claimer in `claimed_by`, else the defect claimers, else everyone.
@@ -64085,7 +64113,7 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     for n in notes:
         k = n.get("kind")
         if k in ("control_regression", "held_control", "ci_check",
-                 "solution_defect"):
+                 "solution_defect", "base_form_case"):
             give(touching(n) or claimers or order, n)
         elif k == "unmet_item":
             cl = [s for s in (n.get("claimed_by") or []) if s in rank]
@@ -66953,6 +66981,473 @@ def _base_form_reason(changed: list[dict]) -> str:
             + (f" (+{more} more)" if more > 0 else ""))
 
 
+# --- A fix that keeps both, on opus when sonnet could not (DESIGN §8) -------
+
+_REDRIVE_BASE_FORM_MESSAGE = 300
+# A runner's colour codes: fixed terminal output, a mechanical string.
+_BASE_FORM_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+async def _redrive_base_form_notes(st: "State", staging: Path
+                                   ) -> list[dict]:
+    """The re-drive's `base_form_case` notes: one per test file whose cases
+    `existing_behaviour` (`_check_existing_behaviour`, run just before the
+    re-drive) records failing in their base form on staging's tree, with
+    the base commit the worker reads the original from. None when the
+    record is of another tree, or raised."""
+    rec = st.data.get("existing_behaviour")
+    if not isinstance(rec, dict) or rec.get("error") or not rec.get("changed"):
+        return []
+    tree = await _view_tree_sha(st, staging) or ""
+    if not tree or rec.get("tree_sha") != tree:
+        return []
+    moved = rec.get("moved_literal") or {}
+    by_file: dict[str, list[dict]] = {}
+    for r in rec["changed"]:
+        if (isinstance(r, dict) and str(r.get("file") or "")
+                and str(r.get("id")) not in moved):
+            by_file.setdefault(str(r["file"]), []).append(r)
+    return [{"kind": "base_form_case", "key": f"base-form:{f}", "file": f,
+             "base": str(rec.get("base") or ""),
+             "cases": [str(r.get("id")) for r in rows],
+             "messages": [_BASE_FORM_ANSI_RE.sub("", str(r.get("message")
+                                                         or ""))
+                          [:_REDRIVE_BASE_FORM_MESSAGE] for r in rows],
+             "exercised": [f]}
+            for f, rows in sorted(by_file.items())]
+
+
+async def _redrive_base_form_fixed(st: "State", caps: dict, staging: Path,
+                                   notes: list[dict], *, label: str,
+                                   log_path: Path) -> list[str]:
+    """The cases of `notes` that pass in their base form on staging's commit
+    now, measured against the run's base (`_base_form_regressions`): a case
+    of a file the run gave no verdict on is not fixed."""
+    base = _diff_base(st) or ""
+    if not base:
+        return []
+    try:
+        out = await _base_form_regressions(st, caps, staging, base,
+                                           label=label, log_path=log_path)
+    except Exception as e:
+        log(f"  {label}: base-form check raised {type(e).__name__}: {e} — "
+            "no case counted fixed")
+        return []
+    if out.get("unmeasured_reason") and not out.get("files"):
+        return []
+    still = {str(r.get("id")) for r in out.get("changed") or []
+             if isinstance(r, dict)}
+    blind = set(out.get("unmeasured") or []) | set(out.get("unsettled") or [])
+    return sorted(c for n in notes for c in n.get("cases") or []
+                  if c not in still and n.get("file") not in blind
+                  and c not in blind)
+
+
+async def _redrive_dropped_cases(st: "State", caps: dict, staging: Path,
+                                 pre_sha: str, *, label: str,
+                                 log_path: Path) -> list[str] | None:
+    """The cases a round dropped that still hold (DESIGN §8 *A fix that keeps
+    both, on opus when sonnet could not*): of each test-case file present at
+    the round's start (`pre_sha`) that its commit modified or deleted, the
+    cases its start form passes on the commit (run in place of the commit's
+    form, in a held-out sandbox, as a base form is) that the commit's own
+    form of the file no longer reports. A case its start form fails on the
+    commit is the one the round's change contradicts, and may go. None when
+    either run gives no report: unmeasured, never a pass."""
+    after = await _branch_head_sha(str(staging)) or ""
+    if not after or not pre_sha or after == pre_sha:
+        return []
+    repo = _run_repo(st)
+    globs = resolve_test_file_globs(st.repo_root)
+    files, _unsupported = await asyncio.to_thread(
+        _base_form_files, repo, pre_sha, after, globs)
+    if not files:
+        return []
+    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
+           or "").strip()
+    if not cmd or not resolve_test_files_scoped(st.repo_root):
+        return None
+    pairs, taken, removed = await asyncio.to_thread(
+        _base_form_place, st, repo, pre_sha, files, [after])
+    if taken:
+        return None
+    timeout = float(caps.get("worker_timeout_sec",
+                             DEFAULT_CAPS["worker_timeout_sec"]))
+    start = await _capture_failing_test_ids(
+        str(staging), cmd, st, caps, label=f"{label}-start-form",
+        log_path=log_path, timeout=timeout, serial=True, files=files,
+        replace=tuple(pairs), remove=removed[after])
+    kept_files = [f for f in files if _redrive_exists_at(repo, after, f)]
+    own = (await _capture_failing_test_ids(
+        str(staging), cmd, st, caps, label=f"{label}-own-form",
+        log_path=log_path, timeout=timeout, serial=True, files=kept_files)
+        if kept_files else {"cases": {}})
+    if start is None or own is None:
+        return None
+    have = set(own.get("cases") or {})
+    return sorted(c for c, status in (start.get("cases") or {}).items()
+                  if status == "passed" and c not in have)
+
+
+def _base_form_closure(repo: str | Path, rev: str, case_files: list[str],
+                       globs: list[str] | None = None) -> set[str]:
+    """The test closure of `case_files` at `rev` (DESIGN §8 *A fix that keeps
+    both, on opus when sonnet could not*): what the base's test is, besides
+    its own file — every test-side file it imports, transitively (a test
+    file, a test-support module of the import graph, a `__mocks__` module),
+    every runner configuration (`_RUNNER_CONFIG_GLOBS`) and each repository
+    file a configuration names by its path that is test-side or setup- or
+    support-shaped (`_JS_SUPPORT_PATH_RE`, a basename naming `setup`), with
+    the test-side files those import, and every `conftest.py` on a Python case
+    file's directory chain. Read from git and the import graphs, mechanical
+    paths only (DESIGN §12). Never raises: an unreadable graph adds
+    nothing."""
+    graphs = []
+    for build in (_js_source_graph, _py_source_graph):
+        try:
+            graphs.append(build(repo, rev))
+        except Exception as e:
+            log(f"  test closure: import graph unreadable "
+                f"({type(e).__name__}: {e})")
+    imp: dict[str, set[str]] = {}
+    support: set[str] = set()
+    allp: set[str] = set()
+    for g in graphs:
+        support |= set(g.get("support") or ())
+        allp |= set(g.get("all") or g.get("files") or ())
+        for k, v in (g.get("imp") or {}).items():
+            imp.setdefault(k, set()).update(v)
+    if not allp:
+        allp = set(x for x in _redrive_git(repo, "ls-tree", "-r", "-z",
+                                            "--name-only", rev).split("\0")
+                   if x)
+
+    def test_side(p: str) -> bool:
+        return (_is_test_file(p, globs) or p in support
+                or "__mocks__" in p.split("/"))
+
+    closure = {f for f in case_files if f}
+    roots = set(closure)
+    for cfg in sorted(p for p in allp if any(
+            fnmatch.fnmatch(posixpath.basename(p), pat)
+            for pats in _RUNNER_CONFIG_GLOBS.values() for pat in pats)):
+        closure.add(cfg)
+        roots.add(cfg)
+        text = _redrive_git(repo, "show", f"{rev}:{cfg}")
+        # What it runs tests with, not what it measures: a configuration
+        # also lists production paths (coverage, aliases), which are not
+        # the test's.
+        named = {p for p in allp if p != cfg and p in text and (
+            test_side(p) or _JS_SUPPORT_PATH_RE.search(p)
+            or "setup" in posixpath.basename(p).lower())}
+        closure |= named
+        roots |= named
+    for f in case_files:
+        if f.endswith(".py"):
+            parts = f.split("/")[:-1]
+            for i in range(len(parts), -1, -1):
+                c = "/".join([*parts[:i], "conftest.py"])
+                if c in allp:
+                    closure.add(c)
+                    roots.add(c)
+    stack = list(roots)
+    while stack:
+        cur = stack.pop()
+        for q in imp.get(cur, ()):
+            if q not in closure and test_side(q):
+                closure.add(q)
+                stack.append(q)
+    return closure
+
+
+def _base_form_closure_breach(repo: str | Path, base: str, pre_sha: str,
+                              post_sha: str, case_files: list[str],
+                              globs: list[str] | None = None) -> list[str]:
+    """What a base-form round (`pre_sha`..`post_sha`) may not have done, in
+    words: change a file of its cases' test closure at `pre_sha`
+    (`_base_form_closure`) other than by writing it back exactly as it is at
+    the run's base, or modify or delete a test file the run added (present
+    at `pre_sha`, absent at `base`). `[]` when it did neither."""
+    rows = _redrive_git(repo, "diff", "--name-status", "--no-renames", "-z",
+                        pre_sha, post_sha).split("\0")
+    changed = [f for f in rows[1::2] if f]
+    if not changed:
+        return []
+    closure = _base_form_closure(repo, pre_sha, case_files, globs)
+    out: list[str] = []
+    for f in sorted(changed):
+        at_base = _redrive_exists_at(repo, base, f)
+        if f in closure:
+            same = (at_base and _redrive_exists_at(repo, post_sha, f)
+                    and _redrive_git(repo, "rev-parse", f"{base}:{f}")
+                    == _redrive_git(repo, "rev-parse", f"{post_sha}:{f}"))
+            if not same:
+                out.append(f"{f} (its cases' test closure, not put back "
+                           "exactly as at the run's base)")
+        elif (_is_test_file(f, globs) and not at_base
+              and _redrive_exists_at(repo, pre_sha, f)):
+            out.append(f"{f} (a test this run added)")
+    return out
+
+
+# --- An existing test that pins text the run moved to the message files ------
+# DESIGN §8 *A case pinning a moved literal gets no round*. Paths and code
+# literals only (DESIGN §12): a message file by its path, a literal by the
+# test's AST (`scripts/test-case-facts.cjs`), its presence by `git grep -F`.
+_MESSAGE_FILE_RE = re.compile(
+    r"(^|/)(messages|locales?|i18n|translations|langs?)/[^/]+\.json$", re.I)
+# A regular-expression literal the classification reads as plain text: word
+# characters, spaces and ordinary punctuation, no regex syntax.
+_PLAIN_REGEX_TEXT_RE = re.compile(r"[\w ¿¡.,:;'’…!?-]+")
+# The base form's AST is read beside the test's own path (`_base_form_moved_
+# literals`), under this prefix.
+_BASE_FORM_FACTS_PREFIX = ".leerie-base-form."
+
+
+def _message_values(obj: object, prefix: str = "") -> list[tuple[str, str]]:
+    """Every string value of a parsed message file, with its dotted key."""
+    if isinstance(obj, str):
+        return [(prefix, obj)]
+    if isinstance(obj, dict):
+        return [kv for k, v in obj.items()
+                for kv in _message_values(v, f"{prefix}.{k}" if prefix
+                                          else str(k))]
+    if isinstance(obj, list):
+        return [kv for i, v in enumerate(obj)
+                for kv in _message_values(v, f"{prefix}[{i}]")]
+    return []
+
+
+def _moved_literal_evidence(repo: str | Path, base: str, head: str,
+                            literals: list[dict],
+                            globs: list[str] | None = None) -> list[dict]:
+    """Of a test case's literals (`test-case-facts.cjs`), each one the run
+    moved into the message files: (a) a production source file at `base`
+    holds it, (b) that file at `head` no longer does (or is gone), and (c) a
+    message file (`_MESSAGE_FILE_RE`) the run added or changed holds it as a
+    value at `head` — a string literal as the whole value, a plain regex
+    literal (`_PLAIN_REGEX_TEXT_RE`) found in it, with its own `i` flag (a
+    value that is the whole text first, for its key). (a) and (b) read the
+    file's code with its comments blanked (`_tt_mask`).
+    `[{literal, kind, file, message_file, key}]`, one per literal."""
+    names = [f for f in _redrive_git(repo, "diff", "--name-only", "-z",
+                                     "--no-renames", base, head).split("\0")
+             if f and _MESSAGE_FILE_RE.search(f)]
+    values: list[tuple[str, str, str]] = []
+    for f in names:
+        if not _redrive_exists_at(repo, head, f):
+            continue
+        try:
+            doc = json.loads(_redrive_git(repo, "show", f"{head}:{f}"))
+        except ValueError:
+            continue
+        values += [(f, k, v) for k, v in _message_values(doc)]
+    if not values:
+        return []
+    out: list[dict] = []
+    for lit in literals:
+        if not isinstance(lit, dict):
+            continue
+        text = str(lit.get("text") or "")
+        regex = lit.get("kind") == "regex"
+        ci = regex and "i" in str(lit.get("flags") or "")
+        if len(text.strip()) < 2 or (
+                regex and not _PLAIN_REGEX_TEXT_RE.fullmatch(text)):
+            continue
+        if regex:
+            rx = re.compile(re.escape(text), re.I if ci else 0)
+            # The value that is the text itself first (its own key), else
+            # the first that holds it.
+            whole = re.compile(re.escape(text) + r"\Z", re.I if ci else 0)
+            hit = next(((f, k) for f, k, v in values if whole.match(v)),
+                       None) or next(((f, k) for f, k, v in values
+                                      if rx.search(v)), None)
+        else:
+            rx = re.compile(re.escape(text))
+            hit = next(((f, k) for f, k, v in values if v == text), None)
+        if hit is None:
+            continue
+        flag = ["-i"] if ci else []
+        found = _redrive_git(repo, "grep", "-l", "-F", *flag, "-e", text,
+                             base, "--")
+        prod = sorted({ln.split(":", 1)[1] for ln in found.splitlines()
+                       if ":" in ln} - {""})
+        prod = [f for f in prod if f.endswith(_JS_SRC_EXT)
+                and not _is_test_file(f, globs)
+                and not _MESSAGE_FILE_RE.search(f)]
+
+        def holds(rev: str, f: str) -> bool:
+            # In the code, never in a comment (`_tt_mask`'s blanked
+            # comments): a doc comment naming the old text is not the text.
+            if not _redrive_exists_at(repo, rev, f):
+                return False
+            code, _mask = _tt_mask(_redrive_git(repo, "show", f"{rev}:{f}"),
+                                   False)
+            return bool(rx.search(code))
+        for f in prod:
+            if not holds(base, f):
+                continue
+            still = holds(head, f)
+            if not still:
+                out.append({"literal": text, "kind": lit.get("kind"),
+                            "file": f, "message_file": hit[0],
+                            "key": hit[1]})
+                break
+    return out
+
+
+async def _base_form_moved_literals(st: "State", caps: dict, staging: Path,
+                                    rec: dict) -> dict[str, list[dict]]:
+    """Per case of `rec["changed"]` (a JS/TS test), the literals of its base
+    form that the run moved into the message files
+    (`_moved_literal_evidence`), read from the case's AST in the base form
+    (`_probe_case_facts_placed`, a held-out sandbox over staging's committed
+    view). A case whose facts cannot be read is not classified. Never
+    raises."""
+    base, head = str(rec.get("base") or ""), str(rec.get("after") or "")
+    rows = [r for r in rec.get("changed") or [] if isinstance(r, dict)
+            and str(r.get("file") or "").endswith(_JS_SRC_EXT)]
+    if not base or not head or not rows:
+        return {}
+    repo = _run_repo(st)
+    globs = resolve_test_file_globs(st.repo_root)
+    out: dict[str, list[dict]] = {}
+    try:
+        tree = await _measured_tree(
+            st, str(staging), caps, label="moved-literals",
+            log_path=st.run_dir / "logs" / "existing-behaviour.log")
+        srcs: dict[str, str] = {}
+        for r in rows:
+            rel = str(r["file"])
+            if rel not in srcs:
+                blob = await asyncio.to_thread(_git_blob_text, repo, base,
+                                               rel)
+                if blob is None:
+                    continue
+                path = (Path(st.run_dir) / "base-form-facts" / base[:12]
+                        / rel)
+                _write_beneath(Path(st.run_dir), path, blob.encode())
+                srcs[rel] = str(path)
+            if rel not in srcs:
+                continue
+            name = str(r.get("id") or "").split(" :: ", 1)[-1]
+            # A sibling path the view does not hold: a sandbox places a file,
+            # never replaces one, and the view holds the test's own path.
+            # The facts are syntax only, so the name changes nothing else.
+            beside = posixpath.join(posixpath.dirname(rel),
+                                    _BASE_FORM_FACTS_PREFIX
+                                    + posixpath.basename(rel))
+            facts = await _probe_case_facts_placed(st, tree, srcs[rel],
+                                                   beside, name)
+            lits = facts.get("literals") if isinstance(facts, dict) else None
+            if not isinstance(lits, list):
+                continue
+            ev = await asyncio.to_thread(_moved_literal_evidence, repo, base,
+                                         head, lits, globs)
+            if ev:
+                out[str(r["id"])] = ev
+    except Exception as e:
+        log(f"  moved-literal classification raised {type(e).__name__}: "
+            f"{e} — the cases it did not reach are not classified")
+    return out
+
+
+def _git_blob_text(repo: str | Path, rev: str, rel: str) -> str | None:
+    """`rel`'s text at `rev`, None when `rev` has no such file."""
+    got = subprocess.run(["git", *_tree_git_args(repo), "show",
+                          f"{rev}:{rel}"], capture_output=True, check=False)
+    return (got.stdout.decode("utf-8", "replace") if got.returncode == 0
+            else None)
+
+
+def _redrive_base_form_open(rec: dict) -> list[dict]:
+    """The base-form notes still to drive: a file no attempt finished on,
+    as found; a file whose one finished attempt left cases failing, once
+    more for those cases only, typed `escalation` (`MODEL_BASE_FORM_
+    ESCALATION` at `EFFORT_BASE_FORM_ESCALATION`). A file two attempts
+    finished on is not offered again: what still fails stays a change."""
+    out: list[dict] = []
+    for n in rec.get("base_form_open") or []:
+        d = (rec.get("base_form_driven") or {}).get(n["key"]) or {}
+        done = [a for a in d.get("attempts") or []
+                if a.get("outcome") != "interrupted"]
+        if not done:
+            out.append(n)
+        elif len(done) == 1:
+            fixed = set(d.get("fixed") or [])
+            keep = [i for i, c in enumerate(n["cases"]) if c not in fixed]
+            if keep:
+                msgs = list(n.get("messages") or [])
+                out.append({**n, "escalation": True,
+                            "cases": [n["cases"][i] for i in keep],
+                            "messages": [msgs[i] for i in keep
+                                         if i < len(msgs)]})
+    return out
+
+
+def _redrive_base_form_attempt(rec: dict, notes: list[dict], *, rnd: int,
+                               group: int, model: str,
+                               effort: str | None) -> None:
+    """Record an attempt at each of `notes` before it runs, `interrupted`
+    until `_redrive_base_form_settled`; an interrupted attempt is replaced
+    by the next."""
+    for n in notes:
+        d = rec.setdefault("base_form_driven", {}).setdefault(n["key"], {
+            "file": n["file"], "cases": list(n["cases"]), "fixed": [],
+            "attempts": []})
+        if d["attempts"] and d["attempts"][-1].get("outcome") == "interrupted":
+            d["attempts"].pop()
+        d["attempts"].append({
+            "round": rnd, "group": group, "cases": list(n["cases"]),
+            "escalation": bool(n.get("escalation")), "model": model,
+            "effort": effort, "outcome": "interrupted", "fixed": []})
+        d["outcome"] = "interrupted"
+
+
+def _redrive_base_form_settled(rec: dict, notes: list[dict],
+                               ge: dict) -> None:
+    """What the attempt at each base-form note came to: `rolled_back` (with
+    the reason), `no_change`, or `kept` with the cases it fixed, which join
+    the file's `fixed`."""
+    for n in notes:
+        d = rec.setdefault("base_form_driven", {}).setdefault(n["key"], {
+            "file": n["file"], "cases": list(n["cases"]), "fixed": [],
+            "attempts": [{}]})
+        a = d["attempts"][-1]
+        if ge.get("rolled_back"):
+            a.update(outcome="rolled_back", fixed=[],
+                     reason=str(ge.get("rollback_reason") or ""))
+        elif ge.get("no_change") or ge.get("rollback_failed"):
+            a.update(outcome="no_change" if ge.get("no_change")
+                     else "rollback_failed", fixed=[])
+        else:
+            a.update(outcome="kept", fixed=sorted(
+                set(ge.get("base_form_fixed") or []) & set(n["cases"])))
+        d["fixed"] = sorted(set(d.get("fixed") or []) | set(a["fixed"]))
+        d["outcome"] = a["outcome"]
+
+
+def _redrive_base_form_unkept(rec: dict, rnd: int, group: int,
+                              reason: str) -> None:
+    """A group kept and then rolled back with the commits built on it (a
+    flip, DESIGN §8 *A kept group that turns a met item's confirmed probe
+    from passing to failing is rolled back*): its base-form attempts read
+    `rolled_back`, and each file's `fixed` is what its still-kept attempts
+    fixed."""
+    for d in (rec.get("base_form_driven") or {}).values():
+        hit = False
+        for a in d.get("attempts") or []:
+            if ((a.get("round"), a.get("group")) == (rnd, group)
+                    and a.get("outcome") == "kept"):
+                a.update(outcome="rolled_back", fixed=[], reason=reason)
+                hit = True
+        if hit:
+            d["fixed"] = sorted({c for a in d["attempts"]
+                                 if a.get("outcome") == "kept"
+                                 for c in a.get("fixed") or []})
+            d["outcome"] = d["attempts"][-1].get("outcome")
+
+
 async def _check_existing_behaviour(leerie_dir: Path, st: "State",
                                     caps: dict) -> None:
     """Phase 5's last measurement before the outcome (DESIGN §8 *What an
@@ -66984,6 +67479,12 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
         log(f"phase 5: existing-behaviour check raised {rec['error']} — "
             "recorded as unmeasured")
     rec["tree_sha"] = tree_sha
+    if rec.get("changed") and not rec.get("error"):
+        # A case pinning text the run moved into the message files gets no
+        # round: its only passing form is that text back in production
+        # (DESIGN §8 *A case pinning a moved literal gets no round*).
+        rec["moved_literal"] = await _base_form_moved_literals(
+            st, caps, staging, rec)
     st.data["existing_behaviour"] = rec
     st.save()
     _set_base_form_gap(st, rec)
@@ -67398,6 +67899,14 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                           "where": n.get("where"),
                           "concrete_case": n.get("concrete_case"),
                           "why_ships_a_defect": n.get("why")})
+        elif k == "base_form_case":
+            shown.append({"kind": k, "test_file": n.get("file"),
+                          "base_form": f"git show {n.get('base')}:"
+                                       f"{n.get('file')}",
+                          "failing": [{"case": c, "failure": m} for c, m in
+                                      zip(n.get("cases") or [],
+                                          n.get("messages") or [])]
+                          [:_REDRIVE_CASES_MAX]})
     parts = [
         f"DELIVERY RE-DRIVE (round {rnd} of {rounds}). Your work and your "
         "siblings' work are already integrated on this tree (your cwd). The "
@@ -67414,7 +67923,17 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
         "against the run's base — make it pass without weakening it; "
         "kind=solution_defect means the final whole-tree review attacked "
         "this run's combined diff and found this concrete case unhandled at "
-        "`where` — handle it at its root.",
+        "`where` — handle it at its root; kind=base_form_case means a test "
+        "the repository had before this run, which this run changed or "
+        "deleted, fails here in its ORIGINAL form (read it with the "
+        "`base_form` command) in the cases listed: behaviour the repository "
+        "pinned is gone. Find the change that keeps both: make those cases "
+        "pass as the original test wrote them while every required item of "
+        "the task stays met, restoring the pinned behaviour wherever the "
+        "task does not need it changed (restoring an original case in "
+        "the test file is allowed). If no change can keep both, leave that behaviour as it "
+        "is and say why in your summary; never undo what the task asks "
+        "for.",
         json.dumps(shown, indent=1)]
     if any(isinstance(n.get("probe"), dict) for n in notes
            if n["kind"] == "unmet_item"):
@@ -67485,6 +68004,21 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                f"{selfcheck['name_flag']} '<name pattern>'`"
                if selfcheck.get("name_flag") else "")
             + ". Do not copy the set's files into this tree.")
+    if any(n["kind"] == "base_form_case" for n in notes):
+        parts.append(
+            "BASE-FORM CHECK: a kind=base_form_case entry is checked by "
+            "running the original test: write it over the file (its "
+            "`base_form` command, redirected) and run it with the "
+            "repository's test command. Change production code only. The "
+            "test file and everything it is run with — the test files, "
+            "mocks, fixtures and helpers it imports, the test runner's "
+            "configuration and setup files — you may only put back exactly "
+            "as they are in the original (the same command for each file), "
+            "or leave as you found them; a test file this run added you may "
+            "not change at all. A round that does otherwise is rolled back, "
+            "and so is one whose restored test file drops a case this run "
+            "added that still passes. Restoring what the code did before "
+            "this run is not copying a test's literal.")
     parts.append(
         "Fix the cause in the production code. Do not special-case test "
         "inputs or copy literals from tests into production code, and do not "
@@ -68242,6 +68776,18 @@ def _redrive_rollback_reason(ge: dict) -> str:
     if ge.get("new_failures"):
         why.append(f"{len(ge['new_failures'])} test(s) newly fail: "
                    + ", ".join(ge["new_failures"]))
+    if ge.get("test_closure_breach"):
+        why.append("it changed what a base-form case's test is, which only "
+                   "putting the original back may: "
+                   + "; ".join(str(x) for x in ge["test_closure_breach"]
+                               [:_BASE_FORM_SHOWN]))
+    if ge.get("dropped_cases"):
+        shown = [str(c) for c in ge["dropped_cases"][:_BASE_FORM_SHOWN]]
+        why.append(
+            "it dropped case(s) of a test it changed that still hold on its "
+            "commit, or could not show it kept them: " + "; ".join(shown)
+            + (f" (+{len(ge['dropped_cases']) - len(shown)} more)"
+               if len(ge["dropped_cases"]) > len(shown) else ""))
     if ge.get("base_form_changed"):
         why.append("it changed what an existing test pinned on the base: "
                    + _base_form_reason([{"id": i} for i in
@@ -68457,6 +69003,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         "exercised": [f] if f else []})
         return out
 
+    # The existing tests whose base form fails on the tree this pass starts
+    # from (DESIGN §8 *A fix that keeps both, on opus when sonnet could
+    # not*): one note per file, driven once, and once more escalated for the
+    # cases still failing.
+    rec.setdefault("base_form_driven", {})
+    if "base_form_open" not in rec:
+        rec["base_form_open"] = await _redrive_base_form_notes(st, staging)
+        _save()
+
+    def open_base_forms() -> list[dict]:
+        return _redrive_base_form_open(rec)
+
     async def measure(subset: list[dict], label: str
                       ) -> tuple[dict[str, dict], list]:
         if not subset:
@@ -68481,7 +69039,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("evidence_handed", [])
     stopped_on_budget = False
     if not (F or (held and H_known is None) or H_known or open_items()
-            or open_checks() or open_defects()):
+            or open_checks() or open_defects() or open_base_forms()):
         # An item no fixer could reproduce is still recorded (rule 4).
         record_unrouted()
         rec["done"] = True
@@ -68490,7 +69048,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     log("phase 5: delivery re-drive — "
         f"{len(F)} failing shown set file(s), {len(open_items())} unmet "
         f"item(s), {len(open_checks())} red merge check(s), "
-        f"{len(open_defects())} unfixed solution defect(s)"
+        f"{len(open_defects())} unfixed solution defect(s), "
+        f"{len(open_base_forms())} existing test file(s) failing in their "
+        "base form"
         + "".join(
             f"; {n} unmet item(s) {why} — not driven ({reason})"
             for reason, why in (
@@ -68573,6 +69133,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             ge_["rollback_reason"] = (
                 reason if (r_, g_) == (first["round"], first["group"])
                 else f"built on {label}, rolled back: {reason}")
+            _redrive_base_form_unkept(rec, r_, g_, ge_["rollback_reason"])
         rec.setdefault("flip_rollbacks", []).append({
             "group": label, "pre_sha": first["pre_sha"],
             "items": [c["item_index"] for c, _s in culprits],
@@ -68621,8 +69182,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                              for k in n.get("evidence_keys") or ())
             checks_open = open_checks()
             defects_open = open_defects()
+            base_forms_open = open_base_forms()
             if not held_mode and not (F or items_open or checks_open
-                                      or defects_open):
+                                      or defects_open or base_forms_open):
                 rnd -= 1
                 break
             if held_mode:
@@ -68633,7 +69195,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                   else "control_regression")
                          for k, v in F.items()]
                 fallback = site_claimers
-            notes += items_open + checks_open + defects_open
+            notes += items_open + checks_open + defects_open + base_forms_open
             # The self-check every group is given runs the shown sets: a note
             # it cannot reproduce is a leerie defect, never handed on (DESIGN §8
             # *Delivery re-drive* rule 4).
@@ -68648,6 +69210,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             rec["rounds"].append(entry_round)
             _save()
             drove = False
+            # A base-form note routed to several groups is driven by the first:
+            # its next attempt is the next round's, routed afresh.
+            round_bf: set[str] = set()
             routed_items: set[int] = set()
             routed_checks = False
             for gi, g in enumerate(groups):
@@ -68663,7 +69228,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         and n["key"] in F
                         or n["kind"].startswith("held_") and n["key"] in H
                         or n["kind"] in ("unmet_item", "ci_check",
-                                         "solution_defect")]
+                                         "solution_defect")
+                        or n["kind"] == "base_form_case"
+                        and n["key"] in {x["key"] for x in open_base_forms()}
+                        and n["key"] not in round_bf]
+                # A base-form escalation is driven alone: the model it is
+                # escalated to works on those cases only (DESIGN §8 *A fix that
+                # keeps both, on opus when sonnet could not*).
+                if any(n.get("escalation") for n in live):
+                    live = [n for n in live if n.get("escalation")]
                 ge["notes"] = sorted({n["kind"] for n in live})
                 if not live:
                     ge["skipped"] = "nothing_left"
@@ -68694,6 +69267,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
                 for m in members:
                     _consume_redrive(st, m)
+                bf_live = [n for n in live if n["kind"] == "base_form_case"]
+                round_bf |= {n["key"] for n in bf_live}
                 _save()
                 t0 = time.monotonic()
                 # The shown sets' source, for the anti-cheat history check
@@ -68709,6 +69284,17 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 label = f"delivery-redrive-r{rnd}-g{gi}"
                 effort = (EFFORT_REDRIVE_ESCALATION if escalate
                           else efforts.get("implementer"))
+                drive_models = models
+                if any(n.get("escalation") for n in bf_live):
+                    effort = EFFORT_BASE_FORM_ESCALATION
+                    drive_models = {**models,
+                                    "implementer": MODEL_BASE_FORM_ESCALATION}
+                # Each attempt at a base-form note is recorded with the model and
+                # effort it ran at before it runs.
+                _redrive_base_form_attempt(
+                    rec, bf_live, rnd=rnd, group=gi, effort=effort,
+                    model=drive_models.get("implementer", MODEL_DEFAULT))
+                _save()
                 try:
                     suite = _browser_suite(st)
                     if suite is not None and any(p_.get("via_browser_suite")
@@ -68742,7 +69328,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         held_names=held_names, defect_shape=shape,
                         selfcheck=sc if sc and sc.get("command") else None)
                     ge["implementer"] = await _redrive_drive(
-                        leerie_dir, st, caps, models, staging, members,
+                        leerie_dir, st, caps, drive_models, staging, members,
                         note, effort=effort, label=label,
                         bin_dir=sc["bin"] if sc else None,
                         db=bool(shown or probe_sets))
@@ -68785,7 +69371,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         st, caps, log_sid=label,
                         cwd=str(staging), schema_key="implementer",
                         system_prompt=_load_prompt("implementer"),
-                        model=models.get("implementer", MODEL_DEFAULT),
+                        model=drive_models.get("implementer", MODEL_DEFAULT),
                         effort=effort, max_turns=120),
                     branch=_compute_run_branch(st.run_id), base=pre_sha)
                 if unclean:
@@ -68800,6 +69386,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         where="re-drive rollback",
                         branch=_compute_run_branch(st.run_id))
                     ge["rolled_back"] = ok
+                    _redrive_base_form_settled(rec, bf_live, ge)
                     drove = True
                     prior_members += [m for m in members
                                       if m not in prior_members]
@@ -68889,6 +69476,27 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         [f"set {i}" for i in unm]
                         + list(newv.get("no_verdict") or [])
                         + (["test ids"] if newv["unmeasured"] else []))
+                    if bf_live:
+                        # Whether the group made its base-form cases pass, as
+                        # the base wrote them, against the run's base; and
+                        # whether, putting an original test back, it dropped a
+                        # case of the file it found that still holds.
+                        ge["base_form_fixed"] = await _redrive_base_form_fixed(
+                            st, caps, staging, bf_live,
+                            label=f"redrive-r{rnd}g{gi}-base-form",
+                            log_path=st.run_dir / "logs" / _REDRIVE_LOG)
+                        ge["test_closure_breach"] = await asyncio.to_thread(
+                            _base_form_closure_breach, _run_repo(st),
+                            _diff_base(st) or "", pre_sha, post_sha,
+                            sorted({n["file"] for n in bf_live}),
+                            resolve_test_file_globs(st.repo_root))
+                        dropped = await _redrive_dropped_cases(
+                            st, caps, staging, pre_sha,
+                            label=f"redrive-r{rnd}g{gi}-dropped",
+                            log_path=st.run_dir / "logs" / _REDRIVE_LOG)
+                        ge["dropped_cases"] = (
+                            dropped if dropped is not None
+                            else ["(not measured)"])
                     v = _redrive_verdict(F, F1, newv["new"],
                                          held=H if held_mode else None,
                                          held_after=H1)
@@ -68921,9 +69529,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     measured_probes = [i for i, x in probes_after.items()
                                        if x != "unmeasured"]
                     ge["zero_progress"] = bool(
-                        (measured_live or measured_probes)
+                        (measured_live or measured_probes or bf_live)
                         and not v["fixed_cases"]
-                        and not v["held_fixed_cases"] and not probe_fixed)
+                        and not v["held_fixed_cases"] and not probe_fixed
+                        and not ge.get("base_form_fixed"))
                     # A shown probe never forces a change that breaks what an
                     # existing test pins (rule 4): a commit that made a probe
                     # pass and broke such a case contests the probe — measured,
@@ -68950,7 +69559,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     # back: each pinned case is a confirmed new failure (worse)
                     # or a base-form change (void).
                     void = (void or ge["zero_progress"]
-                            or bool(ge.get("base_form_changed")))
+                            or bool(ge.get("base_form_changed"))
+                            or bool(ge.get("dropped_cases"))
+                            or bool(ge.get("test_closure_breach")))
                     if escalate:
                         async with _exec_lock().shared():
                             eg = _redrive_escalation_gate(
@@ -69081,6 +69692,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                         {"fixed": fa, "tracked_test": fb,
                                          "file": f, "round": rnd})
                             log(f"  WARNING: {reason}")
+                _redrive_base_form_settled(rec, bf_live, ge)
                 if not ge.get("rolled_back"):
                     rec["defects_driven"] += [
                         n["key"] for n in live if n["kind"] == "solution_defect"
@@ -77624,8 +78236,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"CI parity (final) raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # The existing tests the run changed, in their base form, on the tree
+    # the re-drive starts from: each file failing there is a note it drives
+    # once (DESIGN §8 *A fix that keeps both, else a conflict the task
+    # decides*).
+    await _check_existing_behaviour(leerie_dir, st, caps)
     # Hand confirmed-unmet work back to the subtasks that own it (DESIGN §8
-    # *Delivery re-drive*): failing sets, unmet items, red merge checks.
+    # *Delivery re-drive*): failing sets, unmet items, red merge checks,
+    # existing tests failing in their base form.
     try:
         await _run_delivery_redrive(leerie_dir, st, caps, models, efforts)
     except Exception as e:

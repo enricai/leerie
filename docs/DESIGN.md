@@ -13965,6 +13965,11 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    control takes — and is driven once (a group that is rolled back leaves
    it open for the next). No step re-verifies it mechanically, so it stays
    in the outcome's reasons.
+   So is an existing test whose base form fails on the tree the re-drive
+   starts from (`existing_behaviour`, measured just before it): one typed
+   `base_form_case` note per test file, routed like a control, driven once
+   and once more on opus for the cases still failing, never again (*A fix
+   that keeps both, on opus when sonnet could not*).
 2. *Who owns it.* The planner types, per subtask, the required items it
    delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
    An unmet deliverable item re-drives **every** claimer. A process item
@@ -16702,34 +16707,133 @@ On a79384a4 the round check would have acted where it mattered: at round 2's
 start (`4a48b8c`, where the final conformer had restored the budget) all 67
 base-form cases pass; after it, the 4 above fail, 11 s a side.
 
-**Why a person decides, and not a re-drive first.** A failing base form is
-either a regression (a79384a4) or the task asking for the change (five of the
-six). Code cannot tell them apart: that is the task's meaning, and the
-declaration path that tried to read it failed its bench (§8 *Existing tests the
-run changed are listed in the PR*: weak quotes passed 4 of 6 weakenings). So
-the run stops and shows the conflict: the case that fails in its base form, its
-failure, and, beside it in the PR, what the run changed in that test. One read
-settles it. The cost is convergence, measured above: 5 of 13 `done` runs would
-have ended `unconverged` for a change their task required, and their PRs would
-have opened as drafts. That is the price of "never".
+**Why a person decides, after two rounds that try to keep both.** A failing
+base form is either a regression (a79384a4) or the task asking for the change
+(five of the six). Code cannot tell them apart by reading: that is the task's
+meaning, and every reading tried failed its bench — the declaration path (§8
+*Existing tests the run changed are listed in the PR*: weak quotes passed 4 of
+6 weakenings), and an independent judge with verified quotes and a majority
+of three (T9 bench 1: it accepted a2a825c2's inverted #358 case 6 of 6,
+because report C16 names #358's pinned behaviour as the defect word for
+word). What does tell them apart is constructive: a regression is a change a
+fix could have avoided. So before the run stops, the delivery re-drive tries
+to build that fix (*A fix that keeps both, on opus when sonnet could not*,
+below); what it cannot build stops the run and shows the conflict: the case
+that fails in its base form, its failure, and, beside it in the PR, what the
+run changed in that test. One read settles it. Nothing is accepted by
+reading. The cost is convergence on a task whose required change IS the
+tested behaviour (a sweep that moves literals into message files): no fix
+keeps both, so such a run ends `unconverged` and opens a draft.
 
-A re-drive first — one more round told to satisfy both the task and the
-existing test — was not taken, because its benefit could not be measured here
-(no worker ran in this replay). It would help a case like a2a825c2's, where a
-fix satisfies both. It could not help the five task-required rows, where the
-pinned behaviour is the defect the report names: one round each spent, and the
-run still stops. Measure it before adding it.
+### A fix that keeps both, on opus when sonnet could not
 
-**Known limits.** A case that fails in its base form on the base itself (an
-environment it needs) is pre-existing under B\* and protects nothing; ef425976
-has three such cases, among them the tracked-test replay's weakened
-`tsc --noEmit` e2e file. The final conformer's own rounds are not checked one by
-one: the tree that ships is (a2a825c2's `aea6d06` was a final-conformer
-commit). Integration and subtask rounds are not checked one by one either; the
-shipping tree is. A removed export: pytest
-fails to load the file (pinned by a test); for vitest and jest it was not
-measured here: a runner that binds a missing named export to `undefined` fails
-the cases that use it rather than the load, and either way they fail.
+*Designed 2026-11-09, lane T9.* Before the tree that ships is checked, the
+existing tests' base forms are run on the tree the delivery re-drive starts
+from (`_check_existing_behaviour`), and each test file with failing cases is
+a typed `base_form_case` note of the re-drive (§8 *Delivery re-drive*): its
+cases, their failures, and the command that shows the original test. The
+note asks for the change that keeps both — the cases pass as the original
+test wrote them while every required item stays met, the pinned behaviour
+restored wherever the task does not need it changed — and never for undoing
+what the task asks. It is routed like a control, on the shared re-drive
+budget, and judged by the re-drive's own checks: the base-form run against
+the run's base (did its cases pass?), the round's own base-form check (did it
+break another pinned case?), the shown held-out sets, the delivery ratchet
+(did a met item go unmet?), the clean-tree gate; a round that fixed none of
+its cases is zero progress. Each is rolled back like any other group.
+
+**Two attempts, the second on opus.** A file's note is driven once on the
+implementer's own model and effort (sonnet, `low`). The cases still failing
+after that attempt get exactly one more, on `MODEL_BASE_FORM_ESCALATION`
+(`opus`) at `EFFORT_BASE_FORM_ESCALATION` (`high`), with the same note for
+those cases only, driven alone (no other note in its group), with the same
+checks and rollback. A per-call override of that one round: no worker's
+default model changes. Why opus there and nowhere else: the cases that reach
+it are the ones sonnet at low effort could not keep, which is where a
+stronger model is worth its cost, and only there — as the delivery re-drive
+raises effort only on its last round (`EFFORT_REDRIVE_ESCALATION`). Measured
+(T9 bench 7b, 3 samples per run, 2026-11-10, on 0.55.2 — before
+#365's flip rollback):
+- A responsive grid the task did not need changed: sonnet put it back in all
+  3 samples (3/3 cases each).
+- An existing test the run had inverted: sonnet kept nothing in any sample.
+  Opus kept the fix that holds both in 2 of 3; the third stays blocking.
+- A run whose base-form cases cannot pass without undoing its own late-body
+  test: blocking 3/3, every round rolled back.
+
+No kept round's harm ended a run with the harmed item reported met. In one
+sample, the #352 re-check judged a required item unmet after the opus round
+was kept, and that run ended `unconverged`. #365's flip rollback would now
+roll such a group back when the item's confirmed probe passed on its start;
+its base-form attempt then reads `rolled_back`, like any other group's.
+
+**A round changes what the test is run against, never the test.** A base-form
+case asks whether the base's test, in its original form, passes on the new
+code — and the test's form includes what it runs with. So a round driving
+base-form notes may change only files outside its cases' **test closure**
+(`_base_form_closure`): the case files, every test-side file they import
+transitively (test files, the import graph's test-support modules,
+`__mocks__`), the runner's configuration and the setup or support files it
+names, and a Python case's `conftest.py` chain. A closure file may be
+written back exactly as it is at the run's base — that is putting the
+original test back — and nothing else; and a test file the run added may not
+be changed or deleted at all (`_base_form_closure_breach`). A round that
+does otherwise is void and rolled back. The rule needs no attribution: in
+T9 bench 4 the two harmful kept rounds changed the test's support (e0d101e3:
+the global message mock rewritten so old literal assertions pass, and a
+test the run added changed) and would have been rolled back by it, which a
+check of which cases still pass could not see, because the round's own mock
+change is what made the run's deleted cases fail.
+
+**And it may not drop a case that still holds.** Putting an original test
+file back exactly is allowed, and with it every case the run had added to
+that file goes. A case the restored behaviour contradicts may go; one that
+still passes may not: the round's commit is measured for the cases of each
+test file it modified whose form at the round's start passes on its commit
+but that the commit's own form no longer has (`_redrive_dropped_cases`); any
+such case, or a measurement with no report, voids the round. The closure
+rule does not catch this: in T9 bench 3 a kept round wrote a79384a4's
+original `flow-runner.post-click-settle.test.ts` back exactly (no breach) and
+dropped 10 of the 32 run-start cases still passing there, the task's own
+guards among them.
+
+**A case pinning a moved literal gets no round.** Some base-form cases
+cannot be satisfied without harm. When a task moves UI text into message
+files, a base test that finds or asserts that literal text passes only if
+production holds the literal again. In T9 benches 4-6, opus took exactly
+that path on navegando 4134b78c in 3 runs of 3, and every check passed it.
+Reading the task cannot tell such a case apart (T9 bench 1). Code facts can
+(`_base_form_moved_literals`, in `_check_existing_behaviour`). A case is
+classified `pins_moved_literal` when a string or plain regex literal of its
+base form's reachable code (from `scripts/test-case-facts.cjs`) meets all
+three of:
+
+- (a) a production source file at the base holds it;
+- (b) that file on the run's tree no longer holds it;
+- (c) a message file the run added or changed holds it as a value.
+
+Presence is read from the file's code with its comments blanked: a doc
+comment that still names the old text is not the text (4134b78c's
+`campaign-list.tsx` kept one). A message file is
+`(messages|locales?|i18n|translations|langs?)/*.json`. Such a case gets no
+round: it stays `existing_behaviour_changed`, never accepted. The PR lists it
+as "existing test pins text the run moved to the message files", with the
+literal and the key it moved to, so the person updates that test. The run
+ends `unconverged`, which is the honest verdict.
+
+Known limits: a moved text inside a larger literal (a CSS selector) or with
+its case changed (`includes("transferir")`) is not classified, so such a case
+still gets its rounds.
+
+**What neither catches.** A round that undoes a required item in production
+code while keeping every test green: in T9 bench 4 an opus round on
+4134b78c restored the original password-input cases by giving the
+component hard-coded Spanish label defaults. The item stays covered only by
+the delivery ratchet, which re-verifies a met item after a kept round with
+its judge alone (`_ratchet_judge`); the falsifier that a met needs at
+detection, and that a re-check runs again (`_redrive_falsify_met`), never
+runs on a ratchet's tree. That is a delivery-detection gap, not this
+section's.
 
 ### Held-out acceptance tests
 
@@ -21371,6 +21475,11 @@ whole-PR review (§9 *An advisory whole-PR review feeds the final
 conformer*), at effort `high`. It is not a judgment the run waits on;
 it looks for what nothing else is anchored to, and there the tier
 measured about five times the verified findings (bench N2f).
+
+One round is on `opus` by a per-call override, not by a worker default: the
+delivery re-drive's escalation of an existing test's base-form cases that
+the implementer's own round (sonnet, `low`) could not keep (§8 *A fix that
+keeps both, on opus when sonnet could not*). It is paid only by those cases.
 
 ---
 

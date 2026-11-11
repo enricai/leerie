@@ -258,6 +258,11 @@ the rest of the family stay denied.
   whole-PR review, which never gates, measured at about 5x sonnet's
   verified findings on code no required item names (bench N2f; the
   reason is at its `MODEL_DEFAULT_PER_WORKER` entry and DESIGN §12).
+  One ROUND, not a worker, is on `opus` too: the delivery re-drive's
+  escalation of an existing test's base-form cases the implementer's own
+  round could not keep (`MODEL_BASE_FORM_ESCALATION`,
+  `EFFORT_BASE_FORM_ESCALATION = "high"`, a per-call override; DESIGN §8
+  *A fix that keeps both, on opus when sonnet could not*).
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.

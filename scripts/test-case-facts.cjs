@@ -485,6 +485,20 @@ for (const r of reach) (function v(x) {
   }
   ts.forEachChild(x, v);
 })(r);
+// Every string and regular-expression literal of the reachable code, for the
+// moved-literal classification (`_base_form_moved_literals`): text as the
+// literal holds it, a regex as its source and flags.
+const literals = []; const seenLit = new Set();
+for (const r of reach) (function v(x) {
+  let lit = null;
+  if (ts.isStringLiteral(x) || ts.isNoSubstitutionTemplateLiteral(x)) lit = { kind: 'string', text: x.text };
+  else if (x.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+    const t = x.getText(sf); const i = t.lastIndexOf('/');
+    lit = { kind: 'regex', text: t.slice(1, i), flags: t.slice(i + 1) };
+  }
+  if (lit) { const k = lit.kind + '\0' + lit.text + '\0' + (lit.flags || ''); if (!seenLit.has(k)) { seenLit.add(k); literals.push(lit); } }
+  ts.forEachChild(x, v);
+})(r);
 const reach_src = [...reach].map(n => n.getText(sf));
-emit({ title: best.title, reach_src, case_src: best.node.getText(sf), steps, asserts, reads, copies, execs, evals, imports: usedImports,
+emit({ title: best.title, reach_src, literals, case_src: best.node.getText(sf), steps, asserts, reads, copies, execs, evals, imports: usedImports,
   vm_import: imports.some(s => s === 'vm' || s === 'node:vm'), all_imports: imports });
