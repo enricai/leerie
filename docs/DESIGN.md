@@ -13962,9 +13962,15 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    as a typed `solution_defect` note (kind, `where`, concrete case), is
    routed like a failing control — to the subtasks whose integrated diff
    touches the file its `where` names, with none the same fallback a
-   control takes — and is driven once (a group that is rolled back leaves
-   it open for the next). No step re-verifies it mechanically, so it stays
-   in the outcome's reasons.
+   control takes — and is driven once. No step re-verifies it
+   mechanically, so its re-check before each group (rule 3) reads the
+   record: it is closed once a group that was handed it is kept, and no
+   later group, in that round or a later one, is handed it. A group that
+   is rolled back leaves it open, whether at once or after the last round
+   by a flip (*A kept group that turns a met item's confirmed probe from
+   passing to failing is rolled back*): its change is gone from the tree,
+   so the next group the defect is routed to, in that round or the next,
+   is handed it. It stays in the outcome's reasons either way.
    So is an existing test whose base form fails on the tree the re-drive
    starts from (`existing_behaviour`, measured just before it): one typed
    `base_form_case` note per test file, routed like a control, driven once
@@ -14030,6 +14036,16 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `006`) were handed only that note, and each spent a round on it,
    about 80 seconds in all. Each reported that it could not reproduce
    the red lint and changed nothing.
+   A solution defect is re-checked the same way, by its record (rule 1):
+   once a kept group was handed it, its note goes to no later group. A
+   defect whose `where` names no subtask's file goes to every group (rule
+   2), as a plain red gate does, so the same waste was open to it. Before
+   this rule, a round's notes were built once, and every group a defect
+   was routed to was handed it, whatever an earlier group of that round
+   had done; only the next round's notes left it out. This was found by
+   reading the code while fixing the merge-check case; no recorded run
+   hit it, since every recorded re-drive started with no unfixed solution
+   defect.
 4. *A self-check, then a re-check.* The implementer is given a command
    that runs the shown sets against a copy of its current working tree,
    outside that tree (*A held-out set never enters a tree a worker commits
