@@ -19944,7 +19944,8 @@ unchanged — only the inputs (cwd, `DIFF_BASE`, and the absence of a
 subtask spec / criteria file) differ. The pass's structured output
 lands at `st.data["conformance"]["_final"]` and is threaded into the
 `pr_writer` payload so its residuals surface as an advisory section
-in the PR body alongside the wave-by-wave summary. That record is also the
+in the PR body alongside the wave-by-wave summary — when it is of the tree
+that ships (next paragraph). That record is also the
 pass's resume sentinel, but only for a pass that **cleared**: `resume`
 skips the pass when `_final` is recorded with `blocked` false, and runs it
 again when `blocked` is true. A blocked final pass (`--strict-conformer`
@@ -19952,6 +19953,36 @@ only, below) stops the run with "fix and resume"; skipping it on that
 resume would let the very run the operator resumed to finish the gap ship
 without the pass ever looking at the gap again (in the attribution of 32
 traced chains, one needed exactly this fix).
+
+**Every test outcome the PR states was measured on the tree that ships.**
+*Built 2026-11-11 (lane FC, barnacle 39c4c5ad).* The final pass is not the
+last step that commits: the held-out gate's repair rounds and the delivery
+re-drive's groups commit after it. Its record is a verdict of the tree its
+last measurement read, stamped `tree_sha`; once a later step moved the run
+branch, its failed axes, residuals and warnings describe a tree no reviewer
+can check out from the PR. So the `pr_writer` payload carries
+`final_conformance` only when `tree_sha` is the run branch's tree
+(`_shipping_tree`), and leaves it out — with a log line naming both trees —
+when the trees differ or either is unknown. It is not re-labelled with its
+commit for the worker to state: the worker composes prose, and a label it
+can drop is a prompt rule, not a guarantee (§12). Nothing the reviewer
+needs is lost: every test outcome of the tree that ships is measured
+again after the last commit and rendered by code — the failing-test-ID
+diff, the held-out gate's `final` (`final_sha`), the merge checks
+(`ci_parity.final.sha`), detection's `unmet_final` (`final_tree`) and the
+base forms of existing tests (`existing_behaviour.tree_sha`). What is
+lost is the pass's own rule residuals on a moved tree, the same as the
+test outcomes: a statement about a tree that does not ship. Measured on
+barnacle 39c4c5ad (leerie 0.60.0): `_final.tree_sha` was `b0ef30f`'s tree,
+the run shipped `4304168`'s, and the PR's "Conformance notes" said
+`recon-generate-shape-verdict-base-headers.test.ts` failed — it fails only
+at `b0ef30f` and passes at the four commits after it, the head included.
+The PR's other inputs were checked for the same staleness and are already
+of the tree that ships at finalize: the held-out verdict is re-measured
+after the re-drive (`final_unremeasured` says so in the PR when it could
+not be), the merge checks re-run there, the unmet evidence names a
+verdict of an earlier tree as `residual`, and `base_health` is the base's
+own and says so.
 
 **An unfixed solution defect keeps the final loop going, and what survives
 it is unfinished work, not a stop.** The round loop ends early only when

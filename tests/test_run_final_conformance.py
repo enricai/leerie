@@ -769,6 +769,11 @@ def test_failing_axis_summarized_into_warnings(env):
 # _final_conformance_payload — the PR-writer payload surfacing helper
 # ---------------------------------------------------------------------------
 
+# The tree the stub records were measured on, passed as the shipping tree:
+# the payload states a record only of the tree that ships.
+_TREE = "d53e7b829860763f0a7621e3c64af79966e71cfe"
+
+
 class _StatePayload:
     """Minimal stand-in for State for _final_conformance_payload, which
     only reads `data`."""
@@ -779,14 +784,14 @@ class _StatePayload:
 
 def test_payload_none_when_block_absent(leerie):
     st = _StatePayload({})
-    assert leerie._final_conformance_payload(st) is None
+    assert leerie._final_conformance_payload(st, _TREE) is None
 
 
 def test_payload_none_when_clean(leerie):
     st = _StatePayload({"conformance": {"_final": {
         "result": _clean_result(), "warnings": [],
     }}})
-    assert leerie._final_conformance_payload(st) is None
+    assert leerie._final_conformance_payload(st, _TREE) is None
 
 
 def test_payload_surfaces_residuals(leerie):
@@ -797,9 +802,9 @@ def test_payload_surfaces_residuals(leerie):
         ],
     )
     st = _StatePayload({"conformance": {"_final": {
-        "result": res, "warnings": [],
+        "result": res, "warnings": [], "tree_sha": _TREE,
     }}})
-    out = leerie._final_conformance_payload(st)
+    out = leerie._final_conformance_payload(st, _TREE)
     assert out is not None
     assert out["residuals"] == [{"rule": "no print statements",
                                  "why_not_fixed": "user-facing UI"}]
@@ -812,9 +817,9 @@ def test_payload_surfaces_failed_axes(leerie):
               "summary": "src.py:5: E501 line too long"},
     )
     st = _StatePayload({"conformance": {"_final": {
-        "result": res, "warnings": [],
+        "result": res, "warnings": [], "tree_sha": _TREE,
     }}})
-    out = leerie._final_conformance_payload(st)
+    out = leerie._final_conformance_payload(st, _TREE)
     assert out is not None
     assert out["failed_axes"] == [{
         "axis": "lint",
@@ -825,10 +830,10 @@ def test_payload_surfaces_failed_axes(leerie):
 
 def test_payload_surfaces_warnings(leerie):
     st = _StatePayload({"conformance": {"_final": {
-        "result": None,
+        "result": None, "tree_sha": _TREE,
         "warnings": ["final conformer round 0: WorkerError: budget"],
     }}})
-    out = leerie._final_conformance_payload(st)
+    out = leerie._final_conformance_payload(st, _TREE)
     assert out is not None
     assert out["warnings"] == [
         "final conformer round 0: WorkerError: budget"]
@@ -850,10 +855,10 @@ def test_payload_truncates_when_over_cap(leerie):
         ],
     )
     st = _StatePayload({"conformance": {"_final": {
-        "result": res,
+        "result": res, "tree_sha": _TREE,
         "warnings": [f"{big_warning} ({i})" for i in range(50)],
     }}})
-    out = leerie._final_conformance_payload(st)
+    out = leerie._final_conformance_payload(st, _TREE)
     assert out is not None
     import json as _json
     serialized = _json.dumps(out, separators=(",", ":")).encode("utf-8")
