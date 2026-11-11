@@ -59944,6 +59944,104 @@ async def _acceptance_remeasure_final(st: "State", caps: dict, staging: str,
     return True
 
 
+async def _conformer_flip_check(st: "State", caps: dict, staging: str,
+                                sets: list[dict], end_res: list[dict],
+                                end_sha: str) -> dict | None:
+    """Whether the final conformer turned a passing held-out case failing
+    (DESIGN §8 *A final-conformer round that turns a passing held-out case
+    failing is rolled back*): `end_res`, the gate's `initial`, is the sets'
+    verdict on `end_sha`. None when the rule does not apply — the pass
+    recorded no rounds or ended elsewhere, no round committed, or no case
+    fails at the end. Otherwise `{start_sha, end_sha, broken_cases}` — the
+    cases failing at the end that passed on the pass's start
+    (`_acceptance_broken_cases`) — and, when there are any, the culprit
+    (`_conformer_flip_culprit`): `culprit_round`, `rollback_to` (its start)
+    and `start_results` (the sets' verdict there)."""
+    fin = (st.data.get("conformance") or {}).get("_final")
+    if not isinstance(fin, dict):
+        return None
+    starts = [str(x or "") for x in fin.get("round_starts") or []]
+    if (not starts or not end_sha or fin.get("end_sha") != end_sha
+            or not _acceptance_any_fails(end_res)):
+        return None
+    ends = starts[1:] + [end_sha]
+    moved = [(i, s_, e) for i, (s_, e) in enumerate(zip(starts, ends))
+             if s_ and s_ != e]
+    if not moved:
+        return None
+    start = moved[0][1]
+    before = await _evaluate_acceptance_sets(st, caps, staging, sets,
+                                             "conformer-start", rev=start)
+    rec: dict = {"start_sha": start, "end_sha": end_sha,
+                 "broken_cases": _acceptance_broken_cases(before, end_res)}
+    if not rec["broken_cases"]:
+        log("phase 5: acceptance gate — the final conformer broke no held-out "
+            f"case that passed on its start {start[:12]}")
+        return rec
+    rnd, rollback_to, at = await _conformer_flip_culprit(
+        st, caps, staging, sets, moved, before, end_res)
+    rec.update({"culprit_round": rnd, "rollback_to": rollback_to,
+                "start_results": at})
+    log(f"phase 5: acceptance gate — the final conformer turned "
+        f"{len(rec['broken_cases'])} held-out case(s) that passed on its "
+        f"start {start[:12]} failing on {end_sha[:12]}; round {rnd} did "
+        f"first — rolling it back to {rollback_to[:12]}")
+    return rec
+
+
+async def _conformer_flip_culprit(st: "State", caps: dict, staging: str,
+                                  sets: list[dict],
+                                  moved: list[tuple[int, str, str]],
+                                  before: list[dict], end_res: list[dict]
+                                  ) -> tuple[int, str, list[dict]]:
+    """The first committing round whose commit fails a held-out case that
+    passed on its start: `(round, its start, the sets' verdict there)`. Each
+    round's commit is evaluated in turn, the last one's being `end_res`;
+    with no step showing it (a set unmeasured on an intermediate commit),
+    the first committing round (DESIGN §8 *A final-conformer round that
+    turns a passing held-out case failing is rolled back*)."""
+    prev = before
+    for k, (rnd, start, end) in enumerate(moved):
+        after = (end_res if k == len(moved) - 1 else
+                 await _evaluate_acceptance_sets(
+                     st, caps, staging, sets, f"conformer-r{rnd}", rev=end))
+        if _acceptance_broken_cases(prev, after):
+            return rnd, start, prev
+        prev = after
+    return moved[0][0], moved[0][1], before
+
+
+async def _conformer_flip_undo(st: "State", staging: Path, gate: dict,
+                               flip: dict, at_start: list[dict] | None
+                               ) -> bool:
+    """Reset staging to `flip["rollback_to"]` (`_roll_back_round`, which
+    says why) and record whether it landed on `flip` — the decision was
+    saved before, so a resume finishes it. In the same save, the gate's
+    `initial` becomes `at_start`, the sets' verdict on the restored commit,
+    when the reset landed; with none (a resume finishing the reset), it is
+    dropped, and the gate measures the tree it finds."""
+    ok = await _roll_back_round(
+        st, staging, flip["rollback_to"], worker="final conformer",
+        label=f"round {flip.get('culprit_round')}",
+        reason="broke previously passing held-out case(s)",
+        where="final conformer held-out rollback",
+        branch=_compute_run_branch(st.run_id))
+    flip["rolled_back"] = ok
+    if not ok:
+        flip["rollback_failed"] = True
+    if ok and at_start is not None:
+        gate["initial"] = at_start
+        gate["initial_sha"] = flip["rollback_to"]
+    elif at_start is None:
+        gate.pop("initial", None)
+        gate.pop("initial_sha", None)
+    acc = st.data.get("acceptance") or {}
+    acc["gate"] = gate
+    st.data["acceptance"] = acc
+    st.save()
+    return ok
+
+
 async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                                      caps: dict, models: dict,
                                      efforts: dict) -> None:
@@ -59986,6 +60084,14 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
         return (await _evaluate_acceptance_sets(
             st, caps, str(staging), sets, label, rev=sha or "HEAD"), sha)
 
+    # A final-conformer rollback decided before an interruption is finished
+    # first; the verdict of the tree it leaves is then measured afresh
+    # (DESIGN §8 *A final-conformer round that turns a passing held-out case
+    # failing is rolled back*).
+    flip = gate.get("conformer_flip")
+    if (isinstance(flip, dict) and flip.get("rollback_to")
+            and flip.get("rolled_back") is None):
+        await _conformer_flip_undo(st, staging, gate, flip, None)
     # The pre-repair verdict is reused on resume: re-measured, it would read
     # an already-repaired tree, and a rolled-back tree would be recorded with
     # the repaired tree's verdict. It reaches disk with before_sha, before
@@ -59995,6 +60101,19 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     else:
         initial, gate["initial_sha"] = await _measure("gate-initial")
         gate["initial"] = initial
+        if "conformer_flip" not in gate:
+            flip = await _conformer_flip_check(st, caps, str(staging), sets,
+                                               initial, gate["initial_sha"])
+            if flip is not None:
+                start_results = flip.pop("start_results", None)
+                gate["conformer_flip"] = flip
+                acc["gate"] = gate
+                st.data["acceptance"] = acc
+                st.save()
+                if (flip.get("rollback_to")
+                        and await _conformer_flip_undo(st, staging, gate,
+                                                       flip, start_results)):
+                    initial = gate["initial"]
     # The latest verdict with results: an errored round carries results
     # only when it committed (and was measured again); otherwise the round
     # before it still describes the tree. `final_sha` is the commit that
@@ -69372,8 +69491,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # are measured first*).
     near_rejected: dict[str, dict] | None = None
 
+    # Each round's start, for the held-out flip check after the pass (DESIGN
+    # §8 *A final-conformer round that turns a passing held-out case failing
+    # is rolled back*).
+    round_starts: list[str] = []
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
+        round_starts.append(before_sha)
         post_taken = False
         pre = (near_rejected if near_rejected is not None
                else await _measure_final(c_round, "pre"))
@@ -69686,6 +69810,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         "warnings": warnings,
         "blocked": final_blocked,
         "tree_sha": post_stamp if post_taken else pre_tree,
+        "round_starts": round_starts,
+        "end_sha": await _branch_head_sha(str(staging)),
     }
     if final_defects:
         final_rec["residual_defects"] = [
