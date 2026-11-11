@@ -14004,6 +14004,32 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    as one implementer session (their scopes merged), and groups run one
    after another on the same tree. Before each group the open work is
    re-checked, and a group with nothing left failing is skipped.
+   A red merge check is re-checked like a set: its note goes to a group
+   only while the check is still red on that group's start. The
+   measurement read is the one already kept for that commit
+   (`ci_parity.measured`). Every kept group's commit is measured whole by
+   *A kept repair keeps the repository's merge checks green*, so the
+   re-check runs nothing. The check is closed when that measurement
+   reads it green: a gate that passed; a strict lint with no diagnostic
+   new since the base in a file the run changed; a coverage ratchet with
+   no threshold firing. A closed check's note goes to no later group. A
+   start with no kept measurement leaves the check open as last read. A
+   group whose every note is closed is skipped, and its members draw no
+   round (rule 8).
+   Routing alone cannot fix this. A plain red gate names no file, so no
+   diff owns it, and rule 2 sends it to every group. Sequence makes that
+   affordable, but only if each group re-reads the check before it is
+   handed on. A note handed after the check went green also breaks rule
+   4: it is a failure the fixer cannot reproduce. Leaving the round
+   uncharged would not cure that, since the fixer is still sent after a
+   failure that is gone. Before this rule, a check's note went to every
+   group it was routed to, whatever the earlier groups had done. In
+   barnacle 39c4c5ad (leerie 0.60.0), lint was red on the final tree and
+   named no file. Round 1's group 0 turned it green: `1a6d3d8`, which
+   its own ratchet measured green. Groups 1–3 (`bugfix-003`, `004` and
+   `006`) were handed only that note, and each spent a round on it,
+   about 80 seconds in all. Each reported that it could not reproduce
+   the red lint and changed nothing.
 4. *A self-check, then a re-check.* The implementer is given a command
    that runs the shown sets against a copy of its current working tree,
    outside that tree (*A held-out set never enters a tree a worker commits

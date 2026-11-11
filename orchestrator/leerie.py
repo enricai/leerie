@@ -64077,6 +64077,43 @@ def _redrive_ci_files(u: dict, files: Iterable[str]) -> list[str]:
     return out
 
 
+def _redrive_checks_cleared(st: "State", caps: dict, notes: list[dict],
+                            head: str, touched: list[str]) -> set[str]:
+    """The keys of the `ci_check` notes in `notes` whose check the kept
+    measurement of commit `head` (`ci_parity.measured`, `_ci_remembered`)
+    reads green — a gate that passed, a diagnostic ratchet with no key new
+    since the base in `touched`, a coverage ratchet with no threshold
+    firing — so no group starting from `head` is handed them (DESIGN §8
+    *Delivery re-drive* rule 3). No kept measurement clears nothing:
+    nothing is run here. `touched` is base..`head`'s paths."""
+    recs = {r["id"]: r for r in _ci_gating_recs(st)}
+    eps = float(caps.get("ci_coverage_epsilon_pct",
+                         DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
+    out: set[str] = set()
+    for n in notes:
+        r = recs.get(n.get("id")) if n.get("kind") == "ci_check" else None
+        raw = _ci_remembered(st, head, [r]) if r else None
+        got = (raw or {}).get(r["id"]) if r else None
+        if not isinstance(got, dict):
+            continue
+        why = n.get("why")
+        if why == "red":
+            green = got.get("passed") is True
+        elif why == "new_diagnostics":
+            green = isinstance(got.get("diagnostics"), dict) and not (
+                _ci_new_diagnostics(
+                    r, got["diagnostics"],
+                    (r.get("base") or {}).get("diagnostics") or {}, touched))
+        elif why == "coverage_ratchet":
+            green = isinstance(got.get("coverage"), dict) and not (
+                _ci_coverage_fired(r, got["coverage"], touched, eps))
+        else:
+            green = False
+        if green:
+            out.add(n["key"])
+    return out
+
+
 def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
                    fallback: list[str], pending: list[dict]) -> list[dict]:
     """Rules 2-4 (bench P8d `route`): the groups `[{members, files, notes}]`
@@ -69221,14 +69258,35 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 if held_mode and gi > 0 and drove:
                     H, _u2 = await measure(held, f"redrive-r{rnd}g{gi}-held-pre")
                     H = _redrive_carry(H_known or {}, H, _u2)
+                # A red check is re-checked like a set (rule 3): from the
+                # kept measurement of this group's start, which an earlier
+                # group's ratchet took — never run again for it.
+                cleared: set[str] = set()
+                gchecks = [n for n in g["notes"] if n["kind"] == "ci_check"]
+                if gchecks:
+                    at = await _branch_head_sha(str(staging))
+                    base_ci = (st.data.get("ci_parity") or {}).get(
+                        "base_sha") or ""
+                    touched = (await _ci_touched(staging, base_ci, at)
+                               if any(n.get("why") != "red" for n in gchecks)
+                               else [])
+                    cleared = (_redrive_checks_cleared(
+                        st, caps, gchecks, at, touched) if at else set())
+                if cleared:
+                    ge["checks_cleared"] = sorted(
+                        n["id"] for n in gchecks if n["key"] in cleared)
+                    log(f"  delivery re-drive r{rnd} g{gi}: merge check(s) "
+                        f"{', '.join(ge['checks_cleared'])} green on its "
+                        "start — not handed on")
                 live = [n for n in g["notes"] if
                         (n["kind"] in ("defect",) or (n["kind"] ==
                                                       "control_regression"
                                                       and n.get("file")))
                         and n["key"] in F
                         or n["kind"].startswith("held_") and n["key"] in H
-                        or n["kind"] in ("unmet_item", "ci_check",
-                                         "solution_defect")
+                        or n["kind"] in ("unmet_item", "solution_defect")
+                        or n["kind"] == "ci_check"
+                        and n["key"] not in cleared
                         or n["kind"] == "base_form_case"
                         and n["key"] in {x["key"] for x in open_base_forms()}
                         and n["key"] not in round_bf]
