@@ -68567,40 +68567,61 @@ async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
             os.unlink(src)
 
 
-async def _redrive_flip_culprit(st: "State", caps: dict, rec: dict,
-                                item_index: int, smp: dict) -> dict | None:
-    """The first kept group across which `item_index`'s confirmed probe
-    `smp` flips from passing to failing under B* (`_redrive_probe_flips`),
-    as `{item_index, round, group, pre_sha, post_sha, case_id,
-    probe_saved, b_star}`, or
-    None: no kept group did, so the probe's failure is detection's verdict
-    and nothing is rolled back."""
-    for rnd, gi, ge in _redrive_kept_groups(rec):
+async def _probe_flip_culprit(st: "State", caps: dict,
+                              steps: list[tuple[dict, str, str, str]],
+                              item_index: int, smp: dict, *,
+                              where: str) -> dict | None:
+    """The first of `steps` — `(key, name, pre_sha, post_sha)` per kept
+    commit, in the order they landed — across which `item_index`'s confirmed
+    probe `smp` flips from passing to failing under B*
+    (`_redrive_probe_flips`), as `{item_index, **key, pre_sha, post_sha,
+    case_id, probe_saved, b_star}`, or None: none did, so the probe's
+    failure is detection's verdict and nothing is rolled back. Shared by the
+    re-drive's kept groups and the acceptance gate's kept repair rounds
+    (DESIGN §8 *A kept group that turns a met item's confirmed probe from
+    passing to failing is rolled back*, *A held-out repair round that turns
+    a confirmed probe from passing to failing is rolled back*)."""
+    for key, name, pre, post in steps:
         got = await _redrive_probe_flips(
-            st, caps, smp, ge["pre_sha"], ge["post_sha"],
-            label=f"i{item_index}-r{rnd}g{gi}")
-        log(f"  delivery re-drive: item {item_index}'s confirmed probe on "
-            f"r{rnd}g{gi}: {got['pre']} on its start, {got['post']} on its "
-            "commit" + (" — flipped under B*" if got["flip"] else ""))
+            st, caps, smp, pre, post, label=f"i{item_index}-{name}")
+        log(f"  {where}: item {item_index}'s confirmed probe on {name}: "
+            f"{got['pre']} on its start, {got['post']} on its commit"
+            + (" — flipped under B*" if got["flip"] else ""))
         if got["flip"]:
-            return {"item_index": item_index, "round": rnd, "group": gi,
-                    "pre_sha": ge["pre_sha"], "post_sha": ge["post_sha"],
-                    "case_id": smp["case_id"],
+            return {"item_index": item_index, **key, "pre_sha": pre,
+                    "post_sha": post, "case_id": smp["case_id"],
                     "probe_saved": dict(smp["probe_saved"]),
                     "b_star": got.get("b_star")}
     return None
 
 
-def _redrive_flip_note(i: int, item: str, smp: dict) -> dict:
+async def _redrive_flip_culprit(st: "State", caps: dict, rec: dict,
+                                item_index: int, smp: dict) -> dict | None:
+    """The first kept re-drive group across which `item_index`'s confirmed
+    probe `smp` flips (`_probe_flip_culprit`), with its `round` and
+    `group`, or None."""
+    return await _probe_flip_culprit(
+        st, caps, [({"round": rnd, "group": gi}, f"r{rnd}g{gi}",
+                    ge["pre_sha"], ge["post_sha"])
+                   for rnd, gi, ge in _redrive_kept_groups(rec)],
+        item_index, smp, where="delivery re-drive")
+
+
+def _redrive_flip_note(i: int, item: str, smp: dict, *,
+                       who: str = "re-drive attempt",
+                       short: str = "attempt") -> dict:
     """The pending `control_regression` note a flip leaves for the next
     groups (DESIGN §8 *A kept group that turns a met item's confirmed probe
     from passing to failing is rolled back*): the ratchet's `met-item-<i>`
-    note, its detail naming the probe's case and failure."""
-    detail = ("an earlier re-drive attempt made this required item, met "
+    note, its detail naming the probe's case and failure. `who` names the
+    work that flipped it (an acceptance repair round's flip passes its own:
+    *A held-out repair round that turns a confirmed probe from passing to
+    failing is rolled back*)."""
+    detail = (f"an earlier {who} made this required item, met "
               "before it, unmet: the falsifier's probe case "
               f"`{smp.get('case_id')}` passed on the tree before the "
-              "attempt and failed on its commit (confirmed under B*), so "
-              "the attempt was reverted. Keep it met: " + item[:400])
+              f"{short} and failed on its commit (confirmed under B*), so "
+              f"the {short} was reverted. Keep it met: " + item[:400])
     if smp.get("assertion_quote"):
         detail += ("\nThe probe's assertion: "
                    + str(smp["assertion_quote"])[:300])
@@ -68609,6 +68630,161 @@ def _redrive_flip_note(i: int, item: str, smp: dict) -> dict:
                    + str(smp["failure_message"])[:400])
     return {"kind": "control_regression", "key": f"met-item-{i}",
             "test": f"required item {i}", "detail": detail}
+
+
+def _acceptance_kept_rounds(gate: dict) -> list[dict]:
+    """Every acceptance repair round whose commit is still in staging's
+    history, in the order they landed: it committed (`sha` other than its
+    `pre_sha`, measured) and was not decided rolled back
+    (`_acceptance_round_kept`), and the gate-wide rollback did not take it
+    (`gate.rolled_back`)."""
+    if gate.get("rolled_back"):
+        return []
+    return [e for e in gate.get("rounds") or []
+            if isinstance(e, dict) and _acceptance_round_kept(e)
+            and e.get("pre_sha") and e.get("sha")
+            and e["sha"] != e["pre_sha"] and e.get("results")]
+
+
+async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
+                                 models: dict[str, str],
+                                 efforts: dict[str, str | None]) -> None:
+    """A kept acceptance repair round that turned an item's confirmed probe
+    from passing to failing is rolled back (DESIGN §8 *A held-out repair
+    round that turns a confirmed probe from passing to failing is rolled
+    back*). Runs after final detection, on its verdict of staging's HEAD:
+    each item it holds unmet with a confirmed saved sample
+    (`_redrive_flip_probe`) is tried against every kept repair round
+    (`_acceptance_kept_rounds`) by `_probe_flip_culprit`. With a culprit,
+    the decision (`acceptance.gate.item_flips[]`) is saved before staging
+    is reset to the earliest culprit's start through `_roll_back_round`;
+    that round and every kept round after it are marked rolled back, each
+    flipped item becomes a `met-item-<i>` note in
+    `delivery_redrive.pending_controls`, and the sets, the shipping diff and
+    detection are measured again on the restored commit — then the check
+    repeats over the rounds left. Advisory: never stops a run."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    items = st.data.get("required_items") or []
+    normalized = [_delivery_norm_item(it) for it in items]
+
+    def save_gate(gate: dict) -> None:
+        acc = st.data.get("acceptance") or {}
+        acc["gate"] = gate
+        st.data["acceptance"] = acc
+        st.save()
+
+    while True:
+        acc = st.data.get("acceptance") or {}
+        gate = dict(acc.get("gate") or {})
+        flips = list(gate.get("item_flips") or [])
+        pending = (flips[-1] if flips and isinstance(flips[-1], dict)
+                   and flips[-1].get("landed") is None else None)
+        if pending is None:
+            head = await _branch_head_sha(str(staging))
+            dg = st.data.get("delivery_gate") or {}
+            kept = _acceptance_kept_rounds(gate)
+            # Only detection's verdict of the tree that ships is tried, and
+            # only once per commit (a resume reuses the answer).
+            if (not head or not kept or dg.get("final_sha") != head
+                    or gate.get("item_flip_checked") == head):
+                return
+            steps = [({"round": int(e.get("round") or 0)},
+                      f"acc-r{e.get('round')}",
+                      e["pre_sha"], e["sha"]) for e in kept]
+            culprits: list[tuple[dict, dict]] = []
+            for row in sorted((r for r in dg.get("items") or []
+                               if isinstance(r, dict)
+                               and r.get("verdict") == "unmet"
+                               and isinstance(r.get("item_index"), int)),
+                              key=lambda r: r["item_index"]):
+                smp = _redrive_flip_probe(row)
+                if smp is None:
+                    continue
+                c = await _probe_flip_culprit(
+                    st, caps, steps, row["item_index"], smp,
+                    where="acceptance gate (repair rounds)")
+                if c is not None:
+                    culprits.append((c, smp))
+            if not culprits:
+                gate["item_flip_checked"] = head
+                save_gate(gate)
+                return
+            order = [int(e.get("round") or 0) for e in kept]
+            first = min((c["round"] for c, _s in culprits), key=order.index)
+            mine = [c for c, _s in culprits if c["round"] == first]
+            pending = {
+                "round": first, "rollback_to": mine[0]["pre_sha"],
+                "from_sha": head,
+                "culprits": [c for c, _s in culprits],
+                "reason": (
+                    "its commit turned the confirmed falsifier probe of "
+                    "item(s) from passing on its start to failing on its "
+                    "commit (B*): " + "; ".join(
+                        f"item {c['item_index']} ({c['case_id']})"
+                        for c in mine)),
+                "notes": [_redrive_flip_note(
+                    c["item_index"], normalized[c["item_index"]]["item"],
+                    smp, who="acceptance repair round", short="round")
+                    for c, smp in culprits
+                    if 0 <= c["item_index"] < len(normalized)],
+                "landed": None}
+            gate["item_flips"] = [*flips, pending]
+            # The decision is on disk before the reset: a resume finishes it.
+            save_gate(gate)
+        log(f"phase 5: acceptance gate — repair round {pending['round']} "
+            f"rolled back to {str(pending['rollback_to'])[:12]}: "
+            f"{pending['reason']}")
+        ok = await _roll_back_round(
+            st, staging, pending["rollback_to"], worker="acceptance repair",
+            label=f"round {pending['round']}", reason=pending["reason"],
+            where="acceptance repair rollback",
+            branch=_compute_run_branch(st.run_id))
+        gate = dict((st.data.get("acceptance") or {}).get("gate") or {})
+        pending = gate["item_flips"][-1]
+        pending["landed"] = ok
+        if not ok:
+            pending["rollback_failed"] = True
+            save_gate(gate)
+            log("  WARNING: acceptance gate: a flip's rollback did not land "
+                "— the round's commits stay on staging")
+            return
+        by_round: dict[int, list[dict]] = {}
+        for c in pending.get("culprits") or []:
+            by_round.setdefault(int(c["round"]), []).append(c)
+        kept_ = _acceptance_kept_rounds(gate)
+        at = next((n for n, e in enumerate(kept_)
+                   if int(e.get("round") or 0) == pending["round"]), None)
+        for e in (kept_[at:] if at is not None else []):
+            r_ = int(e.get("round") or 0)
+            if by_round.get(r_):
+                e["flip_regressed"] = by_round[r_]
+            e["rollback_reason"] = (
+                pending["reason"] if r_ == pending["round"] else
+                f"built on round {pending['round']}, rolled back: "
+                + pending["reason"])
+            e["rolled_back"] = True
+        # The flipped items go to the delivery re-drive, the next fixer, as
+        # #365's note: the cases the round fixed fail again and are driven
+        # there too, with the item held.
+        rd = dict(st.data.get("delivery_redrive") or {})
+        have = {n.get("key") for n in rd.get("pending_controls") or []}
+        rd["pending_controls"] = [*(rd.get("pending_controls") or []),
+                                  *(n for n in pending.get("notes") or []
+                                    if n.get("key") not in have)]
+        st.data["delivery_redrive"] = rd
+        save_gate(gate)
+        # Every verdict below described a tree that no longer ships.
+        sets = [s_ for s_ in (st.data.get("acceptance") or {}).get("sets")
+                or [] if isinstance(s_, dict)]
+        if sets:
+            await _acceptance_remeasure_final(st, caps, str(staging), sets,
+                                              pending["rollback_to"],
+                                              "gate-item-flip")
+        await _refresh_shipping_test_id_diff(
+            leerie_dir, st, caps, label="test-id-diff-item-flip")
+        await _run_delivery_detection(leerie_dir, st, caps, models, efforts)
 
 
 def _resettle_test_outcome_rows(st: "State", tree_sha: str | None) -> None:
@@ -78457,6 +78633,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"delivery detection raised {type(e).__name__}: {e} — surfaced "
             "as advisory, finalize proceeds")
+    # A kept repair round that turned an item's confirmed probe from passing
+    # to failing is rolled back, and detection reads the tree it leaves
+    # (DESIGN §8 *A held-out repair round that turns a confirmed probe from
+    # passing to failing is rolled back*).
+    try:
+        await _acceptance_item_flips(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"acceptance repair flip check raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, finalize proceeds")
     # The repository's own merge checks on the final tree (DESIGN §9 *The
     # repository's own merge checks run too*): after the last step that can
     # change it. A red check makes delivery unmet (`_decide_outcome`); its

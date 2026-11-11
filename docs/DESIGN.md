@@ -14463,13 +14463,13 @@ items return to unmet, as on the base, with no regression the run wrote.
 A run with no flip pays one probe run on each side of each kept group per
 newly confirmed met item, plus B\* when one side passes.
 
-**Not covered.** Held-out repair rounds are kept before detection, and
-detection's confirms are routed as unmet items, never tried against the
-round that wrote them. 2dcb4cce item 8 is that shape. It needs its own
-rule: a rollback there also undoes the held-out cases the round fixed.
-(The final conformer, the other committing site before detection, is now
-held to the held-out sets it can break: §8 *A final-conformer round that
-turns a passing held-out case failing is rolled back*.)
+**The rounds before detection.** Held-out repair rounds are kept before
+detection, so detection's confirms are tried against them after it, by
+this rule's measurement (2dcb4cce item 8: §8 *A held-out repair round that
+turns a confirmed probe from passing to failing is rolled back*). The final
+conformer, the other committing site before detection, is held to the
+held-out sets it can break (§8 *A final-conformer round that turns a
+passing held-out case failing is rolled back*).
 
 **An unmet item reaches its owner, or is recorded as reaching none.**
 Rule 2's "every claimer" includes a claimer that settled `unconverged`: it
@@ -17493,17 +17493,100 @@ also fail on its start pays one more evaluation, on the start; a culprit
 search pays one per committing round after the first; a pass whose sets
 all pass at its end pays nothing.
 
-Held-out repair rounds that regress a met item (the falsifier's probe,
-#365's "Not covered") are a different rule and stay open: the probe does
-not exist when the round runs — detection writes it afterwards — so a flip
-there is found only by trying a later probe against an earlier round: a
-measurement of another kind (a falsifier's probe, not a held-out set) at
-another time (after detection, not before the repair). And a rollback
-there trades a met item against the held-out cases the round was shown
-and fixed, verdicts of different standing, which needs its own rule and
-bench; here both sides of the trade are held-out cases, already ranked by
+Held-out repair rounds that regress a met item are a different rule (the
+next one): the probe that shows it does not exist when the round runs —
+detection writes it afterwards — so the flip is found by trying a later
+probe against an earlier round, a measurement of another kind at another
+time. Here both sides of the trade are held-out cases, already ranked by
 the repair round's rule (a round that fixed one case by breaking another
 is not progress).
+
+**A held-out repair round that turns a confirmed probe from passing to
+failing is rolled back.** *Built 2026-11-11 (lane HR, barnacle 2dcb4cce,
+issue 42).* **Invariant:** no kept acceptance repair round ships the
+failure of a required item's confirmed probe that passes on the round's
+start and fails on its commit under B\*.
+
+**Root cause.** The delivery ratchet below reads the met items again after
+each repair round, by its judge, below detection's bar, and said no more
+was needed "because final detection runs after it". Detection does run
+after it, but its confirms were routed to the re-drive as unmet items and
+never tried against the round that wrote them. In barnacle 2dcb4cce
+(leerie 0.49.0) repair round 1 (`3dffb039` → `fa80ed17`) fixed the held-out
+frame-locator case and, in the same commit, made a bare
+`[role='combobox'][aria-expanded]` a prompt trigger. The ratchet's judge
+kept item 8 (layered dropdown widgets) met: "the layered collapse logic is
+untouched". Final detection's falsifier then confirmed item 8 unmet with a
+layered widget of the item's own shape, whose anchor carries the
+`aria-expanded` the round's selector matches. The run ended `unconverged`
+with the regression it wrote on its branch.
+
+**What a repair round can turn from passing to failing, and what catches
+it.**
+- A held-out case: the round's own rule above (`broken_cases`), measured
+  against the verdict before it.
+- A repository merge check: *A kept repair keeps the repository's merge
+  checks green*, in the ratchet.
+- An existing test: the ratchet's execution route (the failing-test-ID diff
+  under B\*).
+- A required item: the ratchet's judge on the round's commit; and, for an
+  item detection then confirms with a probe, this rule.
+
+**The rule.** After final detection, each item its verdict of staging's
+HEAD holds unmet with a confirmed, saved falsifier sample is tried against
+every kept repair round in the order they landed, by #365's measurement
+and culprit search: the saved probe in a held-out sandbox over a pristine
+installed checkout of the round's commit and of its start, through the
+channel that confirmed it; a start where the case did not run and pass is
+not a pass; a case failing on the commit and passing on the start goes to
+B\*, the start as the base side. The first round B\* calls it new for is
+the item's culprit. The decision is on disk before the reset
+(`acceptance.gate.item_flips`), so a resume finishes it. Staging goes back
+to the earliest culprit's start through the one restore, which also takes
+every kept round after it, built on its commit. Each round goes out with
+a reason naming the item and the probe's case. Each flipped item becomes
+the ratchet's `met-item-<i>` `control_regression` note, pending for the
+delivery re-drive. Then everything measured on the tree that no longer
+ships is measured again on the restored commit: the held-out sets (the
+gate's `final` and residual), the shipping diff and detection. The check
+repeats over the rounds left; each pass takes at least one, so it ends.
+A probe that fails on the round's start too (one that over-reads its item)
+flips nothing: it stays detection's verdict, as in #365.
+
+**Why a rollback, though the round also fixed held-out cases.** The trade
+was already decided: the ratchet rolls back a repair round that fixes a
+failing case and undoes a met item (*A repair that regresses met work is
+rolled back*). Only the measurement was missing, because the judge reads
+the round's own claim. The cases the round fixed are not lost to the run.
+They fail again on the restored tree, and the delivery re-drive drives
+failing held-out sets, so they go to the next fixer with the item's note.
+A group must then fix the case and keep the item: a group that breaks a
+passing case is rolled back (*Delivery re-drive* rule 4), and one that
+flips the item again is rolled back by #365. That is #365's shape:
+rollback, and a note for the next fixer. #369 has no note, because no fixer
+runs after the final conformer that could take one. If the re-drive
+cannot keep both, the run ships the case failing, which the run never
+fixed before the round, and no regression it wrote.
+
+Measured: lane HR's replay of every confirmed, saved falsifier probe
+recorded in a run with a kept repair round under `~/.leerie/*/runs`, as
+lane FL's replay ran them: 13 probes in 6 runs, each run as 3
+interleaved pairs on the kept round's start and commit, in a clone of the
+run's repository copy, confined, the case read from the runner's report.
+One flips: 2dcb4cce item 8 across round 1 (3/3 pass on `3dffb039`, 3/3 fail
+on `fa80ed17`), the only rollback. 10 fail on both sides, among them the
+two probes the audits call false (22a30525 and 87580f62 item 8), 2dcb4cce
+items 0 and 13 and a2a825c2's four, and 2 pass on both. Most probes were
+recorded after later re-drive groups, a stricter test than detection's
+own probes on the round's commit: none of them fires.
+
+**What it costs.** The culprit's other work, and every round after it:
+2dcb4cce's round 1 also fixed the frame-locator case, which then fails again
+and is driven by the re-drive. A run with no kept repair round, or no
+confirmed probe, pays nothing. Otherwise it pays one probe run on each side
+of each kept round per confirmed item, plus B\* when one side passes, once
+per detected commit. A flip pays one evaluation of the sets and one
+detection on the restored commit.
 
 **A repair that regresses met work is rolled back (the delivery ratchet).**
 A repair writer runs after the judges that verified the run's required
@@ -17552,8 +17635,11 @@ judge and the falsifier (*Every item the tree that ships reports met passed
 detection's bar on it*), and a confirm there whose probe passed on a kept
 group's start and fails on its commit rolls that group back (*A kept group
 that turns a met item's confirmed probe from passing to failing is rolled
-back*). An acceptance repair round needs no such read,
-because final detection runs after it.
+back*). An acceptance repair round needs no such read of its own:
+final detection runs after it, on the tree it leaves, and a confirm there
+whose probe passed on a kept round's start and fails on its commit rolls
+that round back (*A held-out repair round that turns a confirmed probe from
+passing to failing is rolled back*).
 
 Measured (bench Q4 N5, frozen design): 49 natural repair rounds and
 cross-run pairs, 517 met items re-verified. 2 runs false-alarmed (4.1%,
