@@ -67604,6 +67604,22 @@ def _redrive_base_form_unkept(rec: dict, rnd: int, group: int,
             d["outcome"] = d["attempts"][-1].get("outcome")
 
 
+def _redrive_defects_unkept(rec: dict) -> None:
+    """Groups kept and then rolled back with a flip (DESIGN §8 *Delivery
+    re-drive* rule 1): a solution defect only they drove is open again —
+    dropped from `defects_driven`, so the next group it is routed to is
+    handed it. A key no group records (driven before groups recorded theirs)
+    stays."""
+    groups = [ge for rd in rec.get("rounds") or [] if isinstance(rd, dict)
+              for ge in rd.get("groups") or [] if isinstance(ge, dict)]
+    kept = {k for ge in groups if not ge.get("rolled_back")
+            for k in ge.get("defects_driven") or []}
+    gone = {k for ge in groups if ge.get("rolled_back")
+            for k in ge.get("defects_driven") or []} - kept
+    rec["defects_driven"] = [k for k in rec.get("defects_driven") or []
+                             if k not in gone]
+
+
 async def _check_existing_behaviour(leerie_dir: Path, st: "State",
                                     caps: dict) -> None:
     """Phase 5's last measurement before the outcome (DESIGN §8 *What an
@@ -69290,6 +69306,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 reason if (r_, g_) == (first["round"], first["group"])
                 else f"built on {label}, rolled back: {reason}")
             _redrive_base_form_unkept(rec, r_, g_, ge_["rollback_reason"])
+        _redrive_defects_unkept(rec)
         rec.setdefault("flip_rollbacks", []).append({
             "group": label, "pre_sha": first["pre_sha"],
             "items": [c["item_index"] for c, _s in culprits],
@@ -69397,13 +69414,25 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     log(f"  delivery re-drive r{rnd} g{gi}: merge check(s) "
                         f"{', '.join(ge['checks_cleared'])} green on its "
                         "start — not handed on")
+                # A solution defect is re-checked by its record (rules 1,
+                # 3): an earlier kept group of this round may have driven it.
+                closed = sorted(n["key"] for n in g["notes"]
+                                if n["kind"] == "solution_defect"
+                                and n["key"] in rec["defects_driven"])
+                if closed:
+                    ge["defects_closed"] = closed
+                    log(f"  delivery re-drive r{rnd} g{gi}: solution "
+                        f"defect(s) {', '.join(closed)} driven by an earlier "
+                        "kept group — not handed on")
                 live = [n for n in g["notes"] if
                         (n["kind"] in ("defect",) or (n["kind"] ==
                                                       "control_regression"
                                                       and n.get("file")))
                         and n["key"] in F
                         or n["kind"].startswith("held_") and n["key"] in H
-                        or n["kind"] in ("unmet_item", "solution_defect")
+                        or n["kind"] == "unmet_item"
+                        or n["kind"] == "solution_defect"
+                        and n["key"] not in closed
                         or n["kind"] == "ci_check"
                         and n["key"] not in cleared
                         or n["kind"] == "base_form_case"
@@ -69871,9 +69900,12 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             log(f"  WARNING: {reason}")
                 _redrive_base_form_settled(rec, bf_live, ge)
                 if not ge.get("rolled_back"):
+                    handed = [n["key"] for n in live
+                              if n["kind"] == "solution_defect"]
+                    if handed:
+                        ge["defects_driven"] = handed
                     rec["defects_driven"] += [
-                        n["key"] for n in live if n["kind"] == "solution_defect"
-                        and n["key"] not in rec["defects_driven"]]
+                        k for k in handed if k not in rec["defects_driven"]]
                 _charge_redrive_time(st, time.monotonic() - t0)
                 rec.pop("in_flight", None)
                 _save()
