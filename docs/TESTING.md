@@ -8582,3 +8582,40 @@ returned (4 tests: the rollback, no-round and B\* tests, and the first test
 of the previous section); a one-sided confirm that ignores the start (the
 over-read and B\* tests); and a start that need not record the case as
 passed (the did-not-load test).
+
+## A fix that keeps both, on opus when sonnet could not
+
+`tests/test_base_form_redrive.py` (DESIGN §8 *A fix that keeps both, on opus
+when sonnet could not*): the delivery re-drive's `base_form_case` notes over
+the re-drive World (`tests/test_delivery_redrive.py`), its base-form
+measurement answering from staging's committed `src/a.ts` as its set
+evaluation does — a kept round that fixes the case (and is not escalated), a
+case sonnet could not keep driven once more on opus at high and alone, a case
+neither keeps left `existing_behaviour_changed` with no third round, the
+escalation carrying only the cases still failing, a round that drops a case
+that still holds rolled back, an interrupted attempt replaced, and no note for
+another tree's record. `_redrive_dropped_cases` itself runs over real git and
+a real confined pytest (`tests/test_existing_behaviour_base_form.py`'s World).
+The test closure (`_base_form_closure`) and its breach
+(`_base_form_closure_breach`) run over a real git repository: the case file,
+its imported helpers, the runner configuration, the setup file it names and
+the mock that imports are the closure, production code and another test are
+not; a round that changes production, puts the original back exactly, adds a
+new test or edits a test outside the closure passes; one that edits the setup
+file, a mock, a helper, the case file other than back to base, or changes or
+deletes a test the run added breaches, and its group is rolled back.
+
+The moved-literal classification (`_moved_literal_evidence`) runs over real git:
+a string and a plain `i` regex moved from production into a message file are
+found with their key; a literal still in production, one never in production,
+a regex with syntax, a regex without its `i` flag against a capitalised value,
+a JSON outside a message directory, and a bracketed path read as a glob are not.
+`_base_form_moved_literals` reads the base form's AST (facts stubbed), a
+moved-literal case gets no round and is listed in the PR, and
+`scripts/test-case-facts.cjs`'s `literals` are checked against a real
+`typescript` where one is installed.
+A kept group that #365's flip rollback later rolls back has its base-form
+attempts read `rolled_back` and its file's `fixed` recomputed from the
+still-kept ones (`_redrive_base_form_unkept`, unit), and the real flip path
+(the 22a30525 replay) passes on exactly the group it rolls back, with that
+group's reason.
