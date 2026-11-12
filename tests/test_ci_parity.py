@@ -525,6 +525,130 @@ def test_ci_checks_is_a_registered_judgment_worker(leerie):
         "prompts", "ci_checks.md").is_file()
 
 
+# ---- a check is the command its file runs (lane HK) -------------------------
+# funeralworks' pre-push hook runs `pnpm run typecheck` (a script that sets
+# its own NODE_OPTIONS); its CI step runs `pnpm exec tsc --noEmit`. The
+# worker, told to list "one entry per distinct command", kept only the CI
+# step with `pre_push_hook` added to its triggers, and the hook's own
+# command never ran. The worker now lists each file's commands apart; code
+# merges only entries that run exactly the same thing.
+
+HOOK = "python3 build.py\npython3 lint.py src\n"
+
+
+def _hook_check(cid, argv, kind="lint", env=()):
+    c = _check(cid, argv, kind=kind, trigger=("pre_push_hook",), env=env)
+    c["source"] = {"file": ".husky/pre-push", "job": "pre-push", "step": cid}
+    return c
+
+
+def _ran_at_baseline(env, cid):
+    return (env["run_dir"] / "logs" / "ci" / f"base-{cid}.log").exists()
+
+
+def test_a_hook_running_what_a_ci_step_runs_runs_once(leerie, env):
+    _commit(env, {".husky/pre-push": HOOK})
+    env["checks"][:] = [
+        _check("build", [PY, "build.py"], kind="build"),
+        _hook_check("hook-build", [PY, "build.py"], kind="build"),
+    ]
+    recs = _baseline(env)
+    assert recs["build"]["selected"] is True
+    assert recs["build"]["gate"] == "plain"
+    hook = recs["hook-build"]
+    assert hook["selected"] is False
+    assert hook["reason"] == "duplicate"
+    assert hook["duplicate_of"] == "build"
+    assert "base" not in hook
+    assert _ran_at_baseline(env, "build")
+    assert not _ran_at_baseline(env, "hook-build")
+    # Its own record keeps its own file and trigger: nothing is moved onto
+    # the CI step's entry.
+    assert hook["source"]["file"] == ".husky/pre-push"
+    assert recs["build"]["trigger"] == ["pull_request"]
+
+
+def test_a_hook_running_the_same_tool_another_way_is_its_own_check(
+        leerie, env):
+    # The CI step runs the linter under an environment of its own; the hook
+    # runs it bare. Different commands, so both run — leerie never decides
+    # that two command lines are "equivalent".
+    _commit(env, {".husky/pre-push": HOOK})
+    env["checks"][:] = [
+        _check("lint", [PY, "lint.py", "src"],
+               env=[("DATABASE_URL", "postgresql://ci@localhost:5432/ci")]),
+        _hook_check("hook-lint", [PY, "lint.py", "src"]),
+    ]
+    recs = _baseline(env)
+    for cid in ("lint", "hook-lint"):
+        assert recs[cid]["selected"] is True, recs[cid]
+        assert "reason" not in recs[cid] or recs[cid]["reason"] != "duplicate"
+        assert "duplicate_of" not in recs[cid]
+        assert _ran_at_baseline(env, cid)
+
+
+def test_the_run_key_reads_what_runs_and_nothing_else(leerie):
+    a = _check("a", [PY, "lint.py", "src"],
+               env=[("X", "1"), ("Y", "2")])
+    b = _hook_check("b", [PY, "lint.py", "src"], env=[("Y", "2"), ("X", "1")])
+    b["path_filters"] = ["src/**"]
+    b["notes"] = "the hook's"
+    b["cwd"] = "./"
+    # Same command, cwd and environment: where it was read, when it runs and
+    # what it is called do not make it another check.
+    assert leerie._ci_run_key(a) == leerie._ci_run_key(b)
+    for field, value in (("argv", [PY, "lint.py", "src", "--fix"]),
+                         ("cwd", "src"),
+                         ("env", [{"name": "X", "value": "2"}]),
+                         ("kind", "typecheck"),
+                         ("requires", ["database"]),
+                         ("prerequisites", [{"argv": [PY, "build.py"],
+                                             "cwd": ".", "root": "none",
+                                             "rootless_argv": []}])):
+        c = dict(a, **{field: value})
+        assert leerie._ci_run_key(c) != leerie._ci_run_key(a), field
+    # A prerequisite that needs only root runs nothing here: not what runs.
+    c = dict(a, prerequisites=[{"argv": ["sudo", "apt-get", "install", "-y",
+                                         "gnupg"], "cwd": ".", "root": "all",
+                                "rootless_argv": []}])
+    assert leerie._ci_run_key(c) == leerie._ci_run_key(a)
+    # The strict form only adds to the plain check: not what it runs.
+    c = dict(a, strict_argv=[PY, "lint.py", "src", "--strict"])
+    assert leerie._ci_run_key(c) == leerie._ci_run_key(a)
+
+
+def test_the_kept_twin_takes_the_strict_form_only_its_twin_could_trace(
+        leerie, env):
+    # barnacle: the workflow and the hook both run `pnpm run lint`; the
+    # strict form's `exec` traces to the hook only. One lint runs, strict.
+    _commit(env, {".husky/pre-push": HOOK + "# python3 exec lint.py\n"})
+    recs = {r["id"]: r for r in leerie._ci_select([
+        _check("lint", [PY, "lint.py", "src"], strict=UNTRACED_STRICT),
+        dict(_hook_check("hook-lint", [PY, "lint.py", "src"]),
+             strict_argv=UNTRACED_STRICT),
+    ], env["staging"])}
+    lint, hook = recs["lint"], recs["hook-lint"]
+    assert lint["selected"] is True
+    assert lint["strict_problems"]
+    assert lint["strict_argv"] == UNTRACED_STRICT
+    assert lint["strict_from"] == "hook-lint"
+    assert hook["reason"] == "duplicate" and hook["duplicate_of"] == "lint"
+
+
+def test_only_a_selected_check_absorbs_its_twin(leerie, env):
+    # The first copy is not merge-gating (push only); the hook's copy is,
+    # so the hook's runs: a duplicate is only of a check that runs.
+    _commit(env, {".husky/pre-push": HOOK})
+    recs = {r["id"]: r for r in leerie._ci_select([
+        _check("push-build", [PY, "build.py"], kind="build",
+               trigger=("push_default_branch",)),
+        _hook_check("hook-build", [PY, "build.py"], kind="build"),
+    ], env["staging"])}
+    assert recs["push-build"]["reason"] == "not_merge_gating"
+    assert recs["hook-build"]["selected"] is True
+    assert "duplicate_of" not in recs["hook-build"]
+
+
 # ---- database-backed checks each get a throwaway database of their own ------
 # (DESIGN §6 *No database server leerie starts is ever unconfined*: the
 # wrapper, `scripts/sandbox-db.sh`, runs as the check itself; here it is
