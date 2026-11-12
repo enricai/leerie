@@ -1211,14 +1211,14 @@ _resolve_ec2_knob() {
 
 # --- _leerie_aws_creds_args_tokens -----------------------------------------
 # Emit, one token per line, the --profile/--region flags to pass to
-# resolve_aws_credentials for the 6 accept-blocked/accept-integration/
-# stop/kill/finalize/main-dispatch EC2 arms below. Reads ONLY
+# resolve_aws_credentials for the accept-blocked/accept-integration/
+# accept-heldout/stop/kill/finalize/prune/main-dispatch EC2 arms below. Reads ONLY
 # LEERIE_AWS_PROFILE/LEERIE_AWS_REGION (the launcher's own knobs, resolved
 # above) -- deliberately NOT scripts/remote/ec2-provision.sh's
 # _aws_region_profile_args, which additionally falls back to bare
 # AWS_REGION/AWS_PROFILE and emits region before profile: a different,
 # already-intentional precedence for that file's own `aws ec2`/`aws sts`
-# calls. Reusing it here would silently change these 6 sites' resolution
+# calls. Reusing it here would silently change these sites' resolution
 # behavior.
 #
 # One-token-per-line (not a bare string), read back with the `while read`

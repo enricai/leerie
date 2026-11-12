@@ -1,6 +1,7 @@
 """The `--profile`/`--region` creds-args block has exactly one implementation.
 
-`accept-blocked`, `accept-integration`, `stop`, `kill --runtime ec2`,
+`accept-blocked`, `accept-integration`, `accept-heldout`, `stop`,
+`kill --runtime ec2`,
 `finalize --runtime ec2`, and the main `RUNTIME=ec2` dispatch each used to
 carry a byte-identical, independently-copied two-line block:
 
@@ -87,7 +88,7 @@ def test_shared_function_defined_exactly_once() -> None:
     )
 
 
-def test_shared_function_called_at_all_seven_sites() -> None:
+def test_shared_function_called_at_all_eight_sites() -> None:
     src = LAUNCHER.read_text()
     # The definition's own usage-example comment also contains the call
     # marker, so the call-site count is (occurrences - 1 for the def body's
@@ -99,9 +100,10 @@ def test_shared_function_called_at_all_seven_sites() -> None:
     # function definition; the rest are real call sites.
     comment_occurrences = src.count(f"#     {_CALL_MARKER}")
     call_sites = total - comment_occurrences
-    assert call_sites == 7, (
-        f"expected 7 real call sites of `_leerie_aws_creds_args_tokens` "
-        f"(accept-blocked, accept-integration, stop, kill --runtime ec2, "
+    assert call_sites == 8, (
+        f"expected 8 real call sites of `_leerie_aws_creds_args_tokens` "
+        f"(accept-blocked, accept-integration, accept-heldout, stop, "
+        f"kill --runtime ec2, "
         f"finalize --runtime ec2, prune's EC2 cleanup, main RUNTIME=ec2 "
         f"dispatch), found "
         f"{call_sites} (total occurrences of the call marker: {total}, "
