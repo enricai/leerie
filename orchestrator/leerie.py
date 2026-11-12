@@ -696,6 +696,8 @@ STATE_FIELDS = (
     # §8 *Typed evidence for the delivery judge*). pr_review: the advisory
     # whole-PR review and its verified findings (DESIGN §9). Never gate.
     "contract_literal_checks", "pr_review",
+    # DESIGN §11 *Intent conflicts are settled with evidence, else asked*.
+    "plan_item_check", "intent_questions",
     # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
     # acceptance tests*): {validity_base, written, sets[], skipped?, gate?}
     # — each valid set {index, valid, dir, defect_files[], control_files[],
@@ -2108,6 +2110,18 @@ MODEL_DEFAULT_PER_WORKER = {
     # contradiction exclusive 5 of 6. It runs only when a re-drive commit
     # makes a probe pass by breaking a pinned case.
     "contradiction_judge": "opus",
+    # The two intent-conflict workers (DESIGN §11 *Intent conflicts are
+    # settled with evidence, else asked*), each on opus because its answer
+    # decides what the run builds and sonnet measured worse on exactly that
+    # answer. intent_resolver: bench B2, six samples per question, the
+    # 303-redirect question (report vs the code's deliberate 303 -> GET)
+    # answered report-wins or unsettled 6/6 on opus high against 2/6 on
+    # sonnet medium. plan_item_checker: bench B1, explicit plan/item
+    # conflicts found 12/12 on opus high against 10/12 on sonnet medium, no
+    # false conflict on 30 control samples either way. Both run only when
+    # the run has such a question.
+    "intent_resolver": "opus",
+    "plan_item_checker": "opus",
 }
 # NOTE: with MODEL_DEFAULT now "sonnet", every worker not listed above
 # (all judgment workers, plus the post-run `judge` worker) also resolves
@@ -2225,6 +2239,11 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # command the task forbids*). Judgment tier; absent from
     # TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
     "forbidden_command_extractor": "medium",
+    # The intent-conflict workers run at `high`, as benched (B1, B2: opus
+    # high); see their MODEL_DEFAULT_PER_WORKER entries. Absent from
+    # TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
+    "intent_resolver": "high",
+    "plan_item_checker": "high",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -2360,7 +2379,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "scope_judge", "pr_reviewer", "contract_extractor",
                 "falsifier", "verifiability_classifier", "delivery_ratchet",
                 "forbidden_command_extractor", "observability_judge",
-                "contradiction_judge")
+                "contradiction_judge",
+                "intent_resolver", "plan_item_checker")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2391,6 +2411,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "verifiability_classifier", "delivery_ratchet",
     "forbidden_command_extractor", "observability_judge",
     "contradiction_judge",
+    "intent_resolver", "plan_item_checker",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2904,6 +2925,30 @@ _SOLUTION_DEFECT_KINDS = [
 ]
 
 
+def _set_aside_schema() -> dict:
+    """The conformer's `set_aside` (DESIGN §11 *Intent conflicts are settled
+    with evidence, else asked*): each shown finding it leaves unfixed, typed;
+    code decides whether a set-aside on a required item stands
+    (`_adjudicate_set_asides`). The item is the finding's own, so it is not
+    asked for; and `reason_kind` carries no enum on the wire, as
+    `risk_dispositions` carries none, for the grammar budget
+    (tests/test_conformer_schema_size.py: with both, the hardened conformer
+    schema is 3,226 bytes, over the 3,178 the compiler rejects; without,
+    3,097). Code checks `reason_kind` against SET_ASIDE_REASON_KINDS."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["finding_id", "reason_kind", "quote"],
+            "properties": {
+                "finding_id": {"type": "string"},
+                "reason_kind": {"type": "string"},
+                "quote": {"type": "string"},
+            },
+        },
+    }
+
+
 def _risk_dispositions_schema() -> dict:
     """DESIGN §9 *Self-reported risk is routed, not read*: the conformer's
     positional answers to the SELF_REPORTED_RISKS challenge block — bare
@@ -3060,6 +3105,25 @@ SITE_READINGS = ("both", "broad_only")
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
+# Intent conflicts (DESIGN §11 *Intent conflicts are settled with evidence,
+# else asked*). Every intent question is a yes/no question; its decision is
+# one of INTENT_ANSWERS, from the user or a settled, trusted resolver
+# verdict.
+INTENT_ANSWERS = ("yes", "no")
+INTENT_SOURCES = ("plan", "set_aside", "contradiction")
+INTENT_EVIDENCE_SOURCES = ("code", "history", "task", "report", "web")
+# The evidence sources code checks verbatim; `web` is not checked.
+INTENT_CHECKED_SOURCES = ("code", "history", "task", "report")
+INTENT_STATUSES = ("settled", "unsettled")
+# The plan fields the plan-versus-items check reads, and its conflict kinds
+# (bench B1's schema).
+PLAN_CONFLICT_FIELDS = ("intent", "scope_note", "investigation_notes",
+                        "success_criteria_seed", "verify")
+PLAN_CONFLICT_KINDS = ("preserve_vs_change", "narrowing",
+                       "pinned_test_contradicts")
+# Why the final conformer leaves a shown finding unfixed (its `set_aside`).
+SET_ASIDE_REASON_KINDS = ("deliberate", "out_of_scope", "larger_change",
+                          "incorrect")
 CONTRACT_LITERAL_KINDS = ("string_value", "identifier", "route_path",
                           "other")
 # The planner's typed blocker (DESIGN §8 *A partially blocked plan is
@@ -4013,6 +4077,64 @@ SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "intent_resolver": {
+        # DESIGN §11 *Intent conflicts are settled with evidence, else
+        # asked*: bench B2's schema, plus `answer`, the typed direction code
+        # applies (the decision's prose is never read). `_verify_intent_
+        # evidence` checks every code/task/report/history quote.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["decision", "answer", "evidence", "status"],
+        "properties": {
+            "decision": {"type": "string", "minLength": 1},
+            "answer": {"type": "string", "enum": list(INTENT_ANSWERS)},
+            "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["source", "quote", "locator"],
+                    "properties": {
+                        "source": {"type": "string",
+                                   "enum": list(INTENT_EVIDENCE_SOURCES)},
+                        "quote": {"type": "string", "minLength": 1},
+                        "locator": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+            "status": {"type": "string", "enum": list(INTENT_STATUSES)},
+        },
+    },
+    "plan_item_checker": {
+        # DESIGN §11, source (a): bench B1's schema. `_verify_plan_conflict`
+        # checks both quotes; a conflict whose quotes fail is dropped.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["conflicts"],
+        "properties": {
+            "conflicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "item_quote", "subtask_id",
+                                 "field", "plan_quote", "kind", "test_file"],
+                    "properties": {
+                        "item_index": {"type": "integer", "minimum": 0},
+                        "item_quote": {"type": "string"},
+                        "subtask_id": {"type": "string"},
+                        "field": {"type": "string",
+                                  "enum": list(PLAN_CONFLICT_FIELDS)},
+                        "plan_quote": {"type": "string"},
+                        "kind": {"type": "string",
+                                 "enum": list(PLAN_CONFLICT_KINDS)},
+                        "test_file": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
     "contract_extractor": {
         # Types one `external_contract_assumption` risk (DESIGN §8 *Typed
         # evidence for the delivery judge*), as benched (bench/q10
@@ -4160,6 +4282,8 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            # DESIGN §11: a shown finding left unfixed, typed.
+            "set_aside": _set_aside_schema(),
             # DESIGN §9 *Self-reported risk is routed, not read*.
             "risk_dispositions": _risk_dispositions_schema(),
             # Advisory; gating axis is solution_defects above (DESIGN §8/§9).
@@ -7506,6 +7630,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     "## Repository merge checks still red",
     "## Existing tests changed by this run",
     "## Advisory (not verified by this run)",
+    "## Intent decisions",
 )
 # One rendered entry's text: one line, bounded (`_normalize_risk_text`).
 _PR_ENTRY_MAX = 300
@@ -8143,12 +8268,13 @@ def _pr_scope_reading_lines(state: dict) -> list[str]:
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to ten headed lists, each
+    rendered by code, from typed state*). Up to eleven headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Still failing when the run ended` (what is unmet, as the
     tests that show it: `_pr_unmet_evidence_lines`), `## Scope reading`
     (the run took the broad reading of a task that reads two ways:
     `_pr_scope_reading_lines`),
+    `## Intent decisions` (`_pr_intent_lines`, DESIGN §11),
     `## Needs human verification` (typed external resources only),
     `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
@@ -8207,6 +8333,13 @@ def _format_pr_end_state_section(state: dict) -> str:
     lines = _pr_scope_reading_lines(state)
     if lines:
         sections.append(("## Scope reading", lines))
+    lines = _pr_intent_lines(state)
+    if lines:
+        sections.append(("## Intent decisions", [
+            "Where the run's sources pulled two ways on what the task wants, "
+            "and how each was decided: by the intent resolver on quotes "
+            "checked against the task, its files and the code, or by you.",
+            "", *lines]))
 
     groups = _pr_needs_human(state, in_pr)
     if groups:
@@ -25669,6 +25802,10 @@ _COMMITTING_WORKERS = frozenset({
     "surrogate_fixer", "falsifier", "rebaser"})
 # Workers whose prompt reads the run's subtask specs and notes.
 _RUN_NOTES_READERS = frozenset({"implementer", "conformer", "integrator"})
+# Workers that read the files the task references and nothing else of the
+# run's (DESIGN §11 *Intent conflicts are settled with evidence, else
+# asked*): the resolver quotes them.
+_TASK_FILES_READERS = frozenset({"intent_resolver"})
 # The files the task references, copied at plan time into `<run-dir>/task-files/`
 # and read by `_RUN_NOTES_READERS` (DESIGN §6 *A report the task names is read,
 # not searched for*): a worker's tree holds committed code, so an untracked
@@ -26103,6 +26240,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         # made has none, and a grant names no path that is not there.
         if (run_dir / TASK_FILES_DIRNAME).is_dir():
             ro.append(str(run_dir / TASK_FILES_DIRNAME))
+    if (schema_key in _TASK_FILES_READERS
+            and (run_dir / TASK_FILES_DIRNAME).is_dir()):
+        ro.append(str(run_dir / TASK_FILES_DIRNAME))
     if notes_id:
         own = _notes_dir(run_dir, notes_id)
         _mkdir_private(own, run_dir)
@@ -35959,18 +36099,9 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
 
     if not sys.stdin.isatty():
         # launched non-interactively (e.g. via the plugin skill): defer.
-        leerie_dir = st.path.parent
-        (leerie_dir / "pending-questions.json").write_text(json.dumps({
-            "questions": pending,
-        }, indent=2))
-        log(f"clarification needed; wrote {leerie_dir}/pending-questions.json")
-        sys.exit(EXIT_NEEDS_ANSWERS)
+        _defer_questions(st, pending)
 
-    for q in pending:
-        print(f"\n? {q['question']}")
-        if q.get("why_underivable"):
-            print(f"  (underivable: {q['why_underivable']})")
-        answers[q["id"]] = input("  > ").strip()
+    _ask_questions(pending, answers)
 
     st.data["answers"] = answers
     st.save()
@@ -36013,6 +36144,41 @@ def _settle_scope_reading(st: State) -> None:
                    else ""))
     st.data["scope_reading"] = rec
     st.save()
+
+
+def _defer_questions(st: State, pending: list[dict]) -> None:
+    """No terminal: write `pending` to `pending-questions.json` and exit
+    `EXIT_NEEDS_ANSWERS`, for the surrounding layer to collect the answers
+    and `resume --answers`. Shared by `gather_answers` and
+    `_stop_for_intent_questions`."""
+    leerie_dir = st.path.parent
+    st.save()
+    (leerie_dir / "pending-questions.json").write_text(json.dumps({
+        "questions": pending,
+    }, indent=2))
+    log(f"clarification needed; wrote {leerie_dir}/pending-questions.json")
+    sys.exit(EXIT_NEEDS_ANSWERS)
+
+
+def _ask_questions(pending: list[dict], answers: dict) -> None:
+    """Ask each question once on the terminal, into `answers`. A question
+    with `choices` (an intent question, DESIGN §11) is re-prompted until the
+    answer is one of them, and shows its quotes."""
+    for q in pending:
+        print(f"\n? {q['question']}")
+        if q.get("why_underivable"):
+            print(f"  (underivable: {q['why_underivable']})")
+        for e in q.get("evidence") or []:
+            print(f"  [{e.get('source')}] {e.get('locator')}: "
+                  f"\"{e.get('quote')}\"")
+        choices = q.get("choices")
+        while True:
+            a = input(f"  ({'/'.join(choices)}) > " if choices
+                      else "  > ").strip()
+            if not choices or a.lower() in choices:
+                break
+            print(f"  answer one of: {', '.join(choices)}")
+        answers[q["id"]] = a.lower() if choices else a
 
 
 def _absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
@@ -53159,19 +53325,24 @@ def _format_unmet_required_items_section(
         "conformance work — a post-pass recheck verifies it again:")
     lines = [header]
     for u in unmet:
-        lines.append(f"  - [{u.get('item_index')}] {u.get('item', '')}")
+        lines.append(f"  - [{u.get('item_index')}] (finding_id "
+                     f"unmet-{u.get('item_index')}) {u.get('item', '')}")
         ev = (u.get("evidence") or "").strip()
         if ev:
             lines.append(f"    evidence: {ev}")
     if contract_unmet is not None:
         lines.append(
-            "  - [DEFECT CONTRACT] the run's audited defect contract is "
+            "  - [DEFECT CONTRACT] (finding_id unmet-contract) the run's "
+            "audited defect contract is "
             "confirmed unmet on this tree (DESIGN §8 *The gate judges "
             "the finding, not only the items*) — remedy the residual it "
             "names, at its site:")
         cev = (contract_unmet.get("evidence") or "").strip()
         if cev:
             lines.append(f"    evidence: {cev}")
+    lines.append("  One you do not remedy goes in `set_aside` with its "
+                 "`finding_id`; a set-aside stands only if an independent "
+                 "reading of the task agrees the task does not require it.")
     return "\n".join(lines)
 
 
@@ -63320,9 +63491,12 @@ def _format_pr_review_section(st: "State") -> str | None:
     """The final conformer's ADVISORY WHOLE-PR REVIEW section: the verified
     findings only, or None."""
     rec = st.data.get("pr_review") or {}
-    shown = [{k: f.get(k) for k in ("kind", "item_id", "path", "line_start",
-                                    "line_end", "quote", "explanation")}
-             for f in (rec.get("findings") or []) if f.get("verified")]
+    shown = [{"finding_id": f"pr-{k}",
+              **{key: f.get(key) for key in ("kind", "item_id", "path",
+                                             "line_start", "line_end",
+                                             "quote", "explanation")}}
+             for k, f in enumerate(rec.get("findings") or [])
+             if f.get("verified")]
     if not shown:
         return None
     more = len(shown) - _PR_REVIEW_SHOWN
@@ -63330,12 +63504,666 @@ def _format_pr_review_section(st: "State") -> str | None:
     return (
         "ADVISORY WHOLE-PR REVIEW: an independent reviewer read this run's "
         "whole diff before this pass; each finding's quote was checked "
-        "verbatim against the file. Advisory — nothing here is required and "
-        "nothing waits on it. For each finding, check the code: fix the "
-        "ones that are real, within the run's task, and leave any you can "
-        "show is wrong."
+        "verbatim against the file. For each finding, check the code: fix "
+        "the ones that are real and within the run's task. List every "
+        "finding you do not fix in `set_aside` with its `finding_id`, why "
+        "(`reason_kind`) and the exact words your reason rests on "
+        "(`quote`). A set-aside of a finding on a required item (`item_id` "
+        "set) stands only if an independent reading of the task agrees the "
+        "task does not require it; otherwise it comes back to you as an "
+        "unfixed defect."
         + (f" ({more} more not shown.)" if more > 0 else "") + "\n"
         + json.dumps(shown, indent=2, ensure_ascii=False))
+# --- Intent conflicts (DESIGN §11 *Intent conflicts are settled with
+# evidence, else asked*). Three sources ask one question each: the plan
+# against the required items (`plan_item_checker`, bench B1), the final
+# conformer's set-aside of a finding on a required item, and an unsettled
+# contradiction judge. The `intent_resolver` (bench B2) answers from the
+# task, its files, the base tree and its history; code checks its quotes; a
+# settled, trusted answer is applied; anything else stops and asks.
+#
+# The resolver's tools, as benched (B2 argv): the judges' inspect bucket
+# plus file reads and `git blame`.
+INTENT_RESOLVER_TOOLS = f"{INSPECT_TOOLS},Read,Grep,Glob,Bash(git blame:*)"
+INTENT_RESOLVER_MAX_TURNS = 60
+# The plan check is one tool-less judgment over its payload (B1:
+# `--max-turns 6`).
+PLAN_ITEM_CHECK_MAX_TURNS = 6
+# Verified quotes shown with an open question.
+_INTENT_EVIDENCE_SHOWN = 6
+
+
+def _plan_field_text(subtask: dict, field: str) -> str:
+    """One plan field as the plan check reads it (B1 `dump.verify_text`):
+    `verify` one line per criterion, `criterion: argv joined by spaces`;
+    every other field its string, "" when absent."""
+    v = subtask.get(field)
+    if field == "verify":
+        out: list[str] = []
+        for c in v or []:
+            if isinstance(c, dict):
+                argv = c.get("argv") or []
+                out.append(f"{c.get('criterion', '')}: "
+                           + (" ".join(str(a) for a in argv) if argv
+                              else str(c.get("cmd", ""))))
+            else:
+                out.append(str(c))
+        return "\n".join(out)
+    return v if isinstance(v, str) else ""
+
+
+def _item_text_parts(item: object) -> tuple[str, list[str]]:
+    """A required item's text and its parts' texts."""
+    if not isinstance(item, dict):
+        return (item if isinstance(item, str) else ""), []
+    parts = [p if isinstance(p, str) else json.dumps(p, sort_keys=True)
+             for p in (item.get("parts") or [])]
+    text = item.get("item")
+    return (text if isinstance(text, str) else ""), parts
+
+
+def _plan_item_check_prompt(items: list, subtasks: dict) -> str:
+    """The plan check's user message, as benched (B1 `cases.render`)."""
+    out = ["REQUIRED ITEMS", ""]
+    for i, it in enumerate(items):
+        text, parts = _item_text_parts(it)
+        out.append(f"[item {i}] {text}")
+        out += [f"    part: {p}" for p in parts]
+    out += ["", "PLAN", ""]
+    for sid, s in subtasks.items():
+        out.append(f"=== subtask {sid}")
+        for k in PLAN_CONFLICT_FIELDS:
+            out.append(f"--- {k}:")
+            t = _plan_field_text(s if isinstance(s, dict) else {}, k)
+            out.append(t if t else "(empty)")
+        out.append("")
+    out.append("Return the conflicts JSON.")
+    return "\n".join(out) + "\n"
+
+
+def _verify_plan_conflict(c: dict, items: list, subtasks: dict) -> bool:
+    """B1's mechanical check: both quotes, whitespace-collapsed, inside the
+    item (its text or one part) and the named field of the named subtask."""
+    i = c.get("item_index")
+    if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < len(items):
+        return False
+    text, parts = _item_text_parts(items[i])
+    iq = _ws_norm(str(c.get("item_quote") or ""))
+    if not iq or not any(iq in _ws_norm(t) for t in [text, *parts]):
+        return False
+    sub = subtasks.get(c.get("subtask_id"))
+    if not isinstance(sub, dict) or c.get("field") not in PLAN_CONFLICT_FIELDS:
+        return False
+    pq = _ws_norm(str(c.get("plan_quote") or ""))
+    return bool(pq) and pq in _ws_norm(_plan_field_text(sub, c["field"]))
+
+
+async def _run_plan_item_check(st: "State", subtasks: dict, caps: dict,
+                               models: dict[str, str],
+                               efforts: dict[str, str | None]) -> list[dict]:
+    """Source (a): one `plan_item_checker` over the required items and the
+    scheduled plan. Persists `plan_item_check` with the verified conflicts
+    only and returns them; a recorded check is reused, one that crashed is
+    tried again. Never gates: a crash records `error` and finds nothing."""
+    rec = st.data.get("plan_item_check")
+    if isinstance(rec, dict) and "error" not in rec:
+        return [c for c in rec.get("conflicts") or [] if isinstance(c, dict)]
+    items = st.data.get("required_items") or []
+    if not items or not subtasks:
+        return []
+    rec = {"model": models.get("plan_item_checker", MODEL_DEFAULT),
+           "effort": efforts.get("plan_item_checker"),
+           "conflicts": [], "rejected": 0}
+    log("phase 3: plan-versus-items check (DESIGN §11)")
+    try:
+        st.bump_workers(caps)
+        out = await claude_p(
+            user_prompt=_plan_item_check_prompt(items, subtasks),
+            system_prompt=_load_prompt("plan_item_checker"),
+            schema_key="plan_item_checker", cwd=_payload_only_cwd(st),
+            allowed_tools=PAYLOAD_ONLY_TOOLS,
+            max_turns=PLAN_ITEM_CHECK_MAX_TURNS, autonomous=False,
+            caps=caps, st=st, model=rec["model"], effort=rec["effort"],
+            sid="plan_item_checker")
+        for c in (out or {}).get("conflicts") or []:
+            if isinstance(c, dict) and _verify_plan_conflict(c, items,
+                                                             subtasks):
+                rec["conflicts"].append(c)
+            else:
+                rec["rejected"] += 1
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        rec["error"] = _brief_worker_exc(e)
+        log(f"  plan check: the checker failed ({rec['error']}); no plan "
+            "conflict found, continuing")
+    rec["at"] = now()
+    st.data["plan_item_check"] = rec
+    st.save()
+    if "error" not in rec:
+        log(f"  plan check: {len(rec['conflicts'])} conflict(s) with "
+            f"verified quotes ({rec['rejected']} dropped for a quote that "
+            "did not check)")
+    return rec["conflicts"]
+
+
+def _plan_conflict_question(sid: str, conflicts: list[dict],
+                            items: list) -> str:
+    """The resolver's (and the user's) question for one subtask's verified
+    conflicts."""
+    lines = ["The run's plan and the required items derived from the task "
+             f"disagree. The plan's subtask `{sid}` says:"]
+    for c in conflicts:
+        lines.append(f"- in its {c['field']}: \"{c['plan_quote']}\"")
+    lines.append("The required items say:")
+    for i in sorted({c["item_index"] for c in conflicts}):
+        text, _ = _item_text_parts(items[i])
+        quotes = sorted({c["item_quote"] for c in conflicts
+                         if c["item_index"] == i})
+        lines.append(f"- item {i} (\"{text}\"): "
+                     + "; ".join(f"\"{q}\"" for q in quotes))
+    lines.append("Does the task require what the required items say here, "
+                 "over what the plan says?")
+    return "\n".join(lines)
+
+
+def _register_intent_question(st: "State", qid: str, source: str,
+                              question: str, context: dict) -> dict:
+    """The question `qid`, added to `intent_questions` when new."""
+    if source not in INTENT_SOURCES:
+        raise ValueError(f"unknown intent question source {source!r}")
+    qs = st.data.setdefault("intent_questions", {})
+    if qid not in qs:
+        qs[qid] = {"qid": qid, "source": source, "question": question,
+                   "context": context, "at": now()}
+        st.save()
+    return qs[qid]
+
+
+def _intent_decision(st: "State", qid: str) -> str | None:
+    """`yes`/`no`: the user's answer when it is one of INTENT_ANSWERS, else
+    the resolver's answer when its verdict is settled and trusted; None while
+    the question is open."""
+    a = (st.data.get("answers") or {}).get(qid)
+    if isinstance(a, str) and a.strip().lower() in INTENT_ANSWERS:
+        return a.strip().lower()
+    q = (st.data.get("intent_questions") or {}).get(qid) or {}
+    v = q.get("verdict") if isinstance(q, dict) else None
+    if (isinstance(v, dict) and v.get("status") == "settled"
+            and v.get("trusted") is True and v.get("answer") in INTENT_ANSWERS):
+        return v["answer"]
+    return None
+
+
+def _intent_decided_by(st: "State", qid: str) -> str | None:
+    """Who decided `qid`: `user`, `resolver`, or None while it is open."""
+    a = (st.data.get("answers") or {}).get(qid)
+    if isinstance(a, str) and a.strip().lower() in INTENT_ANSWERS:
+        return "user"
+    return "resolver" if _intent_decision(st, qid) is not None else None
+
+
+def _task_file_copies(st: "State") -> list[Path]:
+    """Leerie's copies of the files the task references (`_stage_task_files`),
+    regular files reached without a link."""
+    root = st.run_dir / TASK_FILES_DIRNAME
+    return [p for p in _glob_beneath(root, "**/*") if p.is_file()]
+
+
+def _intent_resolver_prompt(st: "State", question: str, base: str,
+                            files: list[Path]) -> str:
+    """The resolver's user message, as benched (B2 `driver.user_prompt`):
+    the question, the base commit, the task's referenced files by path and
+    the task verbatim."""
+    listed = "\n".join(f"- {p}" for p in files) or "(none)"
+    return (f"QUESTION: {question}\n\n"
+            "The repository is your working directory, checked out at "
+            f"commit {base}.\n"
+            f"The task's referenced files:\n{listed}\n\n"
+            f"THE TASK (verbatim):\n\n{st.data.get('task', '')}\n")
+
+
+def _verify_intent_evidence(item: dict, *, task: str, task_files: list[Path],
+                            files_root: Path, tree: Path,
+                            base: str) -> bool | None:
+    """One resolver quote, whitespace-collapsed containment (B2
+    `verify.py`): `code` in the file the locator names at `base`; `task` in
+    the task; `report` in the task file the locator names, else in any;
+    `history` in `git show <sha>`, raw or with diff markers stripped. `web`
+    is not checked (None)."""
+    src = item.get("source")
+    if src == "web":
+        return None
+    quote = _ws_norm(str(item.get("quote") or ""))
+    loc = str(item.get("locator") or "").strip()
+    if not quote:
+        return False
+    if src == "task":
+        return quote in _ws_norm(task)
+    if src == "report":
+        named = [f for f in task_files
+                 if f.name in loc or str(f.relative_to(files_root)) in loc]
+        for f in named or task_files:
+            try:
+                text = _read_text_beneath(files_root, f, limit=READ_LIMIT_TEXT)
+            except OSError:
+                continue
+            if quote in _ws_norm(text):
+                return True
+        return False
+    if src == "code":
+        path = loc.split(":")[0].strip().strip("`")
+        if path.startswith(str(tree) + "/"):
+            path = path[len(str(tree)) + 1:]
+        if path.startswith("./"):
+            path = path[2:]
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            return False
+        p = subprocess.run(["git", *_tree_git_args(tree), "show",
+                            f"{base}:{path}"], capture_output=True, text=True,
+                           errors="replace", check=False)
+        return p.returncode == 0 and quote in _ws_norm(p.stdout)
+    if src == "history":
+        m = re.search(r"\b[0-9a-f]{7,40}\b", loc)
+        if not m:
+            return False
+        p = subprocess.run(["git", *_tree_git_args(tree), "show", m.group(0)],
+                           capture_output=True, text=True, errors="replace",
+                           check=False)
+        if p.returncode != 0:
+            return False
+        stripped = "\n".join(ln[1:] if ln[:1] in "+- " else ln
+                             for ln in p.stdout.splitlines())
+        return quote in _ws_norm(p.stdout) or quote in _ws_norm(stripped)
+    return False
+
+
+def _intent_verdict_trusted(evidence: list[dict]) -> bool:
+    """At least one checkable quote, and every checkable quote held."""
+    checked = [e for e in evidence if e.get("source") in INTENT_CHECKED_SOURCES]
+    return bool(checked) and all(e.get("ok") is True for e in checked)
+
+
+def _intent_base(st: "State", tree: Path | None) -> str | None:
+    """The commit the resolver reads: `base_sha` once the run branch is cut,
+    and before the cut — when the item and plan questions are asked — the
+    commit the planning worktree is checked out at, the start every
+    judgment worker reads. `base_sha` alone left every pre-cut question
+    without a base, so it was asked of the user, never settled."""
+    base = _diff_base(st)
+    if base or tree is None or not tree.is_dir():
+        return base
+    p = subprocess.run(["git", *_tree_git_args(tree), "rev-parse", "--verify",
+                        "-q", "HEAD^{commit}"], capture_output=True,
+                       text=True, check=False)
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
+
+
+async def _settle_intent_question(st: "State", qid: str, caps: dict,
+                                  models: dict[str, str],
+                                  efforts: dict[str, str | None]) -> dict:
+    """Ask the `intent_resolver` question `qid` unless it already has a
+    decision or a verdict (a verdict that crashed is asked again). The
+    resolver reads a checkout of the base commit: staging's run repository
+    when staging exists, else the planning worktree's."""
+    q = st.data["intent_questions"][qid]
+    v = q.get("verdict")
+    if (_intent_decision(st, qid) is not None
+            or (isinstance(v, dict) and "error" not in v)):
+        return q
+    staging = (st.run_dir / "worktrees" / "staging").resolve()
+    planning = st.data.get("planning_worktree")
+    tree = (staging if staging.is_dir()
+            else Path(planning) if planning else None)
+    base = _intent_base(st, tree)
+    files_root = st.run_dir / TASK_FILES_DIRNAME
+    files = _task_file_copies(st)
+    rec: dict = {"model": models.get("intent_resolver", MODEL_DEFAULT),
+                 "effort": efforts.get("intent_resolver")}
+    log(f"  intent: asking the resolver {qid}")
+    try:
+        if not base or tree is None or not tree.is_dir():
+            raise WorkerError("intent resolver: no base commit or tree to "
+                              "check out")
+        async with _judge_checkout(st, tree, "intent-resolver",
+                                   rev=base) as cwd:
+            st.bump_workers(caps)
+            out = await claude_p(
+                user_prompt=_intent_resolver_prompt(st, q["question"], base,
+                                                    files),
+                system_prompt=_load_prompt("intent_resolver"),
+                schema_key="intent_resolver", cwd=str(cwd),
+                allowed_tools=INTENT_RESOLVER_TOOLS,
+                max_turns=INTENT_RESOLVER_MAX_TURNS, autonomous=False,
+                caps=caps, st=st, model=rec["model"], effort=rec["effort"],
+                sid=f"intent-resolver-{qid}",
+                add_dirs=[str(files_root)] if files else None)
+            ev = [{**e, "ok": _verify_intent_evidence(
+                      e, task=st.data.get("task", ""), task_files=files,
+                      files_root=files_root, tree=cwd, base=base)}
+                  for e in (out or {}).get("evidence") or []
+                  if isinstance(e, dict)]
+            rec.update(decision=str((out or {}).get("decision") or ""),
+                       answer=(out or {}).get("answer"),
+                       status=(out or {}).get("status"), evidence=ev,
+                       trusted=_intent_verdict_trusted(ev))
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        rec["error"] = _brief_worker_exc(e)
+    rec["at"] = now()
+    q["verdict"] = rec
+    st.save()
+    if "error" in rec:
+        log(f"  intent: the resolver failed on {qid} ({rec['error']}); "
+            "the question stays open")
+    else:
+        log(f"  intent: {qid} — {rec['status']}, answer {rec['answer']}, "
+            f"quotes {'verified' if rec['trusted'] else 'NOT verified'}"
+            + ("" if _intent_decision(st, qid) else "; the question stays "
+               "open"))
+    return q
+
+
+async def _plan_intent_check(st: "State", subtasks: dict, caps: dict,
+                             models: dict[str, str],
+                             efforts: dict[str, str | None]) -> None:
+    """Source (a): the plan check, then one question per subtask with a
+    verified conflict, each settled by the resolver when it can be."""
+    _stage_task_files(st, st.run_dir, st.data.get("task", ""))
+    conflicts = await _run_plan_item_check(st, subtasks, caps, models,
+                                           efforts)
+    items = st.data.get("required_items") or []
+    by_sid: dict[str, list[dict]] = {}
+    for c in conflicts:
+        by_sid.setdefault(c["subtask_id"], []).append(c)
+    for sid, cs in by_sid.items():
+        qid = f"intent-plan-{sid}"
+        _register_intent_question(
+            st, qid, "plan", _plan_conflict_question(sid, cs, items),
+            {"subtask_id": sid, "conflicts": cs})
+        await _settle_intent_question(st, qid, caps, models, efforts)
+
+
+def _apply_plan_intent_rulings(st: "State", subtasks: dict) -> None:
+    """Amend the plan by every `plan` question decided `yes`: each
+    conflicting quote is struck from its field and replaced by the ruling,
+    a `verify` criterion containing one is dropped, and the subtask lists
+    the ruling in `_intent_rulings`. Deterministic from state."""
+    for qid, q in sorted((st.data.get("intent_questions") or {}).items()):
+        if not isinstance(q, dict) or q.get("source") != "plan":
+            continue
+        sid = (q.get("context") or {}).get("subtask_id")
+        sub = subtasks.get(sid)
+        if not isinstance(sub, dict) or _intent_decision(st, qid) != "yes":
+            continue
+        if any(r.get("qid") == qid for r in sub.get("_intent_rulings") or []):
+            continue
+        v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+        by = _intent_decided_by(st, qid)
+        ruling = (v.get("decision") if by == "resolver"
+                  else "the user answered yes") or "yes"
+        marker = f"[intent ruling {qid}: {ruling}]"
+        for c in (q.get("context") or {}).get("conflicts") or []:
+            field, quote = c.get("field"), c.get("plan_quote") or ""
+            if field == "verify":
+                sub["verify"] = [
+                    crit for crit in sub.get("verify") or []
+                    if _ws_norm(quote) not in _ws_norm(
+                        _plan_field_text({"verify": [crit]}, "verify"))]
+            elif isinstance(sub.get(field), str):
+                text = sub[field]
+                if quote in text:
+                    sub[field] = text.replace(quote, marker)
+                else:
+                    # The quote checked whitespace-collapsed: strike the
+                    # collapsed field, which keeps every other word.
+                    sub[field] = _ws_norm(text).replace(_ws_norm(quote),
+                                                        marker)
+        sub.setdefault("_intent_rulings", []).append(
+            {"qid": qid, "decided_by": by, "decision": ruling,
+             "evidence": [e for e in v.get("evidence") or []
+                          if e.get("ok") is not False]})
+        log(f"  intent: plan amended for {sid} ({qid}, decided by {by})")
+
+
+def _intent_open_questions(st: "State") -> list[dict]:
+    """The intent questions with no decision, as `pending-questions.json`
+    entries: the yes/no question, the resolver's reasoning when it ran, and
+    its verified quotes."""
+    out: list[dict] = []
+    for qid, q in sorted((st.data.get("intent_questions") or {}).items()):
+        if not isinstance(q, dict) or _intent_decision(st, qid) is not None:
+            continue
+        v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+        why = ("The run's own sources pull two ways on what the task "
+               "wants, so leerie does not decide it for you.")
+        if v.get("decision"):
+            why += (f" The resolver's reading ({v.get('status')}"
+                    + ("" if v.get("trusted") else ", quotes not verified")
+                    + f"): {v['decision']}")
+        elif v.get("error"):
+            why += f" The resolver could not answer ({v['error']})."
+        out.append({"id": qid, "question": q.get("question", ""),
+                    "choices": list(INTENT_ANSWERS),
+                    "why_underivable": why,
+                    "evidence": [{k: e.get(k) for k in
+                                  ("source", "quote", "locator")}
+                                 for e in v.get("evidence") or []
+                                 if e.get("ok") is not False
+                                 ][:_INTENT_EVIDENCE_SHOWN]})
+    return out
+
+
+def _stop_for_intent_questions(st: "State") -> None:
+    """Every open intent question is asked now: once, on a terminal, through
+    `_ask_questions`; unattended, written to `pending-questions.json` and the
+    run exits `EXIT_NEEDS_ANSWERS` (`_defer_questions`), and `resume
+    --answers` applies the answers. Never gated on `--clarify`: an intent
+    conflict is never decided best-effort (DESIGN §11)."""
+    pending = _intent_open_questions(st)
+    if not pending:
+        return
+    log(f"intent: {len(pending)} intent question(s) the run cannot settle "
+        "from its sources — asking")
+    if not sys.stdin.isatty():
+        _defer_questions(st, pending)
+    answers = st.data.setdefault("answers", {})
+    _ask_questions(pending, answers)
+    st.data["answers"] = answers
+    st.save()
+
+
+# The `kind` of a refused set-aside, as the residual-defect channel carries
+# it (it is never a conformer-reported kind).
+SET_ASIDE_REFUSED_KIND = "set_aside_refused"
+
+
+def _set_aside_findings(st: "State", unmet: list[dict] | None,
+                        contract_unmet: dict | None) -> dict[str, dict]:
+    """The findings the final conformer is shown, by `finding_id`:
+    `pr-<k>` per shown verified review finding, `unmet-<i>` per
+    confirmed-unmet item, `unmet-contract` for the confirmed-unmet defect
+    contract. Each `{finding_id, kind, item (index, "contract" or None),
+    where, text}`."""
+    out: dict[str, dict] = {}
+    items = st.data.get("required_items") or []
+    rec = st.data.get("pr_review") or {}
+    shown = [(k, f) for k, f in enumerate(rec.get("findings") or [])
+             if isinstance(f, dict) and f.get("verified")][:_PR_REVIEW_SHOWN]
+    for k, f in shown:
+        nid = f.get("item_id_norm")
+        item: int | str | None = None
+        if f.get("item_known") and isinstance(nid, str):
+            item = int(nid) if nid.isdigit() else nid
+            if isinstance(item, int) and not 0 <= item < len(items):
+                item = None
+        out[f"pr-{k}"] = {
+            "finding_id": f"pr-{k}", "kind": f.get("kind"), "item": item,
+            "where": f"{f.get('path')}:{f.get('line_start')}-"
+                     f"{f.get('line_end')}",
+            "quote": f.get("quote") or "",
+            "text": str(f.get("explanation") or "")}
+    for u in unmet or []:
+        i = u.get("item_index")
+        if isinstance(i, int) and 0 <= i < len(items):
+            out[f"unmet-{i}"] = {
+                "finding_id": f"unmet-{i}", "kind": "unmet_required_item",
+                "item": i, "where": f"required item {i}", "quote": "",
+                "text": str(u.get("evidence") or "")}
+    if contract_unmet is not None:
+        out["unmet-contract"] = {
+            "finding_id": "unmet-contract", "kind": "unmet_defect_contract",
+            "item": "contract", "where": "the defect contract", "quote": "",
+            "text": str(contract_unmet.get("evidence") or "")}
+    return out
+
+
+def _set_aside_question(finding: dict, entry: dict, st: "State") -> str:
+    """The question for a set-aside of `finding` on a required item."""
+    item = finding["item"]
+    if item == "contract":
+        on = "the run's audited defect contract"
+    else:
+        text, _ = _item_text_parts((st.data.get("required_items") or [])[item])
+        on = f"the required item \"{text}\""
+    where = finding["where"]
+    quote = (f" The code there: \"{finding['quote']}\"."
+             if finding.get("quote") else "")
+    why = str(entry.get("quote") or "").strip()
+    # The question is whether what the finding reports must be resolved,
+    # not whether its suggested remedy is required: asked about the remedy,
+    # the resolver accepted the band-aid set-aside of barnacle e7512406 in
+    # 2 of 6 replays (bench RS attempt 1).
+    return ("An independent check of this run's change reported, on "
+            f"{on}: {finding['text']} (at {where}).{quote} The run's final "
+            "fixer left the code as it is, setting this finding aside as "
+            f"`{entry.get('reason_kind')}`"
+            + (f", resting on: \"{why}\"" if why else "") + ". "
+            "Does the task require the run to resolve what this finding "
+            "reports — in whatever way the task allows, not necessarily the "
+            "one the finding suggests — rather than leave the code as it "
+            "is?")
+
+
+async def _adjudicate_set_asides(st: "State", res: dict,
+                                 findings: dict[str, dict], caps: dict,
+                                 models: dict[str, str],
+                                 efforts: dict[str, str | None]) -> None:
+    """Source (b), one final-conformance round: every `set_aside` entry
+    naming a shown finding on a required item is a question; one decided
+    `yes` (the task requires it resolved) refuses the set-aside — an unfixed
+    solution defect is added to `res`, so the next round gets it and the
+    re-drive drives what the last round leaves. A set-aside of a finding on
+    no required item stays the conformer's (the review is advisory)."""
+    for entry in res.get("set_aside") or []:
+        if not isinstance(entry, dict):
+            continue
+        fid = str(entry.get("finding_id") or "").strip()
+        finding = findings.get(fid)
+        if finding is None or finding["item"] is None:
+            continue
+        qid = f"intent-finding-{fid}"
+        q = _register_intent_question(
+            st, qid, "set_aside", _set_aside_question(finding, entry, st),
+            {"finding": finding,
+             "reason_kind": entry.get("reason_kind"),
+             "reason_kind_known": entry.get("reason_kind")
+             in SET_ASIDE_REASON_KINDS,
+             "quote": entry.get("quote")})
+        await _settle_intent_question(st, qid, caps, models, efforts)
+        if _intent_decision(st, qid) == "yes":
+            # A new list: `res` shares the worker's own (telemetry) list.
+            res["solution_defects"] = [*(res.get("solution_defects") or []),
+                                       _refused_set_aside_defect(st, qid)]
+            q["driven"] = True
+            st.save()
+            log(f"  intent: set-aside of {fid} refused — the task requires "
+                "it; it stays open")
+
+
+def _refused_set_aside_defect(st: "State", qid: str) -> dict:
+    """A refused set-aside as an unfixed solution defect."""
+    q = st.data["intent_questions"][qid]
+    f = (q.get("context") or {}).get("finding") or {}
+    v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+    why = (v.get("decision") if _intent_decided_by(st, qid) == "resolver"
+           else "the user answered that the task requires it")
+    return {"fixed": False, "kind": SET_ASIDE_REFUSED_KIND,
+            "where": str(f.get("where") or ""),
+            "concrete_case": f"[{f.get('finding_id')}] {f.get('text', '')}",
+            "why_ships_a_defect": f"set aside, but the task requires it "
+                                  f"({qid}): {why}"}
+
+
+def _apply_set_aside_answers(st: "State") -> None:
+    """After the final conformance's stop: a set-aside question decided
+    `yes` that no round drove is added to `_final.residual_defects`, for the
+    delivery re-drive. Idempotent."""
+    fin = (st.data.get("conformance") or {}).get("_final")
+    if not isinstance(fin, dict):
+        return
+    added = 0
+    for qid, q in sorted((st.data.get("intent_questions") or {}).items()):
+        if (not isinstance(q, dict) or q.get("source") != "set_aside"
+                or q.get("driven") or _intent_decision(st, qid) != "yes"):
+            continue
+        d = _refused_set_aside_defect(st, qid)
+        fin.setdefault("residual_defects", []).append(
+            {k: str(d.get(k) or "").strip()
+             for k in ("kind", "where", "concrete_case",
+                       "why_ships_a_defect")})
+        q["driven"] = True
+        added += 1
+    if added:
+        st.save()
+        log(f"  intent: {added} refused set-aside(s) handed to the delivery "
+            "re-drive")
+
+
+async def resolve_intent_conflict(st: "State", qid: str, question: str,
+                                  context: dict, caps: dict,
+                                  models: dict[str, str],
+                                  efforts: dict[str, str | None]
+                                  ) -> str | None:
+    """Source (c): a contradiction judge's unsettled result, as a yes/no
+    question. Returns its decision, or None while it is open — the stop
+    before finalize then asks it, and a resume returns the answer."""
+    _register_intent_question(st, qid, "contradiction", question, context)
+    await _settle_intent_question(st, qid, caps, models, efforts)
+    return _intent_decision(st, qid)
+
+
+def _pr_intent_lines(state: dict) -> list[str]:
+    """`## Intent decisions`: each intent question, how it was decided and
+    on what evidence, or that it is open."""
+    qs = state.get("intent_questions")
+    if not isinstance(qs, dict) or not qs:
+        return []
+    answers = state.get("answers") if isinstance(state.get("answers"),
+                                                 dict) else {}
+    lines: list[str] = []
+    for qid in sorted(qs):
+        q = qs[qid]
+        if not isinstance(q, dict):
+            continue
+        v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+        a = answers.get(qid)
+        if isinstance(a, str) and a.strip().lower() in INTENT_ANSWERS:
+            how = f"**{a.strip().lower()}**, answered by the user"
+        elif (v.get("status") == "settled" and v.get("trusted") is True
+              and v.get("answer") in INTENT_ANSWERS):
+            how = f"**{v['answer']}**, settled by the intent resolver"
+        else:
+            how = "**open**"
+        lines.append(f"- {_pr_code(qid)} ({_pr_entry(q.get('source'))}): "
+                     f"{_pr_entry(q.get('question'))} — {how}")
+        if v.get("decision"):
+            lines.append(f"  - resolver: {_pr_entry(v.get('decision'))}")
+        for e in [e for e in v.get("evidence") or []
+                  if isinstance(e, dict) and e.get("ok") is True][:3]:
+            lines.append(f"  - {_pr_entry(e.get('source'))} "
+                         f"{_pr_code(e.get('locator'))}: "
+                         f"\"{_pr_entry(e.get('quote'))}\"")
+    return lines
+
+
 def _delivery_judged_record(sha: str, unmet: list[dict],
                             details: dict, tree: str | None = None) -> dict:
     """One delivery-judge pass as final detection reads it: the commit it
@@ -65818,12 +66646,64 @@ def _contradiction_status(res: dict, failures: list[str]) -> str:
 
 def _contradiction_rule(verdict: dict | None) -> str:
     """What a contradiction verdict does to its pinned case:
-    `task_required` on `exclusive`, else `regression` — the conflict rule
-    stands. An `unsettled` verdict (no verified answer) is the one an
-    intent resolver may later decide instead; until one does, it is a
-    regression."""
-    return ("task_required" if isinstance(verdict, dict)
-            and verdict.get("status") == "exclusive" else "regression")
+    `task_required` on `exclusive`, and on `unsettled` when the intent
+    question it was handed to is decided `yes` (`intent_decision`, set by
+    `_contradiction_intent`; DESIGN §11 *Intent conflicts are settled with
+    evidence, else asked*, source (c)); else `regression` — the conflict
+    rule stands."""
+    if not isinstance(verdict, dict):
+        return "regression"
+    if verdict.get("status") == "exclusive":
+        return "task_required"
+    return ("task_required" if verdict.get("status") == "unsettled"
+            and verdict.get("intent_decision") == "yes" else "regression")
+
+
+def _contradiction_question(v: dict, item: str) -> str:
+    """The intent question an unsettled contradiction verdict hands on: does
+    the task ask to change what the existing test case pins? Not whether
+    the item's probe may pass: a pair that can both hold answers that yes
+    too, and the test would change for nothing (T9 bench 1)."""
+    q = v.get("quotes") if isinstance(v.get("quotes"), dict) else {}
+    pinned, probe = q.get("pinned") or "", q.get("independent") or ""
+    return ("An existing test case, `" + str(v.get("case")) + "` in `"
+            + str(v.get("file")) + "`, pins behaviour the repository has at "
+            "the run's base"
+            + (f", asserting: \"{pinned}\"" if pinned else "") + ". A change "
+            f"that makes the run's probe for required item "
+            f"{v.get('item_index')} (\"{item}\") pass breaks it; the probe is "
+            f"`{v.get('probe_test_file')}`"
+            + (f", asserting: \"{probe}\"" if probe else "") + ". An "
+            "independent judge could not settle whether one implementation "
+            "can pass both. Does the task ask to change the behaviour this "
+            "existing test case pins?")
+
+
+async def _contradiction_intent(st: "State", caps: dict, models: dict,
+                                efforts: dict, v: dict) -> None:
+    """Source (c): hand an `unsettled` verdict (a judge that answered, not
+    one that failed) to the intent resolver, and record its decision on the
+    verdict as `intent_qid` / `intent_decision`. An open question is asked
+    now (`_stop_for_intent_questions`): on a terminal, once; unattended, the
+    run exits `EXIT_NEEDS_ANSWERS` mid-group, a resume rolls the group back
+    (`in_flight`) and the answer decides the same verdict next time."""
+    if v.get("status") != "unsettled" or v.get("error"):
+        return
+    case = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(v.get("case") or ""))[:80]
+    qid = f"intent-contradiction-{case}-i{v.get('item_index')}"
+    items = st.data.get("required_items") or []
+    i = v.get("item_index")
+    text = (_item_text_parts(items[i])[0]
+            if isinstance(i, int) and 0 <= i < len(items) else "")
+    d = await resolve_intent_conflict(
+        st, qid, _contradiction_question(v, text),
+        {"case": v.get("case"), "file": v.get("file"), "item_index": i,
+         "probe_test_file": v.get("probe_test_file")},
+        caps, models, efforts)
+    if d is None:
+        _stop_for_intent_questions(st)
+        d = _intent_decision(st, qid)
+    v["intent_qid"], v["intent_decision"] = qid, d
 
 
 def _redrive_task_required_cases(rec: object) -> dict[str, dict]:
@@ -65991,6 +66871,7 @@ async def _redrive_task_required(st: "State", caps: dict, models: dict,
                 + (f" ({'; '.join(v['failures'][:2])})"
                    if v.get("failures") else "")
                 + (f" ({v['error']})" if v.get("error") else ""))
+            await _contradiction_intent(st, caps, models, efforts, v)
             if _contradiction_rule(v) == "task_required":
                 got = v
                 break
@@ -71702,6 +72583,18 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # §8 *A final-conformer round that turns a passing held-out case failing
     # is rolled back*).
     round_starts: list[str] = []
+    # The last round's result that reached the end of its round: valid, its
+    # set-asides adjudicated. A later round that breaks first (malformed, or
+    # rolled back) does not discard its open defects (DESIGN §9 *An unfixed
+    # solution defect keeps the final loop going*).
+    settled_res: dict | None = None
+    # The findings each round is shown, by the id its `set_aside` names
+    # (DESIGN §11 *Intent conflicts are settled with evidence, else asked*).
+    _contract_gate = (st.data.get("delivery_gate") or {}).get(
+        "contract_before") or {}
+    shown_findings = _set_aside_findings(
+        st, unmet_required_items,
+        _contract_gate if _contract_gate.get("verdict") == "unmet" else None)
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
         round_starts.append(before_sha)
@@ -71953,6 +72846,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             warnings, regressions, f"final conformer round {c_round}:",
             c_round, caps)
 
+        # A set-aside of a finding on a required item stands only on a
+        # settled intent verdict; a refused one is an unfixed defect here
+        # (DESIGN §11 *Intent conflicts are settled with evidence, else
+        # asked*).
+        await _adjudicate_set_asides(st, res, shown_findings, caps, models,
+                                     efforts)
+        settled_res = res
         # The one gating axis is part of "clean" here (DESIGN §9, final-tree
         # pass): an unfixed defect is what the remaining rounds are for.
         # `_conformance_clean` alone read a round with an unfixed defect on a
@@ -71994,6 +72894,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # resume", throwing away a finished run for a gap the next step could
     # take. --skip-completeness-check demotes it to a warning.
     final_defects = _actionable_solution_defects(last_res)
+    if settled_res is not None and settled_res is not last_res:
+        # The last round broke before its own result settled: what the last
+        # settled round left open is still open (a malformed round 1 dropped
+        # round 0's refused set-aside, barnacle e7512406 replay).
+        seen = {_defect_identity(d) for d in final_defects}
+        final_defects += [d for d in _actionable_solution_defects(settled_res)
+                          if _defect_identity(d) not in seen]
     if final_defects and skip_completeness:
         warnings.append(
             f"completeness gate found {len(final_defects)} unhandled case(s) "
@@ -72037,6 +72944,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                f"{clobbered_files}" if clobbered_files else "has residuals")
         die(f"strict-conformer: final-tree conformance {why}; "
             "run blocked. Fix and resume.")
+
+
+def _defect_identity(d: dict) -> tuple[str, str, str]:
+    """A solution defect's identity across rounds: its kind, where and
+    case, as reported."""
+    return tuple(str(d.get(k) or "").strip()
+                 for k in ("kind", "where", "concrete_case"))
 
 
 def _format_final_defects_note(defects: list[dict]) -> str:
@@ -79875,6 +80789,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "(DESIGN §5 *Id-vanishing operations*):\n" +
                 "\n".join(f"  • {i}" for i in wiring_issues)
             )
+        # Intent conflicts the plan states against the required items
+        # (DESIGN §11 *Intent conflicts are settled with evidence, else
+        # asked*): checked, settled by the resolver where the sources decide
+        # it, asked here otherwise (unattended: exit 10, and a resume comes
+        # back to this point), and applied to the plan before its specs are
+        # written.
+        await _plan_intent_check(st, subtasks, caps, models, efforts)
+        _stop_for_intent_questions(st)
+        _apply_plan_intent_rulings(st, subtasks)
         _validate_plan(subtasks)
         _write_plan(leerie_dir, task, st, subtasks, waves)
 
@@ -79929,6 +80852,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         )["warnings"].append(
             f"orchestrator-side exception: {type(e).__name__}: {e}")
         st.save()
+    # A set-aside the resolver could not settle is asked now, before the
+    # steps that drive what the final pass left (DESIGN §11); a `yes` is
+    # then handed to the delivery re-drive.
+    _stop_for_intent_questions(st)
+    _apply_set_aside_answers(st)
     # Delivery gate, second half: mechanically re-verify what the
     # conformer was handed — never trust a fixer's self-report. Spawned
     # when EITHER half of the first pass confirmed something unmet:
@@ -80013,6 +80941,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # (DESIGN §8): its base form is run there. The decider reads the record;
     # one that could not be taken is unmeasured, never a pass.
     await _check_existing_behaviour(leerie_dir, st, caps)
+    # No intent question is left open when the PR is written (DESIGN §11).
+    _stop_for_intent_questions(st)
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

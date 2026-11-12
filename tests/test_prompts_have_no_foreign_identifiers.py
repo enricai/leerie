@@ -93,6 +93,9 @@ GENERIC_PLACEHOLDERS = frozenset({
     # own and an exemption here would be dead weight.)
     "Callout", "MetricTile", "TrendLine", "SectionPanel",
     "Panel.tsx", "overview.tsx",
+    # intent_resolver.md's direct answers (`Yes.`, `No.`), the wording bench
+    # B2 measured: English, not a symbol of any codebase.
+    "No.",
     # contradiction_judge.md's generic name for any test framework's
     # assertion call (beside `expect(...)`), in the prompt lane B3 measured
     # and that ships byte for byte (DESIGN §8: what ships is what was

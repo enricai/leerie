@@ -46,7 +46,9 @@ import pytest
 # belongs to the sibling file. Re-measured 2026-11-03, when the three BLT axes
 # became one `$defs` shape and `production_evidence` gained
 # `unexercisable_resource`: current 2,431, reconstruction (its `$ref`s
-# inlined, as the pre-flatten literal had them) 2,875.
+# inlined, as the pre-flatten literal had them) 2,875. Re-measured
+# 2026-11-12, when `set_aside` was added (DESIGN §11 *Intent conflicts are
+# settled with evidence, else asked*): current 2,658.
 _MAX_DUMPED_BYTES = 2750
 
 # Same discipline for the hardened form the grammar compiler actually
@@ -63,7 +65,9 @@ _MAX_DUMPED_BYTES = 2750
 # the shapes rejected as unaffordable. Re-measured 2026-11-03 with the
 # BLT `$defs` shape and `unexercisable_resource`: 2,826 (reconstruction
 # 3,441) — the one shape alone takes 3,143 to 2,754, the new field adds
-# 72 (on the old shape it reached 3,215, over the bound).
+# 72 (on the old shape it reached 3,215, over the bound). Re-measured
+# 2026-11-12 with `set_aside`: 3,097 — with an enum on its `reason_kind` and
+# an `item_index` it would be 3,226, over the bound (`_set_aside_schema`).
 _MAX_HARDENED_BYTES = 3178
 
 

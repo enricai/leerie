@@ -34,7 +34,8 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "ci_checks", "scope_judge", "pr_reviewer",
            "contract_extractor", "falsifier", "verifiability_classifier",
            "delivery_ratchet", "forbidden_command_extractor",
-           "observability_judge", "contradiction_judge")
+           "observability_judge", "contradiction_judge", "intent_resolver",
+           "plan_item_checker")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -90,6 +91,10 @@ DEFAULTS = {
     # The contradiction judge (DESIGN §8 *Delivery re-drive* rule 4): the
     # second documented opus exception (DESIGN §12; lane B3).
     "contradiction_judge": "opus",
+    # The intent-conflict workers (DESIGN §11 *Intent conflicts are settled
+    # with evidence, else asked*): opus, as benched (B2, B1).
+    "intent_resolver": "opus",
+    "plan_item_checker": "opus",
 }
 
 
