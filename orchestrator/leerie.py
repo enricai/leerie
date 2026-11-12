@@ -63782,6 +63782,21 @@ def _intent_verdict_trusted(evidence: list[dict]) -> bool:
     return bool(checked) and all(e.get("ok") is True for e in checked)
 
 
+def _intent_base(st: "State", tree: Path | None) -> str | None:
+    """The commit the resolver reads: `base_sha` once the run branch is cut,
+    and before the cut — when the item and plan questions are asked — the
+    commit the planning worktree is checked out at, the start every
+    judgment worker reads. `base_sha` alone left every pre-cut question
+    without a base, so it was asked of the user, never settled."""
+    base = _diff_base(st)
+    if base or tree is None or not tree.is_dir():
+        return base
+    p = subprocess.run(["git", *_tree_git_args(tree), "rev-parse", "--verify",
+                        "-q", "HEAD^{commit}"], capture_output=True,
+                       text=True, check=False)
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
+
+
 async def _settle_intent_question(st: "State", qid: str, caps: dict,
                                   models: dict[str, str],
                                   efforts: dict[str, str | None]) -> dict:
@@ -63794,11 +63809,11 @@ async def _settle_intent_question(st: "State", qid: str, caps: dict,
     if (_intent_decision(st, qid) is not None
             or (isinstance(v, dict) and "error" not in v)):
         return q
-    base = _diff_base(st)
     staging = (st.run_dir / "worktrees" / "staging").resolve()
     planning = st.data.get("planning_worktree")
     tree = (staging if staging.is_dir()
             else Path(planning) if planning else None)
+    base = _intent_base(st, tree)
     files_root = st.run_dir / TASK_FILES_DIRNAME
     files = _task_file_copies(st)
     rec: dict = {"model": models.get("intent_resolver", MODEL_DEFAULT),

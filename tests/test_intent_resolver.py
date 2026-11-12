@@ -26,6 +26,7 @@ import sys
 
 import pytest
 
+from tests.conftest import run_git_repo_first
 from tests.test_run_final_conformance import _clean_result, env  # noqa: F401
 
 REPORT = ("Also affects `303 See Other`, where the rewrite is mandatory - so "
@@ -319,6 +320,78 @@ def test_a_crashed_resolver_leaves_the_question_open_and_is_asked_again(
     _plan(leerie, env, _subtasks())
     assert [c["schema_key"] for c in calls] == ["intent_resolver"]
     assert leerie._intent_decision(st, QID) == "yes"
+
+
+@pytest.fixture()
+def fresh(leerie, tmp_path, monkeypatch):
+    """A fresh run at the plan check: the user's checkout, the run's own
+    repository and planning worktree made by the real code, and no
+    `base_sha` and no staging (`phase_execute` cuts the run branch later).
+    The user's branch then moves on, so the commit the planning worktree
+    holds is not the branch's tip."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git_repo_first(repo, "init", "-q", "-b", "main", ".")
+    run_git_repo_first(repo, "config", "user.email", "t@t")
+    run_git_repo_first(repo, "config", "user.name", "t")
+    (repo / "client.ts").write_text("// 303 is followed as a GET\n")
+    run_git_repo_first(repo, "add", "-A")
+    run_git_repo_first(repo, "commit", "-qm", "init")
+    monkeypatch.chdir(repo)
+    state = tmp_path / "state"
+    monkeypatch.setenv("LEERIE_STATE_DIR", str(state))
+    st = leerie.State(state, "fresh-plan-1", repo_root=repo)
+    st.data.update(task=TASK, working_branch="main",
+                   answers={"source_of_truth": "codebase"},
+                   required_items=[
+                       {"item": "preserves method, headers and body across "
+                                "301/302/303 redirects",
+                        "parts": ["POST is re-issued with body at the "
+                                  "Location"]}])
+    st.save()
+    tf = st.run_dir / "task-files" / "docs"
+    tf.mkdir(parents=True)
+    (tf / "report.md").write_text(f"# Report\n\n{REPORT}\n")
+    asyncio.run(leerie._ensure_run_repo_or_die(st))
+    planning = asyncio.run(leerie._ensure_planning_worktree(st))
+    head = run_git_repo_first(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "client.ts").write_text("// 303 keeps the method\n")
+    run_git_repo_first(repo, "commit", "-qam", "later")
+    return {"leerie": leerie, "st": st, "planning": planning, "head": head,
+            "tip": run_git_repo_first(repo, "rev-parse",
+                                      "HEAD").stdout.strip(),
+            "caps": dict(leerie.DEFAULT_CAPS)}
+
+
+@pytest.mark.real_planning_worktree
+def test_a_fresh_runs_plan_conflict_is_settled_on_the_planning_commit(
+        fresh, monkeypatch):
+    """The plan check runs before `phase_execute` records `base_sha`, so on
+    a fresh run the resolver's commit is the one the planning worktree
+    holds, the commit the planner read. Reading `base_sha` alone sent every
+    plan conflict to the user unsettled ("no base commit or tree to check
+    out")."""
+    leerie, st = fresh["leerie"], fresh["st"]
+    assert not st.data.get("base_sha")
+    assert not (st.run_dir / "worktrees" / "staging").exists()
+    assert fresh["tip"] != fresh["head"]
+    calls = _stub(leerie, monkeypatch, verdict=_verdict(
+        code_quote="// 303 is followed as a GET", code_path="client.ts"))
+    asyncio.run(leerie._plan_intent_check(
+        st, _subtasks(), fresh["caps"], _models(leerie), _efforts(leerie)))
+
+    (res,) = [c for c in calls if c["schema_key"] == "intent_resolver"]
+    assert res["head"] == fresh["head"]
+    assert res["sid"] == f"intent-resolver-{QID}"
+    assert fresh["head"] in res["user_prompt"]
+    v = st.data["intent_questions"][QID]["verdict"]
+    assert "error" not in v
+    # The code quote holds at the planning commit, not at the branch's tip.
+    assert [e["ok"] for e in v["evidence"]] == [True, True, True, None]
+    assert v["trusted"] is True
+    assert leerie._intent_decision(st, QID) == "yes"
+    _no_tty(monkeypatch)
+    leerie._stop_for_intent_questions(st)        # decided: no stop
 
 
 # === (b) the final conformer's set-aside ====================================
