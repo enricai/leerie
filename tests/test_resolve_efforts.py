@@ -319,8 +319,10 @@ def test_judgment_workers_pinned_set(leerie):
     # "bounded by the DESIGN §8 evidence gate" unset default.
     acting_workers = {"implementer", "conformer"}
     # The advisory whole-PR review runs at high, as benched (bench N2f);
-    # the contradiction judge too (lane B3, opus high).
-    high_workers = {"pr_reviewer", "contradiction_judge"}
+    # the contradiction judge too (lane B3, opus high); and the
+    # intent-conflict workers (B1, B2).
+    high_workers = {"pr_reviewer", "contradiction_judge", "intent_resolver",
+                    "plan_item_checker"}
 
     assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == (
         judgment_workers | acting_workers | high_workers)

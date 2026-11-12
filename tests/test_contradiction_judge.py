@@ -60,6 +60,14 @@ NOT_AN_ASSERTION = {**EXCLUSIVE, "evidence": [
     {"test": "pinned", "quote": "from calc import add"},
     {"test": "independent", "quote": "assert add(2, 2) == 4"}]}
 
+# The intent resolver's answers to an `unsettled` verdict's hand-off (DESIGN
+# §11 *Intent conflicts are settled with evidence, else asked*, source (c)),
+# each quoting the task verbatim so code trusts it.
+def _intent(answer: str, status: str = "settled") -> dict:
+    return {"decision": f"{answer}.", "answer": answer, "status": status,
+            "evidence": [{"source": "task", "quote": "make add return the sum",
+                          "locator": "task.md"}]}
+
 
 @pytest.fixture(autouse=True)
 def _quiet_host(leerie, monkeypatch):
@@ -91,6 +99,10 @@ class Judged(World):
         probe.write_text(EXCL_PROBE)
         self.verdicts = list(verdicts)
         self.judged: list[dict] = []
+        # The task does not ask to change what the pinned case pins: the
+        # conflict rule stands, as before the hand-off existed.
+        self.intent = _intent("no")
+        self.resolved: list[dict] = []
 
     def run(self, monkeypatch) -> dict:
         world = self
@@ -105,6 +117,9 @@ class Judged(World):
                         p.relative_to(cwd).as_posix(): p.read_text()
                         for p in cwd.rglob("*") if p.is_file()}})
                 return world.verdicts.pop(0)
+            if kw["schema_key"] == "intent_resolver":
+                world.resolved.append(kw)
+                return world.intent
             assert kw["schema_key"] == "implementer", kw["schema_key"]
             world.calls.append({"prompt": kw["user_prompt"],
                                 "cwd": kw["cwd"]})
@@ -196,6 +211,62 @@ def test_a_verdict_that_is_not_exclusive_keeps_the_rollback(
     assert [v["status"] for v in rec["contradiction_verdicts"]] == [status]
     assert _git(w.staging, "rev-parse", "HEAD") == w.head
     assert len(w.calls) == 1
+    # Only an unsettled verdict is handed to the intent resolver; its `no`
+    # leaves the rule.
+    assert len(w.resolved) == (status == "unsettled")
+
+
+@pytest.mark.usefixtures("pytest_facts")
+def test_an_unsettled_verdict_the_task_decides_is_task_required(
+        leerie, tmp_path, monkeypatch):
+    """Source (c): the judge's facts did not all hold, so its verdict is
+    `unsettled`; the intent resolver, quoting the task, says the task asks
+    to change what the pinned case pins. The case is task-required: the
+    fix and the test update are kept."""
+    w = Judged(leerie, tmp_path, [{**EXCLUSIVE,
+                                   "same_input_by_meaning": False}])
+    w.intent = _intent("yes")
+    w.edits = [_fix_and_update_test]
+    rec = w.run(monkeypatch)
+    [g] = _groups(rec)
+    assert not g.get("rolled_back"), g.get("rollback_reason")
+    [tr] = g["task_required"]
+    assert PIN_ID in tr["id"]
+    [v] = rec["contradiction_verdicts"]
+    assert v["status"] == "unsettled" and v["intent_decision"] == "yes"
+    [r] = w.resolved
+    assert "Does the task ask to change the behaviour this existing test " \
+        "case pins?" in r["user_prompt"]
+    assert "assert add(2, 2) == 4" in r["user_prompt"]
+    q = w.st.data["intent_questions"][v["intent_qid"]]
+    assert q["source"] == "contradiction"
+    assert leerie._redrive_task_required_cases(rec)
+
+
+@pytest.mark.usefixtures("pytest_facts")
+def test_an_unsettled_verdict_nobody_settles_stops_and_asks(
+        leerie, tmp_path, monkeypatch):
+    """The resolver cannot settle it either: an unattended run stops with
+    the question written down, mid-group, and the group is the one a
+    resume rolls back (`in_flight`)."""
+    class _In:
+        def isatty(self):
+            return False
+    monkeypatch.setattr("sys.stdin", _In())
+    w = Judged(leerie, tmp_path, [{**EXCLUSIVE,
+                                   "same_input_by_meaning": False}])
+    w.intent = _intent("yes", "unsettled")
+    w.edits = [_fix_and_update_test]
+    with pytest.raises(SystemExit) as ex:
+        w.run(monkeypatch)
+    assert ex.value.code == leerie.EXIT_NEEDS_ANSWERS
+    rec = w.st.data["delivery_redrive"]
+    assert rec.get("in_flight")
+    import json
+    (q,) = json.loads((w.st.run_dir / "pending-questions.json")
+                      .read_text())["questions"]
+    assert q["id"].startswith("intent-contradiction-")
+    assert q["choices"] == ["yes", "no"]
 
 
 @pytest.mark.usefixtures("pytest_facts")

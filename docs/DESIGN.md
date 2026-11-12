@@ -14426,7 +14426,10 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `both_can_hold` (a verified answer that both can pass), or `unsettled`
    (no verified answer: a quote not found, no assertion quote, a fact
    false while `mutually_exclusive` is true, a failed worker) — leaves
-   today's rule exactly. Verdicts are kept per case and probe
+   today's rule exactly, except that an `unsettled` verdict from a judge
+   that answered is handed to the intent resolver, and its `yes` makes the
+   case task-required (§11 *Intent conflicts are settled with evidence,
+   else asked*, source (c)). Verdicts are kept per case and probe
    (`delivery_redrive.contradiction_verdicts[]`) and reused, since neither
    input changes during the run. The judge runs only in the delivery
    re-drive: an acceptance repair round runs before final delivery
@@ -20459,7 +20462,11 @@ read clean and exited with two of its three rounds unused, and the run
 `die()`d "fix and resume"; the resumed run's final conformer fixed the same
 defect, same tree, in one round. A defect still unfixed after the last
 round is recorded on `_final` as `residual_defects`; it is no reason to
-stop the run. Every wave has integrated, but the subtasks that own the
+stop the run. A round that breaks before its own result is valid (a
+malformed result, a rollback) does not discard what the last valid round
+left open: those defects stay residual too. Measured on the e7512406
+replay (§11): round 0's refused set-aside was dropped when round 1's result
+was malformed. Every wave has integrated, but the subtasks that own the
 code still exist for the delivery re-drive (§8 *Delivery re-drive*), which
 takes each residual defect as a typed `solution_defect` note, routed to
 the subtasks whose integrated diff touches the file the defect's `where`
@@ -20512,7 +20519,11 @@ grant covered. Each finding is typed (`bug`,
 quotes the file at HEAD; code checks the quote verbatim against the
 file, and an item's quoted span against that item's text, and only a
 finding whose quote checks out reaches the final conformer, as an
-advisory section it verifies against the code before acting. The review
+advisory section it verifies against the code before acting. Each finding
+carries an id, and one the conformer does not fix is listed in its typed
+`set_aside`; a set-aside of a finding on a required item needs a settled
+intent verdict (§11 *Intent conflicts are settled with evidence, else
+asked*). Otherwise the review
 never gates and never changes the run's outcome; whatever it made goes
 with its checkout; its record (`pr_review`) is for the PR. It runs on
 `opus` at effort `high` — a model-tier exception (§12): measured
@@ -21472,9 +21483,13 @@ time. DESIGN.md (this section) is the architectural specification; the
 prompt fragment is the directly-loaded text. They must stay in agreement
 under CLAUDE.md's three-layer rule.
 
-By default leerie does not surface intent questions to the user at all.
-Workers run the filter, treat anything that survives as a forced best-effort
-decision, and document it. Pass `--clarify` (or set `LEERIE_CLARIFY=true`
+By default leerie does not surface the classifier's intent questions to
+the user at all. Workers run the filter, treat anything that survives as a
+forced best-effort decision, and document it. One kind of question is the
+exception and is never decided best-effort: an **intent conflict**, where
+the run's own sources pull two ways on what the task wants built (*Intent
+conflicts are settled with evidence, else asked*, below; the user's
+decision, 2026-11-12). Pass `--clarify` (or set `LEERIE_CLARIFY=true`
 / `clarify = true` in `leerie.toml`) to opt into surfacing the surviving
 questions — interactively if a TTY is attached, otherwise via
 `pending-questions.json` and the standard deferred-resume flow. The
@@ -21508,6 +21523,113 @@ When Leerie runs under `--clarify` in a context where it cannot block for
 an answer, the clarification step is non-blocking: it records the questions,
 exits with a distinct status, and lets the surrounding layer collect answers
 and resume.
+
+### Intent conflicts are settled with evidence, else asked
+
+A run meets the same question in several places: does the task want this
+behaviour changed or kept, this finding fixed or left? The planner answers
+it in a subtask's notes, the conformer answers it when it sets a review
+finding aside, and until 2026-11-12 nothing recorded either answer as a
+decision. The forensics: on four runs (barnacle 5ddc1d67 and e7512406,
+navegando 4134b78c and e99c1df1) the final conformer dismissed an opus
+reviewer's verified finding on a required item, in prose (on 5ddc1d67:
+"The 303 findings are deliberate HTTP semantics, per the code comment, so I
+left them", the report having said 303 is part of the defect), and opus
+agreed with the user's intent on all four. The planner of 5ddc1d67 had
+already written "Preserve all existing behavior (303->GET …)" against two
+items that said the opposite. The confidence record's
+`contradictions_reconciled` is the only place these choices were written,
+and nothing reads it.
+
+So an intent conflict is a typed question, answered by a worker that reads
+the evidence, and its answer is applied by code:
+
+1. **The `intent_resolver`** answers one yes/no question about what the task
+   intends: `{decision, answer: yes|no, evidence: [{source, quote,
+   locator}], status: settled|unsettled}`. It is read-only, in a checkout of
+   the base commit with its history (`git log -p`, `git show`, `git blame`),
+   with the task, the files the task references, and the web. The task and
+   its referenced files decide where they speak, over existing code, tests
+   or a general standard; a limit in the task is as binding as a request;
+   where the task is silent, the repository's deliberate behaviour stands.
+   `unsettled` means the task's own sources conflict, or the task is silent
+   and the repository and outside sources pull apart. Code checks every
+   `code`, `task`, `report` and `history` quote verbatim (whitespace
+   collapsed) against the file at the base, the task, the referenced file or
+   the commit it names; a `web` quote is not checked. A verdict is trusted
+   only when it carries at least one checkable quote and every checkable
+   quote holds: an untrusted verdict is `unsettled`. Measured (bench B2,
+   six samples per question): on 5ddc1d67's 303 question opus at effort
+   `high` answered report-wins or unsettled 6/6, sonnet 2/6; the band-aid
+   and responsive-header questions and four narrow controls 6/6 each, every
+   code/task/report quote verifying. So it runs on opus at `high` (§12).
+2. **Three sources ask it.**
+   - **(a) The plan against the items, explicit conflicts only.** Once the
+     plan is scheduled and before its specs are written, a tool-less
+     `plan_item_checker` on opus at `high` reads the required items and
+     every subtask's `intent`, `scope_note`, `investigation_notes`,
+     `success_criteria_seed` and `verify`, and returns each place the
+     plan's words contradict an item's, with both quotes; code checks each
+     quote against the item and the named field and drops a conflict whose
+     quotes fail. Measured (bench B1): explicit conflicts — a subtask told
+     to keep a behaviour an item says to change, or told not to run what an
+     item requires — found 12/12 on opus, with no conflict on any of 30
+     control samples of faithful plans. A narrowing the plan never states,
+     or an item part it simply omits, is found 1–3 times in 6 and is
+     therefore not claimed: nothing waits on this check finding it. The
+     verified conflicts of one subtask are one question: does the task
+     require what the items say there, over what the plan says?
+   - **(b) A conformer's set-aside.** The final conformer is handed the
+     advisory review's verified findings and detection's confirmed-unmet
+     items, each with an id. One it does not fix is listed in its typed
+     `set_aside` (`{finding_id, reason_kind: deliberate | out_of_scope |
+     larger_change | incorrect, quote}`); prose is not read. The item is
+     the one the finding itself names, so the conformer is not asked for
+     it. A set-aside of a finding on a required item is allowed only by a
+     settled verdict that the task does not require the run to resolve
+     what the finding reports (in any way the task allows: the question
+     is not about the finding's suggested remedy, which a first bench
+     showed the resolver can reject while the band-aid it reported
+     stands). Without one the set-aside is refused: the finding
+     stays open as an unfixed solution defect, so the next round gets it
+     and, after the last round, the delivery re-drive drives it and the
+     run is `unconverged` while it is open (§9 *An unfixed solution defect
+     keeps the final loop going*). A set-aside of a finding on no required
+     item stays the conformer's call, as the review is advisory.
+   - **(c) A contradiction judge's unsettled result** (§8 *Delivery
+     re-drive* rule 4). When the `contradiction_judge` answered but its
+     facts or quotes did not all hold (`unsettled`, not a failed worker),
+     the question becomes: does the task ask to change the behaviour this
+     existing test case pins? — with the pinned and the probe's assertion
+     quotes. Not whether the item's probe may pass: a pair that can both
+     hold answers that yes too, and the pinned test would change for
+     nothing; T9 bench 1 measured exactly that (a judge asked whether the
+     task required the test's change accepted a2a825c2's real regression
+     6/6). A `yes` makes the case task-required as an `exclusive` verdict
+     does; `no` keeps the conflict rule; an open question stops the run
+     there (a resume rolls the in-flight group back, and the answer decides
+     the same verdict the next time it is read).
+3. **A settled verdict is applied.** For (a), `yes` amends the plan: each
+   conflicting quoted span is struck from its field and replaced by the
+   ruling, and a `verify` criterion containing it is dropped, before the
+   specs the implementers read are written; `no` leaves the plan as it is.
+   For (b), `yes` refuses the set-aside, `no` accepts it. Either way the
+   ruling, its status and its verified quotes are kept in state
+   (`intent_questions`) and listed in the PR (`## Intent decisions`).
+4. **An unsettled verdict stops and asks.** On a terminal it is asked once,
+   through the same path as the classifier's questions, as a yes/no
+   question with the resolver's reasoning and both sides' quotes.
+   Unattended, the run writes the questions to `pending-questions.json`
+   and exits `EXIT_NEEDS_ANSWERS`; `resume --answers` applies them. The
+   stop comes where the answer is needed and nothing later is wasted:
+   before the plan's specs are written for (a), after the final
+   conformance pass for (b) (an answer `yes` then becomes a residual
+   defect the re-drive drives), and before finalize for anything still
+   open. `--clarify` does not gate it: a run that would otherwise pick a
+   reading of the task the user never chose stops instead.
+
+A `no` ruling is the task's answer to the question asked, not a change to
+the required items: detection still judges each item as written (§15).
 
 ### Mid-execution clarification
 
@@ -22064,6 +22186,14 @@ test cannot both pass, with every quote verified, in 1 of 6 samples; opus at
 `high` gave no such answer in 42 samples over seven pairs that can both
 hold. It runs only when a re-drive commit makes a probe pass by breaking a
 pinned case.
+
+Two more are on `opus` at `high`, both measured against sonnet on the
+question they answer (§11 *Intent conflicts are settled with evidence, else
+asked*): the `intent_resolver` (bench B2: the 303 question answered
+correctly 6/6 against sonnet's 2/6) and the `plan_item_checker` (bench B1:
+explicit plan/item conflicts 12/12 against sonnet's 10/12, both with no
+false conflict on 30 control samples). A wrong answer from either decides
+what the run builds.
 
 One round is on `opus` by a per-call override, not by a worker default: the
 delivery re-drive's escalation of an existing test's base-form cases that
@@ -22707,6 +22837,13 @@ what the architecture can guarantee.
   a personal fork) isn't supported today; the workaround is `--no-push`
   plus a manual push. A follow-up `--remote <name>` flag is possible but
   outside the current design.
+- **An intent ruling answers its question; it does not rewrite the
+  items.** A settled `no` (the plan stands, a set-aside is accepted) is
+  recorded and shown in the PR, but delivery detection still judges each
+  required item as the classifier wrote it, so an item the ruling found
+  over-read can still be reported unmet. And the plan check finds only
+  conflicts the plan states (§11): a plan that silently narrows an item is
+  left to detection.
 - **System-wide worker concurrency scales with run count.** Each run obeys
   its own `max_parallel` cap; with N concurrent runs the total active
   worker count can be N × max_parallel — bounded per run but not

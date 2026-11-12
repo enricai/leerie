@@ -619,6 +619,16 @@ def test_every_documented_range_guard_is_wired(leerie):
                leerie._recipe_timeout_s):          # provision timeout_s
         assert "_bounded_or_conservative(" in inspect.getsource(fn), (
             f"{fn.__name__} does not use the guard")
+    # plan_item_checker.conflicts[].item_index (`minimum: 0`, DESIGN §11):
+    # an index naming no item drops the conflict — executed, not read.
+    items = [{"item": "x"}]
+    subs = {"s": {"intent": "keep x"}}
+    c = {"item_quote": "x", "subtask_id": "s", "field": "intent",
+         "plan_quote": "keep x"}
+    assert leerie._verify_plan_conflict({**c, "item_index": 0}, items, subs)
+    for bad in (-1, 1):
+        assert not leerie._verify_plan_conflict({**c, "item_index": bad},
+                                                items, subs)
 
 
 def test_the_three_guards_match_the_schemas_numeric_bounds(leerie):
@@ -638,8 +648,8 @@ def test_the_three_guards_match_the_schemas_numeric_bounds(leerie):
 
     for name, schema in leerie.SCHEMAS.items():
         walk(schema, name)
-    assert len(found) == 3, (
-        f"schemas now carry {len(found)} range-bounded fields, not 3: {found}. "
+    assert len(found) == 4, (
+        f"schemas now carry {len(found)} range-bounded fields, not 4: {found}. "
         "Strict mode strips these — each needs a _bounded_or_conservative guard "
         "and a line in DESIGN §7 / IMPLEMENTATION.md.")
 

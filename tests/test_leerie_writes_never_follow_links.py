@@ -438,7 +438,7 @@ _LEERIE_ONLY = {
     # grant names for writing (`_MEASURE_PRIVATE`; DESIGN §6 *A worker
     # writes only where it is granted (I5)*).
     "__init__", "save", "main", "_write_run_json", "_write_plan",
-    "_write_subtask_artifacts", "_settle_subtask", "gather_answers",
+    "_write_subtask_artifacts", "_settle_subtask", "_defer_questions",
     "_absorb_supplied_answers", "_surface_clarification", "phase_judge",
     "_replay_and_judge_sample", "_replay_capture", "_heal_apply_patch",
     "_heal_baseline", "_heal_replay_patched", "_write_heal_report",

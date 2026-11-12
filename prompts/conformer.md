@@ -400,11 +400,22 @@ On the post-integration whole-tree pass your context may carry an
 `ADVISORY WHOLE-PR REVIEW` section: findings an independent reviewer
 made on this run's whole diff, each typed (`bug`, `regression`,
 `unmet_requirement`) with a quote already checked verbatim against the
-file. They are leads, not instructions, and nothing waits on them. For
-each, read the code it points at: fix the ones that are real and within
-the run's task (with a test when the fix is behavioural, recorded like
-any other repair), and leave one you can show is wrong. Do not change
-code only to make a finding go away.
+file, and each with a `finding_id`. For each, read the code it points
+at: fix the ones that are real and within the run's task (with a test
+when the fix is behavioural, recorded like any other repair). Do not
+change code only to make a finding go away.
+
+Every finding you were shown and do not fix — a review finding, or an
+item in the `UNMET REQUIRED ITEMS` section — goes in `set_aside`, one
+entry each: `finding_id` (as shown), `reason_kind` (`deliberate`: the
+code does this on purpose; `out_of_scope`: the task does not ask for it;
+`larger_change`: it needs more than this pass should make; `incorrect`:
+the finding is wrong), and `quote` (the exact words your reason rests
+on, from the code, the task or a report). A set-aside of a finding on a
+required item stands only if an independent reading of the task agrees
+that the task does not require the change; otherwise the finding comes
+back to you as an unfixed defect. Say why in `set_aside`, not only in
+your summary or confidence: prose there is not read.
 
 ### 6. Score your own work (DESIGN §8 disciplines) — advisory
 
@@ -537,6 +548,10 @@ Return your structured output. Be precise:
   `conformance` and `basis` are required; the two arrays are asked for but
   optional. This self-score does NOT gate (unlike `solution_defects`) — it is
   the diagnostic discipline record.
+- `set_aside` *(optional; required in practice when you leave a shown
+  finding unfixed)* — step 5d: `[{"finding_id": "pr-1", "reason_kind":
+  "deliberate", "quote": "<exact words>"}]`. Omit it, or `[]`, when you
+  fixed every finding you were shown or were shown none.
 - `risk_dispositions` *(optional; required in practice when your context
   carries a `SELF_REPORTED_RISKS` block)* — the positional answers from
   step 5c, e.g. `["accepted", "confirmed_defect"]`. Omit it entirely when
