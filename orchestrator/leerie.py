@@ -650,6 +650,10 @@ STATE_FIELDS = (
     # tree and which derived required items it made (DESIGN §8 *A sweep's
     # instances are items*).
     "sweeps",
+    # scope_reading: which reading of the task the run took (DESIGN §8 *A
+    # sweep's instances are items*); also the resume checkpoint of
+    # _settle_scope_reading.
+    "scope_reading",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -3030,6 +3034,12 @@ SITE_EXCLUSION_KINDS = ("holds_on_tree", "covered_by_other_site",
 # callees. Code enumerates either structurally (tree-sitter); the classifier
 # only says which, and where.
 SWEEP_PATTERNS = ("text_literal", "call")
+# The scope reading (DESIGN §8 *A sweep's instances are items*): the auditor
+# says whether the task's words admit one reading or a narrow and a broad
+# one, and which sites only the broad reading needs. The run always takes
+# the broad reading, which contains the narrow one; nobody is asked.
+SCOPE_READING_KINDS = ("one_reading", "narrow_or_broad")
+SITE_READINGS = ("both", "broad_only")
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
@@ -4821,12 +4831,31 @@ SCHEMAS: dict[str, dict] = {
         # a fix campaign never looks at.
         "type": "object",
         "additionalProperties": False,
-        "required": ["applicable", "sites"],
+        # reading (DESIGN §8 *A sweep's instances are items*): required, so
+        # whether the task reads two ways is
+        # decided on every audit rather than noticed on some — the extent
+        # precedent. Measured (SW2 bench 4): on 2 of 6 audits of a task that
+        # reads two ways, the auditor took the narrow reading and never
+        # listed the broad one's sites.
+        "required": ["applicable", "sites", "reading"],
         "$defs": {
             "resolution_kind": {"type": "string",
                                 "enum": list(SITE_RESOLUTION_KINDS)},
         },
         "properties": {
+            # What each reading covers, one sentence each ("" with
+            # one_reading) — shown to the user verbatim, never read by code.
+            "reading": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["kind", "narrow", "broad"],
+                "properties": {
+                    "kind": {"type": "string",
+                             "enum": list(SCOPE_READING_KINDS)},
+                    "narrow": {"type": "string"},
+                    "broad": {"type": "string"},
+                },
+            },
             # False only when the task is not a defect fix at all (a
             # feature, a doc change) or the defect has a single obvious
             # location with no competing candidate mechanisms;
@@ -4881,6 +4910,11 @@ SCHEMAS: dict[str, dict] = {
                         "extent": {"type": "string",
                                    "enum": ["one_place", "pattern"]},
                         "sweep": _sweep_spec_schema(),
+                        # Which reading needs the site (absent: both). The
+                        # run takes the broad reading, so every site is kept;
+                        # the field feeds the auditor's check loop.
+                        "reading": {"type": "string",
+                                    "enum": list(SITE_READINGS)},
                     },
                 },
             },
@@ -7402,6 +7436,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
     _UNMET_HEADING,
+    "## Scope reading",
     "## Needs human verification",
     "## Not verified by this run",
     "## Untested after re-drive",
@@ -8015,13 +8050,29 @@ def _pr_unmet_evidence_lines(state: dict) -> list[str]:
     return out
 
 
+def _pr_scope_reading_lines(state: dict) -> list[str]:
+    """The PR's `## Scope reading` lines (DESIGN §8 *A sweep's instances are
+    items*), from the typed `scope_reading` record; [] unless the task was
+    found to read two ways. Never raises."""
+    rec = state.get("scope_reading") if isinstance(state, dict) else None
+    if not (isinstance(rec, dict) and rec.get("kind") == "narrow_or_broad"):
+        return []
+    return ["The task can be read narrowly or broadly. This run did both: it "
+            "took the **broad** reading, which contains the narrow one. "
+            "Nobody was asked.", "",
+            f"- Narrow: {_pr_entry(rec.get('narrow'))}",
+            f"- Broad: {_pr_entry(rec.get('broad'))}"]
+
+
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to nine headed lists, each
+    rendered by code, from typed state*). Up to ten headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Still failing when the run ended` (what is unmet, as the
-    tests that show it: `_pr_unmet_evidence_lines`),
+    tests that show it: `_pr_unmet_evidence_lines`), `## Scope reading`
+    (the run took the broad reading of a task that reads two ways:
+    `_pr_scope_reading_lines`),
     `## Needs human verification` (typed external resources only),
     `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
@@ -8076,6 +8127,10 @@ def _format_pr_end_state_section(state: dict) -> str:
     lines = _pr_unmet_evidence_lines(state)
     if lines:
         sections.append((_UNMET_HEADING, lines))
+
+    lines = _pr_scope_reading_lines(state)
+    if lines:
+        sections.append(("## Scope reading", lines))
 
     groups = _pr_needs_human(state, in_pr)
     if groups:
@@ -34932,6 +34987,54 @@ def _site_sweep_issues(result: dict, tree: str | Path, caps: dict,
                      for x in _sweep_issues(shaped, tree, caps, cache)]
 
 
+def _reading_issues(result: dict) -> list[str]:
+    """The auditor-loop check on its `reading` (DESIGN §8 *A sweep's instances
+    are items*), for an applicable result only: two
+    readings need both described and at least one `fix` site only the broad
+    one needs that is a swept pattern (`extent: pattern` with a `sweep`) —
+    else the question would offer a choice that changes nothing measurable;
+    one reading has no `broad_only` site. Typed fields only; the sentences
+    are checked for being present, never read."""
+    if not isinstance(result, dict) or not result.get("applicable"):
+        return []
+    reading = result.get("reading")
+    kind = reading.get("kind") if isinstance(reading, dict) else None
+    sites = [s for s in result.get("sites") or [] if isinstance(s, dict)]
+    issues: list[str] = []
+    if kind == "narrow_or_broad":
+        if not all(isinstance(reading.get(k), str) and reading[k].strip()
+                   for k in ("narrow", "broad")):
+            issues.append(
+                "READING_UNDESCRIBED: `reading` — two readings need one "
+                "sentence each in `narrow` and `broad` saying what that "
+                "reading covers; the user chooses between them.")
+        # A broad reading counts only by a swept pattern: extra single files
+        # leave the rest of the pattern unenumerated (SW3 attempt 5: three
+        # component files and no sweep, so the partial sweep went unseen).
+        if not any(s.get("reading") == "broad_only"
+                   and s.get("disposition", "fix") == "fix"
+                   and s.get("extent") == "pattern"
+                   and isinstance(s.get("sweep"), dict) for s in sites):
+            issues.append(
+                "READING_BROAD_ADDS_NOTHING: `reading` — the broad reading "
+                "covers more than the narrow one, so list the pattern it "
+                "adds: at least one `fix` site typed `reading: broad_only`, "
+                "`extent: pattern`, with the `sweep` that enumerates its "
+                "places (one site per kind of place). Single files alone do "
+                "not make a broad reading. Or, if the task truly reads one "
+                "way, type `kind: one_reading`.")
+    else:
+        for n, s in enumerate(result.get("sites") or []):
+            if isinstance(s, dict) and s.get("reading") == "broad_only":
+                issues.append(
+                    f"READING_UNDECLARED: sites[{n}] — typed `broad_only`, "
+                    "but `reading.kind` is `one_reading`. If the task "
+                    "admits a narrow and a broad reading, say so in "
+                    "`reading` (`narrow_or_broad`, what each covers); "
+                    "otherwise drop the site's `reading`.")
+    return issues
+
+
 def _derive_site_sweep_items(items: list, defect_scope: object,
                              tree: str | Path, cache: dict | None = None
                              ) -> tuple[list, list[dict]]:
@@ -35798,6 +35901,44 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     return answers
 
 
+def _settle_scope_reading(st: State) -> None:
+    """Which reading of the task the run takes, and the work it derives
+    (DESIGN §8 *A sweep's instances are items*). Runs once, right after the
+    audit. The run always takes the broad reading — it does both, since the
+    broad reading contains the narrow one — and nobody is asked; every
+    audited site's sweep derives its items. `scope_reading` records the
+    outcome for the PR, and is this step's resume checkpoint."""
+    scope = st.data.get("defect_scope")
+    reading = scope.get("reading") if isinstance(scope, dict) else None
+    if not (isinstance(scope, dict) and scope.get("applicable")):
+        rec: dict = {"kind": "none"}
+    elif (isinstance(reading, dict)
+          and reading.get("kind") == "narrow_or_broad"):
+        rec = {"kind": "narrow_or_broad",
+               "narrow": reading.get("narrow", ""),
+               "broad": reading.get("broad", ""), "chosen": "broad"}
+        log("  scope reading: the task reads narrow or broad — taking the "
+            "broad reading (it contains the narrow one)")
+    else:
+        rec = {"kind": "one_reading"}
+    # Each file a site's sweep hits becomes a required item (DESIGN §8 *A
+    # sweep's instances are items*), appended after the classifier's.
+    items, site_rec = _derive_site_sweep_items(
+        st.data.get("required_items") or [], scope, _judgment_cwd(st))
+    if site_rec:
+        st.data["required_items"] = items
+        st.data["sweeps"] = [r for r in st.data.get("sweeps") or []
+                             if "site_id" not in r] + site_rec
+        for r in site_rec:
+            log(f"  sweep on site {r['site_id']} ({r['pattern']}): "
+                f"{r['instances']} instance(s) in {r['files']} file(s) — "
+                f"{len(r['derived'])} derived item(s)"
+                + (f"; enumeration failed: {r['error']}" if r["error"]
+                   else ""))
+    st.data["scope_reading"] = rec
+    st.save()
+
+
 def _absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
     """Merge --answers FILE into st.data['answers'] and propagate the
     update to existing subtask spec files. Safe to call on both initial
@@ -36526,9 +36667,9 @@ async def phase_defect_scope_audit(
     st.data["current_phase"] = "phase 2: defect-scope audit"
     st.save()
     sys_prompt = _load_prompt("defect_scope_auditor")
-    # A site's sweep is enumerated on the tree the auditor read (DESIGN §8 *A
-    # sweep's instances are items*); one enumeration per spec serves the
-    # check and the derived items.
+    # A site's sweep is checked on the tree the auditor read (DESIGN §8 *A
+    # sweep's instances are items*); its items are derived only once the
+    # reading is settled (_settle_scope_reading), on the same tree.
     sweep_tree = _judgment_cwd(st)
     sweep_cache: dict = {}
     feedback_slot: list[str] = []
@@ -36545,8 +36686,10 @@ async def phase_defect_scope_audit(
             "defect shape (the violated behavioral contract, when the "
             "cause is not yet diagnosed), enumerate every site on this "
             "tree that implements it (including bypasses — or the "
-            "candidate mechanisms, for an unconfirmed-cause report), and "
-            "give the chokepoint verdict. `applicable: false` is the "
+            "candidate mechanisms, for an unconfirmed-cause report), "
+            "give the chokepoint verdict, and say whether the task reads "
+            "one way or narrow and broad (`reading`). `applicable: false` "
+            "is the "
             "correct answer only when the task is not a defect fix at "
             "all, or the defect has a single obvious location with no "
             "competing candidate mechanisms."
@@ -36564,7 +36707,8 @@ async def phase_defect_scope_audit(
 
     result, _warnings = await _run_checked_loop(
         invoke=_invoke,
-        check=lambda r: _site_sweep_issues(r, sweep_tree, caps, sweep_cache),
+        check=lambda r: (_site_sweep_issues(r, sweep_tree, caps, sweep_cache)
+                         + _reading_issues(r)),
         name="defect_scope_auditor",
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_feedback,
@@ -36675,26 +36819,18 @@ async def phase_defect_scope_audit(
     ground_truth = _check_ground_truth_inputs(result.get("ground_truth"))
     if ground_truth is not None:
         scope["ground_truth"] = ground_truth
+    # The scope reading (DESIGN §8 *A sweep's instances are items*): kept as
+    # the auditor typed it, for _settle_scope_reading and the PR.
+    reading = result.get("reading")
+    if isinstance(reading, dict) and reading.get("kind") in SCOPE_READING_KINDS:
+        scope["reading"] = {"kind": reading["kind"],
+                            "narrow": str(reading.get("narrow") or ""),
+                            "broad": str(reading.get("broad") or "")}
     chokepoint = scope["chokepoint"]
     log(f"phase 2: defect-scope audit — {len(sites)} site(s) share the "
         "defect shape"
         + (f"; chokepoint: {chokepoint.get('symbol') or chokepoint.get('file')}"
            if chokepoint.get("exists") else "; no single chokepoint"))
-    # Each file a site's sweep hits becomes a required item (DESIGN §8 *A
-    # sweep's instances are items*), appended after the classifier's.
-    items, site_rec = _derive_site_sweep_items(
-        st.data.get("required_items") or [], scope, sweep_tree, sweep_cache)
-    if site_rec:
-        st.data["required_items"] = items
-        st.data["sweeps"] = [r for r in st.data.get("sweeps") or []
-                             if "site_id" not in r] + site_rec
-        st.save()
-        for rec in site_rec:
-            log(f"  sweep on site {rec['site_id']} ({rec['pattern']}): "
-                f"{rec['instances']} instance(s) in {rec['files']} file(s) — "
-                f"{len(rec['derived'])} derived item(s)"
-                + (f"; enumeration failed: {rec['error']}" if rec["error"]
-                   else ""))
     return scope
 
 
@@ -78889,6 +79025,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.data["defect_scope"] = await phase_defect_scope_audit(
                 task, st, caps, models, efforts)
             st.save()
+        # The scope reading (always the broad one) and the audited sites'
+        # sweep items (DESIGN §8 *A sweep's instances are items*). Its own
+        # presence-keyed checkpoint, so a resume derives nothing twice.
+        if ("scope_reading" not in st.data
+                and "plans_after_plan" not in st.data):
+            _settle_scope_reading(st)
         # Held-out acceptance sets (DESIGN §8 *Held-out acceptance tests*):
         # written from the report alone, before the plan exists. Presence-
         # keyed checkpoint like defect_scope; advisory (a failure records a

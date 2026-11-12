@@ -316,7 +316,10 @@ subtask it tests). Three mechanisms reconcile that coupling:
   sites), it warned on 3 sites, and 2 of those were claimed by
   `site_id`. Navegando 4134b78c's audited site `src/components` is a
   directory that no file path equals, and three subtasks claimed it.
-  A task that is not a defect fix pays nothing.
+  A task that is not a defect fix pays nothing. The audit also says
+  whether the task reads one way or narrow and broad, and which sites
+  only the broad reading needs; the run takes the broad reading (§8 *A
+  sweep's instances are items*).
 
   **The applicability trigger includes unconfirmed-cause reports.**
   Measured on the audit's first two live runs (one task, 2026-09-28):
@@ -7825,7 +7828,7 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most nine short lists, each under its own heading, each
+recorded into at most ten short lists, each under its own heading, each
 present only when it has an entry:
 
 - `## Unconverged` — why the PR is a draft: the outcome decider's reasons
@@ -7835,6 +7838,10 @@ present only when it has an entry:
   confirmed falsifier probe and every held-out case still failing on the
   tree that ships, each as a test the reader can run (below, *What is
   still unmet when the run ends is shown as tests the reader can run*).
+- `## Scope reading` — when the audit found that the task admits a narrow
+  and a broad reading (§8 *A sweep's instances are items*): what each
+  covers, and that the run took the broad one, which contains the narrow
+  one — it did both, and nobody was asked.
 - `## Needs human verification` — one checkbox list, grouped by the
   resource a human must supply, and only entries that carry a typed
   external resource: the task's required items the classifier typed
@@ -13097,15 +13104,35 @@ So a sweep is typed and its instances are enumerated:
   directory of the tree typed anything but `pattern` (SITE_IS_A_DIRECTORY —
   a path fact read from git, never from the site's prose). Requirement coverage is computed on the
   classifier's own items, so derived items never read as duplicates.
-- **What is left is evidence, never a count to reach zero.** At every
-  delivery pass code re-enumerates each sweep on the tree being judged and
-  hands the judge, as a typed-evidence section, each derived item's
-  instances still present (its file still holds a literal of the same kind
-  and text, however the lines moved). The judge's entry for a derived item
-  carries its `instances`. The verdict stays the judge's: a heuristic's
-  false positives would make "no instance left" unreachable, and an
-  instance that is not the defect (a log line, a format string) is met
-  with a cite saying why.
+- **When the task reads two ways, the run takes the broad reading, and
+  the PR says so.** The same words can ask for a narrow change or a
+  sweep: "the translations in the messages directory … complete for the
+  entire site" is the message files' keys to one reader and every
+  hard-coded string in the site to another. Measured (lane SW2, four
+  pre-registered benches): whenever the auditor typed the sweep, the half
+  done sweep showed as unmet items; on the samples that failed, the
+  auditor had read the task as the message files only and never listed
+  the components — no check can make a worker write a site it never
+  thought of. So the auditor reports the ambiguity as a required typed
+  field (`reading`): whether the task admits one reading or a narrow and
+  a broad one, a sentence for what each covers, and for each site whether
+  both readings need it or only the broad one. The auditor is the worker
+  that notices it because noticing takes reading the code — the broad
+  reading is visible only as the places the narrow one leaves alone; the
+  classifier read this task narrowly in every measured sample. Its check
+  loop sends back a two-reading report whose readings are not described,
+  a one-reading report with a site only a broad reading needs, and a
+  two-reading report whose broad reading adds no swept pattern: at least
+  one `fix` site only the broad reading needs must be typed `extent:
+  pattern` and carry a `sweep`. Extra single files are not a broad
+  reading — measured (lane SW3, attempt 5), one audit gave the broad
+  reading as three component files and no sweep, so nothing enumerated
+  the rest. The run then takes the broad reading — it does both, since the
+  broad reading contains the narrow one — and nobody is asked: a run is
+  not stopped, and the user not interrupted, for a choice whose safe
+  answer is known. The PR's end-state section (§6) says what each
+  reading covered and that the run took the broad one. Code reads only
+  the typed fields, never the sentences (§12 *Language-to-JSON*).
 
 Measured (lane SW2, pre-registered): on navegando at the merge of #501, the
 enumerator with a reference pair of sweeps (components; server messages
@@ -13117,7 +13144,22 @@ Precision, from a labelled sample of 100 of the 140 instances outside the
 list, was about 0.77 (0.40 for the component sweep, whose reference spec did
 not ignore the logger calls; 0.98 for the server sweep). At least 37 of the
 80 files hold a real instance. End to end (classify, plan, detection on the
-shipped tree): RESULT_E2E.
+shipped tree; navegando 4134b78c as the target, barnacle 6da090bf and web
+deb96d3e as controls; a target sample passes when a sweep's derived items
+reach the reference strings' files, planning returns, and detection confirms
+one of them unmet on the tree #501 shipped): with a sweep the classifier
+types, 0 of 6, twice; with an optional site sweep, 2 of 6; with a required
+`extent`, 4 of 6 — every sample that typed a sweep passed, the rest had
+read the task as the message files only. With the typed `reading` (lane
+SW3, attempt 5), 10 of 12, the ambiguity reported on 9; one miss gave the
+broad reading as single files. With the broad reading required to be a
+swept pattern (attempt 6, the shipped rule, 12 samples), the ambiguity was
+reported on 12 of 12 and the partial sweep shown unmet on 11 of 12; the
+miss narrowed its sweep to one directory after a too-broad send-back. The
+shipped behaviour — the broad reading taken, nobody asked — is that
+bench's unattended arm: 6 of 6 reported, 6 of 6 shown unmet. No control
+sample typed a sweep (6 per SW2 bench, 24 per SW3 attempt), and none of
+SW3's 48 reported a second reading.
 
 **Typed evidence for the delivery judge.** Two mechanical checks hand
 the judge evidence it would otherwise have to find by reading, each as

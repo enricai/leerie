@@ -143,6 +143,38 @@ you to fix, and so does a `"pattern"` site without a sweep or a site whose
 different kinds of place (components that render text, server code that
 returns messages), list one site per kind, each with its own sweep.
 
+## Does the task read one way, or narrow and broad?
+
+Some tasks' words admit two readings that differ in which places must
+change. "Make the dates in the reports module consistent — the same format
+everywhere" can mean the reports module's own formatting (narrow), or every
+place the product renders a date (broad). Which one the user meant is
+not yours to pick: the run does both, taking the broad reading. Your job is to
+notice it and lay out both. Always type `reading`:
+
+- `kind: "one_reading"` — the task's words support one scope: a bug report
+  with one symptom, a change named by its place. `narrow` and `broad` are
+  `""`. This is most tasks; do not invent a second reading.
+- `kind: "narrow_or_broad"` — the words support both a narrow scope (usually
+  the files or place the task names) and a broad one (everywhere the
+  property it states must hold). Before you answer, read the code for the
+  broad reading as carefully as for the narrow one: the broad reading's
+  places are the ones the narrow reading never looks at. Then:
+  - `narrow`: one sentence saying what the narrow reading covers;
+  - `broad`: one sentence saying what the broad reading covers;
+  - list the sites of BOTH readings, and type each site's `reading`:
+    `"both"` when either reading needs it, `"broad_only"` when only the
+    broad one does. The broad reading must add at least one pattern: a
+    `broad_only` site typed `extent: "pattern"` with the `sweep` that
+    enumerates its places (one site per kind of place, as above). A few
+    files you happened to read are not the broad reading — they are some
+    of its places; name the pattern they belong to.
+
+The run takes the broad reading, so every site you list is worked; the PR
+states both readings. A two-reading answer whose `broad_only`
+sites include no swept pattern, or with `narrow` or `broad` empty, comes back
+to you, and so does a `broad_only` site under `one_reading`.
+
 ## Unconfirmed-cause reports ARE applicable
 
 A report that describes one live symptom, says the cause is
@@ -247,11 +279,12 @@ no audit). Do not force an enumeration where there is genuinely
 nothing to enumerate — a fabricated site list sends the planner to
 files that do not need changing. But "the cause is not yet diagnosed"
 is the opposite of that case, not an instance of it. The
-not-applicable output is exactly this (`sites` is required by your
+not-applicable output is exactly this (`sites` and `reading` are required by your
 schema even when empty):
 
 ```json
-{"applicable": false, "sites": []}
+{"applicable": false, "sites": [],
+ "reading": {"kind": "one_reading", "narrow": "", "broad": ""}}
 ```
 
 ## Output
@@ -262,6 +295,7 @@ Return **only** a JSON object per your schema:
 {
   "applicable": true,
   "defect_shape": "candidate matching keys on positional index instead of the declared identity field",
+  "reading": {"kind": "one_reading", "narrow": "", "broad": ""},
   "sites": [
     {"file": "src/example_module.py", "symbol": "merge_candidates",
      "line_hint": 120, "role": "decision_site", "disposition": "fix",

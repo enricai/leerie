@@ -391,6 +391,7 @@ SITE_SWEEP = {k: v for k, v in UI_SWEEP.items() if k != "part"}
 
 def _audit_reply(sweep):
     return {"applicable": True, "defect_shape": "UI text bypasses messages",
+            "reading": {"kind": "one_reading", "narrow": "", "broad": ""},
             "sites": [
                 {"file": "messages/en.json", "symbol": "values",
                  "role": "decision_site", "disposition": "fix",
@@ -436,6 +437,10 @@ def test_the_audit_sends_back_an_empty_site_sweep_and_derives_its_items(
     assert len(prompts) == 2
     assert "SWEEP_EMPTY: sites[1].sweep" in prompts[1]
     assert scope["sites"][1]["sweep"] == SITE_SWEEP
+    # The items are derived once the reading is settled (one reading here).
+    assert st.data["required_items"] == [own]
+    st.data["defect_scope"] = scope
+    leerie._settle_scope_reading(st)
     items = st.data["required_items"]
     assert items[0] == own and len(items) == 2
     d = items[1]

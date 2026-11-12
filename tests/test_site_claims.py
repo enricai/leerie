@@ -294,14 +294,20 @@ def test_auditor_schema_requires_a_typed_resolution_kind(leerie):
             "disposition": "fix", "resolution_kind": "relink",
             "resolution": "route into the existing path",
             "extent": "one_place"}
-    _validate(schema, {"applicable": True, "sites": [site]})
+    one = {"kind": "one_reading", "narrow": "", "broad": ""}
+    _validate(schema, {"applicable": True, "sites": [site], "reading": one})
+    # The reading is required (DESIGN §11 *A task that reads narrow or broad
+    # is asked about once*).
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"applicable": True, "sites": [site]}, schema)
     for bad in ({**site, "resolution_kind": "retry"},
                 {k: v for k, v in site.items() if k != "resolution_kind"},
                 {k: v for k, v in site.items() if k != "extent"},
                 {**site, "extent": "many"},
                 {**site, "site_id": "D1"}):
         with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate({"applicable": True, "sites": [bad]}, schema)
+            jsonschema.validate({"applicable": True, "sites": [bad],
+                                 "reading": one}, schema)
 
 
 # === wiring: the real audit stamps IDs ======================================
