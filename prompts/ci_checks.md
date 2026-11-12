@@ -16,10 +16,11 @@ file you cite) and is simply dropped.
 - Git hooks that block a push or commit: `.husky/*`, `.pre-commit-config.yaml`,
   `lefthook.yml`, `.git-hooks/`.
 - Package manifests (`package.json` scripts, `Makefile` targets, `pyproject.toml`,
-  `tox.ini`, `noxfile.py`) — only to RESOLVE what a CI step or hook calls
-  (e.g. what a `run lint` script actually executes, and whether a test runner
-  config declares coverage thresholds). Do not list a manifest script that no
-  CI step or hook invokes.
+  `tox.ini`, `noxfile.py`) — only to learn what a CI step or hook's call does
+  (its `kind`, its `strict_argv`, and whether a test runner config declares
+  coverage thresholds). What you read there never replaces the call: the
+  check is the call as the CI file or hook writes it. Do not list a manifest
+  script that no CI step or hook invokes.
 - Test-runner configs (vitest/jest config files, `pyproject.toml`
   coverage sections, `.coveragerc`, `setup.cfg`) to decide whether a coverage
   run **enforces a threshold** (fails below a number) or only reports.
@@ -27,7 +28,20 @@ file you cite) and is simply dropped.
 ## What to emit
 
 Return a JSON object with `checks` and `excluded`. One entry in `checks` per
-distinct command a merge-gating job step or blocking hook runs:
+command a merge-gating job step or blocking hook runs, recorded from the file
+that runs it:
+
+- The command is the one that file writes. A script call stays the script
+  call (`npm run lint` stays `npm run lint`), never the command its manifest
+  entry resolves to: a script can set its own environment and flags, so the
+  resolved command is a different check.
+- Each file's commands are its own entries. When a hook and a CI step (or two
+  workflows) run the same command, or commands that do the same thing, list
+  each one, citing its own file, with that file's triggers only. Never merge
+  them into one entry and never add one file's triggers to another file's
+  entry: leerie merges entries that run exactly the same thing itself.
+
+Each entry:
 
 - `id`: a short unique name for the check.
 - `kind`: one of `"build"`, `"lint"`, `"format"`, `"typecheck"`, `"test"`,
@@ -62,7 +76,8 @@ distinct command a merge-gating job step or blocking hook runs:
     removed — remove words, never add or change one.
   - `"all"`: all it does needs root (a system package install, `sudo …`).
     `rootless_argv` is `[]`.
-- `trigger`: the events that run it — any of `"pull_request"`,
+- `trigger`: the events that run it from the file it cites (a hook file's
+  hook, a CI file's events) — any of `"pull_request"`,
   `"push_default_branch"`, `"push_other"`, `"pre_push_hook"`,
   `"pre_commit_hook"`, `"schedule"`, `"manual"`, `"tag"`.
 - `path_filters`: the `paths:` globs restricting when it runs, verbatim; `[]` if
@@ -78,8 +93,9 @@ distinct command a merge-gating job step or blocking hook runs:
   runs `<tool> check src`, the strict form calls the tool directly with the
   flag. Only add flags — every other token must come from the CI file or the
   manifest that resolves it, and the flag must not write files.
-- `source`: `{file, job, step}` — the repo-relative file path you read it from
-  and the job and step names. The orchestrator checks that every `argv`,
+- `source`: `{file, job, step}` — the repo-relative path of the CI file or
+  hook that runs the command (never a manifest that resolves it) and the job
+  and step names. The orchestrator checks that every `argv`,
   prerequisite and `env` token appears in that file.
 - `coverage`: for a `"coverage"` check, `{summary_path, config_file,
   thresholds}` — `summary_path` the JSON summary the run writes (the
@@ -96,6 +112,7 @@ is NOT a merge gate, each `{file, job, reason}` with `reason` one of
 `"deploy"`, `"release"`, `"schedule_only"`, `"manual_only"`, `"push_only"`,
 `"reporting_only"`, `"duplicate"`, `"external_action"`, `"other"`.
 
-Be exhaustive over merge-gating jobs, including matrix entries (emit one entry
-per distinct command, keeping a matrix placeholder verbatim) and jobs
-restricted by path filters. Return only the structured output.
+Be exhaustive over merge-gating jobs and blocking hooks, including matrix
+entries and jobs restricted by path filters. Within one file, emit one entry
+per distinct command (keeping a matrix placeholder verbatim). Return only the
+structured output.

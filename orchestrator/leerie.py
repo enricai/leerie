@@ -50990,6 +50990,27 @@ def _ci_strict_problems(check: dict, tree: Path) -> list[str]:
     return probs
 
 
+def _ci_run_key(check: dict) -> str:
+    """What a check runs, as one comparable string: everything that reaches
+    its plain command or its judgment, nothing that only says where the
+    worker read it or when it runs (DESIGN §9 *A check is the command its
+    file runs*). The strict form is not in it: it only ever adds to the
+    plain check, so twins merge and the kept one takes the other's strict
+    form when it has none (`_ci_select`). Mechanical (typed fields)."""
+    return json.dumps([
+        check.get("kind"),
+        [str(a) for a in (check.get("argv") or [])],
+        os.path.normpath((check.get("cwd") or ".").strip() or "."),
+        sorted((str(e.get("name") or ""), str(e.get("value") or ""))
+               for e in (check.get("env") or [])),
+        [[argv, os.path.normpath((p.get("cwd") or ".").strip() or ".")]
+         for p in (check.get("prerequisites") or [])
+         if (argv := _ci_prereq_argv(p)) is not None],
+        sorted(str(r) for r in (check.get("requires") or [])),
+        check.get("coverage") if check.get("kind") == "coverage" else None,
+    ], sort_keys=True)
+
+
 def _ci_select(checks: list[dict], tree: Path,
                forbidden: list[str | dict] | tuple = ()) -> list[dict]:
     """One record per discovered check, with `selected` and, when not, the
@@ -50997,10 +51018,14 @@ def _ci_select(checks: list[dict], tree: Path,
     `external_resource`, `db_reset` (its argv pushes to or resets a
     database — `_ci_runs_db_reset`), `forbidden_by_task` (its argv runs a
     command the task forbids — never run, so never judged), `provenance`
-    (with `problems`). A forbidden `strict_argv` is dropped
-    (`strict_forbidden`), and so is one that fails its own provenance
-    (`strict_problems`); either way the check is judged on its plain argv —
-    a strict form never takes the plain check down with it."""
+    (with `problems`), `duplicate` (with `duplicate_of`: it runs exactly
+    what an earlier selected check runs — `_ci_run_key`; the worker lists
+    each file's commands apart, and only code merges them, DESIGN §9 *A
+    check is the command its file runs*; the kept check takes a twin's
+    strict form when its own has none, `strict_from` naming the twin). A forbidden `strict_argv` is
+    dropped (`strict_forbidden`), and so is one that fails its own
+    provenance (`strict_problems`); either way the check is judged on its
+    plain argv — a strict form never takes the plain check down with it."""
     forbidden = list(forbidden)
 
     def _hit(argv: object) -> str | None:
@@ -51010,6 +51035,7 @@ def _ci_select(checks: list[dict], tree: Path,
                                       forbidden)
     out: list[dict] = []
     seen: set[str] = set()
+    runs: dict[str, dict] = {}
     reset_pats = _db_reset_rule_patterns(tree)
     for i, c in enumerate(checks):
         rec = {k: c.get(k) for k in (
@@ -51046,6 +51072,16 @@ def _ci_select(checks: list[dict], tree: Path,
                 if sprobs:
                     rec["strict_problems"] = sprobs[:10]
                     rec["strict_argv"] = None
+                key = _ci_run_key(rec)
+                if key in runs:
+                    kept = runs[key]
+                    rec.update({"selected": False, "reason": "duplicate",
+                                "duplicate_of": kept["id"]})
+                    if rec.get("strict_argv") and not kept.get("strict_argv"):
+                        kept["strict_argv"] = rec["strict_argv"]
+                        kept["strict_from"] = cid
+                else:
+                    runs[key] = rec
         out.append(rec)
     return out
 
@@ -51611,7 +51647,9 @@ async def _capture_ci_parity_baseline(
         if not r["selected"]:
             log(f"  ci parity: {r['id']} not run — {r['reason']}"
                 + (f" ({'; '.join(r.get('problems') or [])[:200]})"
-                   if r.get("problems") else ""))
+                   if r.get("problems") else "")
+                + (f" (runs what {r['duplicate_of']} runs)"
+                   if r.get("duplicate_of") else ""))
         elif r.get("strict_forbidden") or r.get("strict_problems"):
             why = (f"forbidden by the task ({r['strict_forbidden']})"
                    if r.get("strict_forbidden") else

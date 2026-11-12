@@ -20784,7 +20784,11 @@ on the final tree:
    checks: `kind`, the `argv` exactly as the step runs it, `cwd`, literal
    `env`, prerequisites, `trigger`s, `requires` (external resources), a
    `strict_argv` (the warnings-as-errors form) and, for a coverage check,
-   its typed thresholds. It runs only when such a file exists. Code then
+   its typed thresholds. It runs only when such a file exists. Each entry
+   is one command as one file runs it, citing that file: a script call
+   stays the script call, and a hook and a CI step are two entries even
+   when they run the same command (*A check is the command its file
+   runs*, below). Code then
    checks **provenance**: every argv token, prerequisite token and env value
    must appear verbatim (whitespace-collapsed) in the CI file the check
    cites; a strict form's non-flag tokens must appear in that file or a
@@ -20946,6 +20950,62 @@ plain command passes provenance is selected and judged at the baseline as
 any other; a strict form that fails provenance is dropped by itself
 (`strict_argv` null, its problems recorded as `strict_problems`), exactly
 as a strict form the task forbids already was.
+
+**A check is the command its file runs.** *Built 2026-11-12 (lane HK;
+found by lane BP).* **Root cause.** The worker was asked for "one entry per
+distinct command" and to read manifests "to resolve what a CI step or hook
+calls", so it judged two different command lines the same command once it
+had resolved one of them, and kept one entry for both. funeralworks'
+pre-push hook runs `pnpm run typecheck`, whose script is
+`NODE_OPTIONS=--max-old-space-size=4096 tsc --noEmit`; its CI step runs
+`pnpm exec tsc --noEmit` under the job's own environment. In 5 of 15
+draws of the worker on that commit (lane BP's bench) it kept only the CI
+step, with `pre_push_hook` added to its triggers, and the hook's own
+command was in none of them. In 26 of the 27 recorded runs with CI parity
+(barnacle, navegando, web) a check citing a workflow carries a hook
+trigger: 18 are barnacle's `pnpm run lint`, which its hook runs word for
+word; 8 are navegando's and web's `pnpm exec tsc --noEmit`, which their
+hooks run without the job's environment; and in 2 barnacle runs the hook's
+`pnpm exec tsc --noEmit` was recorded as the workflow's `pnpm run
+typecheck` and never run. A hook trigger on a check citing a CI file is a
+claim no provenance rule reads: the argv is traced to the workflow, the
+hook is not, so whatever the hook really runs is never run. Resolving the
+script call and running the result is not the fix either: the script's
+own environment and flags are the script's, and a resolved command is
+leerie's translation of the check, not the check. **Invariant:** every
+check's `argv` is a command line the file it cites runs, written as that
+file writes it — a script call is recorded as the call, never as what the
+script resolves to — and each file's commands are entries of their own,
+with only that file's triggers. A manifest is still read for what only it
+says: a strict form (*A strict form that fails provenance drops alone*)
+and a coverage check's thresholds.
+
+Merging is code's, and literal. Two selected checks that run the same
+thing — the same `kind`, `argv`, `cwd`, `env`, prerequisites as they run
+(one that needs only root runs nothing and is left out), `requires` and
+coverage — run once: the later one is not selected,
+`reason: "duplicate"`, `duplicate_of` the first one's id. The strict form
+is not part of what is compared: it only ever adds to the plain check, so
+when the kept check has none left and its twin does, the kept one takes
+it (`strict_from`) — barnacle's hook and workflow both run `pnpm run lint`,
+and only the hook's strict form traces (its `exec` appears in the hook,
+not the workflow). So a
+hook that runs exactly what a CI step runs still costs one run, as it did
+when the worker merged them; a hook that runs the same tool another way,
+or under another environment, is a check of its own.
+
+Benched (lane HK, pre-registered; the real `ci_checks` worker, confined, 6
+samples per repository on the commits lane BP benched — navegando,
+barnacle, web, api, funeralworks — against the prompt before this rule).
+Every hook command and its paired workflow command recorded word for word
+from its own file: 30 of 30 samples (6 of 6 on each repository), against 1
+of 30 before. Checks citing a workflow while carrying a hook trigger: 0,
+against 35. No check the control selected in at least 4 of its 6 samples
+went missing. Checks selected per sample, before → after: navegando 5–6 →
+5–7 and web 5 → 6 (the hook's `tsc`, which runs without the job's
+environment), funeralworks 9–11 → 11 (the hook's own `pnpm run
+typecheck`), barnacle 5–6 → 5 and api 4 → 4 (identical hook and workflow
+commands merged by code).
 
 **A prerequisite runs in the form that needs no root.** *Built 2026-11-09
 (lane BP).* **Root cause.** CI parity turns a CI step into a command leerie
