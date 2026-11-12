@@ -613,6 +613,62 @@ _host_finalize_rebase_repo() {
   return 0
 }
 
+# _host_finalize_refresh_pr <run-json> — bring an open PR up to its run's
+# re-decided outcome (DESIGN §6 *An open PR follows its run's re-decided
+# outcome*). Acts only when `pr_refresh` is an object, which `resume` writes
+# (`_redecide_after_operator_acceptance`) after the operator accepted
+# held-out cases of a finished, pushed run: the PR body's end-state section
+# as the PR was opened (`end_state_was`) is replaced with run.json's
+# `pr_end_state` (appended when the body no longer holds the old text), and
+# a draft is marked ready when the outcome is no longer `unconverged`. The
+# PR is edited, never re-created; nothing is pushed. A failure is said and
+# keeps `pr_refresh`, so the next finalize tries again. Never fails the
+# caller.
+_host_finalize_refresh_pr() {
+  local run_json="$1"
+  [ "$(jq -r '.pr_refresh | type' "$run_json" 2>/dev/null || true)" = "object" ] || return 0
+  local url outcome
+  url="$(jq -r '.pr_url // ""' "$run_json" 2>/dev/null || true)"
+  outcome="$(jq -r '.pr_refresh.outcome // ""' "$run_json" 2>/dev/null || true)"
+  if [ -z "$url" ]; then
+    echo "[leerie] finalize: the run's outcome changed, but run.json names no PR to update" >&2
+    return 0
+  fi
+  local _gd view body was new new_body
+  _gd="$(git -C "$USER_REPO" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  # gh runs from `/` and finds the repository through GIT_DIR and
+  # GIT_WORK_TREE (DESIGN §6 *The host never runs a program the checkout
+  # chose*), as `gh pr create` does below.
+  if ! view="$( ( cd / && GIT_DIR="$_gd" GIT_WORK_TREE="$USER_REPO" gh pr view "$url" --json body,isDraft ) 2>&1 )"; then
+    echo "⚠  could not read PR $(_terminal_safe "$url") to update its end state; it is left as it was (finalize tries again):" >&2
+    printf '%s\n' "$view" | sed 's/^/    /' | _terminal_relay >&2
+    return 0
+  fi
+  body="$(printf '%s' "$view" | jq -r '.body // ""')"
+  was="$(jq -r '.pr_refresh.end_state_was // ""' "$run_json")"
+  new="$(jq -r '.pr_end_state // ""' "$run_json")"
+  # A literal substring swap, done by jq (split/join on the exact text): the
+  # end-state section is leerie's own rendering, never interpreted.
+  new_body="$(jq -rn --arg b "$body" --arg w "$was" --arg n "$new" '
+    if ($w != "") and ($b | contains($w)) then ($b | split($w) | join($n))
+    else $b + "\n\n" + $n end')"
+  if ! printf '%s' "$new_body" | ( cd / && GIT_DIR="$_gd" GIT_WORK_TREE="$USER_REPO" gh pr edit "$url" --body-file - ) >/dev/null 2>&1; then
+    echo "⚠  could not update the end state of PR $(_terminal_safe "$url"); it is left as it was (finalize tries again)" >&2
+    return 0
+  fi
+  echo "[leerie] finalize: updated the end state of PR $(_terminal_safe "$url") (outcome: $(_terminal_safe "$outcome"))" >&2
+  if [ "$outcome" != "unconverged" ] \
+     && [ "$(printf '%s' "$view" | jq -r '.isDraft // false')" = "true" ]; then
+    if ! ( cd / && GIT_DIR="$_gd" GIT_WORK_TREE="$USER_REPO" gh pr ready "$url" ) >/dev/null 2>&1; then
+      echo "⚠  could not mark PR $(_terminal_safe "$url") ready for review; it stays a draft (finalize tries again)" >&2
+      return 0
+    fi
+    echo "[leerie] finalize: marked PR $(_terminal_safe "$url") ready for review" >&2
+  fi
+  _host_finalize_update_run_json "$run_json" "pr_refresh="
+  return 0
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
@@ -651,6 +707,10 @@ host_finalize() {
   # branch here (duplicated with the block below) rather than reordering
   # the whole function, keeping the change surgical.
   if [ -n "$(jq -r '.pushed_at // ""' "$run_json")" ]; then
+    # An open PR follows its run's re-decided outcome, whatever the branch
+    # push below decides (DESIGN §6 *An open PR follows its run's
+    # re-decided outcome*).
+    _host_finalize_refresh_pr "$run_json"
     local _rb _lt _ot
     _rb="$(jq -r '.branch // ""' "$run_json")"
     if [ -n "$_rb" ] && git -C "$USER_REPO" rev-parse --verify "refs/heads/$_rb" >/dev/null 2>&1; then

@@ -7554,6 +7554,18 @@ catches stale states, and Claude Code's OAuth token is in Keychain rather
 than any mountable file. Moving the network-y phases to the host
 eliminates all of that — the host already has working git/gh/ssh auth.
 
+**An open PR follows its run's re-decided outcome.** A finished run's
+outcome is decided again only when the operator has accepted held-out cases
+since it was decided (§8 *An operator accepts a held-out case the task does
+not require*). When that run's PR is already open, the PR would otherwise
+keep saying what the run no longer says: so `resume` records in `run.json`
+the end-state section the PR was opened with, and the host, finding the run
+already pushed, replaces that section in the PR's body with the new one (or
+appends the new one when the body no longer holds the old text) and, when the
+outcome is no longer `unconverged`, marks the draft ready. A host that cannot
+do it says so and keeps the request, so the next `finalize` tries again. The
+PR is edited, never re-created, and nothing is pushed.
+
 **Local runs** hand off through `run.json` on the bind-mounted host
 filesystem. The orchestrator writes `finished_at` and exits 0; the
 launcher reads that field and proceeds with push + PR. If the container
@@ -7829,7 +7841,7 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most ten short lists, each under its own heading, each
+recorded into at most eleven short lists, each under its own heading, each
 present only when it has an entry:
 
 - `## Unconverged` — why the PR is a draft: the outcome decider's reasons
@@ -7839,6 +7851,10 @@ present only when it has an entry:
   confirmed falsifier probe and every held-out case still failing on the
   tree that ships, each as a test the reader can run (below, *What is
   still unmet when the run ends is shown as tests the reader can run*).
+- `## Held-out cases accepted by the operator` — each held-out case the
+  operator accepted as not required by the task (§8 *An operator accepts a
+  held-out case the task does not require*), by set, file and name, said to
+  be the operator's call and not leerie's.
 - `## Scope reading` — when the audit found that the task admits a narrow
   and a broad reading (§8 *A sweep's instances are items*): what each
   covers, and that the run took the broad one, which contains the narrow
@@ -18538,6 +18554,93 @@ report or rewording the task.
 repository code and so stays inside leerie's confinement; the statuses above are
 read, not executed. The re-run, its statuses and the no-work exit are exercised
 only by the test suite, on small real repositories.
+
+**An operator accepts a held-out case the task does not require
+(`accept-heldout`).** The settled bar ends over-reach only on a task that has
+ended `done` once. On a task that never finished, every run still draws fresh
+sets, and a counted case that asks for more than the task (a declared-name
+rebinding, a fallback the report rules out, a delay outside the report's
+range) is unfinished work for as long as it fails: it drives a plan at the
+own start, a repair at the gate, a draft PR at the end and the next run's
+residual. Three lanes looked for a rule that tells such a case from a genuine
+one without a person, and none was found:
+
+- *a worker, reading the case against what an earlier run accepted* (lane SB):
+  the `set_auditor` dropped 2 of 17 hand-labelled bad cases (above);
+- *the scope judge, listing each case's added conditions* (lane SJ): on 29
+  held-out inputs labelled blind, genuine cases kept fell from 40 to 30 of 51
+  while variants counted fell from 3 to 1 of 37 — test scaffolding and
+  renamed values read as additions;
+- *a mechanical signal* (lane OR, frozen bar: genuine cases kept ≥ 95 %,
+  non-genuine dropped ≥ 50 %, every run holding a genuine case keeps work,
+  on a selection and a fresh corpus): no case-level signal met it (best
+  within-run AUC 0.64, the recorded scope judge's 0.79); a run-level failing
+  fraction ranks runs (AUC 0.93 and 1.00) but with a one-case margin, and
+  leaves 43bd4671, 396c84e3 and 8aa14a04 above any line that keeps the
+  genuine runs; and "no held-out case ever blocks" changes 1 of 30 recorded
+  finished outcomes (d8aff199, and only with its two unmet items also clear).
+
+So the judgement is the operator's, made by name and recorded: `leerie
+accept-heldout <run-id> <set>[/<case>] …` accepts held-out cases of one run as
+not required by its task. It is the third accept verb, beside `accept-blocked`
+and `accept-integration`, and like them it changes the run's state and nothing
+else; `resume` acts on it.
+
+- *Per case, or a whole set.* A token `<set>/<case>` names one case of set
+  `<set>`, by the name the PR's `## Still failing when the run ended` section
+  shows (the part of its case ID after ` :: `) or by its whole ID; a bare
+  `<set>` names every case of that set. Per case because work is already
+  counted per case (*A task that points at a report is bounded by the report's
+  own scenarios*: a variant left failing beside a passing counted case is not
+  work), and one set holds both kinds (d8aff199's set 4 ended failing on one
+  counted case, labelled over-reach, while its three other counted cases
+  passed). A set that
+  is not bounded counts per file — a failing file is work whatever its cases
+  — so a case of one cannot be withdrawn on its own; only the whole set can.
+- *What it changes.* An accepted case leaves its set's counted cases, exactly
+  as a case the scope judge typed `other_scenario` does, so every reader that
+  already reads only counted cases stops counting it: the no-work settle, the
+  already-fixed check, the satisfied-probe protection, the delivery re-drive,
+  the run outcome, the unmet evidence, the settled bar a `done` run records,
+  and the next same-task run's residual. A whole set leaves with all its
+  counted cases (a set that was not bounded becomes bounded with none, as the
+  settled bar's withdrawal does). One thing differs from a variant: an
+  accepted case is not repaired. The gate's repair rounds run only while a
+  failure that is not accepted remains, and an accepted case's name is not
+  handed to them or to the next run's planner. A variant is repaired because
+  nobody has said it is not wanted; here the operator has, and a repair or
+  plan aimed at over-reach changes code the task never asked to change — on
+  REST-GET it brought a real regression (43bd4671, above).
+- *What it refuses.* A run, set or case that does not exist (the case must be
+  one the run recorded for that set), a name that matches cases in two files,
+  a case of a set that is not bounded, and a set of a regressed settled bar
+  — those are tests that passed when the task last ended `done`, and the way
+  past a bar is to edit the report or reword the task (*Done is a fixed bar
+  per task*). A case already outside the counted cases (a variant, a set typed
+  broken, a case accepted before) changes nothing and is said so. The verb
+  takes the run directory's lock, as `State` does, so it refuses while an
+  orchestrator owns the run: that orchestrator's next save would overwrite it.
+- *Never silent.* The set keeps the record — each accepted case with its file
+  and time, and the scope it had before — and the PR's end state carries
+  `## Held-out cases accepted by the operator`, listing each by set, file and
+  name and saying that the operator, not leerie, decided they are not
+  required. The cases stay in the evidence: a set's own record, its files and
+  every verdict are kept as they were measured.
+- *On resume.* A run that has not finished reads the acceptance wherever it
+  resumes. A run that has finished re-decides its outcome on its record — no
+  phase runs again and no worker is called — and re-renders its unmet
+  evidence and end state; when its PR is already open, the host replaces the
+  end-state section in the PR's body and, when the outcome is no longer
+  `unconverged`, marks the draft ready (§6 *Finalization*). A run that ends
+  `done` this way records the task's settled bar from it, so later runs of
+  the task withhold their fresh failures as advisory: the acceptance ends the
+  churn, not only this run's draft.
+- *Not a cross-run rule.* A later run writes fresh sets whose cases have other
+  names; nothing matches them to an accepted case, which would need a
+  judgement this rule exists to avoid. The bar a `done` run records is what
+  carries forward. A set the audit rewrites after an acceptance is a new set
+  (its scope is typed afresh), and the acceptance stays with the tests it
+  named.
 
 **A case has one name in every tree.** A set runs in several trees: its
 validation and its scope judge in its own (`acceptance-N`,

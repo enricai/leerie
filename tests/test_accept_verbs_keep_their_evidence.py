@@ -136,7 +136,7 @@ class TestAcceptIntegration:
         assert stat.S_IMODE(os.stat(st).st_mode) == 0o644
 
 
-@pytest.mark.parametrize("name", ["_ab_mutate", "_ai_mutate"])
+@pytest.mark.parametrize("name", ["_ab_mutate", "_ai_mutate", "_ah_mutate"])
 def test_no_apostrophes_in_the_mutator_bodies(name):
     """These live inside SINGLE-QUOTED shell strings.
 

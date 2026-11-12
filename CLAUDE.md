@@ -379,6 +379,12 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 # instead of re-reaching the same verdict forever:
 ./leerie accept-integration <run-id> <subtask-id>
 
+# Accept held-out cases as not required by the task (over-reach no rule can
+# tell apart): a set number, or <set>/<case> by the name the PR shows. resume
+# stops counting them, re-decides a finished run's outcome and updates its PR,
+# which lists them as the operator's call:
+./leerie accept-heldout <run-id> <set>[/<case>] ...
+
 # Reclaim disk. Only idle runs' worktrees are reaped automatically (at
 # preflight, after 7 idle days); everything else waits for prune. Dry-run by default.
 ./leerie prune                        # show what would go
