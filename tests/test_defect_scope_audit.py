@@ -144,7 +144,12 @@ def _drive_phase_plan(leerie, monkeypatch, st):
 
     async def fake_claude_p(**kwargs):
         calls.append(kwargs)
+        # Every audited site excluded, typed: an unclaimed site would stop
+        # the run (DESIGN §5), and this test is about the planner's prompt.
         return {"domain": "bug-fixing", "status": "ready", "subtasks": [],
+                "sites_not_needed": [
+                    {"site_id": f"D{i}", "reason_kind": "outside_task",
+                     "reason": "stub"} for i in (1, 2)],
                 "confidence": {"task_understanding": 9.0,
                                "decomposition_quality": 9.0,
                                "basis": "stub"}}

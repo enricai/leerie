@@ -393,6 +393,13 @@ DEFAULT_CAPS = {
     # the pack stays within this many items. Bench Q7/D1 arm (c): real
     # false unmet 3/116 against 23/50 for one prompt over every item.
     "d1_pack_items": 20,
+    # Sweep enumeration limits (DESIGN §8 *A sweep's instances are items*):
+    # a classifier sweep whose pattern matches more instances, or more
+    # files, than these on the base tree is sent back to be narrowed — a
+    # pattern that broad is a reading of the whole tree, not a sweep. Each
+    # file with hits becomes one derived required item.
+    "sweep_max_instances": 500,
+    "sweep_max_files": 80,
     # Independent `falsifier` samples per judged required item on the final
     # tree (DESIGN §8 *Delivery detection*): the item is unmet when any one
     # is confirmed by code. Bench Q2 F+ (held-out, 31 targets / 148
@@ -639,6 +646,14 @@ STATE_FIELDS = (
     # claimed too, and the plan accounts for every one*), for the log and
     # the PR.
     "item_coverage",
+    # sweeps: per classifier sweep, what its enumeration found on the base
+    # tree and which derived required items it made (DESIGN §8 *A sweep's
+    # instances are items*).
+    "sweeps",
+    # scope_reading: which reading of the task the run took (DESIGN §8 *A
+    # sweep's instances are items*); also the resume checkpoint of
+    # _settle_scope_reading.
+    "scope_reading",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -2760,9 +2775,11 @@ def _planner_defs() -> dict:
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["site_id", "reason"],
+                "required": ["site_id", "reason_kind", "reason"],
                 "properties": {
                     "site_id": {"type": "string"},
+                    "reason_kind": {"type": "string",
+                                    "enum": list(SITE_EXCLUSION_KINDS)},
                     "reason": {"type": "string", "minLength": 1},
                 },
             },
@@ -2786,6 +2803,32 @@ def _planner_defs() -> dict:
         "blocker_kind": {"type": "string",
                          "enum": list(PLANNER_BLOCKER_KINDS)},
     }
+
+
+def _sweep_spec_schema(extra: dict | None = None) -> dict:
+    """A sweep's typed pattern (DESIGN §8 *A sweep's instances are items*),
+    shared by the classifier's `required_items[].sweeps[]` (with `part`) and
+    the defect-scope auditor's `sites[].sweep`."""
+    props: dict = {
+        "pattern": {"type": "string", "enum": list(SWEEP_PATTERNS)},
+        # `call`: the callees whose call sites are the instances.
+        "names": {"type": "array", "items": {"type": "string"}},
+        # Repo-relative globs (`**` crosses directories).
+        "paths": {"type": "array", "items": {"type": "string"}},
+        "exclude_paths": {"type": "array", "items": {"type": "string"}},
+        # Callees whose literal arguments are not instances (a translation
+        # call, a class-name helper, a logger).
+        "ignore_calls": {"type": "array", "items": {"type": "string"}},
+        # Attribute / property names whose values are not instances.
+        "ignore_attributes": {"type": "array", "items": {"type": "string"}},
+        # When non-empty, a literal is an instance only if it holds one: a
+        # word equal to a marker, or a one-character marker anywhere.
+        "markers": {"type": "array", "items": {"type": "string"}},
+    }
+    props.update(extra or {})
+    return {"type": "object",
+            "required": [*(extra or {}), "pattern", "paths"],
+            "properties": props}
 
 
 def _production_evidence_schema() -> dict:
@@ -2980,6 +3023,23 @@ ITEM_CLAIM_KINDS = ("deliverable", "process")
 # already carries it" is no exclusion: no plan-time check of it is sound, so
 # such an item is claimed by a change subtask that settles as a no-op.
 ITEM_EXCLUSION_KINDS = ("other_domain",)
+# Why a plan leaves an audited `fix` site alone (DESIGN §5 *Every `fix` site
+# is claimed*): the site already holds the contract on this tree, another
+# claimed site's change covers it, or the audit's site is not the task's.
+# An unclaimed site without one of these stops the run before execution.
+SITE_EXCLUSION_KINDS = ("holds_on_tree", "covered_by_other_site",
+                        "outside_task")
+# What a classifier sweep enumerates (DESIGN §8 *A sweep's instances are
+# items*): hard-coded natural-language text, or the call sites of named
+# callees. Code enumerates either structurally (tree-sitter); the classifier
+# only says which, and where.
+SWEEP_PATTERNS = ("text_literal", "call")
+# The scope reading (DESIGN §8 *A sweep's instances are items*): the auditor
+# says whether the task's words admit one reading or a narrow and a broad
+# one, and which sites only the broad reading needs. The run always takes
+# the broad reading, which contains the narrow one; nobody is asked.
+SCOPE_READING_KINDS = ("one_reading", "narrow_or_broad")
+SITE_READINGS = ("both", "broad_only")
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
@@ -3239,6 +3299,17 @@ SCHEMAS: dict[str, dict] = {
                         # `git diff` in code at the delivery gate.
                         "untouched_paths": {"type": "array",
                                             "items": {"type": "string"}},
+                        # A part that holds at EVERY place a pattern occurs
+                        # (DESIGN §8 *A sweep's instances are items*): the
+                        # classifier says which part and what pattern; code
+                        # enumerates the instances on the base tree and
+                        # makes each file with hits a derived item.
+                        "sweeps": {
+                            "type": "array",
+                            # One of `parts` (or the item text), verbatim.
+                            "items": _sweep_spec_schema(
+                                {"part": {"type": "string"}}),
+                        },
                     },
                 },
             },
@@ -4760,12 +4831,31 @@ SCHEMAS: dict[str, dict] = {
         # a fix campaign never looks at.
         "type": "object",
         "additionalProperties": False,
-        "required": ["applicable", "sites"],
+        # reading (DESIGN §8 *A sweep's instances are items*): required, so
+        # whether the task reads two ways is
+        # decided on every audit rather than noticed on some — the extent
+        # precedent. Measured (SW2 bench 4): on 2 of 6 audits of a task that
+        # reads two ways, the auditor took the narrow reading and never
+        # listed the broad one's sites.
+        "required": ["applicable", "sites", "reading"],
         "$defs": {
             "resolution_kind": {"type": "string",
                                 "enum": list(SITE_RESOLUTION_KINDS)},
         },
         "properties": {
+            # What each reading covers, one sentence each ("" with
+            # one_reading) — shown to the user verbatim, never read by code.
+            "reading": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["kind", "narrow", "broad"],
+                "properties": {
+                    "kind": {"type": "string",
+                             "enum": list(SCOPE_READING_KINDS)},
+                    "narrow": {"type": "string"},
+                    "broad": {"type": "string"},
+                },
+            },
             # False only when the task is not a defect fix at all (a
             # feature, a doc change) or the defect has a single obvious
             # location with no competing candidate mechanisms;
@@ -4790,8 +4880,13 @@ SCHEMAS: dict[str, dict] = {
                     # mechanical consequence. The evidence goes in `note`,
                     # not a new required string: free-form strings are
                     # the strict grammar's expensive element (§7).
+                    # extent (DESIGN §8 *A sweep's instances are items*):
+                    # whether the site is one place or one pattern in many
+                    # places — required, so the decision is made for every
+                    # site rather than noticed for some (the optional
+                    # `sweep` alone was written on 1 of 6 measured audits).
                     "required": ["file", "symbol", "role", "disposition",
-                                 "resolution_kind"],
+                                 "resolution_kind", "extent"],
                     "properties": {
                         "file": {"type": "string"},
                         "symbol": {"type": "string"},
@@ -4808,6 +4903,18 @@ SCHEMAS: dict[str, dict] = {
                         # assigned by code, never here.
                         "resolution_kind": {"$ref": "#/$defs/resolution_kind"},
                         "resolution": {"type": "string"},
+                        # A site that is one pattern repeated across many
+                        # places (DESIGN §8 *A sweep's instances are
+                        # items*): code enumerates it, and each file with
+                        # instances becomes a required item.
+                        "extent": {"type": "string",
+                                   "enum": ["one_place", "pattern"]},
+                        "sweep": _sweep_spec_schema(),
+                        # Which reading needs the site (absent: both). The
+                        # run takes the broad reading, so every site is kept;
+                        # the field feeds the auditor's check loop.
+                        "reading": {"type": "string",
+                                    "enum": list(SITE_READINGS)},
                     },
                 },
             },
@@ -7329,6 +7436,7 @@ _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
     _UNMET_HEADING,
+    "## Scope reading",
     "## Needs human verification",
     "## Not verified by this run",
     "## Untested after re-drive",
@@ -7942,13 +8050,29 @@ def _pr_unmet_evidence_lines(state: dict) -> list[str]:
     return out
 
 
+def _pr_scope_reading_lines(state: dict) -> list[str]:
+    """The PR's `## Scope reading` lines (DESIGN §8 *A sweep's instances are
+    items*), from the typed `scope_reading` record; [] unless the task was
+    found to read two ways. Never raises."""
+    rec = state.get("scope_reading") if isinstance(state, dict) else None
+    if not (isinstance(rec, dict) and rec.get("kind") == "narrow_or_broad"):
+        return []
+    return ["The task can be read narrowly or broadly. This run did both: it "
+            "took the **broad** reading, which contains the narrow one. "
+            "Nobody was asked.", "",
+            f"- Narrow: {_pr_entry(rec.get('narrow'))}",
+            f"- Broad: {_pr_entry(rec.get('broad'))}"]
+
+
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to nine headed lists, each
+    rendered by code, from typed state*). Up to ten headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Still failing when the run ended` (what is unmet, as the
-    tests that show it: `_pr_unmet_evidence_lines`),
+    tests that show it: `_pr_unmet_evidence_lines`), `## Scope reading`
+    (the run took the broad reading of a task that reads two ways:
+    `_pr_scope_reading_lines`),
     `## Needs human verification` (typed external resources only),
     `## Not verified by this run`, `## Untested after re-drive`,
     `## Integration content loss`, `## Repository merge checks still red`,
@@ -8003,6 +8127,10 @@ def _format_pr_end_state_section(state: dict) -> str:
     lines = _pr_unmet_evidence_lines(state)
     if lines:
         sections.append((_UNMET_HEADING, lines))
+
+    lines = _pr_scope_reading_lines(state)
+    if lines:
+        sections.append(("## Scope reading", lines))
 
     groups = _pr_needs_human(state, in_pr)
     if groups:
@@ -34403,6 +34531,590 @@ def _d1_needs_human_verification(items: list) -> list[dict]:
             if isinstance(it, dict) and it.get("verifiability") == "external"]
 
 
+# --- Sweeps: a part that holds at every place a pattern occurs (DESIGN §8
+# *A sweep's instances are items*) ------------------------------------------
+#
+# The classifier types the sweep (`required_items[*].sweeps`); code finds its
+# instances. Files are chosen by glob over the tree's own path list and parsed
+# with tree-sitter, so an instance is a syntax node, never a regex hit on
+# prose. Each file with instances becomes one derived required item, its
+# instances its parts: a sweep left half done is then a set of unmet items the
+# delivery gate can see, where one broad part was judged as a whole and read
+# `met` (navegando 4134b78c).
+
+# tree-sitter grammars the sweep reads, by `tslp.detect_language` name.
+_SWEEP_LANGS = frozenset({"tsx", "typescript", "javascript", "python"})
+_SWEEP_CALL_NODES = frozenset({"call_expression", "new_expression", "call"})
+_SWEEP_FUNC_NODES = frozenset({
+    "arrow_function", "function_expression", "function_declaration",
+    "function", "method_definition", "generator_function_declaration",
+    "function_definition", "lambda"})
+_SWEEP_SKIP_PARENTS = frozenset({
+    "import_statement", "export_statement", "import_from_statement",
+    "literal_type", "switch_case", "subscript_expression", "case_clause",
+    "external_module_reference",
+    # A string standing as a statement of its own (a Python docstring).
+    "block", "module"})
+_SWEEP_COMPARE_OPS = frozenset({"===", "!==", "==", "!=", "in", "not in"})
+
+
+def _sweep_glob_re(glob: str) -> re.Pattern:
+    """A repo-relative path glob as a regex over a `/`-separated path: `**`
+    crosses directories, `*` and `?` do not. Mechanical: the input is a path
+    pattern."""
+    out, i = [], 0
+    g = glob.strip()
+    if g.startswith("./"):
+        g = g[2:]
+    while i < len(g):
+        if g.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif g.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif g[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif g[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(g[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _sweep_is_text(s: str) -> bool:
+    """Whether a literal's own characters have the shape of natural-language
+    text rather than of an identifier, key, path, class list or enum value.
+    Character classes only — it never decides what the text means: that the
+    text is a defect is the classifier's typed sweep, and `markers` are its
+    words, not code's."""
+    t = " ".join(s.split())
+    if not re.search(r"[^\W\d_]{2}", t):
+        return False
+    if "://" in t or t.startswith(("/", "./", "../", "#", "@", "--")):
+        return False
+    toks = t.split(" ")
+    if len(toks) == 1:
+        # Sentence punctuation around a lone word ("Guardando...", "¿Seguro?")
+        # is not part of its shape.
+        tok = re.sub(r"[.…!?:;,]+\Z", "", re.sub(r"\A[¿¡+]+", "", toks[0]))
+        if re.search(r"[._:/\\=<>{}\[\]|$%^~]", tok):
+            return False
+        if any(c.isalpha() and ord(c) > 127 for c in tok):
+            return True
+        if "-" in tok:
+            return False
+        word = re.sub(r"[^\w]+\Z", "", tok)
+        return (len(word) >= 2 and word[0].isupper()
+                and word[1:] == word[1:].lower() and word[1:].isalpha())
+    codeish = sum(bool(re.search(r"[-:/\[\]=_.]\S", x) or re.search(
+        r"[\[\]{}=]", x)) for x in toks)
+    return codeish * 2 < len(toks)
+
+
+def _sweep_has_marker(s: str, markers: list[str]) -> bool:
+    """A literal holds a marker: a word equal to one (case-folded), or a
+    one-character marker anywhere. Set membership on the literal's words."""
+    if not markers:
+        return True
+    low = s.casefold()
+    words = set(re.findall(r"[^\W\d_]+", low))
+    for m in markers:
+        m = m.casefold().strip()
+        if not m:
+            continue
+        if (len(m) == 1 and m in low) or m in words:
+            return True
+    return False
+
+
+def _sweep_node_text(node: object) -> tuple[str, str] | None:
+    """`(kind, text)` of a literal node, or None. JSX text, a quoted string,
+    a template string or f-string (its literal fragments, the substitutions
+    as a gap)."""
+    t = node.type
+    if t == "jsx_text":
+        return "jsx_text", node.text.decode("utf-8", "replace")
+    if t in ("string", "template_string"):
+        frags = [c.text.decode("utf-8", "replace") for c in node.children
+                 if c.type in ("string_fragment", "string_content",
+                               "escape_sequence")]
+        subs = any(c.type in ("template_substitution", "interpolation")
+                   for c in node.children)
+        kind = "template" if (t == "template_string" or subs) else "string"
+        return kind, " ".join(frags) if subs else "".join(frags)
+    return None
+
+
+def _sweep_callee(call: object) -> str:
+    fn = call.child_by_field_name("function") or call.child_by_field_name(
+        "constructor")
+    return fn.text.decode("utf-8", "replace") if fn is not None else ""
+
+
+def _sweep_name_hit(callee: str, names: set[str]) -> bool:
+    return callee in names or callee.rsplit(".", 1)[-1] in names
+
+
+def _sweep_ignored(node: object, ignore_calls: set[str],
+                   ignore_attrs: set[str]) -> bool:
+    """Whether the literal's place in the syntax tree says it is not shown
+    text: an import source, a type, a directive or docstring, a compared or
+    indexed value, an object key, or a value under an ignored attribute or
+    an ignored callee (up to the enclosing function)."""
+    parent = node.parent
+    if parent is None:
+        return True
+    if parent.type in _SWEEP_SKIP_PARENTS:
+        return True
+    if parent.type == "expression_statement" and parent.named_child_count == 1:
+        return True
+    if parent.type in ("binary_expression", "comparison_operator"):
+        op = parent.child_by_field_name("operator")
+        ops = {c.type for c in parent.children}
+        if (op is not None and op.type in _SWEEP_COMPARE_OPS) or (
+                ops & _SWEEP_COMPARE_OPS):
+            return True
+    if parent.type == "pair" and parent.child_by_field_name("key") == node:
+        return True
+    cur, child = parent, node
+    while cur is not None and cur.type not in _SWEEP_FUNC_NODES:
+        if cur.type in _SWEEP_CALL_NODES:
+            args = cur.child_by_field_name("arguments")
+            if (args is not None and child == args
+                    and _sweep_name_hit(_sweep_callee(cur), ignore_calls)):
+                return True
+        elif cur.type in ("jsx_attribute", "pair", "keyword_argument"):
+            key = (cur.child_by_field_name("key")
+                   or cur.child_by_field_name("name")
+                   or (cur.children[0] if cur.children else None))
+            name = key.text.decode("utf-8", "replace") if key else ""
+            if name.strip("\"'") in ignore_attrs:
+                return True
+        child, cur = cur, cur.parent
+    return False
+
+
+def _sweep_file_instances(path: str, source: bytes, sweep: dict) -> list[dict] | None:
+    """The sweep's instances in one file, or None when no grammar the sweep
+    reads parses it."""
+    try:
+        import tree_sitter_language_pack as tslp  # noqa: PLC0415
+        from tree_sitter import Parser  # noqa: PLC0415
+        lang = tslp.detect_language(path)
+        if lang not in _SWEEP_LANGS:
+            return None
+        tree = Parser(tslp.get_language(lang)).parse(source)
+    except Exception:
+        return None
+    pattern = sweep.get("pattern")
+    ignore_calls = {str(x) for x in sweep.get("ignore_calls") or [] if x}
+    ignore_attrs = {str(x) for x in sweep.get("ignore_attributes") or [] if x}
+    markers = [str(x) for x in sweep.get("markers") or [] if x]
+    names = {str(x) for x in sweep.get("names") or [] if x}
+    out: list[dict] = []
+    stack = [tree.root_node]
+    while stack:
+        n = stack.pop()
+        if pattern == "call":
+            if n.type in _SWEEP_CALL_NODES and _sweep_name_hit(
+                    _sweep_callee(n), names):
+                out.append({"file": path, "line": n.start_point[0] + 1,
+                            "node": "call",
+                            "text": " ".join(n.text.decode(
+                                "utf-8", "replace").split())[:120]})
+        else:
+            got = _sweep_node_text(n)
+            if got is not None:
+                kind, text = got
+                text = " ".join(text.split())
+                if (text and _sweep_is_text(text)
+                        and _sweep_has_marker(text, markers)
+                        and not _sweep_ignored(n, ignore_calls, ignore_attrs)):
+                    out.append({"file": path, "line": n.start_point[0] + 1,
+                                "node": kind, "text": text[:200]})
+                if kind != "template":
+                    continue
+        stack.extend(reversed(n.children))
+    out.sort(key=lambda r: r["line"])
+    return out
+
+
+def _sweep_enumerate(tree: str | Path, sweep: dict,
+                     rev: str = "HEAD") -> dict:
+    """Enumerate one sweep over the committed tree `rev` of `tree` (never its
+    working files): `{instances, files, unparsed, error}`. Paths come from
+    `git ls-tree`, matched against the sweep's globs in Python, and blobs
+    from one `git cat-file --batch` — no pathspec reaches git."""
+    res: dict = {"instances": [], "files": [], "unparsed": [], "error": ""}
+    inc = [_sweep_glob_re(g) for g in sweep.get("paths") or []
+           if isinstance(g, str) and g.strip()]
+    exc = [_sweep_glob_re(g) for g in sweep.get("exclude_paths") or []
+           if isinstance(g, str) and g.strip()]
+    if not inc or sweep.get("pattern") not in SWEEP_PATTERNS:
+        res["error"] = "no paths or an unknown pattern"
+        return res
+    ls = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r", "-z",
+                         "--full-tree", rev], capture_output=True)
+    if ls.returncode:
+        res["error"] = f"git ls-tree: {ls.stderr.decode(errors='replace')[:200]}"
+        return res
+    blobs: list[tuple[str, str]] = []
+    for ent in ls.stdout.split(b"\0"):
+        if not ent or b"\t" not in ent:
+            continue
+        meta, p = ent.split(b"\t", 1)
+        parts = meta.split()
+        if len(parts) < 3 or parts[1] != b"blob":
+            continue
+        path = p.decode("utf-8", "replace")
+        if any(r.match(path) for r in inc) and not any(
+                r.match(path) for r in exc):
+            blobs.append((path, parts[2].decode()))
+    if not blobs:
+        return res
+    cat = subprocess.run(["git", *_tree_git_args(tree), "cat-file", "--batch"],
+                         input="".join(f"{sha}\n" for _, sha in blobs).encode(),
+                         capture_output=True)
+    if cat.returncode:
+        res["error"] = "git cat-file failed"
+        return res
+    buf, pos = cat.stdout, 0
+    for path, _sha in blobs:
+        nl = buf.index(b"\n", pos)
+        head = buf[pos:nl].split()
+        size = int(head[2]) if len(head) == 3 else 0
+        body = buf[nl + 1:nl + 1 + size]
+        pos = nl + 1 + size + 1
+        found = _sweep_file_instances(path, body, sweep)
+        if found is None:
+            res["unparsed"].append(path)
+            continue
+        if found:
+            res["files"].append(path)
+            res["instances"].extend(found)
+    return res
+
+
+def _sweep_specs(item: object) -> list[dict]:
+    """The item's well-formed sweeps (a dict with a known pattern and paths)."""
+    if not isinstance(item, dict):
+        return []
+    return [s for s in item.get("sweeps") or []
+            if isinstance(s, dict) and s.get("pattern") in SWEEP_PATTERNS
+            and isinstance(s.get("paths"), list) and s["paths"]]
+
+
+def _sweep_issues(result: dict, tree: str | Path, caps: dict,
+                  cache: dict | None = None) -> list[str]:
+    """The classifier-loop check on its sweeps (DESIGN §8 *A sweep's
+    instances are items*): a sweep must name one of its item's parts (or the
+    item text) verbatim, match something on the base tree, and stay within
+    `sweep_max_instances` / `sweep_max_files`."""
+    issues: list[str] = []
+    max_i = int(caps.get("sweep_max_instances",
+                         DEFAULT_CAPS["sweep_max_instances"]))
+    max_f = int(caps.get("sweep_max_files", DEFAULT_CAPS["sweep_max_files"]))
+    for n, it in enumerate(result.get("required_items") or []):
+        if not isinstance(it, dict):
+            continue
+        for k, sw in enumerate(_sweep_specs(it)):
+            where = f"required_items[{n}].sweeps[{k}]"
+            if sw.get("part") not in [it.get("item"), *(it.get("parts") or [])]:
+                issues.append(
+                    f"SWEEP_PART_UNKNOWN: {where} — `part` must copy one of "
+                    "the item's `parts` (or its `item` text) verbatim.")
+            if sw.get("pattern") == "call" and not sw.get("names"):
+                issues.append(f"SWEEP_EMPTY: {where} — a `call` sweep needs "
+                              "the callee `names`.")
+                continue
+            got = _sweep_enumerate_cached(tree, sw, cache)
+            if got["error"]:
+                continue
+            if not got["instances"]:
+                issues.append(
+                    f"SWEEP_EMPTY: {where} — the pattern matches nothing on "
+                    f"this tree ({len(got['unparsed'])} file(s) under its "
+                    "paths could not be parsed). Fix `paths`, `markers` or "
+                    "the ignore lists so it finds what the part covers, or "
+                    "drop the sweep if the part is not one.")
+            elif (len(got["instances"]) > max_i
+                  or len(got["files"]) > max_f):
+                issues.append(
+                    f"SWEEP_TOO_BROAD: {where} — {len(got['instances'])} "
+                    f"instance(s) in {len(got['files'])} file(s) (limits "
+                    f"{max_i} / {max_f}). Narrow `paths`, or add the callees "
+                    "and attributes whose literals are not the defect to "
+                    "`ignore_calls` / `ignore_attributes`, or `markers`.")
+    return issues
+
+
+def _sweep_enumerate_cached(tree: str | Path, sweep: dict,
+                            cache: dict | None, rev: str = "HEAD") -> dict:
+    key = (str(tree), rev, json.dumps(
+        {k: v for k, v in sweep.items() if k != "part"}, sort_keys=True))
+    if cache is not None and key in cache:
+        return cache[key]
+    got = _sweep_enumerate(tree, sweep, rev)
+    if cache is not None:
+        cache[key] = got
+    return got
+
+
+def _sweep_part_text(inst: dict) -> str:
+    return (f"{inst['file']}:{inst['line']} {inst['node']} "
+            + json.dumps(inst["text"], ensure_ascii=False))
+
+
+def _sweep_derived(out: list, got: dict, sweep: dict, text: str,
+                   anchor: dict, origin: dict) -> list[int]:
+    """Append one derived item per file of `got` to `out`; their indices.
+    Each carries `sweep_of` = `origin` + {file, spec} — the spec is copied so
+    every later pass re-enumerates exactly what derived it."""
+    by_file: dict[str, list[dict]] = {}
+    for inst in got["instances"]:
+        by_file.setdefault(inst["file"], []).append(inst)
+    spec = {k: v for k, v in sweep.items() if k != "part"}
+    made: list[int] = []
+    for f in sorted(by_file):
+        insts = by_file[f]
+        made.append(len(out))
+        out.append({
+            "item": f"{text} — at every instance in {f} ({len(insts)})",
+            **anchor,
+            "verifiability": "tree",
+            "parts": [_sweep_part_text(x) for x in insts],
+            "sweep_of": {**origin, "file": f, "spec": spec},
+            "instances": insts,
+        })
+    return made
+
+
+def _derive_sweep_items(items: list, tree: str | Path, caps: dict,
+                        cache: dict | None = None) -> tuple[list, list[dict]]:
+    """`items` plus one derived required item per file each classifier
+    sweep's enumeration hits on `tree` (DESIGN §8 *A sweep's instances are
+    items*), appended after the classifier's own so their indices never
+    move; and the per-sweep record. A derived item carries `sweep_of`
+    {item_index, sweep, part, file, spec}, its instances (structured, for
+    re-enumeration) and, as `parts`, one line per instance — what every
+    planner, judge and falsifier reads. Every derived item from an earlier
+    call is dropped first."""
+    own = [it for it in items
+           if not (isinstance(it, dict) and it.get("sweep_of"))]
+    out = list(own)
+    record: list[dict] = []
+    for i, it in enumerate(own):
+        for k, sw in enumerate(_sweep_specs(it)):
+            got = _sweep_enumerate_cached(tree, sw, cache)
+            record.append({
+                "item_index": i, "sweep": k, "part": sw.get("part") or "",
+                "pattern": sw.get("pattern"),
+                "instances": len(got["instances"]),
+                "files": len(got["files"]),
+                "unparsed": got["unparsed"][:50], "error": got["error"],
+                "derived": _sweep_derived(
+                    out, got, sw, sw.get("part") or str(it.get("item") or ""),
+                    {"span": it.get("span"),
+                     **({"source_ref": it["source_ref"]}
+                        if it.get("source_ref") else {})},
+                    {"item_index": i, "sweep": k,
+                     "part": sw.get("part") or ""})})
+    return out, record
+
+
+def _site_sweep_specs(defect_scope: object) -> list[tuple[dict, dict]]:
+    """`(site, sweep)` for every audited `fix` site carrying a well-formed
+    sweep, in site order."""
+    out: list[tuple[dict, dict]] = []
+    for site in _scope_sites(defect_scope):
+        sw = site.get("sweep")
+        if (site.get("disposition", "fix") == "fix" and isinstance(sw, dict)
+                and _sweep_specs({"sweeps": [sw]})):
+            out.append((site, sw))
+    return out
+
+
+def _tree_dirs(tree: str | Path, rev: str = "HEAD") -> set[str] | None:
+    """Every directory of the committed tree `rev` (from `git ls-tree -r -d`),
+    or None when git cannot answer."""
+    ls = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r", "-d",
+                         "-z", "--name-only", "--full-tree", rev],
+                        capture_output=True)
+    if ls.returncode:
+        return None
+    return {p.decode("utf-8", "replace") for p in ls.stdout.split(b"\0") if p}
+
+
+def _site_sweep_issues(result: dict, tree: str | Path, caps: dict,
+                       cache: dict | None = None) -> list[str]:
+    """The auditor-loop check on its sites' extent and sweeps (DESIGN §8 *A
+    sweep's instances are items*): a `fix` site typed `extent: pattern`
+    needs a `sweep`; a `fix` site whose `file` is a directory of the tree is
+    a pattern, never one place (a path fact, read from git); and every sweep
+    must pass what `_sweep_issues` asks of a classifier sweep, part aside,
+    named by `sites[<n>].sweep`."""
+    issues: list[str] = []
+    dirs = None
+    for n, s in enumerate(result.get("sites") or []):
+        if not isinstance(s, dict) or s.get("disposition", "fix") != "fix":
+            continue
+        if s.get("extent") == "pattern" and not isinstance(s.get("sweep"),
+                                                           dict):
+            issues.append(
+                f"SWEEP_MISSING: sites[{n}] — `extent: pattern` names a "
+                "pattern in many places; give it the `sweep` that enumerates "
+                "them.")
+        elif s.get("extent") != "pattern" and isinstance(s.get("file"), str):
+            if dirs is None:
+                dirs = _tree_dirs(tree) or set()
+            if s["file"].strip().strip("/") in dirs:
+                issues.append(
+                    f"SITE_IS_A_DIRECTORY: sites[{n}] — `{s['file']}` is a "
+                    "directory, so the site is a pattern across its files: "
+                    "type `extent: pattern` with a `sweep`, or name the one "
+                    "file it is.")
+    shaped = {"required_items": [
+        {"item": "", "sweeps": [{**s["sweep"], "part": ""}]}
+        if isinstance(s, dict) and isinstance(s.get("sweep"), dict)
+        and s.get("disposition", "fix") == "fix" else {}
+        for s in result.get("sites") or []]}
+    return issues + [re.sub(r"required_items\[(\d+)\]\.sweeps\[0\]",
+                            r"sites[\1].sweep", x)
+                     for x in _sweep_issues(shaped, tree, caps, cache)]
+
+
+def _reading_issues(result: dict) -> list[str]:
+    """The auditor-loop check on its `reading` (DESIGN §8 *A sweep's instances
+    are items*), for an applicable result only: two
+    readings need both described and at least one `fix` site only the broad
+    one needs that is a swept pattern (`extent: pattern` with a `sweep`) —
+    else the question would offer a choice that changes nothing measurable;
+    one reading has no `broad_only` site. Typed fields only; the sentences
+    are checked for being present, never read."""
+    if not isinstance(result, dict) or not result.get("applicable"):
+        return []
+    reading = result.get("reading")
+    kind = reading.get("kind") if isinstance(reading, dict) else None
+    sites = [s for s in result.get("sites") or [] if isinstance(s, dict)]
+    issues: list[str] = []
+    if kind == "narrow_or_broad":
+        if not all(isinstance(reading.get(k), str) and reading[k].strip()
+                   for k in ("narrow", "broad")):
+            issues.append(
+                "READING_UNDESCRIBED: `reading` — two readings need one "
+                "sentence each in `narrow` and `broad` saying what that "
+                "reading covers; the user chooses between them.")
+        # A broad reading counts only by a swept pattern: extra single files
+        # leave the rest of the pattern unenumerated (SW3 attempt 5: three
+        # component files and no sweep, so the partial sweep went unseen).
+        if not any(s.get("reading") == "broad_only"
+                   and s.get("disposition", "fix") == "fix"
+                   and s.get("extent") == "pattern"
+                   and isinstance(s.get("sweep"), dict) for s in sites):
+            issues.append(
+                "READING_BROAD_ADDS_NOTHING: `reading` — the broad reading "
+                "covers more than the narrow one, so list the pattern it "
+                "adds: at least one `fix` site typed `reading: broad_only`, "
+                "`extent: pattern`, with the `sweep` that enumerates its "
+                "places (one site per kind of place). Single files alone do "
+                "not make a broad reading. Or, if the task truly reads one "
+                "way, type `kind: one_reading`.")
+    else:
+        for n, s in enumerate(result.get("sites") or []):
+            if isinstance(s, dict) and s.get("reading") == "broad_only":
+                issues.append(
+                    f"READING_UNDECLARED: sites[{n}] — typed `broad_only`, "
+                    "but `reading.kind` is `one_reading`. If the task "
+                    "admits a narrow and a broad reading, say so in "
+                    "`reading` (`narrow_or_broad`, what each covers); "
+                    "otherwise drop the site's `reading`.")
+    return issues
+
+
+def _derive_site_sweep_items(items: list, defect_scope: object,
+                             tree: str | Path, cache: dict | None = None
+                             ) -> tuple[list, list[dict]]:
+    """`items` (site-derived items from an earlier call dropped) plus one
+    derived required item per file each audited site's sweep hits on
+    `tree`, and the per-site record. `sweep_of` = {site_id, file, spec}."""
+    out = [it for it in items if not (
+        isinstance(it, dict) and isinstance(it.get("sweep_of"), dict)
+        and "site_id" in it["sweep_of"])]
+    record: list[dict] = []
+    for site, sw in _site_sweep_specs(defect_scope):
+        got = _sweep_enumerate_cached(tree, sw, cache)
+        text = (f"Audited defect site {site['site_id']} "
+                f"({site.get('symbol') or site.get('file')}) is resolved: "
+                + (site.get("resolution") or "")).rstrip(": ")
+        record.append({
+            "site_id": site["site_id"], "pattern": sw.get("pattern"),
+            "instances": len(got["instances"]),
+            "files": len(got["files"]), "unparsed": got["unparsed"][:50],
+            "error": got["error"],
+            "derived": _sweep_derived(out, got, sw, text,
+                                      {"source_ref": site["site_id"]},
+                                      {"site_id": site["site_id"]})})
+    return out, record
+
+
+def _sweep_still_present(items: list, tree: str | Path,
+                         rev: str = "HEAD") -> dict[int, list[dict]]:
+    """Per derived item, its base instances still on `tree` at `rev`: the
+    sweep re-enumerated there, an instance present when its file still holds
+    one of the same kind with the same text (as many times as the base did).
+    Evidence for the delivery judge, never a verdict."""
+    out: dict[int, list[dict]] = {}
+    cache: dict = {}
+    for idx, it in enumerate(items):
+        so = it.get("sweep_of") if isinstance(it, dict) else None
+        if not isinstance(so, dict) or not _sweep_specs(
+                {"sweeps": [so.get("spec")]}):
+            continue
+        got = _sweep_enumerate_cached(tree, so["spec"], cache, rev)
+        if got["error"]:
+            continue
+        now: dict[tuple[str, str], int] = {}
+        for x in got["instances"]:
+            if x["file"] == so.get("file"):
+                key = (x["node"], x["text"])
+                now[key] = now.get(key, 0) + 1
+        left: list[dict] = []
+        for x in it.get("instances") or []:
+            key = (x.get("node"), x.get("text"))
+            if now.get(key, 0) > 0:
+                now[key] -= 1
+                left.append(x)
+        out[idx] = left
+    return out
+
+
+def _sweep_evidence_section(items: list, present: dict[int, list[dict]]
+                            ) -> str:
+    """The delivery judge's SWEEP INSTANCES section, or "" when no derived
+    item has an instance left."""
+    rows = []
+    for idx in sorted(present):
+        left = present[idx]
+        if not left:
+            continue
+        total = len((items[idx] or {}).get("instances") or [])
+        rows.append(f"item {idx}: {len(left)} of {total} still present — "
+                    + "; ".join(_sweep_part_text(x) for x in left[:40])
+                    + (f"; … {len(left) - 40} more" if len(left) > 40 else ""))
+    if not rows:
+        return ""
+    return ("SWEEP INSTANCES STILL PRESENT (code re-ran each sweep's "
+            "enumeration on this tree; an instance is listed when its file "
+            "still holds a literal of the same kind and text. Evidence, not a "
+            "verdict: an instance that is not the defect the item names — not "
+            "shown to a user, say — can still be met, with a cite that shows "
+            "why):\n" + "\n".join(rows))
+
+
 def _d1_judge_packs(items: list[dict], indices: list[int],
                     spans: list[dict], limit: int) -> list[list[int]]:
     """Cut the judge-bound item indices into delivery-judge prompts
@@ -34530,13 +35242,19 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     # A report with no requirement section is asked about once: a second
     # "no requirement" stands, since a named file can be pure background.
     checks_run = [0]
+    # Sweeps are enumerated on the tree the classifier read (DESIGN §8 *A
+    # sweep's instances are items*); one enumeration per spec serves the
+    # check and the derived items.
+    sweep_tree = _judgment_cwd(st)
+    sweep_cache: dict = {}
 
     def _check(r: dict) -> list[str]:
         checks_run[0] += 1
         return (check_classifier_output(r, repo_root,
                                         judge_confirmed=judge_confirmed)
                 + _d1_coverage_holes(r, units,
-                                     ask_report=checks_run[0] == 1))
+                                     ask_report=checks_run[0] == 1)
+                + _sweep_issues(r, sweep_tree, caps, sweep_cache))
 
     async def _invoke() -> dict:
         st.bump_workers(caps)
@@ -34638,7 +35356,21 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         log("  and what those package scripts run: " + ", ".join(derived))
     items = [it for it in result.get("required_items") or []
              if isinstance(it, dict)]
+    # Each file a sweep's enumeration hits becomes a derived item, appended
+    # after the classifier's own (DESIGN §8 *A sweep's instances are
+    # items*).
+    items, sweep_rec = _derive_sweep_items(items, sweep_tree, caps,
+                                           sweep_cache)
     st.data["required_items"] = items
+    st.data["sweeps"] = sweep_rec
+    for rec in sweep_rec:
+        log(f"  sweep on item {rec['item_index']} ({rec['pattern']}): "
+            f"{rec['instances']} instance(s) in {rec['files']} file(s) — "
+            f"{len(rec['derived'])} derived item(s)"
+            + (f"; {len(rec['unparsed'])} file(s) unparsed"
+               if rec["unparsed"] else "")
+            + (f"; enumeration failed: {rec['error']}" if rec["error"]
+               else ""))
     residual = _d1_holes(result, units, ask_report=False)
     st.data["requirement_coverage"] = {
         "spans": [{"id": s_["id"], "parent": s_["parent"]}
@@ -35167,6 +35899,44 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     st.data["answers"] = answers
     st.save()
     return answers
+
+
+def _settle_scope_reading(st: State) -> None:
+    """Which reading of the task the run takes, and the work it derives
+    (DESIGN §8 *A sweep's instances are items*). Runs once, right after the
+    audit. The run always takes the broad reading — it does both, since the
+    broad reading contains the narrow one — and nobody is asked; every
+    audited site's sweep derives its items. `scope_reading` records the
+    outcome for the PR, and is this step's resume checkpoint."""
+    scope = st.data.get("defect_scope")
+    reading = scope.get("reading") if isinstance(scope, dict) else None
+    if not (isinstance(scope, dict) and scope.get("applicable")):
+        rec: dict = {"kind": "none"}
+    elif (isinstance(reading, dict)
+          and reading.get("kind") == "narrow_or_broad"):
+        rec = {"kind": "narrow_or_broad",
+               "narrow": reading.get("narrow", ""),
+               "broad": reading.get("broad", ""), "chosen": "broad"}
+        log("  scope reading: the task reads narrow or broad — taking the "
+            "broad reading (it contains the narrow one)")
+    else:
+        rec = {"kind": "one_reading"}
+    # Each file a site's sweep hits becomes a required item (DESIGN §8 *A
+    # sweep's instances are items*), appended after the classifier's.
+    items, site_rec = _derive_site_sweep_items(
+        st.data.get("required_items") or [], scope, _judgment_cwd(st))
+    if site_rec:
+        st.data["required_items"] = items
+        st.data["sweeps"] = [r for r in st.data.get("sweeps") or []
+                             if "site_id" not in r] + site_rec
+        for r in site_rec:
+            log(f"  sweep on site {r['site_id']} ({r['pattern']}): "
+                f"{r['instances']} instance(s) in {r['files']} file(s) — "
+                f"{len(r['derived'])} derived item(s)"
+                + (f"; enumeration failed: {r['error']}" if r["error"]
+                   else ""))
+    st.data["scope_reading"] = rec
+    st.save()
 
 
 def _absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
@@ -35897,6 +36667,16 @@ async def phase_defect_scope_audit(
     st.data["current_phase"] = "phase 2: defect-scope audit"
     st.save()
     sys_prompt = _load_prompt("defect_scope_auditor")
+    # A site's sweep is checked on the tree the auditor read (DESIGN §8 *A
+    # sweep's instances are items*); its items are derived only once the
+    # reading is settled (_settle_scope_reading), on the same tree.
+    sweep_tree = _judgment_cwd(st)
+    sweep_cache: dict = {}
+    feedback_slot: list[str] = []
+
+    async def _on_feedback(fb: str) -> dict:
+        feedback_slot[:] = [fb]
+        return {}
 
     async def _invoke() -> dict:
         st.bump_workers(caps)
@@ -35906,12 +36686,14 @@ async def phase_defect_scope_audit(
             "defect shape (the violated behavioral contract, when the "
             "cause is not yet diagnosed), enumerate every site on this "
             "tree that implements it (including bypasses — or the "
-            "candidate mechanisms, for an unconfirmed-cause report), and "
-            "give the chokepoint verdict. `applicable: false` is the "
+            "candidate mechanisms, for an unconfirmed-cause report), "
+            "give the chokepoint verdict, and say whether the task reads "
+            "one way or narrow and broad (`reading`). `applicable: false` "
+            "is the "
             "correct answer only when the task is not a defect fix at "
             "all, or the defect has a single obvious location with no "
             "competing candidate mechanisms."
-        )
+        ) + "".join("\n\n" + fb for fb in feedback_slot)
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
             schema_key="defect_scope_auditor", cwd=_judgment_cwd(st),
@@ -35924,9 +36706,15 @@ async def phase_defect_scope_audit(
         )
 
     result, _warnings = await _run_checked_loop(
-        invoke=_invoke, check=lambda _r: [], name="defect_scope_auditor",
+        invoke=_invoke,
+        check=lambda r: (_site_sweep_issues(r, sweep_tree, caps, sweep_cache)
+                         + _reading_issues(r)),
+        name="defect_scope_auditor",
         max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_feedback,
     )
+    for w in _warnings:
+        log(f"  defect_scope_auditor: {w}")
     if result is None:
         log("  defect-scope audit: worker crashed every round; degrading "
             "(planners run without the site enumeration) — non-fatal")
@@ -36031,6 +36819,13 @@ async def phase_defect_scope_audit(
     ground_truth = _check_ground_truth_inputs(result.get("ground_truth"))
     if ground_truth is not None:
         scope["ground_truth"] = ground_truth
+    # The scope reading (DESIGN §8 *A sweep's instances are items*): kept as
+    # the auditor typed it, for _settle_scope_reading and the PR.
+    reading = result.get("reading")
+    if isinstance(reading, dict) and reading.get("kind") in SCOPE_READING_KINDS:
+        scope["reading"] = {"kind": reading["kind"],
+                            "narrow": str(reading.get("narrow") or ""),
+                            "broad": str(reading.get("broad") or "")}
     chokepoint = scope["chokepoint"]
     log(f"phase 2: defect-scope audit — {len(sites)} site(s) share the "
         "defect shape"
@@ -36073,11 +36868,17 @@ def _site_claim_rows(plan: dict, defect_scope: dict) -> list[dict]:
                      if isinstance(k, str)]
             claims.setdefault(c["site_id"], []).append(
                 {"sid": str(s.get("id", "?")), "kinds": kinds})
+    # An exclusion counts only typed (DESIGN §5 *An audited site the plan
+    # leaves alone is excluded with a typed reason, or the run stops*).
     not_needed: dict[str, str] = {}
+    not_needed_kind: dict[str, str] = {}
     for n in plan.get("sites_not_needed") or []:
         if (isinstance(n, dict) and isinstance(n.get("site_id"), str)
-                and isinstance(n.get("reason"), str) and n["reason"].strip()):
-            not_needed.setdefault(n["site_id"], n["reason"].strip())
+                and n.get("reason_kind") in SITE_EXCLUSION_KINDS
+                and isinstance(n.get("reason"), str) and n["reason"].strip()
+                and n["site_id"] not in not_needed):
+            not_needed[n["site_id"]] = n["reason"].strip()
+            not_needed_kind[n["site_id"]] = n["reason_kind"]
     rows: list[dict] = []
     for site in _scope_sites(defect_scope):
         if site.get("disposition", "fix") != "fix":
@@ -36107,6 +36908,7 @@ def _site_claim_rows(plan: dict, defect_scope: dict) -> list[dict]:
             "resolution": site.get("resolution") or "",
             "claims": cl,
             "not_needed": None if cl else not_needed.get(sid),
+            "not_needed_kind": None if cl else not_needed_kind.get(sid),
             "status": status,
             "surface_other": surface_other,
         })
@@ -36135,8 +36937,10 @@ def _check_site_claims(result: dict, defect_scope: object) -> list[str]:
                 f"`fix` site no `change_kind: \"fix\"` subtask claims; "
                 f"{want}. Claim it in `claims.sites` of the fix subtask "
                 "that changes it, with every resolution kind that change "
-                "applies there, or list it in `sites_not_needed` with the "
-                "reason it needs no change.")
+                "applies there, or list it in `sites_not_needed` with a "
+                "`reason_kind` (" + ", ".join(SITE_EXCLUSION_KINDS)
+                + ") and the code evidence in `reason`. A site left "
+                "unclaimed stops the run before anything executes.")
         elif r["status"] == "mismatch":
             got = "; ".join(f"{c['sid']}: {', '.join(c['kinds']) or '-'}"
                             for c in r["claims"])
@@ -36147,6 +36951,27 @@ def _check_site_claims(result: dict, defect_scope: object) -> list[str]:
                 "that the audit is wrong, stated in that subtask's "
                 "`scope_note`, and claim the kind you implement.")
     return issues
+
+
+def _stop_on_unclaimed_sites(record: dict) -> None:
+    """Stop the run before any subtask executes when an audited `fix` site
+    is still `unclaimed` after the bug-fixing planner's rounds (DESIGN §5
+    *An audited site the plan leaves alone is excluded with a typed reason,
+    or the run stops*): neither scoped by a fix subtask's claim nor excluded
+    with a typed `reason_kind`. A `mismatch` is claimed, so it does not
+    stop. The record is already persisted as `site_claims`."""
+    rows = [r for r in record.get("sites") or []
+            if r.get("status") == "unclaimed"]
+    if not rows:
+        return
+    lines = "\n".join(f"  - {r['site_id']}: {r['file']} :: {r['symbol']}"
+                      for r in rows)
+    die(f"{len(rows)} audited fix site(s) are neither claimed by a fix "
+        f"subtask nor excluded with a typed reason after the planner's "
+        f"rounds:\n{lines}\nNothing was executed. The rows are in "
+        "state.json under site_claims; re-run (resume re-plans) — the "
+        "planner must claim each site or list it in `sites_not_needed` "
+        "with a `reason_kind` (" + ", ".join(SITE_EXCLUSION_KINDS) + ").")
 
 
 def _site_claim_record(plan: object, defect_scope: object) -> dict | None:
@@ -36672,8 +37497,8 @@ async def phase_plan(task: str, st: State, caps: dict,
             log(f"  site claims: {len(open_rows)} audited fix site(s) still "
                 "open after the planner's rounds — "
                 + ", ".join(f"{r['site_id']} {r['status']}"
-                            for r in open_rows)
-                + " (recorded; work only through a failing held-out set)")
+                            for r in open_rows))
+        _stop_on_unclaimed_sites(record)
         break
 
     # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
@@ -53900,7 +54725,12 @@ async def _delivery_judge_unmet(
                     "item_index": i,
                     **({"test_outcome_parts":
                         _test_outcome_parts(normalized[i])}
-                       if _test_outcome_parts(normalized[i]) else {})}
+                       if _test_outcome_parts(normalized[i]) else {}),
+                    # A sweep's derived item names its instances (DESIGN §8
+                    # *A sweep's instances are items*); other items' entries
+                    # are unchanged.
+                    **({"instances": normalized[i].get("parts") or []}
+                       if normalized[i].get("sweep_of") else {})}
                    for i in pack]
         slice_note = (
             f"\n(These are {len(pack)} of the task's {n_items} required "
@@ -62165,6 +62995,19 @@ def _delivery_typed_evidence(st: "State", leerie_dir: Path, *,
     if sec:
         sections.append(sec)
         counts["intermittent_regressions"] = len(rows)
+    items = st.data.get("required_items") or []
+    staging = leerie_dir / "worktrees" / "staging"
+    if staging.is_dir() and any(isinstance(it, dict) and it.get("sweep_of")
+                                for it in items):
+        try:
+            present = _sweep_still_present(items, staging)
+            sec = _sweep_evidence_section(items, present)
+            if sec:
+                sections.append(sec)
+                counts["sweep_instances_left"] = sum(
+                    len(v) for v in present.values())
+        except Exception as e:
+            log(f"  sweep evidence errored ({type(e).__name__}: {e})")
     return sections, counts
 
 
@@ -78182,6 +79025,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.data["defect_scope"] = await phase_defect_scope_audit(
                 task, st, caps, models, efforts)
             st.save()
+        # The scope reading (always the broad one) and the audited sites'
+        # sweep items (DESIGN §8 *A sweep's instances are items*). Its own
+        # presence-keyed checkpoint, so a resume derives nothing twice.
+        if ("scope_reading" not in st.data
+                and "plans_after_plan" not in st.data):
+            _settle_scope_reading(st)
         # Held-out acceptance sets (DESIGN §8 *Held-out acceptance tests*):
         # written from the report alone, before the plan exists. Presence-
         # keyed checkpoint like defect_scope; advisory (a failure records a

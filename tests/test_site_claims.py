@@ -53,7 +53,8 @@ def _sub(sid: str, change_kind: str | None, *claims: tuple[str, list[str]]
 def _plan(*subtasks: dict, not_needed=(), status="ready") -> dict:
     return {"domain": "bug-fixing", "status": status,
             "subtasks": list(subtasks),
-            "sites_not_needed": [{"site_id": i, "reason": r}
+            "sites_not_needed": [{"site_id": i, "reason_kind": "holds_on_tree",
+                                  "reason": r}
                                  for i, r in not_needed]}
 
 
@@ -135,6 +136,32 @@ def test_an_empty_reason_is_no_not_needed(leerie):
     scope = _scope(_site("a", "guard"))
     plan = _plan(not_needed=[("D1", "   ")])
     assert _status(leerie, plan, scope) == {"D1": "unclaimed"}
+
+
+@pytest.mark.parametrize("kind", [None, "", "already_fine", "other_domain"])
+def test_an_untyped_exclusion_is_no_not_needed(leerie, kind):
+    """DESIGN §5 *An audited site the plan leaves alone is excluded with a
+    typed reason, or the run stops*: the reason text alone, or a kind outside
+    SITE_EXCLUSION_KINDS, leaves the site unclaimed."""
+    scope = _scope(_site("a", "guard"))
+    entry = {"site_id": "D1", "reason": "fine at :12"}
+    if kind is not None:
+        entry["reason_kind"] = kind
+    plan = {"domain": "bug-fixing", "status": "ready", "subtasks": [],
+            "sites_not_needed": [entry]}
+    assert _status(leerie, plan, scope) == {"D1": "unclaimed"}
+
+
+@pytest.mark.parametrize("kind", ["holds_on_tree", "covered_by_other_site",
+                                  "outside_task"])
+def test_each_typed_exclusion_settles_and_is_recorded(leerie, kind):
+    scope = _scope(_site("a", "guard"))
+    plan = {"domain": "bug-fixing", "status": "ready", "subtasks": [],
+            "sites_not_needed": [{"site_id": "D1", "reason_kind": kind,
+                                  "reason": "evidence at :12"}]}
+    row = leerie._site_claim_rows(plan, scope)[0]
+    assert (row["status"], row["not_needed_kind"], row["not_needed"]) == (
+        "not_needed", kind, "evidence at :12")
 
 
 def test_a_claim_wins_over_not_needed(leerie):
@@ -225,7 +252,9 @@ def test_planner_schema_accepts_claims_and_rejects_bad_kinds(leerie):
                                  "resolution_kinds": ["rerun_flow"]}]}}
     good = {"domain": "bug-fixing", "status": "ready", "blocker_kind": "none",
             "subtasks": [sub],
-            "sites_not_needed": [{"site_id": "D2", "reason": "evidence"}]}
+            "sites_not_needed": [{"site_id": "D2",
+                                  "reason_kind": "covered_by_other_site",
+                                  "reason": "evidence"}]}
     _validate(schema, good)
     for bad in (
             {**good, "subtasks": [{**sub, "change_kind": "bugfix"}]},
@@ -235,7 +264,12 @@ def test_planner_schema_accepts_claims_and_rejects_bad_kinds(leerie):
                 {"site_id": "D1", "resolution_kinds": ["rethrow"]}]}}]},
             {**good, "subtasks": [{**sub, "claims": {"sites": [
                 {"site_id": "D1", "resolution_kinds": []}]}}]},
-            {**good, "sites_not_needed": [{"site_id": "D2", "reason": ""}]}):
+            {**good, "sites_not_needed": [{"site_id": "D2", "reason": ""}]},
+            {**good, "sites_not_needed": [{"site_id": "D2",
+                                           "reason": "evidence"}]},
+            {**good, "sites_not_needed": [{"site_id": "D2",
+                                           "reason_kind": "fine",
+                                           "reason": "evidence"}]}):
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(bad, schema)
 
@@ -258,13 +292,22 @@ def test_auditor_schema_requires_a_typed_resolution_kind(leerie):
     schema = leerie.SCHEMAS["defect_scope_auditor"]
     site = {"file": "f", "symbol": "s", "role": "decision_site",
             "disposition": "fix", "resolution_kind": "relink",
-            "resolution": "route into the existing path"}
-    _validate(schema, {"applicable": True, "sites": [site]})
+            "resolution": "route into the existing path",
+            "extent": "one_place"}
+    one = {"kind": "one_reading", "narrow": "", "broad": ""}
+    _validate(schema, {"applicable": True, "sites": [site], "reading": one})
+    # The reading is required (DESIGN §11 *A task that reads narrow or broad
+    # is asked about once*).
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"applicable": True, "sites": [site]}, schema)
     for bad in ({**site, "resolution_kind": "retry"},
                 {k: v for k, v in site.items() if k != "resolution_kind"},
+                {k: v for k, v in site.items() if k != "extent"},
+                {**site, "extent": "many"},
                 {**site, "site_id": "D1"}):
         with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate({"applicable": True, "sites": [bad]}, schema)
+            jsonschema.validate({"applicable": True, "sites": [bad],
+                                 "reading": one}, schema)
 
 
 # === wiring: the real audit stamps IDs ======================================
@@ -289,7 +332,8 @@ SCOPE = _scope(_site("merge_candidates", "rerun_flow"),
 def _planner_reply(*subtasks, not_needed=()):
     return {"domain": "bug-fixing", "status": "ready",
             "blocker_kind": "none", "subtasks": list(subtasks),
-            "sites_not_needed": [{"site_id": i, "reason": r}
+            "sites_not_needed": [{"site_id": i, "reason_kind": "holds_on_tree",
+                                  "reason": r}
                                  for i, r in not_needed],
             "confidence": {"task_understanding": 9.5,
                            "decomposition_quality": 9.5, "basis": "stub"}}
@@ -351,15 +395,34 @@ def test_planner_is_told_the_open_sites_and_the_record_follows(
     assert rec["sites"][1]["not_needed"] == "guard already present at :88"
 
 
-def test_a_residual_is_recorded_and_never_fatal(leerie, tmp_path,
-                                                monkeypatch):
+def test_an_unclaimed_residual_stops_the_run_before_execution(
+        leerie, tmp_path, monkeypatch, capsys):
+    """Issue 12: a site still unclaimed after the planner's rounds stops the
+    run in phase_plan, before any plan is checkpointed or executed; the
+    record is persisted first and names it."""
     st = _state(leerie, tmp_path, defect_scope=SCOPE)
     stuck = _planner_reply(_sub_full("bugfix-001", "fix",
                                      ("D1", ["reraise"])))
+    with pytest.raises(SystemExit):
+        _drive(leerie, monkeypatch, st, [stuck])
+    rows = {r["site_id"]: r["status"] for r in st.data["site_claims"]["sites"]}
+    assert rows == {"D1": "mismatch", "D2": "unclaimed"}
+    err = capsys.readouterr().err
+    assert "D2: src/example_module.py :: collect_pending_rows" in err
+    assert "D1:" not in err, "a mismatch is claimed and never stops the run"
+    assert "plans_after_plan" not in st.data
+
+
+def test_a_mismatch_residual_alone_does_not_stop_the_run(
+        leerie, tmp_path, monkeypatch):
+    st = _state(leerie, tmp_path, defect_scope=SCOPE)
+    stuck = _planner_reply(
+        _sub_full("bugfix-001", "fix", ("D1", ["reraise"])),
+        not_needed=[("D2", "guard already present at :88")])
     calls = _drive(leerie, monkeypatch, st, [stuck])
     assert len(calls) >= 2
     rows = {r["site_id"]: r["status"] for r in st.data["site_claims"]["sites"]}
-    assert rows == {"D1": "mismatch", "D2": "unclaimed"}
+    assert rows == {"D1": "mismatch", "D2": "not_needed"}
 
 
 def test_another_domain_planner_is_not_checked(leerie, tmp_path,
