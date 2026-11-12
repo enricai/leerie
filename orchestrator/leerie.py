@@ -2096,6 +2096,18 @@ MODEL_DEFAULT_PER_WORKER = {
     # real, 5 plausible and none false. It runs once per run and never
     # gates, so the tier is spent where it finds what nothing else does.
     "pr_reviewer": "opus",
+    # contradiction_judge: whether an existing test's pinned case and a
+    # required item's probe can both pass (DESIGN §8 *Delivery re-drive*
+    # rule 4, *A pinned case a required item's probe contradicts is
+    # task-required*). Its costly error is a false "exclusive", which ships
+    # a real regression as task-required. Benched (lane B3, 6 samples per
+    # case per arm): sonnet at medium said a2a825c2's #358 case and the
+    # run's requirement test cannot both pass in 1 of 6, every quote
+    # verified; opus at high gave 0 false "exclusive" in 42 samples over
+    # seven pairs that can both hold and judged 5ddc1d67's real
+    # contradiction exclusive 5 of 6. It runs only when a re-drive commit
+    # makes a probe pass by breaking a pinned case.
+    "contradiction_judge": "opus",
 }
 # NOTE: with MODEL_DEFAULT now "sonnet", every worker not listed above
 # (all judgment workers, plus the post-run `judge` worker) also resolves
@@ -2189,6 +2201,9 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # The advisory whole-PR review runs at `high`, as benched (bench/n2f
     # arm R1, opus high); see its MODEL_DEFAULT_PER_WORKER entry.
     "pr_reviewer": "high",
+    # As benched (lane B3, opus high); see its MODEL_DEFAULT_PER_WORKER
+    # entry.
+    "contradiction_judge": "high",
     # Types one worker-flagged contract risk for the contract-literal check
     # (DESIGN §8 *Typed evidence for the delivery judge*); benched at
     # medium (bench/q5 n7d, q10).
@@ -2344,7 +2359,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "set_auditor", "surrogate_fixer", "ci_checks",
                 "scope_judge", "pr_reviewer", "contract_extractor",
                 "falsifier", "verifiability_classifier", "delivery_ratchet",
-                "forbidden_command_extractor", "observability_judge")
+                "forbidden_command_extractor", "observability_judge",
+                "contradiction_judge")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2374,6 +2390,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "scope_judge", "pr_reviewer", "contract_extractor",
     "verifiability_classifier", "delivery_ratchet",
     "forbidden_command_extractor", "observability_judge",
+    "contradiction_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -3146,6 +3163,18 @@ BAKE_INSTALL_COMMANDS: dict[str, str] = {
 # (`_redrive_pinned_breaks`).
 PROBE_OBJECTION_KINDS = ("input_outside_domain", "contradicts_task",
                          "breaks_existing_test")
+
+# The contradiction judge (DESIGN §8 *Delivery re-drive* rule 4, *A pinned
+# case a required item's probe contradicts is task-required*): the payload
+# trees a quote names (`pinned`: the pinned test file as the base has it;
+# `independent`: the probe; `code`: the production modules either reaches),
+# and what code makes of a verdict. Only `exclusive` changes anything;
+# `both_can_hold` and `unsettled` leave the conflict rule as it is.
+CONTRADICTION_SOURCES = ("pinned", "independent", "code")
+CONTRADICTION_STATUSES = ("exclusive", "both_can_hold", "unsettled")
+# Read-only in its payload directory, as benched (lane B3).
+CONTRADICTION_JUDGE_TOOLS = "Read,Grep,Glob"
+CONTRADICTION_JUDGE_MAX_TURNS = 60
 
 
 SCHEMAS: dict[str, dict] = {
@@ -5346,6 +5375,39 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+        },
+    },
+    "contradiction_judge": {
+        # Whether an existing test's pinned case and a required item's probe
+        # can both pass (DESIGN §8 *Delivery re-drive* rule 4, *A pinned case
+        # a required item's probe contradicts is task-required*), as benched
+        # (lane B3 h/schema.json). Facts only: code verifies every quote and
+        # decides (`_contradiction_status`).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["same_entry_point", "same_input_by_meaning",
+                     "same_observable", "mutually_exclusive", "evidence",
+                     "explanation"],
+        "properties": {
+            "same_entry_point": {"type": "boolean"},
+            "same_input_by_meaning": {"type": "boolean"},
+            "same_observable": {"type": "boolean"},
+            "mutually_exclusive": {"type": "boolean"},
+            "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["test", "quote"],
+                    "properties": {
+                        "test": {"type": "string",
+                                 "enum": list(CONTRADICTION_SOURCES)},
+                        "quote": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+            "explanation": {"type": "string", "minLength": 1},
         },
     },
 }
@@ -7854,10 +7916,24 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
               else []):
         if isinstance(r, dict) and isinstance(r.get("file"), str):
             failed.setdefault(r["file"], []).append(str(r.get("id") or ""))
+    # Cases a required item's probe contradicts (DESIGN §8 *Delivery
+    # re-drive* rule 4): changed because the task asked, named as such.
+    required: dict[str, list[dict]] = {}
+    for r in ((behaviour.get("task_required") or [])
+              if isinstance(behaviour, dict) else []):
+        if isinstance(r, dict) and isinstance(r.get("file"), str):
+            required.setdefault(r["file"], []).append(r)
     for rec in files:
         if not isinstance(rec, dict) or not _pr_entry(rec.get("file")):
             continue
         entries: list[str] = []
+        for r in required.get(rec["file"], []):
+            entries.append(
+                f"- existing test changed because required item "
+                f"{r.get('item_index')} contradicts it: "
+                f"{_pr_code(str(r.get('id') or ''))} — the item's probe "
+                f"{_pr_code(str(r.get('probe_test_file') or ''))} asserts "
+                f"{_pr_code(str(r.get('quote') or ''))}")
         for i in failed.get(rec["file"], []):
             if not i.strip():
                 continue
@@ -65628,6 +65704,318 @@ def _redrive_contest_text(c: dict) -> str:
             "again — a person decides; the item stays unmet")
 
 
+# --- A pinned case a required item's probe contradicts is task-required ------
+# (DESIGN §8 *Delivery re-drive* rule 4)
+
+# Where a contradiction judge's payload is made, beneath the run directory,
+# for the call's lifetime only.
+CONTRADICTION_DIRNAME = "contradiction"
+# How many characters of a verdict's explanation and of each quote are kept.
+_CONTRADICTION_TEXT_MAX = 1200
+_CONTRADICTION_QUOTES_KEPT = 12
+
+
+def _contradiction_code_files(g: dict, tests: Iterable[tuple[str, str]]
+                              ) -> list[str]:
+    """The production modules JS/TS tests reach in the import graph `g`
+    (`_js_source_graph`, at the run's base): each test's in-repo imports and
+    mocks, then every production module those import, transitively — never
+    a test file or a test-support module. `tests`: `(path, text)` of each
+    test, which need not be in `g` (a saved probe is not)."""
+    files = set(g.get("files") or ())
+    support = set(g.get("support") or ())
+    imp = g.get("imp") or {}
+    aliases = g.get("aliases") or {}
+
+    def prod(r: str | None) -> bool:
+        return bool(r) and r in files and not _js_is_test(r) \
+            and r not in support
+    stack: list[str] = []
+    for rel, text in tests:
+        for rx in (_JS_IMPORT_RE, _JS_MOCK_RE):
+            for m in rx.finditer(text):
+                r = _js_resolve(m.group(1), rel, files | {rel}, aliases)
+                if prod(r):
+                    stack.append(r)
+    seen: set[str] = set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(q for q in imp.get(cur, ()) if prod(q) and q not in seen)
+    return sorted(seen)
+
+
+def _contradiction_user_prompt(pinned: tuple[str, str],
+                               independent: tuple[str, str],
+                               code: Iterable[str]) -> str:
+    """The judge's request, as benched (lane B3 h/runner.py `prompt`): each
+    case by its payload path and title, and the code files."""
+    return (f"PINNED case: in `pinned/{pinned[0]}`, the case titled "
+            f"\"{pinned[1]}\".\n"
+            f"INDEPENDENT case: in `independent/{independent[0]}`, the case "
+            f"titled \"{independent[1]}\".\n"
+            "Production code both reach: "
+            + ", ".join(f"`code/{c}`" for c in code)
+            + " (and anything else under `code/`).\n\n"
+            "Can any implementation of the production code make both cases "
+            "pass? Decide the four facts and return them with quoted "
+            "evidence.\n")
+
+
+def _contradiction_check(res: dict, srcs: dict[str, str],
+                         code: dict[str, str], asserts: dict[str, list]
+                         ) -> tuple[list[str], dict[str, str]]:
+    """Code's check of a verdict's evidence: every quote, whitespace
+    collapsed, is verbatim in the file its `test` names (`pinned` and
+    `independent` their file, `code` any code file); and each test supplies
+    at least one quote naming a line inside one of its case's assertions
+    (`_falsifier_quoted_assertion_lines` over the facts' `asserts`).
+    `(failures, {test: its first assertion quote})`; no failures is
+    verified."""
+    fails: list[str] = []
+    first: dict[str, str] = {}
+    for e in res.get("evidence") or []:
+        raw = str((e or {}).get("quote") or "") if isinstance(e, dict) else ""
+        t = str(e.get("test")) if isinstance(e, dict) else ""
+        q = _ws_norm(raw)
+        if not q:
+            fails.append(f"an empty quote ({t})")
+            continue
+        if t == "code":
+            if not any(q in _ws_norm(c) for c in code.values()):
+                fails.append(f"code quote not found: {q[:160]}")
+            continue
+        if t not in srcs:
+            fails.append(f"a quote of no payload file ({t})")
+            continue
+        if q not in _ws_norm(srcs[t]):
+            fails.append(f"{t} quote not found: {q[:160]}")
+            continue
+        if (t not in first and _falsifier_quoted_assertion_lines(
+                srcs[t], raw, asserts.get(t))):
+            first[t] = raw.strip()
+    for t in ("pinned", "independent"):
+        if t not in first:
+            fails.append(f"no quote of an assertion of the {t} case")
+    return fails, first
+
+
+def _contradiction_status(res: dict, failures: list[str]) -> str:
+    """`exclusive` only when the three facts and `mutually_exclusive` are
+    true and the evidence verified; `both_can_hold` when the verified answer
+    says both can pass; `unsettled` otherwise — no verified answer, or
+    `mutually_exclusive` claimed without the facts it rests on."""
+    if failures:
+        return "unsettled"
+    facts = all(res.get(k) is True for k in (
+        "same_entry_point", "same_input_by_meaning", "same_observable"))
+    if res.get("mutually_exclusive") is True:
+        return "exclusive" if facts else "unsettled"
+    return "both_can_hold"
+
+
+def _contradiction_rule(verdict: dict | None) -> str:
+    """What a contradiction verdict does to its pinned case:
+    `task_required` on `exclusive`, else `regression` — the conflict rule
+    stands. An `unsettled` verdict (no verified answer) is the one an
+    intent resolver may later decide instead; until one does, it is a
+    regression."""
+    return ("task_required" if isinstance(verdict, dict)
+            and verdict.get("status") == "exclusive" else "regression")
+
+
+def _redrive_task_required_cases(rec: object) -> dict[str, dict]:
+    """case id -> the `exclusive` verdict that makes it task-required
+    (`delivery_redrive.contradiction_verdicts`), the first per case."""
+    out: dict[str, dict] = {}
+    raw = rec.get("contradiction_verdicts") if isinstance(rec, dict) else None
+    for v in raw if isinstance(raw, list) else []:
+        if (isinstance(v, dict) and _contradiction_rule(v) == "task_required"
+                and v.get("case") and str(v["case"]) not in out):
+            out[str(v["case"])] = v
+    return out
+
+
+async def _contradiction_facts(st: "State", view: str, src: Path, rel: str,
+                               case: str) -> dict:
+    """The facts of `case` in the test file `src` (`_probe_case_facts_placed`
+    over the installed `view`), placed beside `rel`: a sandbox places a
+    file, never replaces one, and the facts are syntax only."""
+    beside = posixpath.join(posixpath.dirname(rel),
+                            _BASE_FORM_FACTS_PREFIX + posixpath.basename(rel))
+    return await _probe_case_facts_placed(st, view, str(src), beside, case)
+
+
+async def _contradiction_verdict(st: "State", caps: dict, models: dict,
+                                 efforts: dict, staging: Path, rec: dict, *,
+                                 base: str, case: dict, item_index: int,
+                                 probe: dict, rnd: int, gi: int) -> dict:
+    """One `contradiction_judge` verdict on a pinned case (`{id, file}`)
+    against item `item_index`'s shown probe (`{dir, file, case_name}`),
+    appended to `rec["contradiction_verdicts"]` — or the one already there
+    for the same case and probe, since neither changes during a run (a call
+    that failed is asked again). The judge is given the pinned file as the
+    run's `base` has it, never a later form; the probe; and every production
+    module either reaches at `base` (`_contradiction_code_files`), in a
+    payload directory it reads and nothing else of the run. Code verifies
+    the evidence (`_contradiction_check`, over the facts script's assertion
+    spans of each case) and decides (`_contradiction_status`). The spans
+    come from a TS parse: a case whose facts cannot be read (any other
+    language) is `unsettled` before any call."""
+    rel, prel = str(case.get("file") or ""), str(probe.get("file") or "")
+    out: dict = {"case": str(case.get("id") or ""), "file": rel,
+                 "item_index": item_index, "probe_test_file": prel,
+                 "round": rnd, "group": gi, "status": "unsettled"}
+    verdicts = rec.setdefault("contradiction_verdicts", [])
+    repo = _run_repo(st)
+    pdir = Path(str(probe.get("dir") or ""))
+    pinned_src = await asyncio.to_thread(_git_blob_text, repo, base, rel)
+    try:
+        probe_src = _read_beneath(pdir, pdir / prel,
+                                  limit=READ_LIMIT_TEXT).decode(
+                                      "utf-8", "replace")
+    except OSError:
+        probe_src = None
+    if pinned_src is None or probe_src is None:
+        out["failures"] = ["the pinned file at the base or the probe is "
+                           "unreadable"]
+        verdicts.append(out)
+        return out
+    key = hashlib.sha256("\0".join(
+        (out["case"], base, rel, prel, probe_src)).encode()).hexdigest()[:16]
+    out["key"] = key
+    for v in verdicts:
+        if isinstance(v, dict) and v.get("key") == key and not v.get("error"):
+            return v
+    g = await asyncio.to_thread(_js_source_graph, repo, base)
+    code = {r: g["src"][r] for r in _contradiction_code_files(
+        g, [(rel, pinned_src), (prel, probe_src)]) if r in g.get("src", {})}
+    pin_case = out["case"].split(" :: ", 1)[-1]
+    probe_case = str(probe.get("case_name") or "")
+    model = models.get("contradiction_judge",
+                       MODEL_DEFAULT_PER_WORKER.get("contradiction_judge",
+                                                    MODEL_DEFAULT))
+    effort = efforts.get("contradiction_judge",
+                         EFFORT_DEFAULT_PER_WORKER.get("contradiction_judge"))
+    out.update(model=model, effort=effort, code_files=len(code))
+    run_dir = Path(st.run_dir)
+    d = run_dir / CONTRADICTION_DIRNAME / key
+    try:
+        _rmtree_owned(d)
+        _mkdir_private(d, run_dir)
+        for side, p_, text in (("pinned", rel, pinned_src),
+                               ("independent", prel, probe_src),
+                               *(("code", r, t) for r, t in code.items())):
+            _write_beneath(run_dir, d / side / p_, text.encode())
+        view = await _measured_tree(
+            st, str(staging), caps, label="contradiction",
+            log_path=run_dir / "logs" / "contradiction.log")
+        facts = {
+            "pinned": await _contradiction_facts(
+                st, view, d / "pinned" / rel, rel, pin_case),
+            "independent": await _contradiction_facts(
+                st, view, d / "independent" / prel, prel, probe_case)}
+        bad = [t for t, f in facts.items()
+               if not isinstance(f, dict) or f.get("error")]
+        if bad:
+            out["failures"] = [f"the {t} case's facts could not be read"
+                               for t in bad]
+            verdicts.append(out)
+            return out
+        titles = {t: str(f.get("title") or "") or name for (t, f), name in
+                  zip(facts.items(), (pin_case, probe_case))}
+        st.bump_workers(caps)
+        res = await claude_p(
+            user_prompt=_contradiction_user_prompt(
+                (rel, titles["pinned"]), (prel, titles["independent"]),
+                code),
+            system_prompt=_load_prompt("contradiction_judge"),
+            schema_key="contradiction_judge", cwd=str(d),
+            allowed_tools=CONTRADICTION_JUDGE_TOOLS,
+            max_turns=CONTRADICTION_JUDGE_MAX_TURNS, autonomous=False,
+            caps=caps, st=st, model=model, effort=effort,
+            sid=f"contradiction_judge-r{rnd}g{gi}-i{item_index}-{key[:8]}")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        out["error"] = _brief_worker_exc(e)
+        verdicts.append(out)
+        return out
+    finally:
+        _rmtree_owned(d)
+    res = res if isinstance(res, dict) else {}
+    fails, first = _contradiction_check(
+        res, {"pinned": pinned_src, "independent": probe_src}, code,
+        {t: (facts[t].get("asserts") or []) for t in facts})
+    out.update({k: res.get(k) for k in (
+        "same_entry_point", "same_input_by_meaning", "same_observable",
+        "mutually_exclusive")})
+    out["evidence"] = [
+        {"test": str(e.get("test")),
+         "quote": str(e.get("quote"))[:_CONTRADICTION_TEXT_MAX]}
+        for e in (res.get("evidence") or [])[:_CONTRADICTION_QUOTES_KEPT]
+        if isinstance(e, dict)]
+    out["explanation"] = str(res.get("explanation") or "")[
+        :_CONTRADICTION_TEXT_MAX]
+    out["failures"] = fails
+    out["quotes"] = first
+    out["status"] = _contradiction_status(res, fails)
+    verdicts.append(out)
+    return out
+
+
+async def _redrive_task_required(st: "State", caps: dict, models: dict,
+                                 efforts: dict, staging: Path, rec: dict,
+                                 pinned: list[dict], probes: dict[int, dict],
+                                 *, rnd: int, gi: int) -> dict[str, dict]:
+    """{case id: its `exclusive` verdict} for the pinned cases a group's
+    commit broke while making shown probes pass (`pinned`,
+    `_redrive_pinned_breaks`; `probes`, item index -> the probe the group was
+    handed) — only when EVERY one is task-required by some item's probe
+    (`_contradiction_verdict`, items in order, the first `exclusive` wins);
+    else {}, and the conflict rule stands. More cases than
+    `_REDRIVE_CONTEST_TESTS_MAX` are not judged."""
+    base = _diff_base(st) or ""
+    if not pinned or not probes or not base or len(
+            pinned) > _REDRIVE_CONTEST_TESTS_MAX:
+        return {}
+    out: dict[str, dict] = {}
+    for case in pinned:
+        got = None
+        for i in sorted(probes):
+            v = await _contradiction_verdict(
+                st, caps, models, efforts, staging, rec, base=base,
+                case=case, item_index=i, probe=probes[i], rnd=rnd, gi=gi)
+            log(f"  delivery re-drive r{rnd} g{gi}: contradiction judge on "
+                f"{case.get('id')} vs item {i}'s probe: {v['status']}"
+                + (f" ({'; '.join(v['failures'][:2])})"
+                   if v.get("failures") else "")
+                + (f" ({v['error']})" if v.get("error") else ""))
+            if _contradiction_rule(v) == "task_required":
+                got = v
+                break
+        if got is None:
+            return {}
+        out[str(case.get("id"))] = got
+    return out
+
+
+def _redrive_task_required_detail(v: dict) -> str:
+    """The note for a task-required case a rolled-back commit left failing in
+    the test file the base had: the item contradicts it, so the test
+    changes, never the item."""
+    q = (v.get("quotes") or {}).get("independent") or ""
+    return (f"required item {v.get('item_index')} contradicts this existing "
+            f"test case: no implementation passes both it and the item's "
+            f"probe {v.get('probe_test_file')}"
+            + (f" (which asserts `{_normalize_risk_text(q, 300)}`)" if q
+               else "")
+            + ", a contradiction judge's verdict whose quotes leerie "
+            "verified. An earlier re-drive attempt left it failing and was "
+            "reverted. Change this test case to what the item requires; do "
+            "not leave it failing, and do not restore the old behaviour.")
+
+
 def _redrive_objection_text(o: dict) -> str:
     """A fixer's objection to a probe in words, marked unverified."""
     return (f"item {o.get('item_index')}: a re-drive fixer objected to its "
@@ -68386,9 +68774,19 @@ def _redrive_base_form_open(rec: dict) -> list[dict]:
     as found; a file whose one finished attempt left cases failing, once
     more for those cases only, typed `escalation` (`MODEL_BASE_FORM_
     ESCALATION` at `EFFORT_BASE_FORM_ESCALATION`). A file two attempts
-    finished on is not offered again: what still fails stays a change."""
+    finished on is not offered again: what still fails stays a change. A
+    case a required item's probe contradicts (`_redrive_task_required_cases`)
+    is task-required: no round puts it back."""
     out: list[dict] = []
+    settled = _redrive_task_required_cases(rec)
     for n in rec.get("base_form_open") or []:
+        if any(c in settled for c in n["cases"]):
+            msgs = list(n.get("messages") or [])
+            keep = [i for i, c in enumerate(n["cases"]) if c not in settled]
+            if not keep:
+                continue
+            n = {**n, "cases": [n["cases"][i] for i in keep],
+                 "messages": [msgs[i] for i in keep if i < len(msgs)]}
         d = (rec.get("base_form_driven") or {}).get(n["key"]) or {}
         done = [a for a in d.get("attempts") or []
                 if a.get("outcome") != "interrupted"]
@@ -68505,6 +68903,8 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
     prior = st.data.get("existing_behaviour")
     if (isinstance(prior, dict) and tree_sha
             and prior.get("tree_sha") == tree_sha and not prior.get("error")):
+        if _existing_behaviour_task_required(st, prior):
+            st.save()
         return
     try:
         rec = await _base_form_regressions(
@@ -68522,9 +68922,38 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
         # (DESIGN §8 *A case pinning a moved literal gets no round*).
         rec["moved_literal"] = await _base_form_moved_literals(
             st, caps, staging, rec)
+    _existing_behaviour_task_required(st, rec)
     st.data["existing_behaviour"] = rec
     st.save()
     _set_base_form_gap(st, rec)
+
+
+def _existing_behaviour_task_required(st: "State", rec: dict) -> bool:
+    """Move each case of `rec["changed"]` a required item's probe
+    contradicts (`_redrive_task_required_cases`) to `rec["task_required"]`,
+    with the item, the probe and its verified assertion quote: a change the
+    task asked for, which the PR lists and the outcome does not count
+    (DESIGN §8 *Delivery re-drive* rule 4). Whether any moved."""
+    settled = _redrive_task_required_cases(st.data.get("delivery_redrive"))
+    rows = rec.get("changed")
+    if not settled or not isinstance(rows, list):
+        return False
+    keep: list = []
+    moved = list(rec.get("task_required") or [])
+    for r in rows:
+        v = settled.get(str(r.get("id"))) if isinstance(r, dict) else None
+        if v is None:
+            keep.append(r)
+            continue
+        moved.append({**r, "item_index": v.get("item_index"),
+                      "probe_test_file": v.get("probe_test_file"),
+                      "quote": str((v.get("quotes") or {}).get(
+                          "independent") or "")})
+    if len(keep) == len(rows):
+        return False
+    rec["changed"] = keep
+    rec["task_required"] = moved
+    return True
 
 
 def _set_base_form_gap(st: "State", rec: dict) -> None:
@@ -70072,6 +70501,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("contradictions", [])
     rec.setdefault("defects_driven", [])
     rec.setdefault("contested_probes", [])
+    rec.setdefault("contradiction_verdicts", [])
     rec.setdefault("probe_objections", [])
     # The browser suite's prerequisites run in staging once per pass.
     suite_prepared: set[str] = set()
@@ -70707,6 +71137,47 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             label=f"redrive-r{rnd}g{gi}",
                             log_path=st.run_dir / "logs" / _REDRIVE_LOG,
                             base_form=True)
+                    # A shown probe never forces a change that breaks what an
+                    # existing test pins (rule 4): a commit that made a probe
+                    # pass and broke such a case contests the probe — measured,
+                    # never a worker's say-so — unless every case it broke is
+                    # one a required item's probe contradicts: then those cases
+                    # are task-required, no longer the commit's base-form
+                    # changes, and nothing is contested.
+                    probe_fixed = sorted(i for i, x in probes_after.items()
+                                         if x == "pass")
+                    pinned = (_redrive_pinned_breaks(
+                        _run_repo(st), _diff_base(st) or "", post_sha, newv)
+                        if probe_fixed else [])
+                    settled: dict[str, dict] = {}
+                    if pinned:
+                        shown_probes = {
+                            n["item_index"]: n["probe"] for n in live
+                            if n["kind"] == "unmet_item"
+                            and n.get("item_index") in probe_fixed
+                            and isinstance(n.get("probe"), dict)}
+                        try:
+                            settled = await _redrive_task_required(
+                                st, caps, models, efforts, staging, rec,
+                                pinned, shown_probes, rnd=rnd, gi=gi)
+                        except Exception as e:
+                            log(f"  delivery re-drive r{rnd} g{gi}: "
+                                f"contradiction judge raised "
+                                f"{type(e).__name__}: {e} — the conflict "
+                                "rule stands")
+                        _save()
+                    if settled:
+                        ge["task_required"] = [
+                            {"id": c, "item_index": v["item_index"]}
+                            for c, v in sorted(settled.items())]
+                        newv["base_form_changed"] = [
+                            c for c in newv.get("base_form_changed") or []
+                            if c not in settled]
+                        pinned = []
+                        log(f"  delivery re-drive r{rnd} g{gi}: "
+                            f"{len(settled)} pinned case(s) a required "
+                            "item's probe contradicts — task-required, not "
+                            "a conflict")
                     ge["new_failures"] = newv["new"]
                     if newv.get("base_form_changed"):
                         ge["base_form_changed"] = list(newv["base_form_changed"])
@@ -70771,8 +71242,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     # A shown probe is a case too: one that passes now is
                     # progress, one that still fails is not, and one with no
                     # verdict is no evidence either way (rule 4).
-                    probe_fixed = sorted(i for i, x in probes_after.items()
-                                         if x == "pass")
                     measured_probes = [i for i, x in probes_after.items()
                                        if x != "unmeasured"]
                     ge["zero_progress"] = bool(
@@ -70780,13 +71249,6 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         and not v["fixed_cases"]
                         and not v["held_fixed_cases"] and not probe_fixed
                         and not ge.get("base_form_fixed"))
-                    # A shown probe never forces a change that breaks what an
-                    # existing test pins (rule 4): a commit that made a probe
-                    # pass and broke such a case contests the probe — measured,
-                    # never a worker's say-so.
-                    pinned = (_redrive_pinned_breaks(
-                        _run_repo(st), _diff_base(st) or "", post_sha, newv)
-                        if probe_fixed else [])
                     if pinned:
                         ge["probe_conflict"] = {
                             "items": probe_fixed,
@@ -70862,6 +71324,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                 rec["pending_controls"].append({
                                     "kind": "control_regression", "key": k,
                                     "test": k, "detail": (
+                                        _redrive_task_required_detail(
+                                            settled[k]) if k in settled else
                                         "an earlier re-drive attempt broke this "
                                         "existing test (confirmed against the tree "
                                         "before it) and was reverted. Keep it "

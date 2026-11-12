@@ -34,7 +34,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "ci_checks", "scope_judge", "pr_reviewer",
            "contract_extractor", "falsifier", "verifiability_classifier",
            "delivery_ratchet", "forbidden_command_extractor",
-           "observability_judge")
+           "observability_judge", "contradiction_judge")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -73,7 +73,7 @@ DEFAULTS = {
     # The report-bounded scope judge (DESIGN §8 *A task that points at a
     # report is bounded by the report's own scenarios*): MODEL_DEFAULT.
     "scope_judge": "sonnet",
-    # The advisory whole-PR review: the one documented opus exception
+    # The advisory whole-PR review: a documented opus exception
     # (DESIGN §12; bench N2f). The contract extractor falls through.
     "pr_reviewer": "opus",
     "contract_extractor": "sonnet",
@@ -87,6 +87,9 @@ DEFAULTS = {
     # The observability judge (DESIGN §8 *A met is only what the run could
     # observe*): MODEL_DEFAULT.
     "observability_judge": "sonnet",
+    # The contradiction judge (DESIGN §8 *Delivery re-drive* rule 4): the
+    # second documented opus exception (DESIGN §12; lane B3).
+    "contradiction_judge": "opus",
 }
 
 
