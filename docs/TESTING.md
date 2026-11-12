@@ -7370,6 +7370,18 @@ sample's probe never counts for the next.
   The gate records its result. Against the code before the fix, 3 of the
   4 fail. The fourth, finished provisioning not being redone, holds there
   too, because nothing was ever redone.
+- `tests/test_docs_only_task_provisions.py` (2 tests, open issue 19,
+  DESIGN §6½: the phase runs for every task whatever classification
+  returned). A task classified `documentation` alone, on a repository whose
+  merge check runs a runner only its install provides (`npm ci` of a local
+  package, offline):
+  - the real `phase_provision` records the table's `npm ci` recipe;
+  - the 9aa2506d replay: real `phase_provision`, then the real CI parity
+    baseline with real confined child processes, where the check is green
+    and gates.
+
+  With the old docs-only short-circuit restored, both fail (source
+  `skipped-docs-only`; the check's base rc 127, `command not found`).
 - `tests/test_confined_store_install.py` (6 test functions; DESIGN §6
   *The stores a view installs from are leerie's*, *corepack never floats*,
   *pnpm's settings are spelled for the pnpm that reads them*; review round
