@@ -4312,7 +4312,55 @@ measurement directory. The git metadata is read-only because no
 measurement needs more: in a confined view `git status`, `log`, `diff`,
 `rev-parse`, `ls-files`, `stash list` and `describe` all succeed with the
 run repository read-only, and `git status` skips its opportunistic index
-refresh (measured 2026-10-31). A tree whose path holds or lies beneath one
+refresh (measured 2026-10-31).
+
+*An install that writes the repository's git config is refused, and says
+so.* A repository whose root `prepare` is husky runs `git config
+core.hooksPath .husky/_` on every install. git writes a worktree's local
+config only to its common directory's `config`, here
+`<run-dir>/repo/config`, which this grant reads and does not write. So
+git reports `could not lock config file <run-dir>/repo/config: Read-only
+file system`, husky returns without installing hooks, and the install
+succeeds. Measured on barnacle 87580f62: the refusal appeared in all 31
+installs in worktrees of the run repository (views, CI parity, the
+baselines, the planning tree, the evaluation trees), and in none of the 25
+in ref-less clones, whose `config` is the clone's own.
+
+The refusal is this grant working, and the line is git's true report of
+it. The run repository's settings are leerie's (§8 *The settings are
+leerie's*): in a tree a command can write, leerie puts the same write
+back after the command. No measured checkout commits, and leerie's own
+git runs with hooks off (§6½ *Hooks off*). So the hooks husky would have
+installed have no use there.
+
+The install still runs every lifecycle script, `prepare` included, as
+CI's install does. A `prepare` can build what the commit's commands need,
+such as a `dist/` the tests import. Telling such a script from one that
+only installs hooks would mean interpreting the repository's scripts.
+
+Weighed and rejected:
+- *A writable config scope of the checkout's own.* git has none for a
+  worktree: a plain `git config` writes the common directory's `config`,
+  whatever `extensions.worktreeConfig` says.
+  - `GIT_CONFIG` redirects the write, but also every `git config` read.
+    Measured on git 2.53.0: `git config --get user.name` returned nothing
+    with a repository-local name set, and `git config --global` failed
+    with "only one config file at a time". That changes what the measured
+    commands see.
+  - A repository per checkout (a ref-less clone, as the acceptance
+    writer's) keeps the clone's own `.git` in the tree. A view moves to the
+    next tip under leerie's git directory, so the measured commands' own
+    `git` would read the old HEAD.
+  - An overlay over the run repository is undefined while other trees
+    commit to it.
+- *Skipping `prepare`.* No package manager skips one lifecycle script
+  alone. `--ignore-scripts` also skips the `postinstall` generators this
+  install exists to run (§8 *Every measurement reads the committed view*).
+  A `prepare` that builds would leave the measurement without its build.
+- *`HUSKY=0`.* That is one tool's switch, an exemption keyed to the
+  symptom. The next hook installer would print the same refusal.
+
+A tree whose path holds or lies beneath one
 of the run directory's private entries is no measured tree: the run stops
 naming it (`die`), since granting it would grant them.
 
