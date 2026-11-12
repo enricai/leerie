@@ -11149,7 +11149,17 @@ For the unfrozen installers the rewrite is put back like any other and
 logged by path.
 
 The orchestrator addresses both with a dedicated phase between
-classification and planning, layered top-to-bottom by determinism:
+classification and planning, layered top-to-bottom by determinism. It
+runs for every task, whatever classification returned. The recipe it
+detects is not only a hint to workers: it is what every tree leerie
+measures installs from (*Who runs that install*, above), and a
+documentation-only task is measured like any other — the conformance
+baseline, CI parity and the repository's browser suite all run on its
+base. What a docs-only task saves, it saves through laziness: a tree no
+axis is measured in installs nothing. A docs-only short-circuit that
+recorded "nothing to install" once ran here, and every check of such a
+run then failed for want of its runners (`vitest: command not found` at
+the CI parity baseline, the browser suite unable to start).
 
 1. **`.leerie-setup.sh` hook.** Optional, repo-owned. If the repo
    needs user-space tooling the language layer can't install — a

@@ -33404,15 +33404,6 @@ async def phase_heal(call_type: str, failing_records: list[dict],
 # per-repo dependency provisioning helpers (DESIGN §6½)
 # =========================================================================
 
-# Categories that touch only documentation / non-code surfaces. If classify
-# returned *only* these, phase_provision short-circuits to kind:none — no
-# point detecting an install recipe for a docs-only run (workers wouldn't
-# need it anyway, and skipping the lockfile-table / LLM-fallback work
-# trims the run time). The check is "are all returned categories in this
-# set?" so a feature+docs task still produces a recipe.
-_DOCS_ONLY_CATEGORIES = frozenset({"documentation"})
-
-
 async def _run_setup_hook(repo_root: Path, log_dir: Path,
                           st: "State") -> None:
     """Execute `<repo>/.leerie-setup.sh` if present. Idempotent via
@@ -35374,11 +35365,15 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
                            efforts: dict[str, str | None]) -> None:
     """Phase 1½: per-repo dependency *detection*.
 
-    Runs after classify so a docs-only run can short-circuit. Five
-    ordered steps (DESIGN §6½):
+    Runs for every task, whatever classify returned: the recipe is what
+    every measurement installs from — the conformance baseline, CI parity,
+    the browser suite, the held-out sets — and a docs-only task is measured
+    like any other (DESIGN §6½ *Who runs that install*). Five ordered steps
+    (DESIGN §6½):
 
-      1. Docs-only short-circuit. If classify returned only
-         documentation categories, persist `kind: none` and return.
+      1. The provisioning checkout: a throwaway checkout of the planning
+         tree's commit (`_judge_checkout`), never the user's checkout.
+         Steps 2–4 run in it (`_provision_hook_and_toolchain`).
       2. `.leerie-setup.sh` hook if present.
       3. Synthesize a mise go-override from `go.mod` if needed.
       4. `mise install` (reads .tool-versions natively
@@ -35386,14 +35381,12 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
          rust-toolchain.toml via the image-set
          MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS env). Capture
          resolved versions via `mise ls --current --json`.
-         Steps 2–4 run in a throwaway checkout of the planning tree's
-         commit (`_provision_hook_and_toolchain`), never the user's
-         checkout.
       5. Detect install commands: deterministic lockfile table first
          (emits all matches for polyglot repos), LLM fallback if the
          table abstains. Validate the recipe and persist it to
-         st.data["provision"]["recipe"] for downstream workers to
-         consult via prompt injection.
+         st.data["provision"]["recipe"]: every tree leerie measures
+         installs from it (`_ensure_worktree_deps`), and the workers
+         read it in their prompts.
 
     Phase 1½ deliberately does NOT execute the install recipe at
     repo_root. The repo is bind-mounted from the host; writing
@@ -35414,20 +35407,11 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     log_dir = st.run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Docs-only short-circuit.
-    cats = set(st.data.get("categories") or [])
-    if cats and cats <= _DOCS_ONLY_CATEGORIES:
-        log("  docs-only task: skipping dep detection")
-        prov["source"] = "skipped-docs-only"
-        prov["recipe"] = [{"kind": "none", "command": [],
-                           "working_dir": ".", "timeout_s": 0}]
-        st.save()
-        return
-
-    # 2–4 run in a throwaway checkout of the planning tree's commit, never in
-    # the user's checkout: the hook and `mise` (`mise.lock`, a configured
-    # `.venv`) may write their working directory, and the container never
-    # writes the user's checkout (DESIGN §6 *The explicit channel*, §6½).
+    # 1. The provisioning checkout. 2–4 run in a throwaway checkout of the
+    # planning tree's commit, never in the user's checkout: the hook and
+    # `mise` (`mise.lock`, a configured `.venv`) may write their working
+    # directory, and the container never writes the user's checkout (DESIGN
+    # §6 *The explicit channel*, §6½).
     planning = st.data.get("planning_worktree")
     if not planning:
         die("phase 1½: no planning worktree to provision from (it is made "
@@ -35566,7 +35550,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
     already ran). Cheap-skips when no recipe was detected (`kind: none`)."""
     prov = st.data.get("provision") or {}
     recipe = prov.get("recipe") or []
-    # kind:none (docs-only, or nothing to install) → nothing to attack.
+    # kind:none (nothing to install) → nothing to attack.
     kinds = {(e.get("kind") if isinstance(e, dict) else None) for e in recipe}
     if not recipe or kinds <= {"none"}:
         log("phase 1½: provision gate skipped (no install recipe)")
@@ -78095,10 +78079,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # here is keyed on its own result instead — the recipe, the gate's
         # verdict — so a resume redoes exactly what did not finish (DESIGN
         # §6 *Resumable planning*).
-        # Provision per-repo deps (DESIGN §6½). Runs after classify (so
-        # a docs-only run can short-circuit). Guarded on presence of
-        # the "recipe" key rather than unconditional: `mise install`
-        # (inside phase_provision) is real subprocess work, not
+        # Provision per-repo deps (DESIGN §6½), for every task whatever its
+        # categories: every measurement installs from the recipe. Guarded
+        # on presence of the "recipe" key rather than unconditional: `mise
+        # install` (inside phase_provision) is real subprocess work, not
         # idempotent, and a resume that already has a recipe persisted
         # must not redo it. Key-presence, not truthiness — a repo with
         # no recognized lockfile and no install commands needed is a
@@ -78111,7 +78095,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 Path(os.getcwd()), st, caps, models, efforts)
         # Independent adversarial verification of the detected install
         # recipe (DESIGN §8) — gates before plan spend, detect-and-die.
-        # Cheap-skips when no recipe was detected (docs-only / kind:none),
+        # Cheap-skips when no recipe was detected (kind:none),
         # and once it has a result (`provision.gate`), so a resume does not
         # pay for it twice.
         if "gate" not in (st.data.get("provision") or {}):
