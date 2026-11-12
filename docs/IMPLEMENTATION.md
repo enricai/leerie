@@ -1184,8 +1184,9 @@ stderr in `seed-auth.sh`. `_terminal_safe <text>` (`_log.sh`) prints
 `<text>` through the same filter, for a value inside leerie's own message:
 the `setup_packages` and `no_push` values the launcher names, a fetch's or a
 collect's machine output (`fetch-branch.sh`, `ec2-fetch-branch.sh`,
-`collect-subtrees.sh`, `force-finalize.sh`, the `accept-blocked` and
-`accept-integration` output lines), and host-finalize's PR base branch,
+`collect-subtrees.sh`, `force-finalize.sh`, the `accept-blocked`,
+`accept-integration` and `accept-heldout` output lines), host-finalize's PR
+URL and outcome in its PR update, and host-finalize's PR base branch,
 rebaser payload tail and passed BLT commands. The rule by source
 (`tests/test_terminal_safe_messages.py`): in the launcher,
 `scripts/host-finalize.sh` and `scripts/remote/*.sh`, a variable assigned
@@ -3558,6 +3559,7 @@ a container.
 | `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
 | `accept-blocked <run-id> <subtask-id> [--force]` | Accept a blocked subtask so `resume` skips it. `--force` also settles one abandoned mid-flight (e.g. after a crash), where neither status field records it as blocked. |
 | `accept-integration <run-id> <subtask-id>` | Accept a recorded `integration_judge` finding for a subtask so `resume` stops re-invoking the judge for it. |
+| `accept-heldout <run-id> <set>[/<case>] ...` | Accept held-out cases of a run as not required by its task: `<set>` is a held-out set number, `<set>/<case>` one case of it by the name the PR's `## Still failing when the run ended` section shows (or its whole ID, `<file> :: <title>`). `resume` then stops counting them as unfinished work, and the PR lists them under `## Held-out cases accepted by the operator`; a finished run's outcome is decided again and its open PR updated. See "Operator-accepted held-out cases" below. |
 | `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see "Chain verbs" below). |
 | `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see "Run-group verbs" below). |
 | `version` | Print `leerie <version>` and exit. |
@@ -7400,7 +7402,7 @@ nothing is asked and no answer key exists.
 |----------|---------|
 | `_reading_issues(result)` | The auditor-loop check on `reading`, for an `applicable` result only: `READING_UNDESCRIBED` (`narrow_or_broad` with an empty `narrow` or `broad`), `READING_BROAD_ADDS_NOTHING` (`narrow_or_broad` and no `fix` site typed `broad_only` that is `extent: pattern` with a `sweep` dict — single files alone do not count), `READING_UNDECLARED: sites[<n>]` (`one_reading` and that site typed `broad_only`). |
 | `_settle_scope_reading(st) -> None` | Run by `_run_phases` right after the audit, keyed on the absence of `state.data["scope_reading"]` and skipped once `plans_after_plan` exists. Derives every audited site's sweep items (`_derive_site_sweep_items` — the broad reading keeps every site), logs the reading when the audit found two, and writes `scope_reading` (below). |
-| `_pr_scope_reading_lines(state)` | The PR's `## Scope reading` lines, from `scope_reading` when its `kind` is `narrow_or_broad`: both readings, and that the run took the broad one — it did both, and nobody was asked. `[]` otherwise. `_format_pr_end_state_section` renders them under `## Scope reading` (in `_PR_END_STATE_HEADINGS`, directly after `## Still failing when the run ended`). |
+| `_pr_scope_reading_lines(state)` | The PR's `## Scope reading` lines, from `scope_reading` when its `kind` is `narrow_or_broad`: both readings, and that the run took the broad one — it did both, and nobody was asked. `[]` otherwise. `_format_pr_end_state_section` renders them under `## Scope reading` (in `_PR_END_STATE_HEADINGS`, after `## Still failing when the run ended` and `## Held-out cases accepted by the operator`). |
 Requirement coverage (`_d1_holes`) reads the classifier's result, never the
 derived items. `_delivery_judge_unmet` adds `instances` (the item's `parts`)
 to a derived item's payload entry; every other entry is unchanged.
@@ -11851,6 +11853,102 @@ carries its numbers.
 
 ---
 
+### Operator-accepted held-out cases — `accept-heldout`
+
+DESIGN §8 *An operator accepts a held-out case the task does not require*.
+
+- **`leerie accept-heldout <run-id> <set>[/<case>] ... [--runtime fly|ec2|local]`**
+  (launcher arm `accept-heldout`, beside `accept-blocked` and
+  `accept-integration`, whose local/Fly/EC2 machinery — runtime
+  auto-detection, run-id allowlist, wake-mutate-pause, `ACCEPTED:` /
+  `NOOP:` / `ERROR:` sentinels, the best-effort host mirror — it mirrors).
+  Each case argument is base64-encoded by the launcher before it reaches the
+  mutation program `_ah_mutate` (`python3 -I -c` locally, `python3 -I -`
+  over stdin on Fly/EC2), so free text never meets a remote shell; every
+  line it prints passes a non-printable character as `?` (a case title is
+  worker-written text, DESIGN §6 *No text leerie did not write reaches the
+  operator's terminal as a control sequence*). Usage on a missing argument:
+
+  ```
+  accept-heldout requires <run-id> and at least one <set> or <set>/<case>
+    Usage: leerie accept-heldout <run-id> <set>[/<case>] ... [--runtime fly|ec2|local]
+      <set>         every case of that held-out set (its number, as the PR shows it)
+      <set>/<case>  one case of it, by the name the PR shows, or <file> :: <title>
+  ```
+- **The lock.** `_ah_mutate` takes `fcntl.flock(LOCK_EX | LOCK_NB)` on the
+  run directory — the lock `State._acquire_lock` holds for an
+  orchestrator's life — and refuses with "an orchestrator owns this run"
+  when it is held. It writes `state.json` by temp file and `os.replace`,
+  keeping the file's mode.
+- **Validation, all before any change** (one bad argument changes nothing):
+  `<set>` must be digits naming a set in `acceptance.sets`; a set carrying
+  `settled_bar` (a regressed bar's) is refused; `<set>/<case>` needs a
+  bounded set (`scope.bounded: true`) and a case the run recorded for that
+  set — in `scope.counted_cases`, `base_failing_cases`,
+  `base_case_status`, a gate result's `failing_cases` (`initial`, `final`,
+  `rounds[].results`) or `residual.failing_cases_by_set` — named by its
+  whole ID, its ID with an absolute file part made relative, or its title
+  (the part after ` :: `, which the PR shows); a name matching cases in two
+  files is refused, asking for the whole ID. The error lists up to eight of
+  the set's case titles.
+- **The change**, per argument: a case is removed from
+  `scope.counted_cases[file]` and appended to the set's
+  `operator_accepted.cases` (`was_counted` records whether it was counted);
+  a whole set records `whole_set: {at}` and empties `counted_cases`,
+  bounding a set that was not bounded. `scope_before` keeps the first scope
+  seen; `pending: true` is set. `NOOP:` for a set typed `broken`, a case or
+  set already accepted.
+- **Readers.** Every has-work reader reads `scope.counted_cases`
+  (`_acceptance_counted_files`, `_acceptance_file_has_work`,
+  `_acceptance_result_has_work`, `_settle_case_names`, the held signals,
+  `_collect_unmet_evidence`), so the withdrawal alone takes the case out of
+  the no-work settle, the already-fixed check, the satisfied-probe
+  protection, the delivery re-drive, `_decide_outcome`, the unmet evidence,
+  `_record_settled_bar` and `_acceptance_residual_unbroken`. Read from
+  `operator_accepted` itself (`_acceptance_operator_accepted(set_) ->
+  (whole, {file: ids})`):
+  - `_acceptance_failure_unaccepted(set_, result)` / `_acceptance_repair_fails(results, sets)`:
+    the gate's repair starts and each round runs only while a measured
+    failure holds a failing file with no per-case record or a failing ID
+    outside the accepted ones (a gate whose every failure is accepted logs
+    so and repairs nothing); `_acceptance_audit_and_rewrite` leaves such a
+    set out of its `todo`.
+  - `_acceptance_name_accepted(set_, file | None, name)`: a declared name
+    matches an accepted ID whose title is the name or ends with it right
+    after a non-identifier character (jest's space, pytest's dot).
+    `_format_acceptance_failures_section` skips a result with no unaccepted
+    failure and drops accepted names; `_acceptance_residual_unbroken` drops
+    them from the `cases` it hands on.
+  - `_acceptance_operator_pending(data)`: a set's `operator_accepted.pending`;
+    `_decide_outcome` clears every one.
+  - `_pr_operator_accepted_lines(state)`: the
+    `## Held-out cases accepted by the operator` section
+    (`_OPERATOR_ACCEPTED_HEADING`, in `_PR_END_STATE_HEADINGS`, rendered by
+    `_format_pr_end_state_section` after `## Still failing when the run
+    ended`): a statement that the operator, not leerie, decided, then one
+    line per case — set, file, title, time — or per whole set.
+- **Resume.** An unfinished run reads all of the above where it resumes. A
+  finished one (`_run_has_nothing_left` and not `no_work_required`) with
+  `_acceptance_operator_pending` calls `_redecide_after_operator_acceptance(st)`
+  before answering "nothing to resume": `_decide_outcome(st,
+  any_commits=True)` (which records the settled bar when the outcome is now
+  `done`), `_record_unmet_evidence`, `_format_pr_end_state_section` into
+  `run.json.pr_end_state` (swapped into `pr_body` when it holds the old
+  text) and, when `run.json` has `pushed_at` and `pr_url`, `pr_refresh`
+  (above, *Host-side finalize*). No worker is called.
+- **Tests:** `tests/test_accept_heldout.py` — the launcher verb on a real
+  run directory whose run branch lives in a real run repository, then the
+  real `_run_phases` resume: outcome `unconverged` → `done`, the PR section,
+  `pr_refresh` holding the old text, no worker; controls (no acceptance, no
+  re-decision; a variant accepted alone, still `unconverged`); refusals
+  (live run, unknown set or case, malformed argument beside a good one,
+  ambiguous name, a case of an unbounded set, a regressed bar), each leaving
+  `state.json` byte-identical; the next same-task run's residual; the real
+  gate on a real pytest repository repairing nothing when every failure is
+  accepted, and naming only the unaccepted sibling when one case is; the
+  host refresh. `tests/test_accept_verbs_keep_their_evidence.py` checks
+  `_ah_mutate` carries no apostrophe.
+
 ## 6½. Per-repo dependency provisioning
 
 Implements DESIGN §6½. The provision phase fires once per run, between
@@ -12789,6 +12887,26 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    once*). On failure: log a warning
    with the pushed-branch URL and a retry command (using the resolved
    base); update `run.json` with `pr_error`. **Non-fatal** — exit 0.
+
+**An open PR follows its run's re-decided outcome** (DESIGN §6). When
+`run.json.pushed_at` is set, `host_finalize` first calls
+`_host_finalize_refresh_pr <run.json>`, which acts only when `pr_refresh` is
+an object and `pr_url` is set: `gh pr view <url> --json body,isDraft`; the
+body with every occurrence of `pr_refresh.end_state_was` replaced by
+`pr_end_state` (jq `split`/`join` on the literal text; appended after a
+blank line when the body does not hold it, or `end_state_was` is empty);
+`gh pr edit <url> --body-file -`; `gh pr ready <url>` when
+`pr_refresh.outcome` is not `unconverged` and the PR is a draft; then
+`pr_refresh` is set null. Every `gh` runs from `/` with `GIT_DIR` /
+`GIT_WORK_TREE`, as `gh pr create` does. A failing step prints a warning,
+keeps `pr_refresh` and returns 0, so the next `finalize` tries again; nothing
+is pushed and no PR is created. The local launcher's post-exit block, which
+otherwise stops at "already pushed", calls `host_finalize` when
+`pr_refresh` is an object; Fly and EC2 reach it through `decide_teardown`'s
+`host_finalize`, and every runtime through `leerie finalize <run-id>`.
+Pinned in `tests/test_accept_heldout.py` (real git origin, stub `gh`: body
+swapped, draft marked ready, nothing pushed; a failing `gh pr ready` keeps
+the request).
 
 **Local runtime only.** The inline finalize block above runs only when
 `LEERIE_RUNTIME != "fly"`. On Fly the run dir is not yet on the host
@@ -14449,6 +14567,7 @@ discovery without parsing the full `state.json`):
 | `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |
 | `push_error` | str \| null | captured `git push` output if the push failed — stderr plus any pre-push hook stdout under a marker, tail-bounded to 32 KiB; mutually exclusive with `pushed_at`. |
 | `pr_url` | str \| null | the PR URL `gh` returned; null until PR creation succeeds |
+| `pr_refresh` | dict \| null, absent when never asked | `{end_state_was, outcome}`: written by `_redecide_after_operator_acceptance` when a resume re-decided the outcome of a run already pushed with a PR — `end_state_was` the end-state text that PR holds (kept from a refresh still waiting), `outcome` the new outcome. `host_finalize`'s already-pushed branch acts on it (`_host_finalize_refresh_pr`) and sets it null once the PR is updated; a failure keeps it. |
 | `pr_error` | str \| null | captured `gh` stderr if PR creation failed; logical invariant — `pr_error` can be set only after `pushed_at` is set |
 | `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written immediately after `flyctl machine run` succeeds, so a launcher crash before classifying still leaves a recoverable pointer. Null for local runs. |
 | `paused_at` | ISO-8601 str \| null | when the remote run was paused — on failure or by explicit `leerie stop <run-id>`. Cleared at finalize. |
@@ -14462,7 +14581,7 @@ discovery without parsing the full `state.json`):
 | `image_tag` | str \| null | Full Fly registry image tag recorded at provision time; `resume_machine()` updates the machine's image on resume if `$FLY_IMAGE_TAG` has drifted from the stored value. |
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix; the launcher prepends it). Null when the worker errored, or when no push has been chosen for the run (a `--no-push` finalize; a later `resume <id> --push` runs the worker then); `host_finalize` falls back to a deterministic title. |
 | `pr_body` | str \| null | PR body (markdown): the `pr_writer` worker's accepted body, with any worker-emitted copy of a code-owned end-state section stripped and `_format_pr_end_state_section` appended when it is non-empty (`_compose_pr_via_llm` — those sections are deliberately never LLM-written). Null on the same conditions as `pr_title`. |
-| `pr_end_state` | str | the PR's end-state section (`_format_pr_end_state_section`, DESIGN §6 *The PR's end-state section is rendered by code, from typed state*), rendered once by `phase_finalize` after `_decide_outcome` and written with `finished_at`; `""` when there is nothing to say. `host-finalize.sh`'s LLM-less fallback appends it as-is. |
+| `pr_end_state` | str | the PR's end-state section (`_format_pr_end_state_section`, DESIGN §6 *The PR's end-state section is rendered by code, from typed state*), rendered once by `phase_finalize` after `_decide_outcome` and written with `finished_at` — and again by `_redecide_after_operator_acceptance` when the operator accepted held-out cases of the finished run (which also swaps it into `pr_body` when `pr_body` holds the old text); `""` when there is nothing to say. `host-finalize.sh`'s LLM-less fallback appends it as-is. |
 | `unmet_evidence` | dict | `{dir, text}`: what was still unmet when the run ended, as the tests that show it (`_record_unmet_evidence`; DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*) — `dir` the operator path of `<run_dir>/unmet-evidence/`, `text` the section's lines; written by `phase_finalize` and by the dispute-bound no-work exit; absent when nothing is unmet. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 | `rebase_disposition_status` | str \| null | set to `"unusable"` by the rebase fallback arm when the rebaser seam returns rc=0 but its JSON is empty, unparseable, or lacks `status`. |
@@ -14570,7 +14689,7 @@ command line overrides it.
 | `pr_review` | dict | the advisory whole-PR review (DESIGN §9 *An advisory whole-PR review feeds the final conformer*), written once by `_run_pr_review`: `{base, head, model, effort, diff_cut, findings[{item_id, kind, path, line_start, line_end, quote, item_span_quote, explanation, path_exists, quote_ok, line_ok, item_id_norm, item_known, span_ok, verified}], n_findings, n_verified, at, error?}`. Only `verified` findings reach the final conformer; for the PR; never gates and never read by `_decide_outcome`. Its presence is the resume sentinel. |
 | `plan_item_check` | dict | the plan-versus-items check (DESIGN §11 *Intent conflicts are settled with evidence, else asked*), written once by `_run_plan_item_check`: `{conflicts[{item_index, item_quote, subtask_id, field, plan_quote, kind, test_file}], rejected, model, effort, error?}` — `conflicts` the verified ones only, `rejected` how many failed `_verify_plan_conflict`. Its presence is the resume sentinel. |
 | `intent_questions` | dict | every intent question, by id (`intent-plan-<sid>`, `intent-finding-<finding_id>`, or the contradiction hook's id): `{qid, source: plan\|set_aside\|contradiction, question, context, at, verdict?{decision, answer, status, evidence[{source, quote, locator, ok}], trusted, model, effort, at} \| {error, at}, driven?, asked_at?}`. The decision is `answers[qid]` when that is in `INTENT_ANSWERS`, else `verdict.answer` when `verdict.status == "settled"` and `verdict.trusted`, else none (`_intent_decision`). Read by `_apply_plan_intent_rulings`, `_adjudicate_set_asides`, `_apply_set_aside_answers`, `_stop_for_intent_questions` and `_pr_intent_lines`. |
-| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], discarded[{index, reason}], audit_conflicts?[], skipped?, gate?, settled_bar_key?, settled_bar?, settled_bar_recorded?}` — `settled_bar_key` is `_settled_bar_key` at the run's start, `settled_bar` is `_settled_bar_check`'s record at the own start, `settled_bar_recorded` `{entries, cases}` what `_record_settled_bar` kept when the run ended `done` (both: §6 *The settled bar*); `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], sample_kinds[[kind]], samples, skipped?, verdicts?{case: set_defect|implementation_gap}, case_keys?{case: {key, assertion, target[]}}, reconciled?[case]}` (only quote-verified `set_defect` cases, minus any `_reconcile_audit_verdicts` withdrew; `sample_kinds` the verified kinds of each sample that answered, what the delivery re-drive's escalation gate counts a majority over); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, typed, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?, pre_sha?, fixed_cases?, ratchet?, rollback_reason?, rolled_back?, rollback_failed?, flip_regressed?}], round_pre?{round, sha}, test_ids?{sha: {ids[], files{}, kind, messages{}, command} | {unmeasured: true}}, final[], final_sha?, before_sha?, pre_tests_passed?, post_tests_confirm?, residual?, rolled_back?, rollback_reason?, rollback_failed?, final_unremeasured?{sha, label}, conformer_flip?{start_sha, end_sha, broken_cases[], culprit_round?, rollback_to?, rolled_back?, rollback_failed?}, item_flips?[{round, rollback_to, from_sha, culprits[], reason, notes[], landed, rollback_failed?}], item_flip_checked?}` (`conformer_flip`: `_conformer_flip_check`'s decision, saved before its reset; `item_flips`: each `_acceptance_item_flips` decision, saved before its reset, `landed` None until the reset ran; `item_flip_checked`: the HEAD on which that check last found no flip) (`final_unremeasured` written by `_acceptance_remeasure_final` when re-measuring `sha` measured no set, so `final` stays of `final_sha`; dropped when a re-measure succeeds) (`round_pre` the in-flight round's own start, saved before its worker runs and dropped when the round is recorded; a round's `pre_sha` is that start, `fixed_cases` `_acceptance_fixed_cases(verdict before, its verdict)`, `ratchet` the round's `_delivery_ratchet` result (or `{error}`), `test_ids` the test axis's failing IDs per measured commit, and `rollback_reason: "fixed no failing case"` | `"regressed a previously met required item"` | `"broke an existing test"` | an `_acceptance_item_flips` reason (with `flip_regressed[]` on the culprit round) marks a round reset to `pre_sha` — `rolled_back` the confirmed reset, absent while the decision is on disk but the reset not yet done, which a resume finishes; `_acceptance_round_kept` skips such a round wherever the latest or last measured verdict is read) (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on, `final_sha` the staging HEAD when `final` was written — rewritten with `final` by the delivery re-drive, and by `_acceptance_remeasure_final` when a resumed gate finds `final` of another commit than staging's HEAD: the sets are measured again on HEAD with no repair round, and the gate otherwise skips only while `final_sha` is HEAD — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], failing_cases?{file: [case ids]}, resource_affected_files?[], intermittent_cases?{file: [held case ids]}, budget_short_files?[], budget_short_unsettled_files?[], no_case_evidence_files?[], discovery?, unmeasured_reason?, unmeasured_files?{file: reason}}` (`failing_files` confirmed under B*; on an unmeasured result, `unmeasured_reason` a whole-set cause and `unmeasured_files` the per-file causes, both codes of `ACCEPTANCE_UNMEASURED_WHY`; `failing_cases` the runner report's failing case IDs per confirmed failing file, where one was readable); `residual` `{failing_sets, held_back_failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, failing_cases_by_set{index: {file: [case ids]}}, intermittent?[set indices whose failure is a held case seen failing only with resource signatures], unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used with `cases` emptied). `cases` and `cases_by_set` hold the shown sets' declared names only (`_acceptance_shown_indices(sets)`), a failing held-back set counted in `held_back_failing_sets`; `_acceptance_residual_unbroken` re-derives `cases` (and `held_back_failing_sets`) from the shown sets at read time, and only `cases` is handed on (`cases_by_set` is copied unchanged), so a residual recorded before that rule hands on no held-back name, and `acceptance_unmet` carries `held_back_failing_sets` beside `cases` (DESIGN §8 *Nothing a held-out evaluation produces reaches a fixer*). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
+| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], discarded[{index, reason}], audit_conflicts?[], skipped?, gate?, settled_bar_key?, settled_bar?, settled_bar_recorded?}` — `settled_bar_key` is `_settled_bar_key` at the run's start, `settled_bar` is `_settled_bar_check`'s record at the own start, `settled_bar_recorded` `{entries, cases}` what `_record_settled_bar` kept when the run ended `done` (both: §6 *The settled bar*); `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?, operator_accepted?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], sample_kinds[[kind]], samples, skipped?, verdicts?{case: set_defect|implementation_gap}, case_keys?{case: {key, assertion, target[]}}, reconciled?[case]}` (only quote-verified `set_defect` cases, minus any `_reconcile_audit_verdicts` withdrew; `sample_kinds` the verified kinds of each sample that answered, what the delivery re-drive's escalation gate counts a majority over); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, typed, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). `operator_accepted` (written only by the launcher's `accept-heldout` mutator, DESIGN §8 *An operator accepts a held-out case the task does not require*) is `{cases[{file, case, at, was_counted}], whole_set: {at} | null, scope_before, pending?}`: each accepted case was withdrawn from `scope.counted_cases` (a whole set leaves `counted_cases` empty, and a set that was not bounded becomes `{bounded: true, by: "operator", judged: {}, unbounded_error, counted_cases: {}}`); `scope_before` is the scope the first acceptance found; `pending: true` until `_decide_outcome` next runs. A replacing rewrite moves it to `rewrite.original.operator_accepted`. An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?, pre_sha?, fixed_cases?, ratchet?, rollback_reason?, rolled_back?, rollback_failed?, flip_regressed?}], round_pre?{round, sha}, test_ids?{sha: {ids[], files{}, kind, messages{}, command} | {unmeasured: true}}, final[], final_sha?, before_sha?, pre_tests_passed?, post_tests_confirm?, residual?, rolled_back?, rollback_reason?, rollback_failed?, final_unremeasured?{sha, label}, conformer_flip?{start_sha, end_sha, broken_cases[], culprit_round?, rollback_to?, rolled_back?, rollback_failed?}, item_flips?[{round, rollback_to, from_sha, culprits[], reason, notes[], landed, rollback_failed?}], item_flip_checked?}` (`conformer_flip`: `_conformer_flip_check`'s decision, saved before its reset; `item_flips`: each `_acceptance_item_flips` decision, saved before its reset, `landed` None until the reset ran; `item_flip_checked`: the HEAD on which that check last found no flip) (`final_unremeasured` written by `_acceptance_remeasure_final` when re-measuring `sha` measured no set, so `final` stays of `final_sha`; dropped when a re-measure succeeds) (`round_pre` the in-flight round's own start, saved before its worker runs and dropped when the round is recorded; a round's `pre_sha` is that start, `fixed_cases` `_acceptance_fixed_cases(verdict before, its verdict)`, `ratchet` the round's `_delivery_ratchet` result (or `{error}`), `test_ids` the test axis's failing IDs per measured commit, and `rollback_reason: "fixed no failing case"` | `"regressed a previously met required item"` | `"broke an existing test"` | an `_acceptance_item_flips` reason (with `flip_regressed[]` on the culprit round) marks a round reset to `pre_sha` — `rolled_back` the confirmed reset, absent while the decision is on disk but the reset not yet done, which a resume finishes; `_acceptance_round_kept` skips such a round wherever the latest or last measured verdict is read) (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on, `final_sha` the staging HEAD when `final` was written — rewritten with `final` by the delivery re-drive, and by `_acceptance_remeasure_final` when a resumed gate finds `final` of another commit than staging's HEAD: the sets are measured again on HEAD with no repair round, and the gate otherwise skips only while `final_sha` is HEAD — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], failing_cases?{file: [case ids]}, resource_affected_files?[], intermittent_cases?{file: [held case ids]}, budget_short_files?[], budget_short_unsettled_files?[], no_case_evidence_files?[], discovery?, unmeasured_reason?, unmeasured_files?{file: reason}}` (`failing_files` confirmed under B*; on an unmeasured result, `unmeasured_reason` a whole-set cause and `unmeasured_files` the per-file causes, both codes of `ACCEPTANCE_UNMEASURED_WHY`; `failing_cases` the runner report's failing case IDs per confirmed failing file, where one was readable); `residual` `{failing_sets, held_back_failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, failing_cases_by_set{index: {file: [case ids]}}, intermittent?[set indices whose failure is a held case seen failing only with resource signatures], unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used with `cases` emptied). `cases` and `cases_by_set` hold the shown sets' declared names only (`_acceptance_shown_indices(sets)`), a failing held-back set counted in `held_back_failing_sets`; `_acceptance_residual_unbroken` re-derives `cases` (and `held_back_failing_sets`) from the shown sets at read time, and only `cases` is handed on (`cases_by_set` is copied unchanged), so a residual recorded before that rule hands on no held-back name, and `acceptance_unmet` carries `held_back_failing_sets` beside `cases` (DESIGN §8 *Nothing a held-out evaluation produces reaches a fixer*). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
 | `skip_acceptance_check` | bool | whether the held-out acceptance sets and gate are suppressed. Resolved from `--skip-acceptance-check` / `LEERIE_SKIP_ACCEPTANCE_CHECK` / default `False`; seeded in both the fresh and resume branches. |
 | `no_work_pending` | bool | set by `_confirm_no_work_on_converged_gate` when the `no_work_judge` confirms and `_acceptance_can_check(st)` holds (acceptance not skipped, `bug-fixing` category, a scoped test template): the confirmation is held instead of finishing, and `_settle_pending_no_work` decides it after `phase_acceptance_write` (DESIGN §8 *No work is declared on executed evidence, and a dispute is bounded*). Cleared on a dispute. |
 | `no_work_acceptance` | dict | `_settle_pending_no_work`'s verdict, or `_settled_bar_settles_run`'s when the bar settled it first: `{verdict: pass \| dispute \| accepted after dispute \| fixed_on_head_by_execution \| no valid sets \| not measurable \| error: <type> \| settled_bar_holds \| settled_bar_regressed, results?, cases?, discarded?, advisory?}` — `fixed_on_head_by_execution` (an executed basis, with `discarded` copied from `acceptance.discarded`) when there is no valid set, `acceptance.written` ≥ 1 and every one of the `written` sets is in `acceptance.discarded` with that reason; its presence is the settle step's resume sentinel. |

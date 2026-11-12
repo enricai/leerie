@@ -7618,10 +7618,12 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
 # or template may emit it.
 _RISK_SECTION_HEADING = "## ⚠ Residual risks"
 _UNMET_HEADING = "## Still failing when the run ended"
+_OPERATOR_ACCEPTED_HEADING = "## Held-out cases accepted by the operator"
 _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
     _UNMET_HEADING,
+    _OPERATOR_ACCEPTED_HEADING,
     "## Scope reading",
     "## Needs human verification",
     "## Not verified by this run",
@@ -7750,6 +7752,41 @@ def _pr_code(value: object) -> str:
     """`value` as inline code; a backtick inside would end the span."""
     return "`" + _normalize_risk_text(value, _PR_ENTRY_MAX).replace(
         "`", "'") + "`"
+
+
+def _pr_operator_accepted_lines(state: dict) -> list[str]:
+    """The `## Held-out cases accepted by the operator` lines: every
+    held-out case (or whole set) recorded under a set's `operator_accepted`
+    by `leerie accept-heldout`, by set, file and name, said to be the
+    operator's call (DESIGN §8 *An operator accepts a held-out case the task
+    does not require*). [] when there is none."""
+    acc = state.get("acceptance") if isinstance(state, dict) else None
+    sets = acc.get("sets") if isinstance(acc, dict) else None
+    rows: list[str] = []
+    for s_ in sets if isinstance(sets, list) else []:
+        rec = (s_.get("operator_accepted") if isinstance(s_, dict)
+               else None)
+        if not isinstance(rec, dict):
+            continue
+        k = s_.get("index")
+        whole = rec.get("whole_set")
+        if isinstance(whole, dict):
+            rows.append(f"- Held-out set {_pr_entry(k)}: every case "
+                        f"(accepted {_pr_entry(whole.get('at'))})")
+            continue
+        for e in rec.get("cases") or []:
+            if not isinstance(e, dict) or not isinstance(e.get("case"), str):
+                continue
+            title = e["case"].partition(" :: ")[2] or e["case"]
+            rows.append(f"- Held-out set {_pr_entry(k)}, "
+                        f"{_pr_code(e.get('file'))}: {_pr_code(title)} "
+                        f"(accepted {_pr_entry(e.get('at'))})")
+    if not rows:
+        return []
+    return ["The operator accepted these held-out cases as not required by "
+            "the task (`leerie accept-heldout`). It was the operator's "
+            "call, not leerie's: leerie measured them failing and no longer "
+            "counts them as unfinished work.", "", *rows]
 
 
 def _pr_paths(paths: object) -> str:
@@ -8268,10 +8305,11 @@ def _pr_scope_reading_lines(state: dict) -> list[str]:
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to eleven headed lists, each
+    rendered by code, from typed state*). Up to twelve headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Still failing when the run ended` (what is unmet, as the
-    tests that show it: `_pr_unmet_evidence_lines`), `## Scope reading`
+    tests that show it: `_pr_unmet_evidence_lines`), `## Held-out cases
+    accepted by the operator` (`_pr_operator_accepted_lines`), `## Scope reading`
     (the run took the broad reading of a task that reads two ways:
     `_pr_scope_reading_lines`),
     `## Intent decisions` (`_pr_intent_lines`, DESIGN §11),
@@ -8329,6 +8367,9 @@ def _format_pr_end_state_section(state: dict) -> str:
     lines = _pr_unmet_evidence_lines(state)
     if lines:
         sections.append((_UNMET_HEADING, lines))
+    lines = _pr_operator_accepted_lines(state)
+    if lines:
+        sections.append((_OPERATOR_ACCEPTED_HEADING, lines))
 
     lines = _pr_scope_reading_lines(state)
     if lines:
@@ -43439,6 +43480,13 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         outcome = "done"
     st.data["outcome"] = outcome
     st.data["outcome_reasons"] = reasons
+    # This decision read every held-out case the operator accepted so far
+    # (DESIGN §8 *An operator accepts a held-out case the task does not
+    # require*).
+    for s_ in (acc.get("sets") or []) if isinstance(acc, dict) else []:
+        rec = s_.get("operator_accepted") if isinstance(s_, dict) else None
+        if isinstance(rec, dict):
+            rec.pop("pending", None)
     st.save()
     if outcome == "done":
         # The task's settled bar, when it has none yet (DESIGN §8 *Done is a
@@ -53653,6 +53701,97 @@ def _acceptance_set_broken(set_: dict) -> bool:
     return set_.get("broken") is True
 
 
+def _acceptance_operator_accepted(set_: dict
+                                  ) -> tuple[bool, dict[str, set[str]]]:
+    """What the operator accepted of `set_` as not required by the task
+    (`leerie accept-heldout`; DESIGN §8 *An operator accepts a held-out case
+    the task does not require*): `(whole set, {file: case IDs})`. Written
+    only by the launcher's mutator, which also withdraws each accepted case
+    from the set's counted cases, so every has-work reader already leaves it
+    out; read here for what counting cannot say — that an accepted case is
+    not repaired, audited or named to a fixer or planner (a variant is), and
+    that the PR lists it."""
+    rec = set_.get("operator_accepted") if isinstance(set_, dict) else None
+    if not isinstance(rec, dict):
+        return False, {}
+    ids: dict[str, set[str]] = {}
+    for e in rec.get("cases") or []:
+        if (isinstance(e, dict) and isinstance(e.get("file"), str)
+                and isinstance(e.get("case"), str)):
+            ids.setdefault(e["file"], set()).add(e["case"])
+    return isinstance(rec.get("whole_set"), dict), ids
+
+
+def _acceptance_name_accepted(set_: dict, rel: str | None,
+                              name: str) -> bool:
+    """Whether the writer's declared case `name` (of file `rel`; any file of
+    the set when None) is one the operator accepted. A runner's case ID is
+    `<file> :: <title>`, its title the case's own name behind what scopes
+    it — a describe path and a space (jest, vitest), a module and class and
+    a dot (pytest) — so a declared name matches an accepted ID whose title
+    is it, or ends with it right after a character that cannot be part of
+    an identifier: leerie's own mechanical strings (DESIGN §12)."""
+    whole, ids = _acceptance_operator_accepted(set_)
+    if whole:
+        return True
+    pool = (ids.get(rel, set()) if rel is not None
+            else {c for v in ids.values() for c in v})
+
+    def _names(cid: str) -> bool:
+        title = cid.partition(" :: ")[2] or cid
+        if title == name:
+            return True
+        cut = len(title) - len(name)
+        return (cut > 0 and title.endswith(name)
+                and not (title[cut - 1].isalnum() or title[cut - 1] == "_"))
+    return bool(name) and any(_names(c) for c in pool)
+
+
+def _acceptance_failure_unaccepted(set_: dict, result: dict) -> bool:
+    """Whether a failing verdict on `set_` holds a failure the operator did
+    not accept: a failing file with no per-case record, or a failing case ID
+    outside the accepted ones. What decides a repair round and the set
+    audit (DESIGN §8 *An operator accepts a held-out case the task does not
+    require*: an accepted case is not repaired)."""
+    whole, ids = _acceptance_operator_accepted(set_)
+    if whole:
+        return False
+    files = result.get("failing_files") or []
+    if not any(ids.values()) or not files:
+        return True
+    cases = (result.get("failing_cases")
+             if isinstance(result.get("failing_cases"), dict) else {})
+    for rel in files:
+        failing = cases.get(rel)
+        if not isinstance(failing, list) or not failing:
+            return True
+        if {str(c) for c in failing} - ids.get(rel, set()):
+            return True
+    return False
+
+
+def _acceptance_repair_fails(results: list[dict], sets: list[dict]) -> bool:
+    """`_acceptance_any_fails` for the repair rounds: a measured set failed
+    on something the operator did not accept
+    (`_acceptance_failure_unaccepted`). A variant is still repaired."""
+    by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
+    return any(_acceptance_failure_unaccepted(by_index.get(r["index"]) or {},
+                                              r)
+               for r in _acceptance_measured(results) if not r["passed"])
+
+
+def _acceptance_operator_pending(data: dict) -> bool:
+    """Whether the operator accepted held-out cases since the run's outcome
+    was last decided: a set record whose `operator_accepted.pending` the
+    verb set and `_decide_outcome` has not yet cleared."""
+    acc = data.get("acceptance") if isinstance(data, dict) else None
+    sets = acc.get("sets") if isinstance(acc, dict) else None
+    return any(isinstance(s_, dict)
+               and isinstance(s_.get("operator_accepted"), dict)
+               and s_["operator_accepted"].get("pending") is True
+               for s_ in (sets if isinstance(sets, list) else []))
+
+
 def _acceptance_counted_files(set_: dict) -> set[str] | None:
     """The defect files of `set_` holding a case the scope judge counted as
     the report's own scenario (DESIGN §8 *A task that points at a report is
@@ -53764,8 +53903,12 @@ def _acceptance_residual_unbroken(residual: dict | None,
     out["sets"] = keep
     out["failing_sets"] = len(keep)
     out["held_back_failing_sets"] = sum(1 for i in keep if i not in shown)
+    # A case the operator accepted is no work to plan at (DESIGN §8 *An
+    # operator accepts a held-out case the task does not require*).
     out["cases"] = [c for i in keep if i in shown
-                    for c in by_set.get(str(i), [])][:20]
+                    for c in by_set.get(str(i), [])
+                    if not _acceptance_name_accepted(by_index.get(i) or {},
+                                                     None, c)][:20]
     return out
 
 
@@ -59376,10 +59519,16 @@ def _format_acceptance_failures_section(results: list[dict],
         # An unmeasured set is no verdict, never a failure to describe.
         if r["passed"] or r.get("unmeasured") or r["index"] not in shown:
             continue
-        shown_fails = True
         set_ = by_index[r["index"]]
+        # A case the operator accepted is not repaired, so not named
+        # (DESIGN §8 *An operator accepts a held-out case the task does not
+        # require*).
+        if not _acceptance_failure_unaccepted(set_, r):
+            continue
+        shown_fails = True
         for rel in r["failing_files"]:
-            names = set_["cases"].get(rel, [])[:12]
+            names = [n for n in set_["cases"].get(rel, [])
+                     if not _acceptance_name_accepted(set_, rel, n)][:12]
             unnamed = unnamed or not names
             # `modes` records what validation SAW on the base (a declared
             # import defect whose file failed to load there), never runner
@@ -60038,6 +60187,10 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             # no worker may type it away or rewrite it (DESIGN §8 *Done is a
             # fixed bar per task*).
             and not by_index[i].get("settled_bar")
+            # Nor tests the operator accepted: a rewrite would replace the
+            # cases they named (DESIGN §8 *An operator accepts a held-out
+            # case the task does not require*).
+            and _acceptance_failure_unaccepted(by_index[i], results[i])
             and int(by_index[i].get("rewrite_rounds") or 0) < cap]
 
     def _save() -> None:
@@ -60118,6 +60271,11 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                     s_[k] = new.get(k)
                 # A replaced set is a new set: its scope is typed afresh.
                 rw["original"]["scope"] = s_.pop("scope", None)
+                # And the operator's acceptance stays with the tests it
+                # named (DESIGN §8 *An operator accepts a held-out case*).
+                if "operator_accepted" in s_:
+                    rw["original"]["operator_accepted"] = s_.pop(
+                        "operator_accepted")
                 await _acceptance_scope_judge_sets(
                     task, st, caps, models, efforts, [s_])
                 _save()
@@ -61255,7 +61413,12 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     if not resumed_repair and not _acceptance_measured(initial):
         log("phase 5: acceptance gate — no held-out set could be run on the "
             "integrated tree; no evidence either way")
-    elif resumed_repair or _acceptance_any_fails(initial):
+    elif not resumed_repair and not _acceptance_repair_fails(initial, sets):
+        if _acceptance_any_fails(initial):
+            log("phase 5: acceptance gate — every failing held-out case on "
+                "the integrated tree is one the operator accepted as not "
+                "required by the task; no repair")
+    else:
         measured = _acceptance_measured(initial)
         log(f"phase 5: acceptance gate — "
             f"{sum(1 for r in measured if not r['passed'])} of "
@@ -61456,7 +61619,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             # that already passed — or after the rollback decision — must
             # not run another.
             if (gate.get("rolled_back") or gate.get("rollback_failed")
-                    or not _acceptance_any_fails(final)):
+                    or not _acceptance_repair_fails(final, sets)):
                 break
             # Each round's own start, on disk before its worker runs: the
             # round is rolled back to it, never to the gate's start.
@@ -79196,6 +79359,41 @@ async def _compose_pr_via_llm(st: "State",
             "launcher will use deterministic fallback")
 
 
+def _redecide_after_operator_acceptance(st: "State") -> None:
+    """A finished run's outcome, decided again after the operator accepted
+    held-out cases (DESIGN §8 *An operator accepts a held-out case the task
+    does not require*, §6 *An open PR follows its run's re-decided
+    outcome*): on the record alone — no phase runs and no worker is called
+    — `_decide_outcome`, the unmet evidence and the PR's end-state section
+    again, then `run.json`. The end state the PR was opened with is kept as
+    `pr_refresh.end_state_was` when the run is already pushed with a PR, so
+    the host can replace that text in the open PR's body; a refresh still
+    waiting keeps the text the PR still holds. Only a run that finalized
+    with commits reaches here (`_run_has_nothing_left`, not
+    `no_work_required`)."""
+    run_json = _read_run_json_sidecar(st.run_dir / "run.json") or {}
+    before = st.data.get("outcome")
+    was = str(run_json.get("pr_end_state") or "")
+    outcome = _decide_outcome(st, any_commits=True)
+    _record_unmet_evidence(st)
+    end = _format_pr_end_state_section(st.data)
+    fields: dict = {"pr_end_state": end}
+    body = run_json.get("pr_body")
+    if isinstance(body, str) and was and was in body:
+        fields["pr_body"] = body.replace(was, end)
+    if run_json.get("pushed_at") and run_json.get("pr_url"):
+        pending = run_json.get("pr_refresh")
+        if isinstance(pending, dict) and isinstance(
+                pending.get("end_state_was"), str):
+            was = pending["end_state_was"]
+        fields["pr_refresh"] = {"end_state_was": was, "outcome": outcome}
+    _write_run_json(st.run_dir, **fields)
+    log(f"resume: the operator accepted held-out case(s) since the outcome "
+        f"was decided; outcome {before} -> {outcome}"
+        + ("; the host will update the open PR"
+           if "pr_refresh" in fields else ""))
+
+
 async def _compose_pr_for_a_push_chosen_after_finalize(
         st: "State",
         no_push: bool,
@@ -79927,6 +80125,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # through.
         if (_run_has_nothing_left(st.data)
                 and not st.data.get("no_work_required")):
+            if _acceptance_operator_pending(st.data):
+                _redecide_after_operator_acceptance(st)
             log(f"run already completed at {st.data['finished_at']} — "
                 "nothing to resume (host launcher will push + open PR)")
             await _compose_pr_for_a_push_chosen_after_finalize(

@@ -24,18 +24,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _run_accept(state_path: Path, sid: str,
                 force: bool = False,
-                verb: str = "accept-blocked") -> subprocess.CompletedProcess:
-    """Run the accept-blocked/accept-integration mutation via the launcher.
+                verb: str = "accept-blocked",
+                more: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
+    """Run the accept-blocked/accept-integration/accept-heldout mutation via
+    the launcher.
 
     Shared by the whole accept-verb test family (see
     tests/test_accept_integration.py's ``verb="accept-integration"``
-    callers) -- this is the sole owner of the local-path launcher
-    invocation shape.
+    callers and tests/test_accept_heldout.py's, which pass further
+    positionals in ``more``) -- this is the sole owner of the local-path
+    launcher invocation shape.
     """
     env = {k: v for k, v in os.environ.items()}
     env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
     run_id = state_path.parent.name
-    argv = [str(REPO_ROOT / "leerie"), verb, run_id, sid,
+    argv = [str(REPO_ROOT / "leerie"), verb, run_id, sid, *more,
             "--runtime", "local"]
     if force:
         argv.append("--force")

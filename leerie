@@ -3325,6 +3325,456 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     fi
     exit 0
     ;;
+  accept-heldout)
+    # Accept held-out cases of a run as not required by its task, so that
+    # `resume` stops counting them as unfinished work (DESIGN §8 *An operator
+    # accepts a held-out case the task does not require*). Mirrors
+    # accept-integration's shape and local/Fly/EC2 state-mutation machinery;
+    # it differs in what it mutates, in taking the run directory's lock (a
+    # live orchestrator would overwrite the change on its next save), and in
+    # carrying its case arguments base64-encoded: a case name is free text,
+    # and on Fly/EC2 every argument passes through a remote shell.
+    # Usage: leerie accept-heldout <run-id> <set>[/<case>] ... [--runtime fly|ec2|local]
+    shift
+    export USER_REPO
+    _ah_run_id=""
+    _ah_specs=()
+    _ah_runtime=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runtime) _ah_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _ah_runtime="${1#--runtime=}"; shift ;;
+        --*) remote_log "unknown accept-heldout flag: $1"; exit 1 ;;
+        *)
+          if [ -z "$_ah_run_id" ]; then _ah_run_id="$1"
+          else _ah_specs+=("$1")
+          fi
+          shift
+          ;;
+      esac
+    done
+    if [ -z "$_ah_run_id" ] || [ "${#_ah_specs[@]}" -eq 0 ]; then
+      remote_log "accept-heldout requires <run-id> and at least one <set> or <set>/<case>"
+      echo "  Usage: leerie accept-heldout <run-id> <set>[/<case>] ... [--runtime fly|ec2|local]" >&2
+      echo "    <set>         every case of that held-out set (its number, as the PR shows it)" >&2
+      echo "    <set>/<case>  one case of it, by the name the PR shows, or <file> :: <title>" >&2
+      exit 1
+    fi
+    # Same allowlist discipline as accept-blocked (SECURITY.md "Command
+    # injection") for the run-id: it reaches a state-mutating write path
+    # and, on the Fly path, a remote-shell double-parse. The case arguments
+    # never do: each is base64-encoded before it leaves this process.
+    case "$_ah_run_id" in
+      *[!A-Za-z0-9._-]*)
+        remote_log "accept-heldout: invalid run-id '$_ah_run_id' (allowed chars: A-Za-z0-9._-)"
+        exit 1 ;;
+    esac
+    _ah_b64=()
+    for _ah_s in "${_ah_specs[@]}"; do
+      _ah_b64+=("$(printf '%s' "$_ah_s" | base64 | tr -d '\n')")
+    done
+    if [ -n "$_ah_runtime" ] && [ "$_ah_runtime" != "fly" ] && [ "$_ah_runtime" != "local" ] && [ "$_ah_runtime" != "ec2" ]; then
+      remote_log "accept-heldout: --runtime must be 'local', 'fly', or 'ec2' (got '$_ah_runtime')"
+      exit 1
+    fi
+    _ah_detected="$(_auto_detect_run_runtime "$_ah_run_id" "$_ah_runtime")" || _ah_detected=""
+    if [ -n "$_ah_detected" ]; then
+      _ah_runtime="$_ah_detected"
+    elif [ "$_ah_runtime" != "fly" ] && [ "$_ah_runtime" != "ec2" ]; then
+      _ah_runtime="local"
+    fi
+    _ah_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ah_run_id"
+    if [ ! -d "$_ah_state_dir" ]; then
+      remote_log "accept-heldout: no run dir at $_ah_state_dir"
+      exit 1
+    fi
+    _ah_state_file="$_ah_state_dir/state.json"
+    # Same sentinel convention as accept-blocked's _ab_mutate (ACCEPTED: /
+    # NOOP: / ERROR:). Validates every argument before it changes anything:
+    # one bad argument changes nothing.
+    _ah_mutate='
+import base64, copy, datetime, fcntl, json, os, sys, tempfile
+path = sys.argv[1]
+
+
+def safe(text):
+    # Case titles come from tests a worker wrote, and no text leerie did
+    # not write reaches the terminal as a control sequence (DESIGN 6).
+    return "".join(c if c.isprintable() else "?" for c in str(text))
+
+
+try:
+    specs = [base64.b64decode(a.encode("ascii"), validate=True).decode("utf-8")
+             for a in sys.argv[2:]]
+except ValueError:
+    print("ERROR: a case argument did not reach the mutator intact", file=sys.stderr)
+    sys.exit(1)
+run_dir = os.path.dirname(path) or "."
+# The run directory lock State takes (DESIGN §6 *Single owner per run dir*):
+# a live orchestrator owns the run and its next save would overwrite this.
+try:
+    lock_fd = os.open(run_dir, os.O_RDONLY)
+except OSError:
+    print(f"ERROR: no run directory at {run_dir}", file=sys.stderr)
+    sys.exit(1)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("ERROR: an orchestrator owns this run right now (it is running); "
+          "accept once it has stopped, then resume", file=sys.stderr)
+    sys.exit(1)
+try:
+    with open(path) as f:
+        st = json.load(f)
+except FileNotFoundError:
+    print(f"ERROR: state.json not found at {path}", file=sys.stderr)
+    sys.exit(1)
+acc = st.get("acceptance") if isinstance(st.get("acceptance"), dict) else {}
+sets = [s for s in (acc.get("sets") or [])
+        if isinstance(s, dict) and isinstance(s.get("index"), int)]
+by_index = {s["index"]: s for s in sets}
+if not by_index:
+    print("ERROR: this run has no held-out acceptance sets", file=sys.stderr)
+    sys.exit(1)
+gate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
+results = []
+for key in ("initial", "final"):
+    if isinstance(gate.get(key), list):
+        results += gate[key]
+for rnd in gate.get("rounds") or []:
+    if isinstance(rnd, dict) and isinstance(rnd.get("results"), list):
+        results += rnd["results"]
+
+
+def recorded(s):
+    # Every case ID the run recorded for set s, by file: its counted cases,
+    # its own-start failures and statuses, and each failure a gate verdict
+    # or the residual named.
+    k = s["index"]
+    out = {}
+    def add(rel, ids):
+        if isinstance(rel, str):
+            out.setdefault(rel, set()).update(
+                str(c) for c in (ids or []) if isinstance(c, str))
+    scope = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    for src in (scope.get("counted_cases"), s.get("base_failing_cases"),
+                s.get("base_case_status")):
+        for rel, ids in (src.items() if isinstance(src, dict) else ()):
+            add(rel, list(ids) if isinstance(ids, (list, dict)) else [])
+    for r in results:
+        if isinstance(r, dict) and r.get("index") == k and isinstance(
+                r.get("failing_cases"), dict):
+            for rel, ids in r["failing_cases"].items():
+                add(rel, ids if isinstance(ids, list) else [])
+    res = gate.get("residual") if isinstance(gate.get("residual"), dict) else {}
+    by_set = (res.get("failing_cases_by_set") or {}).get(str(k))
+    for rel, ids in (by_set.items() if isinstance(by_set, dict) else ()):
+        add(rel, ids if isinstance(ids, list) else [])
+    return out
+
+
+def names(cid, rel):
+    # The forms an operator may name a case by: its whole ID, the ID with
+    # the file made relative (a run before relative IDs recorded absolute
+    # ones), and its title, which the PR shows.
+    head, sep, title = cid.partition(" :: ")
+    forms = {cid}
+    if sep:
+        forms.add(title)
+        if head.startswith("/") and head.endswith("/" + rel):
+            forms.add(rel + sep + title)
+    return forms
+
+
+errors, plan = [], []
+for spec in specs:
+    head, sep, case = spec.partition("/")
+    if not head.isdigit():
+        errors.append(f"{spec!r}: expected <set> or <set>/<case>, <set> "
+                      "being the held-out set number the PR shows")
+        continue
+    k = int(head)
+    s = by_index.get(k)
+    if s is None:
+        have = ", ".join(str(i) for i in sorted(by_index))
+        errors.append(f"{spec!r}: this run has no held-out set {k} (its "
+                      f"sets: {have})")
+        continue
+    if s.get("settled_bar"):
+        errors.append(f"{spec!r}: set {k} holds tests that passed when this "
+                      "task last ended done (a regressed settled bar); they "
+                      "cannot be accepted -- edit the report or reword the "
+                      "task to start a new bar")
+        continue
+    if not sep:
+        plan.append((k, None, None))
+        continue
+    scope = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    if scope.get("bounded") is not True:
+        errors.append(f"{spec!r}: set {k} is not bounded by the scenarios "
+                      "of a report, so a failing file of it counts whole and "
+                      "one case cannot be withdrawn; accept the whole set "
+                      f"with {k}")
+        continue
+    if not case:
+        errors.append(f"{spec!r}: no case named after the set number")
+        continue
+    hits = sorted({(rel, cid) for rel, ids in recorded(s).items()
+                   for cid in ids if case in names(cid, rel)})
+    if not hits:
+        known = sorted({cid.partition(" :: ")[2] or cid
+                        for ids in recorded(s).values() for cid in ids})
+        shown = "; ".join(known[:8]) + (
+            f"; +{len(known) - 8} more" if len(known) > 8 else "")
+        errors.append(f"{spec!r}: set {k} has no case named {case!r}"
+                      + (f" (its cases: {shown})" if known else ""))
+        continue
+    files = sorted({rel for rel, _ in hits})
+    if len(files) > 1:
+        where = ", ".join(files)
+        errors.append(f"{spec!r}: {case!r} names cases in {len(files)} files "
+                      f"of set {k} ({where}); name one by its "
+                      "whole ID, <file> :: <title>")
+        continue
+    plan.extend((k, rel, cid) for rel, cid in hits)
+if errors:
+    for e in errors:
+        print(safe(f"ERROR: {e}"), file=sys.stderr)
+    sys.exit(1)
+now = (datetime.datetime.now(datetime.timezone.utc)
+       .strftime("%Y-%m-%dT%H:%M:%SZ"))
+out, changed = [], False
+for k, rel, cid in plan:
+    s = by_index[k]
+    rec = s.get("operator_accepted")
+    if not isinstance(rec, dict):
+        rec = {"cases": [], "whole_set": None}
+    scope = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    if s.get("broken") is True:
+        out.append(f"NOOP: set {k} is typed broken by the set audit; it is "
+                   "already not unfinished work")
+        continue
+    if isinstance(rec.get("whole_set"), dict):
+        out.append(f"NOOP: every case of set {k} is already accepted")
+        continue
+    # Kept before anything is withdrawn: a waiver that erases what it waived
+    # leaves nobody able to say what was waived
+    # (tests/test_accept_verbs_keep_their_evidence.py).
+    rec.setdefault("scope_before", copy.deepcopy(s.get("scope")))
+    if rel is None:
+        rec["whole_set"] = {"at": now}
+        if scope.get("bounded") is True:
+            scope["counted_cases"] = {}
+        else:
+            # Bounded with nothing counted, as the settled bar withdraws a
+            # set the scope judge could not bound.
+            scope = {"bounded": True, "by": "operator", "judged": {},
+                     "unbounded_error": scope.get("error"),
+                     "counted_cases": {}}
+        s["scope"] = scope
+        out.append(f"ACCEPTED: every case of held-out set {k}")
+    else:
+        if any(isinstance(e, dict) and e.get("case") == cid
+               for e in rec.get("cases") or []):
+            out.append(f"NOOP: {cid!r} of set {k} is already accepted")
+            continue
+        counted = scope.setdefault("counted_cases", {})
+        was = cid in (counted.get(rel) or [])
+        if was:
+            counted[rel] = [c for c in counted[rel] if c != cid]
+        rec.setdefault("cases", []).append(
+            {"file": rel, "case": cid, "at": now, "was_counted": was})
+        out.append(f"ACCEPTED: {cid!r} of held-out set {k}"
+                   + ("" if was else " (it was not counted already: no "
+                      "longer repaired or named either)"))
+    rec["pending"] = True
+    s["operator_accepted"] = rec
+    changed = True
+if changed:
+    try:
+        _mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        _mode = None
+    with tempfile.NamedTemporaryFile("w", dir=run_dir, delete=False,
+                                     suffix=".tmp") as tmp:
+        json.dump(st, tmp, indent=2)
+        tmp.write("\n")
+        tmp_path = tmp.name
+    if _mode is not None:
+        os.chmod(tmp_path, _mode)
+    os.replace(tmp_path, path)
+for line in out:
+    print(safe(line))
+'
+    if [ "$_ah_runtime" = "ec2" ]; then
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _ah_aws_creds_args=()
+      while IFS= read -r _ah_a; do _ah_aws_creds_args+=("$_ah_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
+      _ah_aws_creds_exports="$(resolve_aws_credentials ${_ah_aws_creds_args[@]+"${_ah_aws_creds_args[@]}"})" || exit 1
+      eval "$_ah_aws_creds_exports"
+      unset _ah_aws_creds_args _ah_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_ah_state_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "accept-heldout: no ec2_instance_id found for run $_ah_run_id"
+        exit 1
+      fi
+      export LEERIE_RUN_ID="$_ah_run_id"
+      _ah_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
+      case "$_ah_ec2_state" in
+        terminated|shutting-down|"")
+          remote_log "accept-heldout: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") is terminated or missing — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ah_started_instance=false
+      if [ "$_ah_ec2_state" != "running" ]; then
+        remote_log "accept-heldout: starting stopped instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID")..."
+        # resume_instance() arms the run-launch teardown traps. Left armed,
+        # this verb's exit would run decide_ec2_teardown as a clean run exit
+        # (sync, then finalize or terminate) against the run being unblocked;
+        # neutralize them as the finalize arm does.
+        LEERIE_TEARDOWN_DONE=1
+        export LEERIE_TEARDOWN_DONE
+        if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
+          remote_log "accept-heldout: instance $(_terminal_safe "$LEERIE_EC2_INSTANCE_ID") never became ready"
+          exit 1
+        fi
+        trap - EXIT INT TERM
+        _ah_started_instance=true
+      fi
+      _ah_teardown_ec2() {
+        if [ "$_ah_started_instance" = true ]; then
+          stop_instance
+          _ensure_run_json "$_ah_state_dir" || true
+          update_run_json "$_ah_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+        fi
+      }
+      _ah_remote_state="/work/.leerie/runs/$_ah_run_id/state.json"
+      _ah_out="$(printf '%s' "$_ah_mutate" \
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 -I - '$_ah_remote_state' ${_ah_b64[*]}" 2>&1 || true)"
+      _ah_sentinel="$(printf '%s\n' "$_ah_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ah_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "accept-heldout: $(_terminal_safe "$_ah_sentinel")"
+          ;;
+        *)
+          remote_log "accept-heldout: failed to modify state on instance"
+          [ -n "$_ah_out" ] && remote_log "  output: $(_terminal_safe "$_ah_out")"
+          _ah_teardown_ec2
+          exit 1
+          ;;
+      esac
+      if [ -f "$_ah_state_file" ]; then
+        python3 -I -c "$_ah_mutate" "$_ah_state_file" "${_ah_b64[@]}" >/dev/null 2>&1 || true
+      fi
+      _ah_teardown_ec2
+      remote_log "accept-heldout: done. Resume via: leerie resume $_ah_run_id"
+      exit 0
+    fi
+    if [ "$_ah_runtime" = "fly" ]; then
+      if [ -z "${LEERIE_FLY_APP:-}" ]; then
+        remote_log "accept-heldout: LEERIE_FLY_APP is required for Fly runs"
+        exit 1
+      fi
+      FLY_APP="${LEERIE_FLY_APP:-}"
+      export FLY_APP
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/provision.sh"
+      require_flyctl || exit 1
+      LEERIE_MACHINE_ID="$_ah_run_id"
+      export LEERIE_MACHINE_ID
+      export LEERIE_RUN_ID="$_ah_run_id"
+      _ah_started_machine=false
+      _ah_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' \
+                    | awk -F': *' '/^State: / && !f { print $2; f = 1 }' \
+                    | tr -d '[:space:]' || true)"
+      case "$_ah_mstate" in
+        started|starting) : ;;
+        stopped)
+          remote_log "accept-heldout: starting paused machine $LEERIE_MACHINE_ID..."
+          if ! flyctl machine start "$LEERIE_MACHINE_ID" --app "$FLY_APP" >/dev/null 2>&1; then
+            remote_log "accept-heldout: flyctl machine start failed for $LEERIE_MACHINE_ID"
+            exit 1
+          fi
+          _ah_started_machine=true
+          wait_for_started "$LEERIE_MACHINE_ID" || {
+            remote_log "accept-heldout: machine $LEERIE_MACHINE_ID never reached started state"
+            stop_machine
+            exit 1
+          }
+          ;;
+        destroyed|"")
+          remote_log "accept-heldout: machine $LEERIE_MACHINE_ID is destroyed or missing — cannot modify state"
+          exit 1
+          ;;
+        *)
+          remote_log "accept-heldout: machine $LEERIE_MACHINE_ID is in state '$_ah_mstate' — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ah_teardown() {
+        if [ "$_ah_started_machine" = true ]; then
+          stop_machine
+          _ensure_run_json "$_ah_state_dir" || true
+          update_run_json "$_ah_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            fly_machine_id "$LEERIE_MACHINE_ID" || true
+        fi
+      }
+      if ! wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID"; then
+        remote_log "accept-heldout: machine $LEERIE_MACHINE_ID never became SSH-ready"
+        _ah_teardown
+        exit 1
+      fi
+      _ah_remote_state="/work/.leerie/runs/$_ah_run_id/state.json"
+      _ah_out="$(printf '%s' "$_ah_mutate" \
+        | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+            --pty=false -C "python3 -I - '$_ah_remote_state' ${_ah_b64[*]}" 2>&1 || true)"
+      _ah_sentinel="$(printf '%s\n' "$_ah_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ah_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "accept-heldout: $(_terminal_safe "$_ah_sentinel")"
+          ;;
+        *)
+          remote_log "accept-heldout: failed to modify state on machine"
+          [ -n "$_ah_out" ] && remote_log "  output: $(_terminal_safe "$_ah_out")"
+          _ah_teardown
+          exit 1
+          ;;
+      esac
+      if [ -f "$_ah_state_file" ]; then
+        python3 -I -c "$_ah_mutate" "$_ah_state_file" "${_ah_b64[@]}" >/dev/null 2>&1 || true
+      fi
+      _ah_teardown
+      remote_log "accept-heldout: done. Resume via: leerie resume $_ah_run_id"
+    else
+      # Local: state.json is on the host (bind-mounted into containers).
+      if [ ! -f "$_ah_state_file" ]; then
+        remote_log "accept-heldout: no state.json at $_ah_state_file"
+        exit 1
+      fi
+      python3 -I -c "$_ah_mutate" "$_ah_state_file" "${_ah_b64[@]}"
+      remote_log "accept-heldout: done. Resume via: leerie resume $_ah_run_id"
+    fi
+    exit 0
+    ;;
   re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
     # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
@@ -6738,7 +7188,7 @@ for arg in "$@"; do
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    finalize|stop|kill|re-seed|accept-blocked|accept-integration|attach|chain|group|config|prune|status|version)
+    finalize|stop|kill|re-seed|accept-blocked|accept-integration|accept-heldout|attach|chain|group|config|prune|status|version)
       # Launcher-only verbs — normally dispatched at the top-level case
       # (line ~945) when they appear as $1. If one appears here it was
       # in a non-$1 position (e.g. `leerie <id> finalize --runtime fly`
@@ -11904,6 +12354,16 @@ if [ "$RUNTIME" = "local" ]; then
     exit 0
   fi
   if [ "$(jq -r '.pushed_at // ""' "$_ran_run_json")" != "" ]; then
+    if [ "$(jq -r '.pr_refresh | type' "$_ran_run_json" 2>/dev/null || true)" = "object" ]; then
+      # The resume re-decided the outcome of a pushed run (the operator
+      # accepted held-out cases): host_finalize brings its open PR up to it
+      # and pushes nothing new (DESIGN §6 *An open PR follows its run's
+      # re-decided outcome*).
+      # shellcheck disable=SC1091
+      . "$_code_dir/scripts/host-finalize.sh"
+      host_finalize "$_ran_run_dir" || exit $?
+      exit 0
+    fi
     echo "[leerie] finalize: run $_ran_run_id is already pushed" >&2
     exit 0
   fi
