@@ -695,7 +695,12 @@ STATE_FIELDS = (
     # contract_extractor's typed contract and the check's flag/why (DESIGN
     # §8 *Typed evidence for the delivery judge*). pr_review: the advisory
     # whole-PR review and its verified findings (DESIGN §9). Never gate.
-    "contract_literal_checks", "pr_review",
+    # pr_review_shipped: the same review of the tree that ships, when the run
+    # branch moved after pr_review; pr_review_shown: the findings the PR
+    # lists, re-checked there (DESIGN §9 *The review the PR shows is of the
+    # tree that ships*). For the PR only.
+    "contract_literal_checks", "pr_review", "pr_review_shipped",
+    "pr_review_shown",
     # DESIGN §11 *Intent conflicts are settled with evidence, else asked*.
     "plan_item_check", "intent_questions",
     # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
@@ -7981,30 +7986,47 @@ def _untyped_site_lines(state: dict) -> list[str]:
 
 
 def _pr_advisory(state: dict) -> list[str]:
-    """The advisory lines: verified whole-PR review findings, contract
-    literal flags, site-token hits — each source capped at
-    `_PR_ADVISORY_SHOWN`, the remainder counted."""
+    """The advisory lines: the whole-PR review findings checked on the
+    tree that ships (`pr_review_shown`), contract literal flags, site-token
+    hits — each source capped at `_PR_ADVISORY_SHOWN`, the remainder
+    counted."""
     out: list[str] = []
 
-    def block(title: str, key: str, lines: list[str]) -> None:
-        if not lines:
+    def block(title: str, key: str, lines: list[str],
+              tail: list[str] | None = None) -> None:
+        if not lines and not tail:
             return
         out.append(f"**{title}**")
         out.extend(lines[:_PR_ADVISORY_SHOWN])
         if len(lines) > _PR_ADVISORY_SHOWN:
             out.append(f"- … {len(lines) - _PR_ADVISORY_SHOWN} more in "
                        f"state.json `{key}`")
+        out.extend(tail or [])
         out.append("")
 
-    rev = state.get("pr_review")
-    findings = ((rev.get("findings") or []) if isinstance(rev, dict) else [])
-    block("Whole-PR review findings (each quote checked in the file)",
-          "pr_review",
-          [f"- {_pr_code(str(f.get('path') or '?') + ':' + str(f.get('line_start') or '?') + '-' + str(f.get('line_end') or '?'))}"
-           f" [{_pr_entry(f.get('kind')) or 'finding'}] "
-           f"{_pr_entry(f.get('explanation'))}"
-           for f in findings
-           if isinstance(f, dict) and f.get("verified") is True])
+    # Only the findings `_record_pr_review_shown` re-checked on the tree
+    # that ships (DESIGN §9 *The review the PR shows is of the tree that
+    # ships*), under the commits they were reviewed and checked on.
+    shown = state.get("pr_review_shown")
+    if isinstance(shown, dict):
+        commit = _pr_code(str(shown.get("commit") or "")[:12])
+        title = (f"Whole-PR review findings (reviewed on {commit}, the run "
+                 "branch's head; each quote checked in the file there)"
+                 if shown.get("reviewed_tree") == shown.get("tree") else
+                 "Whole-PR review findings (reviewed on "
+                 f"{_pr_code(str(shown.get('reviewed') or '')[:12])}; each "
+                 f"quote checked again in the file at {commit}, the run "
+                 "branch's head)")
+        gone = shown.get("n_quote_gone")
+        block(title, str(shown.get("source") or "pr_review"),
+              [f"- {_pr_code(_pr_finding_path(f) + (':' + str(f.get('line_start')) + '-' + str(f.get('line_end')) if f.get('line_ok') is True else ''))}"
+               f" [{_pr_entry(f.get('kind')) or 'finding'}] "
+               f"{_pr_entry(f.get('explanation'))}"
+               for f in shown.get("findings") or [] if isinstance(f, dict)],
+              [f"- {gone} more of that review's findings quote code the file "
+               f"at {commit} no longer has; not listed (state.json "
+               f"`{_pr_entry(shown.get('source'))}`)"]
+              if isinstance(gone, int) and gone > 0 else None)
     checks = state.get("contract_literal_checks")
     rows = []
     for key in sorted(checks) if isinstance(checks, dict) else []:
@@ -43217,12 +43239,32 @@ def _shipping_tree(st: "State") -> str:
     was "" once finalize's `cleanup.sh` had removed staging). Every delivery
     pass stamps its verdict with it and the outcome compares against it. ""
     when the ref cannot be read."""
+    return _run_repo_rev(
+        st, f"refs/heads/{_compute_run_branch(st.run_id)}^{{tree}}")
+
+
+def _shipping_commit(st: "State") -> str:
+    """The commit the run ships: the run branch's head in the run's own
+    repository (`_shipping_tree`'s ref, as a commit). "" when the ref
+    cannot be read."""
+    return _run_repo_rev(st, f"refs/heads/{_compute_run_branch(st.run_id)}")
+
+
+def _commit_tree(st: "State", commit: object) -> str:
+    """The tree of `commit` in the run's own repository, "" when it is not
+    a commit there."""
+    return (_run_repo_rev(st, f"{commit}^{{tree}}")
+            if isinstance(commit, str) and commit else "")
+
+
+def _run_repo_rev(st: "State", rev: str) -> str:
+    """`git rev-parse --verify` of `rev` in the run's own repository; ""
+    when it does not resolve or the run has no directory."""
     if not getattr(st, "run_dir", None):
         return ""
-    ref = f"refs/heads/{_compute_run_branch(st.run_id)}^{{tree}}"
     r = subprocess.run(["git", "--git-dir", str(Path(st.run_dir) / RUN_REPO_NAME),
                         "rev-parse",
-                        "--verify", "-q", ref],
+                        "--verify", "-q", rev],
                        capture_output=True, text=True, check=False)
     return r.stdout.strip() if r.returncode == 0 else ""
 
@@ -63454,22 +63496,20 @@ def _ws_norm(s: str) -> str:
     return " ".join((s or "").split())
 
 
-def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
-    """The bench's mechanical check (n2f review.py `verify_finding`), on
-    strings only: the quote must occur in the file at HEAD (whitespace-
-    normalised, raw or with diff markers stripped); `line_ok` whether it
-    sits within 5 lines of the claimed range; an `item_id` must name a
-    listed item and its `item_span_quote` must occur in that item's text.
-    `verified` is the quote check — an unverified finding is never handed
-    on."""
-    out: dict = {}
+def _pr_finding_path(f: dict) -> str:
+    """A finding's `path` as a path in the tree (a leading `./` dropped)."""
     path = str(f.get("path") or "").strip()
-    if path.startswith("./"):
-        path = path[2:]
-    blob = subprocess.run(["git", *_tree_git_args(staging), "show", f"HEAD:{path}"],
-                          capture_output=True, text=True, errors="replace",
-                          check=False)
-    content = blob.stdout if blob.returncode == 0 else None
+    return path[2:] if path.startswith("./") else path
+
+
+def _pr_quote_check(f: dict, content: str | None) -> tuple[bool, bool | None]:
+    """`(quote_ok, line_ok)` of a finding against its file's `content`
+    (None: no such file): the quote, whitespace-normalised, raw or with
+    leading `+`/space diff markers stripped, occurs in it; `line_ok` whether
+    its first line sits within 5 lines of the claimed range (None when not
+    located). The one quote check, at review time and when the PR is
+    written (DESIGN §9 *The review the PR shows is of the tree that
+    ships*)."""
     q = str(f.get("quote") or "")
     stripped = "\n".join(ln[1:] if ln[:1] in "+ " else ln
                          for ln in q.split("\n"))
@@ -63488,6 +63528,24 @@ def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
             hi = max(int(f.get("line_end") or 0), lo)
             line_ok = (any(lo - 5 <= h <= hi + 5 for h in hits)
                        if hits else None)
+    return quote_ok, line_ok
+
+
+def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
+    """The bench's mechanical check (n2f review.py `verify_finding`), on
+    strings only: the quote must occur in the file at HEAD (whitespace-
+    normalised, raw or with diff markers stripped); `line_ok` whether it
+    sits within 5 lines of the claimed range; an `item_id` must name a
+    listed item and its `item_span_quote` must occur in that item's text.
+    `verified` is the quote check — an unverified finding is never handed
+    on."""
+    out: dict = {}
+    blob = subprocess.run(["git", *_tree_git_args(staging), "show",
+                           f"HEAD:{_pr_finding_path(f)}"],
+                          capture_output=True, text=True, errors="replace",
+                          check=False)
+    content = blob.stdout if blob.returncode == 0 else None
+    quote_ok, line_ok = _pr_quote_check(f, content)
     iid = f.get("item_id")
     norm_id = None
     if iid is not None:
@@ -63548,17 +63606,10 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict | None:
     """One advisory review of the whole PR (DESIGN §9 *An advisory whole-PR
-    review feeds the final conformer*): the pr_reviewer reads the task, its
-    reports, the required items and the full diff from `base_sha`,
-    and may run the repo's build verbs to confirm a suspicion — in its own
-    checkout of staging's HEAD with staging's ignored paths shared
-    (`_judge_checkout(share_ignored=True)`), never in staging: it does not
-    commit, so nothing it runs may land in a tree leerie measures (DESIGN
-    §8 *A worker that does not commit never runs in a tree leerie
-    measures*), and whatever it made goes with the checkout. Each finding
-    is checked by `_verify_pr_finding` against that checkout. Persists
-    `pr_review` and returns it. Never gates: nothing reads it except the
-    final conformer's prompt and the PR; a crash is recorded.
+    review feeds the final conformer*), of staging's HEAD
+    (`_pr_review_record`). Persists `pr_review` and returns it. Never
+    gates: nothing reads it except the final conformer's prompt and, when
+    it is of the tree that ships, the PR; a crash is recorded.
 
     Runs once: skipped when `pr_review` exists or the final conformance
     already ran (resume)."""
@@ -63573,11 +63624,127 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
     log("phase 5: advisory whole-PR review (DESIGN §9)")
     st.data["current_phase"] = "phase 5: pr review"
     st.save()
+    head = (await _git_out(staging, "rev-parse", "HEAD")).strip()
+    record = await _pr_review_record(st, caps, models, efforts, staging,
+                                     base, head, "pr-review")
+    st.data["pr_review"] = record
+    st.save()
+    if "error" in record:
+        log(f"  pr review: reviewer failed ({record['error']}); advisory, "
+            "continuing")
+    else:
+        log(f"  pr review: {record['n_findings']} finding(s), "
+            f"{record['n_verified']} with a verified quote — handed to the "
+            "final conformer (advisory)")
+    return record
+
+
+async def _run_shipping_pr_review(leerie_dir: Path, st: "State", caps: dict,
+                                  models: dict[str, str],
+                                  efforts: dict[str, str | None]
+                                  ) -> dict | None:
+    """The review made again on the tree that ships (DESIGN §9 *The review
+    the PR shows is of the tree that ships*), after the last step that
+    commits: when the run branch's tree is not the tree of the commit
+    `pr_review` read, the same review (`_pr_review_record`) of the run
+    branch's head. Persists `pr_review_shipped` and returns it; read by
+    nothing but `_record_pr_review_shown` — no fixer, gate or decision.
+
+    None, with nothing run, when there was no first review, the run
+    branch cannot be read, or the first review read the tree that ships.
+    A resume returns the record while it is of that tree."""
+    first = st.data.get("pr_review")
+    base = _diff_base(st)
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if (not isinstance(first, dict) or not first.get("head") or not base
+            or not staging.is_dir()):
+        return None
+    commit, tree = _shipping_commit(st), _shipping_tree(st)
+    if not commit or not tree or _commit_tree(st, first["head"]) == tree:
+        return None
+    prev = st.data.get("pr_review_shipped")
+    if isinstance(prev, dict) and _commit_tree(st, prev.get("head")) == tree:
+        return prev
+    log(f"phase 5: whole-PR review again — the run branch moved from "
+        f"{str(first['head'])[:12]} to {commit[:12]} since the review "
+        "(DESIGN §9, for the PR only)")
+    st.data["current_phase"] = "phase 5: pr review of the shipping tree"
+    st.save()
+    record = await _pr_review_record(st, caps, models, efforts, staging,
+                                     base, commit, "pr-review-shipped")
+    st.data["pr_review_shipped"] = record
+    st.save()
+    if "error" in record:
+        log(f"  pr review (shipping tree): reviewer failed "
+            f"({record['error']}); advisory, continuing")
+    else:
+        log(f"  pr review (shipping tree): {record['n_findings']} "
+            f"finding(s), {record['n_verified']} with a verified quote — "
+            "for the PR (advisory)")
+    return record
+
+
+def _record_pr_review_shown(st: "State") -> None:
+    """What the PR lists of the whole-PR review, checked on the tree that
+    ships (DESIGN §9 *The review the PR shows is of the tree that ships*):
+    the newest review that did not crash (`pr_review_shipped`, else
+    `pr_review`), each verified finding's quote checked again
+    (`_pr_quote_check`) against its file at the run branch's head in the
+    run's own repository. Writes `pr_review_shown` `{source, reviewed,
+    reviewed_tree, commit, tree, findings, n_quote_gone}` — `findings` the
+    ones whose quote is there, `line_ok` of that file — or removes it when
+    there is no such review or the run branch cannot be read. Runs in
+    `phase_finalize` after the outcome; the only reader is `_pr_advisory`."""
+    st.data.pop("pr_review_shown", None)
+    commit, tree = _shipping_commit(st), _shipping_tree(st)
+    src = next(((k, r) for k in ("pr_review_shipped", "pr_review")
+                if isinstance(r := st.data.get(k), dict) and "error" not in r),
+               None)
+    if src is not None and commit and tree:
+        key, rec = src
+        found, gone = [], 0
+        for f in rec.get("findings") or []:
+            if not isinstance(f, dict) or f.get("verified") is not True:
+                continue
+            blob = subprocess.run(
+                ["git", *_git_at(_run_repo(st)), "show",
+                 f"{commit}:{_pr_finding_path(f)}"],
+                capture_output=True, text=True, errors="replace", check=False)
+            quote_ok, line_ok = _pr_quote_check(
+                f, blob.stdout if blob.returncode == 0 else None)
+            if quote_ok:
+                found.append({**f, "line_ok": line_ok})
+            else:
+                gone += 1
+        st.data["pr_review_shown"] = {
+            "source": key, "reviewed": rec.get("head"),
+            "reviewed_tree": _commit_tree(st, rec.get("head")),
+            "commit": commit, "tree": tree, "findings": found,
+            "n_quote_gone": gone}
+        if gone:
+            log(f"pr review: {gone} finding(s) of `{key}` quote code the run "
+                f"branch's head {commit[:12]} no longer has — not listed")
+    st.save()
+
+
+async def _pr_review_record(st: "State", caps: dict, models: dict[str, str],
+                            efforts: dict[str, str | None], staging: Path,
+                            base: str, head: str, name: str) -> dict:
+    """One `pr_reviewer` call on commit `head`: the reviewer reads the
+    task, its reports, the required items and the full diff from `base`,
+    and may run the repo's build verbs to confirm a suspicion — in its own
+    checkout of `head` (`_judge_checkout(name, share_ignored=True)`) with
+    staging's ignored paths shared, never in staging: it does not commit,
+    so nothing it runs may land in a tree leerie measures (DESIGN §8 *A
+    worker that does not commit never runs in a tree leerie measures*),
+    and whatever it made goes with the checkout. Each finding is checked
+    by `_verify_pr_finding` against that checkout. Returns the record
+    `{base, head, model, effort, diff_cut, findings, n_findings,
+    n_verified, at, error?}`; a `WorkerError`/timeout is its `error`."""
     task = st.data.get("task", "")
     items = _pr_review_items(st)
-    diff = await _git_out(staging, "diff", f"{base}...HEAD")
-    names = await _git_out(staging, "diff", "--name-only", f"{base}...HEAD")
-    head = (await _git_out(staging, "rev-parse", "HEAD")).strip()
+    diff = await _git_out(staging, "diff", f"{base}...{head}")
+    names = await _git_out(staging, "diff", "--name-only", f"{base}...{head}")
     cut = len(diff) > _PR_REVIEW_DIFF_MAX
     parts = ["TASK:", task.strip(), ""]
     try:
@@ -63617,7 +63784,7 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
                     "effort": efforts.get("pr_reviewer"),
                     "diff_cut": cut, "findings": []}
     try:
-        async with _judge_checkout(st, staging, "pr-review", rev=head,
+        async with _judge_checkout(st, staging, name, rev=head,
                                    share_ignored=True) as cwd:
             st.bump_workers(caps)
             out = await claude_p(
@@ -63638,15 +63805,6 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
     record["n_verified"] = sum(1 for f in record["findings"]
                                if f["verified"])
     record["at"] = now()
-    st.data["pr_review"] = record
-    st.save()
-    if "error" in record:
-        log(f"  pr review: reviewer failed ({record['error']}); advisory, "
-            "continuing")
-    else:
-        log(f"  pr review: {record['n_findings']} finding(s), "
-            f"{record['n_verified']} with a verified quote — handed to the "
-            "final conformer (advisory)")
     return record
 
 
@@ -79808,6 +79966,9 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # tests that show it (DESIGN §6 *What is still unmet when the run ends
     # is shown as tests the reader can run*).
     _record_unmet_evidence(st)
+    # What the PR lists of the whole-PR review, re-checked on the tree that
+    # ships (DESIGN §9 *The review the PR shows is of the tree that ships*).
+    _record_pr_review_shown(st)
     st.data["finished_at"] = now()
     st.save()
     will_push = not no_push
@@ -81143,6 +81304,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     await _check_existing_behaviour(leerie_dir, st, caps)
     # No intent question is left open when the PR is written (DESIGN §11).
     _stop_for_intent_questions(st)
+    # The review the PR shows is of the tree that ships (DESIGN §9): made
+    # again when a step after it moved the run branch. Nothing after this
+    # commits, and nothing that fixes or decides reads it.
+    try:
+        await _run_shipping_pr_review(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"pr review of the shipping tree raised {type(e).__name__}: {e} "
+            "— surfaced as advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

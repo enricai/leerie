@@ -71,12 +71,15 @@ def _full_state() -> dict:
         "ci_parity": {"final": {"unmet": [
             {"id": "lint", "kind": "lint", "why": "red",
              "argv": ["pnpm", "lint"], "cwd": "."}]}},
-        "pr_review": {"findings": [
-            {"verified": True, "path": "src/a.ts", "line_start": 3,
-             "line_end": 5, "kind": "bug", "explanation": "off by one"},
-            {"verified": False, "path": "src/b.ts", "line_start": 1,
-             "line_end": 1, "kind": "bug", "explanation": "unverified"},
-        ]},
+        # What `_record_pr_review_shown` keeps: the findings whose quote
+        # holds on the tree that ships (an unverified one never is).
+        "pr_review_shown": {
+            "source": "pr_review", "reviewed": "c0ffee" * 7,
+            "reviewed_tree": "7ree" * 10, "commit": "c0ffee" * 7,
+            "tree": "7ree" * 10, "n_quote_gone": 0, "findings": [
+                {"verified": True, "path": "src/a.ts", "line_start": 3,
+                 "line_end": 5, "line_ok": True, "kind": "bug",
+                 "explanation": "off by one"}]},
         "tracked_test_report": {"files": [{
             "file": "tests/pay.test.ts",
             "removed": ["expect(total).toBe(10)"],
@@ -165,10 +168,10 @@ def test_advisory_lists_are_capped_and_counted(leerie):
 def test_entry_text_cannot_open_a_heading(leerie):
     state = {"outcome": "unconverged",
              "outcome_reasons": ["a\n## Injected\nb"],
-             "pr_review": {"findings": [{"verified": True, "path": "a`b",
-                                         "line_start": 1, "line_end": 2,
-                                         "kind": "bug",
-                                         "explanation": "x\n## Also"}]}}
+             "pr_review_shown": {"findings": [{
+                 "verified": True, "path": "a`b", "line_start": 1,
+                 "line_end": 2, "line_ok": True, "kind": "bug",
+                 "explanation": "x\n## Also"}]}}
     sec = leerie._format_pr_end_state_section(state)
     assert "\n## Injected" not in sec and "\n## Also" not in sec
     assert "- a ## Injected b" in sec
@@ -178,7 +181,7 @@ def test_entry_text_cannot_open_a_heading(leerie):
 @pytest.mark.parametrize("bad", [None, [], "x", {"risk_register": 3,
                                                   "coverage_redrive": [],
                                                   "site_claims": "x",
-                                                  "pr_review": [],
+                                                  "pr_review_shown": [],
                                                   "ci_parity": {"final": 1},
                                                   "outcome_reasons": "x",
                                                   "needs_human_verification":
