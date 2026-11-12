@@ -7877,8 +7877,10 @@ present only when it has an entry:
   final tree, report-only (§8 *Existing tests the run changed are listed in
   the PR*).
 - `## Advisory (not verified by this run)` — the whole-PR review's verified
-  findings, the contract-literal flags and the site-token hits (§8, §9),
-  labelled advisory because nothing waited on them.
+  findings, of the tree that ships and naming it (§9 *The review the PR
+  shows is of the tree that ships*), the contract-literal flags and the
+  site-token hits (§8, §9), labelled advisory because nothing waited on
+  them.
 
 *What is still unmet when the run ends is shown as tests the reader can
 run.* The invariant: a run that ends with something unmet shows the person
@@ -20531,6 +20533,51 @@ with its checkout; its record (`pr_review`) is for the PR. It runs on
 findings that name no required item against 8 for sonnet high and 7
 for sonnet medium, and of 18 opus findings hand-checked 13 were real,
 5 plausible and none false.
+
+**The review the PR shows is of the tree that ships.** The review runs
+before the final conformer, so that the conformer can act on it, and the
+conformer, the held-out gate's repair rounds and the delivery re-drive all
+commit after it. A finding is a statement about the code its quote names;
+once a later commit changed that code, the PR would state, as a current
+lead, something false of what ships. Measured over the 27 local runs with
+a review (2026-11-12): the run branch moved after the review in 24, 20
+opened a PR listing findings of a tree that did not ship, and of the 61
+findings the 27 runs' PR sections list, 38 quote code the shipped file no
+longer has — 39c4c5ad's "only compares the top-level key set" among them,
+false on its head. The rule is the one the PR's test outcomes follow (§9
+final-tree pass, *Every test outcome the PR states was measured on the
+tree that ships*), and code enforces it in two steps:
+
+- *The review is made again on the tree that ships when that tree moved.*
+  After the last step that commits and before finalize, when the run
+  branch's tree is not the tree of the commit the review read, the same
+  `pr_reviewer` — same prompt, model, effort, tools and quote check —
+  reviews the run branch's head, in its own checkout. Its record
+  (`pr_review_shipped`) is for the PR alone: nothing that fixes, gates or
+  decides reads it, and no step after it commits, so a finding it makes
+  is never handed to a fixer; the first review still feeds the final
+  conformer exactly as before. A resume does not make it again while its
+  record is of the tree the run branch holds, and it is never made when
+  the first review read that tree.
+- *Every finding the PR lists is checked against the tree that ships when
+  the PR is written.* At finalize, after the outcome, code takes the
+  newest review that did not crash and checks each verified finding's
+  quote again, the same check, against the run branch's file. A finding
+  whose quote is not there is not listed; how many were dropped is said,
+  with the record that holds them. They are not listed as "addressed
+  after review": the quoted code changing is all code can see, and it is
+  not evidence the defect went away (code moves, a fix lands elsewhere),
+  while the review of the shipping tree already says what still holds.
+  The heading names the commit the findings were checked on and, when it
+  differs, the commit the review read: a reviewer can check out both.
+  Only when the second review crashed does a finding of the first review
+  reach the PR, and then only with its quote still in the shipped file,
+  under the commit it was reviewed on.
+
+A quote still present is not proof a finding still holds — a fix can
+land beside the quoted line — which is why the second review exists and
+the re-check alone is not enough; the re-check is what makes the rule a
+code guarantee whatever review is shown.
 
 **Base-tree health baseline.** Before this existed, the conformer was the
 first place the repo's build/lint/test suite ran at all, so a red base tree
