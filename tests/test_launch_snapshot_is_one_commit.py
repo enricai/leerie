@@ -156,17 +156,43 @@ def test_an_install_without_git_that_changes_under_the_copy_stops(tmp_path):
     assert "changed while this launch copied it" in err, err
 
 
-def test_a_checkout_an_update_rewrites_during_the_snapshot_never_tears_it(
-        tmp_path):
-    """E3's harness, smaller: `git checkout` flips the install between two
-    same-version commits while the snapshot is taken 25 times. Every
-    accepted snapshot is whole, one commit's, and equals the code its
-    `LEERIE_COMMIT` names; a snapshot that cannot be taken stops the
-    launch. (Measured 2026-11-04 at 300 copies: 0 torn, against 176 of 300
-    for the copy it replaces.)"""
+def _assert_whole(inst: Path, tmp_path: Path, i: object, out: str) -> None:
+    """An accepted snapshot is whole, one commit's, and equal to the code
+    its `LEERIE_COMMIT` names."""
+    snap, commit = out.splitlines()
+    got = _files(Path(snap))
+    letter = got["scripts/landlock_exec.py"][2]
+    # Compared to a bool: on a mismatch pytest's diff of two 200,000-line
+    # strings ran past the 600 s per-test timeout on CI and hid the finding.
+    whole = got["orchestrator/leerie.py"] == f"# {letter}\n" * 200000
+    assert whole, (i, commit, len(got["orchestrator/leerie.py"]))
+    assert got["prompts/planner.md"] == f"# {letter}\n", i
+    ref = commit.partition("-dirty.")[2] or commit
+    assert got == _archive(inst, ref, tmp_path / f"chk{i}"), i
+
+
+def _flipping_install(tmp_path: Path) -> Path:
+    """An install on commit B whose checkout an update flips between two
+    same-version commits, A (branch cA) and B (cB)."""
     inst = _install(tmp_path, "A")
     _write(inst, "B")
     _commit(inst, "B")
+    return inst
+
+
+def test_a_checkout_an_update_rewrites_during_the_snapshot_never_tears_it(
+        tmp_path):
+    """E3's harness, smaller: `git checkout` flips the install between two
+    same-version commits while the snapshot is taken 25 times. Each launch
+    is judged on its own: an accepted snapshot is whole, one commit's, and
+    equals the code its `LEERIE_COMMIT` names; a snapshot that cannot be
+    taken stops the launch, naming why. How many launches win the race is
+    the runner's speed, not the launcher's guarantee (a slow CI runner had
+    all 25 stopped, py3.10, PR #335); that accepted snapshots are taken
+    while the install is rewritten is pinned, launch by launch, by the
+    next test. (Measured 2026-11-04 at 300 copies: 0 torn, against 176 of
+    300 for the copy it replaces.)"""
+    inst = _flipping_install(tmp_path)
     flip = subprocess.Popen(
         ["/bin/bash", "-c",
          f'while :; do git -C "{inst}" checkout -q -f cA 2>/dev/null; '
@@ -181,25 +207,59 @@ def test_a_checkout_an_update_rewrites_during_the_snapshot_never_tears_it(
     finally:
         os.killpg(flip.pid, signal.SIGKILL)
         flip.wait()
-    accepted = 0
     for i, (rc, out, err) in enumerate(results):
         if rc != 0:
             # Stopped by the snapshot itself, naming why.
             assert "launch again" in err, err
             continue
-        accepted += 1
-        snap, commit = out.splitlines()
-        got = _files(Path(snap))
-        letter = got["scripts/landlock_exec.py"][2]
-        # Whole, and every file the same commit's. Compared to a bool: on a
-        # mismatch pytest's diff of two 200,000-line strings ran past the
-        # 600 s per-test timeout on CI and hid the finding.
-        whole = got["orchestrator/leerie.py"] == f"# {letter}\n" * 200000
-        assert whole, (i, commit, len(got["orchestrator/leerie.py"]))
-        assert got["prompts/planner.md"] == f"# {letter}\n", i
-        ref = commit.partition("-dirty.")[2] or commit
-        assert got == _archive(inst, ref, tmp_path / f"chk{i}"), i
-    assert accepted, "no snapshot was taken"
+        _assert_whole(inst, tmp_path, i, out)
+
+
+# The snapshot's git commands on a checkout with nothing changed: HEAD's
+# commit, its short name, the status of the four directories, the archive.
+_CLEAN_PATH_GIT_CALLS = 4
+
+
+@pytest.mark.parametrize("k", range(1, _CLEAN_PATH_GIT_CALLS + 1))
+def test_a_checkout_rewritten_during_one_git_read_is_taken_whole(tmp_path, k):
+    """The race above, pinned to one of the snapshot's git commands at a
+    time, so that no launch's outcome rests on the runner's speed. A
+    stand-in `git` (by name; the real one by absolute path) starts the
+    update's flip loop at the snapshot's k-th git command, runs that
+    command once the loop has rewritten the install at least once, and
+    lets the loop end only after a checkout of A: the install goes from B
+    to A while that command runs, flipping as it does, and is quiet
+    before and after. The launch is accepted, and the snapshot is whole,
+    one commit's, and the code its `LEERIE_COMMIT` names. At the short
+    name and at the archive, HEAD was read as B: a snapshot of what the
+    install holds at the archive (A) under B's name fails there."""
+    inst = _flipping_install(tmp_path)
+    head_b = _git(inst, "rev-parse", "HEAD")
+    st = tmp_path / "stand-in"
+    st.mkdir()
+    cnt, flipped, stop = st / "count", st / "flipped", st / "stop"
+    co = f'/usr/bin/git -C "{inst}" checkout -q -f'
+    pre = ('git() { local _n=0 _f _r=0\n'
+           f'  [ ! -e "{cnt}" ] || read -r _n < "{cnt}"\n'
+           '  _n=$((_n + 1))\n'
+           f'  printf "%s\\n" "$_n" > "{cnt}"\n'
+           f'  [ "$_n" -eq {k} ] || {{ /usr/bin/git "$@"; return; }}\n'
+           f'  ( while :; do {co} cA; : > "{flipped}"; '
+           f'[ ! -e "{stop}" ] || exit 0; {co} cB; done ) &\n'
+           '  _f=$!\n'
+           f'  until [ -e "{flipped}" ]; do /usr/bin/sleep 0.01; done\n'
+           '  /usr/bin/git "$@" || _r=$?\n'
+           f'  : > "{stop}"\n'
+           '  wait "$_f"\n'
+           '  return $_r; }\n')
+    rc, out, err = _run(tmp_path, inst, pre)
+    assert flipped.exists() and stop.exists(), err
+    assert _git(inst, "rev-parse", "HEAD") == _git(inst, "rev-parse", "cA")
+    assert rc == 0, err
+    _assert_whole(inst, tmp_path, k, out)
+    if k in (2, _CLEAN_PATH_GIT_CALLS):
+        assert out.splitlines()[1] == _git(inst, "rev-parse", "--short",
+                                           head_b), out
 
 
 def test_a_checkout_flipped_away_and_back_while_it_is_read_stops(tmp_path):

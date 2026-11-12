@@ -8171,7 +8171,7 @@ sample's probe never counts for the next.
   are each given the snapshot's `orchestrator/leerie.py`, and the install's
   appears in neither. Falsified (2026-11-04): the two arguments back on
   `$LEERIE_REPO` fail both.
-- `tests/test_launch_snapshot_is_one_commit.py` (7 test functions, 9
+- `tests/test_launch_snapshot_is_one_commit.py` (9 test functions, 14
   cases) — the
   snapshot is one state of the install, and `LEERIE_COMMIT` names it
   (review round 39, execution E2 and E3). The launcher's snapshot span,
@@ -8183,6 +8183,20 @@ sample's probe never counts for the next.
   while `git checkout` flips the install between two same-version commits:
   every accepted one is whole, one commit's and equal to the code its
   `LEERIE_COMMIT` names, and every other one stopped with its reason.
+  Each launch is judged on its own: no launch has to win the race (a slow
+  CI runner had all 25 stopped, py3.10, PR #335; issue 6d). That accepted
+  snapshots are taken while the install is rewritten is pinned without a
+  race (4 cases): a stand-in `git` runs the flip loop during exactly one of
+  a clean checkout's four git commands, ending it on A after at least one
+  rewrite, and the launch is accepted, whole and named by its
+  `LEERIE_COMMIT` (B's commit at the short name and the archive).
+  Falsified (2026-11-12), one change at a time: `git archive HEAD` in place
+  of the commit read first fails pinned cases 2, 3 and 4 and the flipping
+  test; a launcher that stops every git checkout's snapshot passes the
+  flipping test and fails all 4 pinned cases; the working tree copied with
+  `cp -pR` fails the flipping test and pinned cases 2 and 4. Under load (one
+  CPU at a 40% quota with three CPU hogs in the cgroup), 20 runs of the
+  5 race cases all passed.
   Falsified (2026-11-04), one change at a time: a git checkout copied
   with `cp -pR` instead of archived fails the flipping test; edits
   recorded as the bare commit fail the edits test; the non-git copy left
