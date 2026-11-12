@@ -7291,13 +7291,19 @@ sample's probe never counts for the next.
   which has no default; `_run_streaming`'s one spawn is the confined argv;
   the self-check is the one raw spawn; `node` and `mise` are never spawned
   directly.
-- `tests/test_measurement_confinement.py` (4 tests, DESIGN §6 *Leerie's
+- `tests/test_measurement_confinement.py` (5 tests, DESIGN §6 *Leerie's
   runs of the repository's commands are confined too*): a real child
   confined with `_measurement_grants` writes its view and measurement
   directory and is refused the run's state (the held-out sets,
   `state.json`, the worker cache, leerie's store, the run repository's
   refs, sibling trees, another tree's measurement directory); its temp and
-  caches point at its own directory.
+  caches point at its own directory. husky's install write, `git config
+  core.hooksPath .husky/_` in the view, is refused (exit 255) with git's
+  "could not lock config file <run-dir>/repo/config", the file is
+  unchanged, and git still reads it (DESIGN §6 *An install that writes the
+  repository's git config is refused, and says so*; issue 32, barnacle
+  87580f62). Falsified (2026-11-12): the run repository granted for
+  writing fails it.
 - `tests/test_measurement_grant_lifetime.py` (9 tests, same section): a
   tree made again at a path gets a fresh measurement directory and a
   removed tree's is swept; the grant kinds differ only where designed; the

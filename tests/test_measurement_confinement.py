@@ -117,3 +117,28 @@ def test_its_temp_and_cache_are_its_trees_private_dir(leerie, run):
     gnupg = Path(env["GNUPGHOME"])
     assert gnupg.parent == tmp
     assert sorted(os.listdir(tmp)) == sorted(["run", "t", gnupg.name])
+
+
+def test_an_installs_git_config_write_is_refused_and_says_so(leerie, run):
+    """DESIGN §6 *An install that writes the repository's git config is
+    refused, and says so*: husky's `prepare` runs `git config
+    core.hooksPath .husky/_` in the view. git writes a worktree's local
+    config only to the run repository's `config`, which the grant reads and
+    does not write. The write is refused with git's own report naming that
+    file, the file is unchanged, and git still reads the config."""
+    import subprocess
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    g = _measure(leerie, run, view)
+    cfg = run["repo"] / "config"
+    before = cfg.read_bytes()
+    r = subprocess.run(
+        leerie._confined_argv(g, [
+            "bash", "-c",
+            f'git -C "{view}" config core.hooksPath .husky/_; '
+            'echo "rc=$?"; '
+            f'git -C "{view}" config --get core.repositoryformatversion']),
+        capture_output=True, text=True, env={**os.environ, **dict(g.env)})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["rc=255", "0"], (r.stdout, r.stderr)
+    assert f"could not lock config file {cfg.resolve()}" in r.stderr, r.stderr
+    assert cfg.read_bytes() == before
