@@ -25,8 +25,9 @@ impossible to derive. Every loop is bounded, every decision is made from the
 codebase or research, and state is kept on disk so a run is observable and
 resumable. Every worker — judgment and workhorse alike — runs on Sonnet 5 (§12
 *Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*), with
-one exception: `pr_reviewer`, the advisory whole-PR review that never gates,
-runs on Opus (§12); a many-worker graph stays cheap against a subscription instead of accumulating
+two exceptions on Opus (§12): `pr_reviewer`, the advisory whole-PR review
+that never gates, and `contradiction_judge`, which decides whether an existing
+test and a required item's probe can both pass; a many-worker graph stays cheap against a subscription instead of accumulating
 per-call API charges the way a fleet of Opus-tier agents would.
 
 **On the term "graph engineering."** Leerie's task graph is literal, not
@@ -14215,9 +14216,78 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    pins the very defect the task reports (navegando e0d101e3 item 0: the
    audit table's existing test finds its column by the hardcoded Spanish
    header the item says must be translated); the conflict then stops a
-   correct fix and hands it to a person. That is the price of the
-   invariant: no worker decides, from a probe, that an existing test may
-   break.
+   correct fix and hands it to a person, unless the two tests are shown
+   to contradict each other (below). No worker decides, from a probe or
+   the task, that an existing test may break.
+
+   *A pinned case a required item's probe contradicts is task-required.*
+   Barnacle 5ddc1d67 (leerie 0.62.0): items 0 and 1 asked the HTTP client
+   to keep POST and its body across a 303; the repository's
+   `http-client.redirect.test.ts` pinned "degrades a 303 to GET and drops
+   the body". All three re-drive groups made the probes pass and broke
+   that case, each was rolled back, and the run ended `unconverged` on a
+   fix the task asked for. No implementation can pass both tests: they
+   drive the same client with the same request and assert opposite
+   methods. That is a fact about two tests and the code they reach, not a
+   reading of the task, and a judge can be asked it. When a group's commit
+   makes a shown probe of item *i* pass and breaks cases an existing test
+   pins (the conflict above), a `contradiction_judge` (opus, effort high)
+   is asked, per pinned case, whether any implementation of the
+   production code can make both the pinned case and the probe pass. It
+   reads a payload directory and nothing else of the run: the pinned
+   test file **as the run's base has it** (never the run's or the group's
+   rewrite of it, which would be a test agreeing with the probe), the
+   probe, and every production module either test reaches through the
+   import graph at the base (`_contradiction_code_files`; B3's one
+   sonnet miss, below, lacked a module). It answers four facts — the same
+   entry point, the same input by meaning, the same observable, and
+   `mutually_exclusive` — with quotes. Code then checks every quote is
+   verbatim in the file it names, and that each test supplies at least
+   one quoted assertion inside its named case's assertion spans
+   (`scripts/test-case-facts.cjs` `asserts`, run on the base form and the
+   probe in a held-out sandbox, as the falsifier's facts are). Only when
+   all four facts are true and every check holds is the verdict
+   `exclusive`, and only when every pinned case the commit broke is
+   `exclusive` with some item's probe does the rule change: the cases are
+   task-required. They stop counting as the commit's base-form changes and
+   as a conflict, the probe is not contested, and the group is judged by
+   everything else as before; the round may change those tests. On the
+   tree that ships, a task-required case whose base form fails is listed
+   in `existing_behaviour.task_required`, not `changed`, so it does not make
+   the run `unconverged`, and the PR names it under *Existing tests changed
+   by this run*: "existing test changed because required item *i*
+   contradicts it", with the probe's quoted assertion. A pinned case the
+   commit left as the base had it, now failing, is still a new failure:
+   the round must change the test, not leave it red; the note handed to
+   the next group then says the item contradicts it. Any other verdict —
+   `both_can_hold` (a verified answer that both can pass), or `unsettled`
+   (no verified answer: a quote not found, no assertion quote, a fact
+   false while `mutually_exclusive` is true, a failed worker) — leaves
+   today's rule exactly. Verdicts are kept per case and probe
+   (`delivery_redrive.contradiction_verdicts[]`) and reused, since neither
+   input changes during the run. The judge runs only in the delivery
+   re-drive: an acceptance repair round runs before final delivery
+   detection, so no confirmed probe exists while it runs. JS/TS tests only,
+   where the facts script reads assertion spans; elsewhere no verdict can
+   be verified and today's rule stands.
+
+   Why this question and not the task's meaning: T9 bench 1 asked a judge
+   whether the task required an existing test's change, with verified
+   quotes and a majority of three, and it accepted a2a825c2's inverted
+   #358 case 6 of 6, because the report names the pinned behaviour as the
+   defect. A task can be read either way; whether two tests can both pass
+   is checked against the code, and a judge that must try to build the
+   joint implementation finds it where one exists. Measured (lane B3,
+   pre-registered, 6 samples per case per arm, payloads and checks as
+   above): opus at effort high judged 5ddc1d67's pinned 303 case and its
+   probe `exclusive` in 5 of 6 (6 of 6 against the other item's probe),
+   and gave no false `exclusive` in 42 samples over seven pairs that can
+   both hold — a2a825c2's #358 case against the run's own requirement
+   test, a79384a4's four post-click-settle cases against the late-body
+   acceptance row, the same file's 301/302 case against the 303 probe, and
+   an unrelated navegando pair. Sonnet at medium said `exclusive` once on
+   a2a825c2, with every quote verified, which is why this worker is on
+   opus.
 
    Fitting a fix to the probe's wording (lane XC's G1: a generic passive
    "is …ed" pattern that made the probe sentence a no-op) is not caught
@@ -16824,7 +16894,12 @@ to build that fix (*A fix that keeps both, on opus when sonnet could not*,
 below); what it cannot build stops the run and shows the conflict: the case
 that fails in its base form, its failure, and, beside it in the PR, what the
 run changed in that test. One read settles it. Nothing is accepted by
-reading. The cost is convergence on a task whose required change IS the
+reading the task. The one exception is not a reading of the task: a pinned
+case that a required item's confirmed, shown probe contradicts — no
+implementation passes both, a fact verified against the two tests' quoted
+assertions and the code — is task-required (§8 *Delivery re-drive* rule 4,
+*A pinned case a required item's probe contradicts is task-required*). The
+cost is convergence on a task whose required change IS the
 tested behaviour (a sweep that moves literals into message files): no fix
 keeps both, so such a run ends `unconverged` and opens a draft.
 
@@ -20277,7 +20352,7 @@ finding whose quote checks out reaches the final conformer, as an
 advisory section it verifies against the code before acting. The review
 never gates and never changes the run's outcome; whatever it made goes
 with its checkout; its record (`pr_review`) is for the PR. It runs on
-`opus` at effort `high` — the one model-tier exception (§12): measured
+`opus` at effort `high` — a model-tier exception (§12): measured
 (bench N2f, 66 calls per arm on 33 PRs), opus high returned 38 verified
 findings that name no required item against 8 for sonnet high and 7
 for sonnet medium, and of 18 opus findings hand-checked 13 were real,
@@ -21816,6 +21891,16 @@ whole-PR review (§9 *An advisory whole-PR review feeds the final
 conformer*), at effort `high`. It is not a judgment the run waits on;
 it looks for what nothing else is anchored to, and there the tier
 measured about five times the verified findings (bench N2f).
+
+A second is on `opus`, at effort `high`: `contradiction_judge` (§8
+*Delivery re-drive* rule 4, *A pinned case a required item's probe
+contradicts is task-required*). Its one wrong answer lets a real regression
+ship as task-required, and that is the answer the tiers split on: in bench
+B3 sonnet at `medium` said a2a825c2's #358 case and the run's requirement
+test cannot both pass, with every quote verified, in 1 of 6 samples; opus at
+`high` gave no such answer in 42 samples over seven pairs that can both
+hold. It runs only when a re-drive commit makes a probe pass by breaking a
+pinned case.
 
 One round is on `opus` by a per-call override, not by a worker default: the
 delivery re-drive's escalation of an existing test's base-form cases that

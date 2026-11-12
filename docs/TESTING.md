@@ -8651,3 +8651,27 @@ attempts read `rolled_back` and its file's `fixed` recomputed from the
 still-kept ones (`_redrive_base_form_unkept`, unit), and the real flip path
 (the 22a30525 replay) passes on exactly the group it rolls back, with that
 group's reason.
+
+## A pinned case a required item's probe contradicts is task-required
+
+`tests/test_contradiction_judge.py` (DESIGN §8 *Delivery re-drive* rule 4):
+the real `_run_delivery_redrive` over `tests/test_shown_probe_contest.py`'s
+World (real git, a real confined pytest, the probe re-run in its sandbox, B*,
+the base-form check), with the probe asserting the opposite of the pinned case
+for the same input. `claude_p` plays the implementer and answers the
+`contradiction_judge` with recorded verdicts; the facts script's read of a
+pytest file is stubbed (`_facts_for`), as every pytest-probe gate test stubs
+it. An `exclusive` verdict keeps the group with its test update, contests
+nothing, makes the item met, and on the tree that ships moves the case to
+`existing_behaviour.task_required`, out of the outcome's reasons and into the
+PR's "existing test changed because required item 0 contradicts it" line; a
+`both_can_hold` verdict, an `exclusive` without its three facts, a quote not
+verbatim and a quote that is no assertion of the case each keep today's
+rollback and contest; the judge's payload holds the base's pinned file and
+never the group's rewrite, and is gone after the call; a settled case the
+commit left failing is still a new failure, the next group is told the item
+contradicts it, and the verdict is reused without a second call. Where node
+and typescript are present, the code the two tests reach and the real facts
+script's assertion spans verify a TS verdict (a quoted `expect` passes, a
+quoted setup line of the case does not). The prompt is pinned to lane B3's
+sha256.

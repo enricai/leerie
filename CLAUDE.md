@@ -254,10 +254,13 @@ the rest of the family stay denied.
   documented reason: it runs once per subtask and throughput dominates,
   with correctness resting on its base-tree-only tool scope rather than
   model tier — see the comment at its `MODEL_DEFAULT_PER_WORKER` entry).
-  `pr_reviewer` is the one worker on `opus` (effort `high`): the advisory
+  Two workers are on `opus` (effort `high`): `pr_reviewer`, the advisory
   whole-PR review, which never gates, measured at about 5x sonnet's
-  verified findings on code no required item names (bench N2f; the
-  reason is at its `MODEL_DEFAULT_PER_WORKER` entry and DESIGN §12).
+  verified findings on code no required item names (bench N2f); and
+  `contradiction_judge`, whether an existing test's pinned case and a
+  required item's probe can both pass, where sonnet gave a verified false
+  "exclusive" on a real regression and opus none (lane B3). The reasons
+  are at their `MODEL_DEFAULT_PER_WORKER` entries and DESIGN §12.
   One ROUND, not a worker, is on `opus` too: the delivery re-drive's
   escalation of an existing test's base-form cases the implementer's own
   round could not keep (`MODEL_BASE_FORM_ESCALATION`,

@@ -41,9 +41,17 @@ import pytest
 PROMPTS = pathlib.Path(__file__).resolve().parent.parent / "prompts"
 
 # Worker -> set of required property names deliberately absent from its prompt.
-# Empty today, and that is the point: adding an entry is a deliberate, reviewed
-# act, not the silent default. Prefer fixing the prompt over adding a row here.
-ALLOWLIST: dict[str, set[str]] = {}
+# Adding an entry is a deliberate, reviewed act, not the silent default. Prefer
+# fixing the prompt over adding a row here.
+ALLOWLIST: dict[str, set[str]] = {
+    # The prompt names the field as its section heading, "Evidence." (capital
+    # E, so the word-boundary match misses it) and describes its items. It
+    # ships byte for byte as lane B3 measured it (120 samples, pinned by
+    # tests/test_contradiction_judge.py::test_the_prompt_is_the_benched_one);
+    # a one-word edit would ship an unmeasured prompt (DESIGN §8: what ships
+    # is what was measured).
+    "contradiction_judge": {"evidence"},
+}
 
 
 def _mentions(text: str, name: str) -> bool:
@@ -197,18 +205,16 @@ def test_no_prompt_documents_a_field_the_schemas_removed(leerie):
 
 
 def test_allowlist_is_empty_and_stays_deliberate(leerie):
-    """The allowlist is empty, and that is the state worth pinning.
+    """The allowlist holds exactly the one justified row, and that is the
+    state worth pinning.
 
-    Every required field on every worker is currently documented, so no
-    exemption is needed. Asserting the emptiness makes adding a row a
-    deliberate, reviewed act that fails this test first — rather than a
-    silent widening nobody sees.
-
-    Written as an explicit assertion because the loop below is vacuous while
-    the dict is empty: `for ... in {}` never executes, so a body-only test
-    passes unconditionally and cannot be falsified by any product change.
+    Every other required field on every worker is documented in its prompt.
+    The one exemption is `contradiction_judge`'s `evidence`, whose prompt
+    must stay byte for byte the one lane B3 measured (see its row). Asserting
+    the exact contents makes adding a row a deliberate, reviewed act that
+    fails this test first — rather than a silent widening nobody sees.
     """
-    assert ALLOWLIST == {}, (
+    assert ALLOWLIST == {"contradiction_judge": {"evidence"}}, (
         "an exemption was added to the prompt/schema parity allowlist. That "
         "is allowed, but it must be justified here: prefer documenting the "
         "field in its prompt over exempting it, since the exemption applies "
@@ -220,8 +226,8 @@ def test_allowlist_entries_are_real_fields(leerie):
     longer exists silently widens the exemption to nothing, hiding a real
     omission behind stale config.
 
-    Vacuous by construction while ALLOWLIST is empty — which is why the test
-    above pins the emptiness separately rather than relying on this one.
+    The test above pins the allowlist's exact contents separately rather than
+    relying on this one.
     """
     for worker, fields in ALLOWLIST.items():
         assert worker in leerie.SCHEMAS, f"allowlist names unknown worker {worker!r}"

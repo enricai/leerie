@@ -318,12 +318,14 @@ def test_judgment_workers_pinned_set(leerie):
     # (determinism/reproducibility). A deliberate override of the prior
     # "bounded by the DESIGN §8 evidence gate" unset default.
     acting_workers = {"implementer", "conformer"}
-    # The advisory whole-PR review runs at high, as benched (bench N2f).
-    high_workers = {"pr_reviewer"}
+    # The advisory whole-PR review runs at high, as benched (bench N2f);
+    # the contradiction judge too (lane B3, opus high).
+    high_workers = {"pr_reviewer", "contradiction_judge"}
 
     assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == (
         judgment_workers | acting_workers | high_workers)
-    assert leerie.EFFORT_DEFAULT_PER_WORKER["pr_reviewer"] == "high"
+    for w in high_workers:
+        assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "high"
     for w in judgment_workers:
         assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "medium"
     for w in acting_workers:

@@ -93,6 +93,11 @@ GENERIC_PLACEHOLDERS = frozenset({
     # own and an exemption here would be dead weight.)
     "Callout", "MetricTile", "TrendLine", "SectionPanel",
     "Panel.tsx", "overview.tsx",
+    # contradiction_judge.md's generic name for any test framework's
+    # assertion call (beside `expect(...)`), in the prompt lane B3 measured
+    # and that ships byte for byte (DESIGN §8: what ships is what was
+    # measured). Names no codebase's symbol.
+    "assert...",
 })
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?$")
