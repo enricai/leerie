@@ -505,11 +505,15 @@ The orchestrator gives you, in your prompt:
    the auditor's: `rerun_flow`, `reraise` and `relink` are each their own
    kind, while `guard`, `recompute` and `propagate` are interchangeable. A
    `fix` site you deliberately leave alone goes in the top-level
-   `sites_not_needed` as `{"site_id": "D4", "reason": "<code evidence it
-   needs no change>"}`. A failed check comes back to you: implement the
-   auditor's resolution, or — only with code evidence the auditor is
-   wrong — keep yours, say why in `scope_note`, and claim the kind you
-   implement.
+   `sites_not_needed` as `{"site_id": "D4", "reason_kind": "<kind>",
+   "reason": "<code evidence>"}`, typed `holds_on_tree` (the site already
+   does what the contract needs on this tree), `covered_by_other_site`
+   (a claimed site's change fixes it too) or `outside_task` (the audit's
+   site is not this task's). An audited `fix` site that is neither claimed
+   nor listed there stops the run before anything executes. A failed check
+   comes back to you: implement the auditor's resolution, or — only with
+   code evidence the auditor is wrong — keep yours, say why in
+   `scope_note`, and claim the kind you implement.
 
    When the `ground_truth` object inside your `defect_scope` ctx
    lists the report's named inputs with every one PRESENT (each
@@ -769,7 +773,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
     }
   ],
   "sites_not_needed": [
-    {"site_id": "D3", "reason": "code evidence that this site needs no change"}
+    {"site_id": "D3", "reason_kind": "holds_on_tree",
+     "reason": "code evidence that this site needs no change"}
   ],
   "items_not_needed": [
     {"item_index": 3, "reason_kind": "other_domain",

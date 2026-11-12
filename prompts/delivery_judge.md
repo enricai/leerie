@@ -189,7 +189,7 @@ record answers the question.
 
 ## Typed evidence sections
 
-Your payload may carry two sections code computed on this tree; each
+Your payload may carry these sections code computed on this tree; each
 appears only when it has something to show.
 
 - `SITE-TOKEN HITS`: lines this run's diff adds that name a token from
@@ -204,8 +204,18 @@ appears only when it has something to show.
   disagree and a required item depends on that contract, that item is
   unmet and your evidence cites the mismatch; if they agree after all,
   say where.
+- `SWEEP INSTANCES STILL PRESENT`: an item whose entry carries
+  `instances` covers one file of a sweep (a requirement that holds at
+  every place a pattern occurs); `instances` are the places code found
+  on the base tree, one per line (`file:line kind "text"`). This
+  section lists, per such item, the instances whose literal is still in
+  that file now. Judge each instance as a part: one still present that
+  is the defect the item names keeps the item unmet; one that is not —
+  it never reaches a user, say, or it is a format string — can be met,
+  with a cite that shows why. An instance gone from the list was
+  changed; check the change does what the item asks.
 
-Neither section is a verdict on its own.
+No section is a verdict on its own.
 
 ## Defect contract
 

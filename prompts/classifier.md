@@ -240,6 +240,41 @@ diagnosis, fix and test sections to it with `supports`.
   non-empty only when the item's **whole** content is that those paths
   must not change ("leave `data/` untouched"). An item that also asks
   for something else leaves it empty.
+- `sweeps` (array, optional): decide this for EVERY part (or item) that
+  says something holds across the whole codebase or site — "the entire
+  site", "everywhere", "every …", "all …", "no … anywhere", "complete".
+  Such a part is a sweep when whether it holds depends on code beyond the
+  files it names. "Every string the site shows is in the message files"
+  is false wherever the code shows text that is not in them, so it sweeps
+  the code for hard-coded text: the message files are what the strings
+  must reach, the code is what is swept. "Every call to the old helper is
+  replaced" sweeps the code for calls to it. Before deciding, look: grep
+  the code for the pattern, and see which directories hold it (the
+  components that render text, the server code that returns messages).
+  For each such part, one entry per kind of place it lives in, saying
+  what to enumerate. The orchestrator enumerates the instances on this
+  tree with a parser and makes each file that has them a required item of
+  its own, listing every instance, so a sweep finished halfway shows as
+  the files still unmet. Fields:
+  - `part`: that entry of `parts` (or the `item` text) copied verbatim;
+  - `pattern`: `"text_literal"` (hard-coded natural-language text: string
+    literals, template-literal text, JSX text) or `"call"` (call sites of
+    the callees in `names`);
+  - `paths` / `exclude_paths`: repo-relative globs (`**` crosses
+    directories) of the code files the sweep covers — exclude tests and
+    generated files unless the part covers them;
+  - `ignore_calls` / `ignore_attributes`: for `text_literal`, the callees
+    whose literal arguments are not the defect (the translation function
+    itself, a class-name helper, loggers and console calls) and the
+    attribute or property names whose values are not (class names, ids,
+    routes, test ids);
+  - `markers`: optional. When the defect is text in one natural language
+    and the code's other literals are not, list words and characters
+    typical of that language; a literal is then an instance only if it
+    holds one.
+  A sweep that matches nothing, or more than a few hundred instances, is
+  sent back to you to fix. A part about one place carries no sweep, and
+  neither does a task that asks for no property across the code.
 
 A requirement written as prose is still a requirement: "fix the race in
 X so the second request gets the idempotent response instead of a 500"

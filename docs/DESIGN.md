@@ -303,7 +303,10 @@ subtask it tests). Three mechanisms reconcile that coupling:
   what operator prompts asking to "fix the root cause at its source"
   have been requesting all along. The audit can be wrong (it is
   judgment, and a hallucinated site must not be able to block a run),
-  so it never stops a run. The plan accounts for each `fix` site
+  so it never stops a run by itself; a site the plan neither claims nor
+  excludes with a typed reason does (*An audited site the plan leaves
+  alone is excluded with a typed reason, or the run stops*, below). The
+  plan accounts for each `fix` site
   through typed site claims (*Every `fix` site is claimed* below),
   checked in the planner's own loop. A file-path floor that warned on
   any audited file missing from every subtask's `files_likely_touched`
@@ -491,7 +494,7 @@ subtask it tests). Three mechanisms reconcile that coupling:
   delivery gate settles it on the integrated tree (§8 *A site resting on
   an untyped resolution is settled by the run*). A
   `fix` site that no fix subtask claims needs either a claim or a typed
-  `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
+  `sites_not_needed` entry (`{site_id, reason_kind, reason}`); one claimed only with
   kinds outside the audit's class is a mismatch. Recursive decomposition
   (§5½) re-homes a split subtask into children; every child — code-built
   or written by the splitter, whose schema has no claims — carries its
@@ -500,10 +503,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
   the bug-fixing planner through its mechanical-check loop — the
   planner either implements the audit's resolution or, only with code
   evidence the audit is wrong, keeps its own and says so. What is left
-  when the rounds run out is persisted (`site_claims`) and logged, never
-  fatal: the audit is judgment, and an unclaimed site becomes work only
-  through a validated held-out acceptance set that fails (§8 *Held-out
-  acceptance tests*). Measured (bench D3/P6, live planners with the
+  when the rounds run out is persisted (`site_claims`) and logged; an
+  unclaimed site then stops the run (next paragraph). Measured (bench D3/P6, live planners with the
   claims check over the same audits, 9 runs: the PR383 target ×3 and 6
   converged controls): every target run ended claiming all 4 fix sites
   with the audit's kinds (two needed the feedback round), 8 of 9 runs
@@ -512,6 +513,30 @@ subtask it tests). Three mechanisms reconcile that coupling:
   whose kind contradicted its intent, and the only contradictions it
   read on a control (4 sites, one run) were all `other` claims — which
   is why `other` is settled at the gate instead of contradicting.
+
+  **An audited site the plan leaves alone is excluded with a typed
+  reason, or the run stops.** A `sites_not_needed` entry carries a
+  typed `reason_kind`: `holds_on_tree` (the site already does what the
+  contract needs on this tree), `covered_by_other_site` (a claimed
+  site's change fixes it too) or `outside_task` (the audit's site is not
+  this task's), with the code evidence in `reason`; an entry without a
+  valid kind is no exclusion. An audited `fix` site still `unclaimed`
+  when the bug-fixing planner's rounds run out stops the run in planning,
+  before the plan is checkpointed or anything executes, naming each such
+  site; a resume plans again. This keeps the audit's fallibility where
+  it belongs: a site the planner judges wrong is excluded, typed, in one
+  line, and the PR shows the exclusion, but a site nobody accounted for
+  is not executed past. A `mismatch` is claimed and does not stop the
+  run. Before this rule a residual was logged and the run proceeded,
+  becoming work only through a failing held-out set. Measured before
+  shipping it: over every recorded run with `site_claims` (21 runs: 18
+  barnacle, 3 navegando, leerie 0.43.0–0.60.0), none ended with an
+  `unclaimed` row, so the stop costs the recorded corpus nothing. The
+  incident that prompted it (navegando 4134b78c, a directory-shaped site
+  `src/components :: hardcoded UI literals` whose sweep shipped half
+  done) was not an unclaimed site: three subtasks claimed it, and each
+  fixed some of the files. That half is *A sweep's instances are items*
+  (§8).
 
   **Required items are claimed too, and the plan accounts for every
   one.** On every run, not only a defect fix, each planner subtask lists
@@ -12997,6 +13022,102 @@ packs of 30, and the per-item re-judge — was **not** adopted: its catch
 was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
 unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
 on average and 15–32× on large tasks.
+
+**A sweep's instances are items.** Some requirements hold at every place
+a pattern occurs: "no user-facing text is hard-coded outside the message
+files", "every call to the old helper is replaced". Judged as one item, such
+a sweep reads `met` when it is half done. Measured on navegando 4134b78c
+(#501, merged; a translations task): the classifier wrote one item whose
+fourth part was the sweep ("the entire site's user-facing strings are
+present in the messages files"); the defect audit listed the components as
+one directory-shaped site that three subtasks claimed and each fixed in
+part; the delivery judge and three falsifiers said met. An independent audit
+of the merged tree then found 44 hard-coded strings in 12 components and
+about 225 Spanish server messages in `src/lib/actions` and `src/app/api`,
+none of them in the run's record. Nothing had enumerated the instances, so
+no check could see how many were left.
+
+So a sweep is typed and its instances are enumerated:
+
+- **A worker says it is a sweep and what it sweeps.** Two can. The
+  defect-scope audit (§5) types every site's `extent` — `one_place`, or
+  `pattern` when the site is one pattern in many places ("components that
+  hard-code user-visible text"), one site per kind of place — and a
+  `pattern` `fix` site carries a `sweep`. The field is required, as
+  `resolved_path` is: an optional `sweep` alone was written on 2 of 6
+  measured audits of the target, the rest handing the pattern over as a
+  partial list of files. And a
+  classifier's required item may carry `sweeps`, each naming one of its
+  parts verbatim (or the item text). Either spec has a `pattern` (`text_literal`: hard-coded natural-language text —
+  string literals, template-literal text, JSX text; or `call`: the call
+  sites of the callees in `names`), the files it covers (`paths`,
+  `exclude_paths`, repo-relative globs), and for text the callees and
+  attribute names whose literals are not the defect (`ignore_calls`,
+  `ignore_attributes`) and optional `markers` (words or characters of the
+  natural language the defect is in). Python never reads the task to decide
+  any of this (§12 *Language-to-JSON*). The auditor is the one that finds
+  them in practice: it reads the code, where the classifier reads the task
+  in a couple of turns (measured below).
+- **Code enumerates; it never interprets.** Files are chosen by glob over
+  the committed tree's own path list (`git ls-tree`, matched in Python, no
+  pathspec reaches git) and read from git, never from working files. Each is
+  parsed with tree-sitter (TypeScript, TSX, JavaScript, Python; other files
+  are counted unparsed). An instance is a syntax node: for `call`, a call
+  whose callee (or its last segment) is named; for `text_literal`, a
+  literal whose own characters have the shape of text rather than of an
+  identifier, key, path, class list or enum value (a code constant over
+  character classes — a capitalised word, several words, or a non-ASCII
+  letter; never a reading of what it says), that is not an import source, a
+  type, a directive or docstring, a compared or indexed value or an object
+  key, that sits under no ignored attribute or callee up to its enclosing
+  function, and that holds a marker when markers are given (word equality,
+  or containment for a one-character marker).
+- **Each file with instances is a required item.** Code appends one derived
+  item per file to `required_items`, after the classifier's own so no index
+  moves (a classifier sweep's at classification, anchored on its item's
+  span; a site's after the audit, `source_ref` its site id),
+  `verifiability: tree`, `sweep_of` naming where it came from, the file
+  and the spec itself, its instances as `parts` (one `file:line kind
+  "text"` line each) and as structured `instances`. A site with a sweep
+  is then accounted for twice, and both bind: the site by the plan's site
+  claims (§5), each of its files by an item claim. From
+  there it rides every item path unchanged: planners claim it
+  (`_check_item_claims`), the coverage gate accounts for it, the delivery
+  judge and the falsifier judge it, the re-drive routes it. A sweep half
+  done is a set of unmet items, one per file left. Grouping is by file, not
+  by instance, chosen before the precision was measured: at about 400
+  instances, one item per instance would put every one before every planner
+  and judge.
+- **The sweep is checked where it is written.** A sweep whose part is not
+  one of its item's, that matches nothing on the base tree, or that matches
+  more than `sweep_max_instances` (500) instances or `sweep_max_files` (80)
+  files goes back to the worker that wrote it, in its check loop
+  (SWEEP_PART_UNKNOWN, SWEEP_EMPTY, SWEEP_TOO_BROAD); so does a `pattern`
+  site without a sweep (SWEEP_MISSING) and a `fix` site whose `file` is a
+  directory of the tree typed anything but `pattern` (SITE_IS_A_DIRECTORY —
+  a path fact read from git, never from the site's prose). Requirement coverage is computed on the
+  classifier's own items, so derived items never read as duplicates.
+- **What is left is evidence, never a count to reach zero.** At every
+  delivery pass code re-enumerates each sweep on the tree being judged and
+  hands the judge, as a typed-evidence section, each derived item's
+  instances still present (its file still holds a literal of the same kind
+  and text, however the lines moved). The judge's entry for a derived item
+  carries its `instances`. The verdict stays the judge's: a heuristic's
+  false positives would make "no instance left" unreachable, and an
+  instance that is not the defect (a log line, a format string) is met
+  with a cite saying why.
+
+Measured (lane SW2, pre-registered): on navegando at the merge of #501, the
+enumerator with a reference pair of sweeps (components; server messages
+with Spanish markers) found 405 instances in 80 files and recalled 265 of
+the 266 listed strings (44 of 44 component strings read by a reviewer; 221
+of 222 server strings, that list itself a word heuristic close to the
+reference spec's markers, so the server half is partly by construction).
+Precision, from a labelled sample of 100 of the 140 instances outside the
+list, was about 0.77 (0.40 for the component sweep, whose reference spec did
+not ignore the logger calls; 0.98 for the server sweep). At least 37 of the
+80 files hold a real instance. End to end (classify, plan, detection on the
+shipped tree): RESULT_E2E.
 
 **Typed evidence for the delivery judge.** Two mechanical checks hand
 the judge evidence it would otherwise have to find by reading, each as

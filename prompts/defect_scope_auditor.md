@@ -107,6 +107,42 @@ Pick the one kind whose absence would leave the symptom in place. A
 `resolution`. The orchestrator numbers your sites itself (`D1`, `D2`, …
 in the order you list them); do not number them.
 
+## Every site's `extent`: one place, or a pattern in many places
+
+Type every site's `extent`. `"one_place"`: the site is one function, one
+branch, one file's decision. `"pattern"`: the site is one pattern repeated
+across many places — "components that hard-code user-visible text",
+"every handler that returns its own error string", "each caller of the old
+helper", anything you would describe by a directory or by "every …". Do
+not hand a pattern to the planner as a directory, a description, or a
+partial list of the files you happened to read: a plan that fixes some of
+them reads as having fixed the site. A `"pattern"` `fix` site carries a
+`sweep` saying what to enumerate, and the orchestrator lists every
+instance with a parser and makes each file that has them a required item
+the run must meet, instance by instance:
+
+- `pattern`: `"text_literal"` (hard-coded natural-language text: string
+  literals, template-literal text, JSX text) or `"call"` (call sites of the
+  callees in `names`);
+- `paths` / `exclude_paths`: repo-relative globs (`**` crosses
+  directories) of the code files it covers — leave tests and generated
+  files out unless the defect is in them;
+- `ignore_calls` / `ignore_attributes`: for `text_literal`, the callees
+  whose literal arguments are not the defect (the translation function
+  itself, class-name helpers, loggers and console calls) and the attribute
+  or property names whose values are not (class names, ids, routes, test
+  ids);
+- `markers`: optional. When the defect is text in one natural language
+  and the code's other literals are not, words and characters typical of
+  that language; a literal then counts only if it holds one.
+
+Grep before you write it: the sweep should find the instances you saw. One
+that matches nothing, or more than a few hundred instances, comes back to
+you to fix, and so does a `"pattern"` site without a sweep or a site whose
+`file` is a directory typed `"one_place"`. When the pattern lives in
+different kinds of place (components that render text, server code that
+returns messages), list one site per kind, each with its own sweep.
+
 ## Unconfirmed-cause reports ARE applicable
 
 A report that describes one live symptom, says the cause is
@@ -229,12 +265,12 @@ Return **only** a JSON object per your schema:
   "sites": [
     {"file": "src/example_module.py", "symbol": "merge_candidates",
      "line_hint": 120, "role": "decision_site", "disposition": "fix",
-     "resolution_kind": "recompute",
+     "extent": "one_place", "resolution_kind": "recompute",
      "resolution": "key rows on the declared identity field instead of their position",
      "note": "example_module.py:120-134 compares rows by position; three branches share the idiom"},
     {"file": "src/example_module.py", "symbol": "collect_pending_rows",
      "line_hint": 480, "role": "bypass", "disposition": "fix",
-     "resolution_kind": "relink",
+     "extent": "one_place", "resolution_kind": "relink",
      "resolution": "route the pending rows through resolve_identity_key like every other caller",
      "note": "example_module.py:480 builds its own plan list; never calls resolve_identity_key"}
   ],
