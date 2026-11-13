@@ -4366,10 +4366,11 @@ SCHEMAS: dict[str, dict] = {
                         # by `_format_provision_recipe_section`; the
                         # worker decides whether and when to run each.
                         "kind": {"enum": ["install", "build", "none"]},
-                        # argv list (NOT a shell string). argv[0] must be
-                        # in the allowlist enforced by
-                        # _validate_provision_recipe; no shell metacharacters
-                        # anywhere in the argv.
+                        # argv list (NOT a shell string). argv[0] is a
+                        # program's bare name or a relative path in the
+                        # repository (_validate_provision_recipe) that the
+                        # run can run (_recipe_program_issues); no shell
+                        # metacharacters anywhere in the argv.
                         "command": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -19524,15 +19525,12 @@ async def _probe_criteria_satisfied_on_head(
 # §6½ for the layered design (.leerie-setup.sh → mise install → table → LLM
 # fallback → worktree replay).
 
-# argv[0] allowlist for any provision command — both table-emitted commands
-# and the LLM-fallback recipe. Validated by _validate_provision_recipe().
-# Anything outside this set is rejected; the §12 carve-out (the LLM
-# fallback worker) is mechanically contained by this list.
-_PROVISION_ARGV0_ALLOW = frozenset({
-    "pnpm", "npm", "yarn", "pip", "pip3", "uv", "poetry", "pipenv",
-    "go", "cargo", "bundle", "gem", "mvn", "gradle", "gradlew", "make",
-    "composer", "dotnet",
-})
+# What a provision command's argv[0] may be (DESIGN §6½ *The §12
+# carve-out*): a program's bare name, or a relative path to a file the
+# repository holds. Which program is the repository's to say; whether the
+# run can run it is `_recipe_program_issues`'s.
+_PROVISION_PROGRAM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_PROVISION_PROGRAM_PATH_RE = re.compile(r"^[A-Za-z0-9._+/-]+$")
 
 # Shell metacharacters that must not appear anywhere in a command argv.
 # A command emitted as a true argv list cannot legitimately need any of
@@ -19936,7 +19934,9 @@ def _validate_provision_recipe(recipe: list[dict]) -> None:
 
     Invariants enforced:
       - command is a non-empty argv list (no shell strings).
-      - command[0] is in _PROVISION_ARGV0_ALLOW (or the entry is kind: none).
+      - command[0] is a program's bare name or a relative path with no
+        `..` segment (or the entry is kind: none); whether the run can run
+        it is `_recipe_program_issues`'s.
       - No shell metacharacters anywhere in the argv (no piping, no
         redirection, no command substitution).
       - No `sudo` anywhere.
@@ -19963,10 +19963,16 @@ def _validate_provision_recipe(recipe: list[dict]) -> None:
         if any(not isinstance(a, str) for a in cmd):
             raise ValueError(
                 f"recipe[{i}].command must be a list of strings")
-        if cmd[0] not in _PROVISION_ARGV0_ALLOW:
+        prog = cmd[0]
+        if "/" in prog:
+            if (prog.startswith("/") or not _PROVISION_PROGRAM_PATH_RE.match(prog)
+                    or ".." in prog.split("/")):
+                raise ValueError(
+                    f"recipe[{i}].command[0]={prog!r} is not a relative "
+                    "path inside the repository")
+        elif not _PROVISION_PROGRAM_RE.match(prog):
             raise ValueError(
-                f"recipe[{i}].command[0]={cmd[0]!r} is not in the allowed "
-                f"package-manager set {sorted(_PROVISION_ARGV0_ALLOW)}")
+                f"recipe[{i}].command[0]={prog!r} is not a program name")
         for j, arg in enumerate(cmd):
             if arg == "sudo":
                 raise ValueError(
@@ -20059,6 +20065,46 @@ _DEPCAP_TEXT_TOOLS = frozenset(
 # keeps the install segment instead of being dropped by the leading `echo`.
 _DEPCAP_SEGMENT_RE = re.compile(r"[\n;]|&&|\|\||[|&]")
 
+
+
+def _recipe_program_issues(recipe: list, repo_root: Path,
+                           bin_paths: list[str], path: str) -> list[str]:
+    """One `UNKNOWN_PROGRAM` issue for each recipe command whose program the
+    run cannot run (DESIGN §6½ *The §12 carve-out*): a bare name with no
+    executable of that name on a directory `mise bin-paths` listed for the
+    provisioning checkout (`bin_paths`) or on `path` (mise's shims aside: a
+    shim exists for every tool any run installed, active here or not); a
+    path with no regular file beneath the repository at its working
+    directory."""
+    shims = os.path.realpath(
+        Path(os.environ.get("MISE_DATA_DIR")
+             or Path.home() / ".local" / "share" / "mise") / "shims")
+    dirs = [d for d in [*bin_paths, *path.split(os.pathsep)]
+            if d and os.path.realpath(d) != shims]
+    issues: list[str] = []
+    for i, entry in enumerate(recipe or []):
+        if not isinstance(entry, dict) or entry.get("kind") == "none":
+            continue
+        cmd = entry.get("command") or []
+        if not cmd or not isinstance(cmd[0], str):
+            continue
+        prog = cmd[0]
+        if "/" in prog:
+            wd = entry.get("working_dir") or "."
+            target = repo_root / wd / prog
+            if not _regular_file_beneath(repo_root, target):
+                issues.append(
+                    f"UNKNOWN_PROGRAM: recipe[{i}] runs {prog!r}, which is "
+                    f"not a file the repository holds at {wd!r}")
+            continue
+        if not any(os.access(os.path.join(d, prog), os.X_OK)
+                   and os.path.isfile(os.path.join(d, prog)) for d in dirs):
+            issues.append(
+                f"UNKNOWN_PROGRAM: recipe[{i}] runs {prog!r}, which this "
+                "run's toolchain does not provide — name the program the "
+                "repository's own steps run; if it is one the repository "
+                "needs and the run lacks, the step cannot run here")
+    return issues
 
 def _is_install_command(cmd: str) -> bool:
     """True if `cmd` invokes a package-manager install verb (SECONDARY hint).
@@ -34180,6 +34226,31 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     prov["mise_versions"] = versions
     st.save()
 
+    # The directories mise puts the resolved versions' programs in, for the
+    # check that a recipe's program is one the run can run
+    # (`_recipe_program_issues`). Not fatal, as the capture above.
+    try:
+        async with _exec_lock().shared():
+            with _shim_refusals("mise bin-paths") as refusal_fd:
+                result = await _run_proc(
+                    _confined_argv(grants, ["mise", "bin-paths"],
+                                   refusal_fd=refusal_fd),
+                    cwd=str(repo_root),
+                    env=_grant_env(_repo_command_env(env), grants),
+                    timeout=MISE_LS_TIMEOUT,
+                    pass_fds=(refusal_fd,),
+                )
+    except subprocess.TimeoutExpired:
+        log("mise bin-paths timed out; skipping its capture")
+        return
+    if result.returncode != 0:
+        log(f"mise bin-paths failed (exit {result.returncode}); skipping "
+            "its capture")
+        return
+    prov["bin_paths"] = [ln.strip() for ln in (result.stdout or "")
+                         .splitlines() if ln.strip()]
+    st.save()
+
 
 # =========================================================================
 # phases
@@ -36094,8 +36165,8 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
         "",
         "Below are the repo signals you have to decide how to install "
         "its dependencies. Emit a recipe that uses the project's own "
-        "documented commands. Reject any command outside the allowlist."
-        " Emit `kind: none` if no install is needed (pure docs repo).",
+        "documented commands. Emit `kind: none` if no install is needed "
+        "(pure docs repo).",
         "",
     ]
     if fixtures["readme"]:
@@ -36257,9 +36328,13 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
                 prov_up_parts.append(fb)
             return {}
 
+        bin_paths = list(prov.get("bin_paths") or [])
         result, prov_warnings = await _run_checked_loop(
             invoke=_invoke_provision,
-            check=lambda r: check_provision_output(r, repo_root),
+            check=lambda r: (check_provision_output(r, repo_root)
+                             + _recipe_program_issues(
+                                 r.get("recipe") or [], repo_root, bin_paths,
+                                 os.environ.get("PATH", ""))),
             name="provision",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_prov_fb,

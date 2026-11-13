@@ -63,10 +63,13 @@ validates it before executing anything, so deviation is rejected.
 1. **`command` is an argv list**, not a shell string. `["pnpm",
    "install"]`, not `"pnpm install"`. The executor invokes `mise exec
    -- <argv...>` directly with no shell.
-2. **`command[0]` must be in this allowlist**: `pnpm`, `npm`, `yarn`,
-   `pip`, `pip3`, `uv`, `poetry`, `pipenv`, `go`, `cargo`, `bundle`,
-   `gem`, `mvn`, `gradle`, `gradlew`, `make`. Anything else is
-   rejected.
+2. **`command[0]` is the program the step runs** — the repository's own
+   tool for it (the command its docs, build files or CI run), by its bare
+   name, or a path inside the repository to a script the repository
+   commits for the purpose (`./gradlew`). The orchestrator checks that the
+   run's toolchain provides that program and re-asks you about one it
+   does not; never substitute another program for the one the repository
+   uses.
 3. **No shell metacharacters anywhere in any argv**: no `|`, `&`, `;`,
    `$`, backticks, `>`, `<`, or newlines. The list form is the only
    form.

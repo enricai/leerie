@@ -11740,9 +11740,9 @@ the CI parity baseline, the browser suite unable to start).
    polyglot Makefile-driven setup), the orchestrator invokes a
    `claude -p` worker whose only job is reading the repo's README and
    configuration files and emitting a JSON recipe. The recipe is
-   schema-validated, the commands inside it are restricted by an
-   argv-allowlist, and any deviation from the schema rejects the
-   worker. This is a *deliberate* exception to §12 — see below.
+   schema-validated, each command's program must be one the run can run
+   (*The §12 carve-out* below), and any deviation from the schema
+   rejects the worker. This is a *deliberate* exception to §12 — see below.
 5. **The repository image holds no dependency.** *Revised 2026-11-12
    (OPEN-ISSUES #23; the language-agnostic audit's cluster C1).*
 
@@ -11837,14 +11837,35 @@ contain it:
    with conventional lockfiles never reach the worker. The model sees
    the genuinely ambiguous tail, where human judgment would be doing
    the work anyway.
-2. **The recipe is mechanically bounded.** Every command's `argv[0]`
-   must come from a fixed allowlist of package managers; shell
-   metacharacters and directory traversal are rejected. The worker
-   cannot emit `sudo`, pipe into `sh`, or reach outside the repo —
-   this is what makes the prompt-injection safe, since the validator
-   ensures the rendered `PROVISION_RECIPE:` block carries only argv
-   sequences from a known-safe vocabulary. The §12 guarantee lives in
-   the validator, not in any worker prompt.
+2. **The recipe is mechanically bounded.** Every command is an argv
+   list whose `argv[0]` is a program: a bare name the run's toolchain
+   provides — on a directory `mise bin-paths` lists for the provisioning
+   checkout, or on the image's own `PATH` (mise's shims aside) — or a
+   relative path, with no `..`, to a file the repository holds (a
+   wrapper it commits, `./gradlew`). Shell metacharacters, `sudo` and
+   directory traversal are rejected. The worker cannot pipe into `sh`,
+   use `sudo`, or reach outside the repo, and a program the run cannot
+   run is sent back to it as feedback rather than reaching a later step.
+
+   *Revised 2026-11-13 (OPEN-ISSUES #23, lane LG2).* This used to be a
+   fixed allowlist of package managers (eighteen in code, sixteen in the
+   prompt). That list held back no
+   authority confinement does not already hold back: what a recipe runs
+   is the repository's own code (`make` runs the repository's
+   Makefile, every package manager runs install scripts), and it runs
+   confined like every repository command (§6 *Leerie's runs of the
+   repository's commands are confined too*). What the list did do was
+   keep the worker from naming a repository's real tool. On a Zig
+   repository it emitted `make --version` (lane LG's launch). In the
+   bench, on Zig and Elixir fixtures, it answered `kind: none` 6/6 each
+   because neither `zig` nor `mix` was in the list. Without the list,
+   the same worker named `zig` 6/6 and `mix` 5/6 (`none` in the sixth),
+   and kept Maven, bare-pyproject and docs controls equal to before
+   (bench PREREG frozen before 60 samples, every bar met). The table's
+   recipes are code's and need no such check; the worker's are checked
+   against the toolchain the run actually has.
+   The §12 guarantee lives in the validator and that check, not in any
+   worker prompt.
 3. **It is the only documented exception.** Any future feature that
    wants to render LLM-generated content into a downstream worker
    prompt needs its own §-level justification, not a pointer to this

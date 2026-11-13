@@ -3772,7 +3772,7 @@ which are specified in their own sections.)
 | `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | sonnet | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
 | `satisfied_probe` | `prompts/satisfied_probe.md` | sonnet | 0 or 1 per subtask (phase 3, before scheduling; skipped when `--skip-satisfied-check`) | `{satisfied: bool, evidence: str, unsatisfied_reason?: "artifact_missing"\|"behavior_gap"\|"partially_met"\|"cannot_verify", equivalent_coverage_exists?: bool, sibling_invalidation_risk?: bool}` — soft-drops subtasks already met on the base tree (pre-schedule base-tree call site: `max_turns=20`; the HEAD-probe helper `_probe_criteria_satisfied_on_head` — serving the no-commit rescue and the provider-subset pre-spawn check — carries `max_turns=40`: the caps differ by consequence, not workload shape — both sites judge one criterion, but a HEAD-probe cap-out had no recovery below the run level (all six attempts for a genuine no-op — two pre-spawn, four rescue — died at turns=21 and killed the run), while a pre-schedule cap-out is retried and at worst fail-safe-keeps the subtask, DESIGN §8); a `satisfied: false` verdict with `unsatisfied_reason: "artifact_missing"`, `equivalent_coverage_exists: true`, **and an explicit `sibling_invalidation_risk: false`** soft-drops the same way (`reason: "equivalent_coverage"`); any other combination, or any field absent, keeps the subtask — the sibling channel stays keep-only by construction. DESIGN §8 *A "not satisfied" verdict carries a typed reason* |
 | `tool_discovery` | `prompts/tool_discovery.md` | sonnet | 1 per fresh run (phase 1½, before `mise install`) | the tools the repository's install/build/test steps run, each at its stated version, held to mise's registry and written to `<run>/mise-tools.toml` (`MISE_GLOBAL_CONFIG_FILE`). See §6½ step 1½ |
-| `provision` | `prompts/provision.md` | sonnet | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See §6½ |
+| `provision` | `prompts/provision.md` | sonnet | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (each program one the run can run, `_recipe_program_issues`) executed via `mise exec --`. See §6½ |
 | `provision_judge` | `prompts/provision_judge.md` | sonnet | 0 or 1 (adversarial re-check of a spawned provision recipe) | `{recipe_would_succeed: bool, defects[], rationale}` — independent verification the recipe would actually install. §6½, DESIGN §8 |
 | `wiring_judge` | `prompts/wiring_judge.md` | sonnet | 0 or 1 (phase 2¾ or later, "A wiring re-check on the fully-merged plan" — semantic check of the reconciled plan's cross-subtask edges) | `{plan_reviewed: bool, wiring_defects[] (each carrying severity: live_defect\|latent_risk — only live_defect gates), rationale}` — independent verification declared edges are the right ones, not just structurally resolvable. DESIGN §5, §8 |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
@@ -12060,14 +12060,31 @@ pnpm > yarn > npm within a directory; sorted; at most
 
 `_validate_provision_recipe(recipe) -> None` enforces (raises `ValueError`
 on violation):
-- `command[0]` is in the argv allowlist `{pnpm, npm, yarn, pip, pip3,
-  uv, poetry, go, cargo, bundle, gem, mvn, gradle, gradlew, make,
-  composer, dotnet}`.
+- `command[0]` is a program's bare name (`_PROVISION_PROGRAM_RE`,
+  `^[A-Za-z0-9][A-Za-z0-9._+-]*$`) or a relative path
+  (`_PROVISION_PROGRAM_PATH_RE`, no leading `/`, no `..` segment). There
+  is no list of programs (DESIGN §6½ *The §12 carve-out*).
 - No `sudo` anywhere in the argv.
 - No shell metacharacters (`|`, `&`, `;`, `$`, backticks, `>`, `<`, `\n`)
   in any argv element.
 - `working_dir` is either `"."` or a relative path with no `..` segments
   and no leading `/`.
+
+`_recipe_program_issues(recipe, repo_root, bin_paths, path) -> list[str]`
+is the provision worker's check, run with `check_provision_output` in its
+`_run_checked_loop` (the table's recipe is code's and is not checked): one
+`UNKNOWN_PROGRAM` issue per non-`none` entry whose bare program has no
+executable regular file of that name in `bin_paths`
+(`st.data["provision"]["bin_paths"]`) or on `path` (the orchestrator's
+`PATH`), `<MISE_DATA_DIR>/shims` left out — a shim exists for every tool
+any run installed, active here or not; or whose path program is not a
+regular file beneath `repo_root/<working_dir>` (`_regular_file_beneath`).
+`bin_paths` is captured by `_run_mise_install` after the version capture:
+`mise bin-paths` confined under the same toolchain grant in the
+provisioning checkout, bounded by `MISE_LS_TIMEOUT`, one directory per
+line; a timeout or nonzero exit is logged and leaves it unrecorded, so a
+bare program then resolves on `PATH` alone. Pinned by
+`tests/test_provision_recipe_validation.py`.
 
 ### Phase implementation (`phase_provision`)
 

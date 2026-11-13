@@ -127,13 +127,19 @@ def test_mise_install_runs_in_a_tree_holding_no_known_pin_file(
         return (0, "ok")
 
     class _Done:
+        # Text, as `_run_proc` returns (`text=True` semantics).
         returncode = 0
-        stdout = (b'{"zig": [{"version": "0.13.0", "requested_version": '
-                  b'"0.13.0", "installed": true}]}')
-        stderr = b""
+        stdout = ('{"zig": [{"version": "0.13.0", "requested_version": '
+                  '"0.13.0", "installed": true}]}')
+        stderr = ""
+
+    class _BinPaths:
+        returncode = 0
+        stdout = "/md/installs/zig/0.13.0\n"
+        stderr = ""
 
     async def _fake_run_proc(argv, **kwargs):
-        return _Done()
+        return _BinPaths() if "bin-paths" in argv else _Done()
 
     monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
     monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
@@ -141,6 +147,9 @@ def test_mise_install_runs_in_a_tree_holding_no_known_pin_file(
     assert ["mise", "install"] in ran
     assert st.data["provision"]["mise_versions"]["zig"][0]["version"] \
         == "0.13.0"
+    # The directories the run's programs resolve in (`mise bin-paths`), for
+    # the recipe's program check.
+    assert st.data["provision"]["bin_paths"] == ["/md/installs/zig/0.13.0"]
 
 
 def _users_env() -> dict[str, str]:
