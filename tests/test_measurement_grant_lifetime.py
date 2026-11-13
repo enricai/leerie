@@ -208,16 +208,16 @@ def test_claude_p_records_the_first_committing_worker(leerie, monkeypatch,
 
 @needs_landlock
 @skip_without_landlock
-def test_a_confined_worker_reads_the_runs_mise_overrides(leerie, run,
-                                                         tmp_path):
-    """A Go repository's run names `<run>/mise-overrides.toml` to every
-    process (`MISE_OVERRIDE_CONFIG_FILENAMES`); a confined worker must be
-    able to load it, or its `mise` cannot."""
-    overrides = run["run_dir"] / leerie.MISE_OVERRIDES_NAME
+def test_a_confined_worker_reads_the_runs_tools_file(leerie, run,
+                                                     tmp_path):
+    """A run names `<run>/mise-tools.toml` to every process
+    (`MISE_GLOBAL_CONFIG_FILE`); a confined worker must be able to load
+    it, or its `mise` cannot."""
+    overrides = run["run_dir"] / leerie.MISE_TOOLS_NAME
     overrides.write_text('[tools]\ngo = "1.22.5"\n')
     g = _grants(leerie, run)
     assert str(overrides) in g.ro
-    env = {**run["env"], "MISE_OVERRIDE_CONFIG_FILENAMES": str(overrides)}
+    env = {**run["env"], "MISE_GLOBAL_CONFIG_FILE": str(overrides)}
     got = _probe(leerie, g, f"read overrides|cat {overrides}", env)
     assert got == {"read overrides": True}
     if shutil.which("mise") is None:

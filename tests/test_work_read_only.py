@@ -379,7 +379,7 @@ def test_the_setup_hook_and_mise_run_outside_the_checkout(
     asyncio.run(leerie._ensure_planning_worktree(st))
     seen: dict = {}
 
-    async def mise(tree, log_dir, st_, override_file=None):
+    async def mise(tree, log_dir, st_):
         seen["mise"] = Path(tree)
         made = Path(tree) / "hook-made.txt"
         seen["made"] = made.is_file()

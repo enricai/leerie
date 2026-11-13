@@ -76,7 +76,7 @@ def test_mise_ls_hang_does_not_block_forever(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
 
     start = time.monotonic()
-    asyncio.run(leerie._run_mise_install(repo, log_dir, st, None))
+    asyncio.run(leerie._run_mise_install(repo, log_dir, st))
     elapsed = time.monotonic() - start
 
     assert elapsed < 5, f"provisioning blocked for {elapsed}s on a hung mise ls"

@@ -132,12 +132,10 @@ def test_resume_points_mise_at_the_recorded_tools_file(leerie,
 def test_resume_lays_the_recorded_mise_configuration(leerie, tmp_path,
                                                      no_global_config):
     st = _make_state(leerie, tmp_path)
-    st.data["provision"] = {"tools_file": "/r/mise-tools.toml",
-                            "override_file": "/r/mise-overrides.toml"}
+    st.data["provision"] = {"tools_file": "/r/mise-tools.toml"}
     env: dict[str, str] = {}
     leerie._resume_provision_env(st, env)
-    assert env == {"MISE_GLOBAL_CONFIG_FILE": "/r/mise-tools.toml",
-                   "MISE_OVERRIDE_CONFIG_FILENAMES": "/r/mise-overrides.toml"}
+    assert env == {"MISE_GLOBAL_CONFIG_FILE": "/r/mise-tools.toml"}
     st.data["provision"] = {"recipe": []}
     env = {}
     leerie._resume_provision_env(st, env)
