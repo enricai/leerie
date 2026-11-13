@@ -17341,9 +17341,11 @@ case that a required item's confirmed, shown probe contradicts — no
 implementation passes both, a fact verified against the two tests' quoted
 assertions and the code — is task-required (§8 *Delivery re-drive* rule 4,
 *A pinned case a required item's probe contradicts is task-required*). The
-cost is convergence on a task whose required change IS the
-tested behaviour (a sweep that moves literals into message files): no fix
-keeps both, so such a run ends `unconverged` and opens a draft.
+other is not a reading either: a case whose cause is a change the run made
+that its base form cannot survive (text moved into the message files, a
+module mock without the export the run's code now reads) is asked once per
+cause whether the task asks for that change (*A broken base-form case whose
+cause is a change the run made is a question first*, below).
 
 ### A fix that keeps both, on opus when sonnet could not
 
@@ -17417,33 +17419,130 @@ original `flow-runner.post-click-settle.test.ts` back exactly (no breach) and
 dropped 10 of the 32 run-start cases still passing there, the task's own
 guards among them.
 
-**A case pinning a moved literal gets no round.** Some base-form cases
-cannot be satisfied without harm. When a task moves UI text into message
-files, a base test that finds or asserts that literal text passes only if
-production holds the literal again. In T9 benches 4-6, opus took exactly
-that path on navegando 4134b78c in 3 runs of 3, and every check passed it.
-Reading the task cannot tell such a case apart (T9 bench 1). Code facts can
-(`_base_form_moved_literals`, in `_check_existing_behaviour`). A case is
-classified `pins_moved_literal` when a string or plain regex literal of its
-base form's reachable code (from `scripts/test-case-facts.cjs`) meets all
-three of:
+**A broken base-form case whose cause is a change the run made is a question
+first.** *Designed 2026-11-12, lane BF, after navegando e0d101e3.* A failing
+base form was a verdict: the case was a regression, and the only ways out
+were a round that kept both or a person. On a sweep that is wrong. e0d101e3's
+translations task broke 272 cases in 45 files: about 200 assert Spanish text
+the run moved into the message files, about 40 more fail because the base
+test's `next-intl/server` mock has no `getTranslations`, which the run's
+pages now call. The run had already updated those tests itself — the
+heading case now asserts the message key `pageTitle`, the mock now provides
+`getTranslations` — and the base-form check blocked a correct run. Worse,
+every round asked to keep the base form passing could only do it by undoing
+the task: in T9 benches 4–6 opus gave `password-input.tsx` hard-coded Spanish
+label defaults on 4134b78c in 3 of 3 runs, and a round on e0d101e3 rewrote
+the global message mock and deleted the run's own tests; every check passed
+them. "Why would we want an old test when we are changing the behaviour?"
+(the user, 2026-11-11.)
 
-- (a) a production source file at the base holds it;
-- (b) that file on the run's tree no longer holds it;
-- (c) a message file the run added or changed holds it as a value.
+So the question comes first: *does the task change what this case
+asserts?* Reading the task case by case is not how it is answered — T9
+bench 1's reading judge accepted a2a825c2's real regression 6/6, because
+the report names the pinned behaviour as the defect, and a fix exists that
+keeps both. It is answered per **cause**, where the cause is a fact code
+reads and is one the base form cannot survive without undoing it:
 
-Presence is read from the file's code with its comments blanked: a doc
-comment that still names the old text is not the text (4134b78c's
-`campaign-list.tsx` kept one). A message file is
-`(messages|locales?|i18n|translations|langs?)/*.json`. Such a case gets no
-round: it stays `existing_behaviour_changed`, never accepted. The PR lists it
-as "existing test pins text the run moved to the message files", with the
-literal and the key it moved to, so the person updates that test. The run
-ends `unconverged`, which is the honest verdict.
+- **`moved_literal`**: a string or plain regex literal of the case's base
+  form's reachable code (`scripts/test-case-facts.cjs`) that (a) a
+  production source file at the base holds, (b) that file on the run's tree
+  no longer holds, and (c) a message file the run added or changed holds as
+  a value (`_base_form_moved_literals`). Presence is read from the code with
+  comments blanked (4134b78c's `campaign-list.tsx` kept a doc comment naming
+  "Enviar ahora"). A message file is
+  `(messages|locales?|i18n|translations|langs?)/*.json`. The base form passes
+  only if production holds the literal again.
+- **`mock_missing_export`**: the case's failure is the runner's fixed
+  message that a module mock has no export the code reads (vitest: `No "X"
+  export is defined on the "M" mock`), and a production module the base
+  test reaches in the import graph at the run's tree imports `X` from `M`
+  there and did not at the base. The base form passes only if that code
+  stops using `X`.
+
+A case may have both. A case with neither is unchanged by this section: the
+rounds that try to keep both, then a person (above), and #379's
+contradiction judge. That is how K1, K2 and the two-up grid stay regressions
+— no fact names their cause, and none of them is asked.
+
+**One question per cause, not per case.** All of a run's `moved_literal`
+cases are one question, and each `(M, X)` of `mock_missing_export` is one;
+e0d101e3's 272 cases are two questions. The question is a typed intent
+question (§11 *Intent conflicts are settled with evidence, else asked*,
+source (d)), asked of the `intent_resolver` (opus, high), built by code from
+the facts: for `moved_literal`, "the run moved this user-facing text out of
+production code into the message files" with the literals, the files they
+left and the keys they went to (a bounded sample, and the counts); for
+`mock_missing_export`, the module, the export and the production lines that
+now use it. It asks whether the task asks for that change — not whether the
+test may change: a test is never the subject of the question, the run's
+change is. The resolver's answer is applied by code:
+
+- **yes**: the case is task-required, *if the run's own form of it still
+  asserts the new behaviour*, which code checks per case, mechanically, on
+  the case's form in the run's tree (its facts by title): the case is still
+  there; it makes at least as many assertions as its base form; and for
+  each moved literal, its reachable code still holds the literal, a key
+  whose value in a message file is the literal (whole, or its last dotted
+  segment), or another message file's value under such a key (a regex
+  literal: one that matches any of those). A case that passes is listed
+  under *Existing tests changed by this run* as "changed because the task
+  changes what it pins", with its cause and the question's id, and does not
+  make the run `unconverged`. A case that fails it — deleted, renamed,
+  asserting less, or no longer asserting the moved text or a key of it —
+  stays `existing_behaviour_changed`, with why: an update that drops or
+  weakens the test is not one the answer allows. It gets no round either:
+  the only round that makes its base form pass undoes the task.
+- **no**: the case is a regression, today's rule exactly. A `moved_literal`
+  case then gets its rounds like any other: if the task did not ask for the
+  text to move, putting it back is the fix.
+- **open** (unsettled, untrusted, or a resolver that failed): the case gets
+  no round, stays `existing_behaviour_changed`, and the question is asked
+  before finalize (§11, item 4).
+
+**Both sides of gaming.** A round cannot "update" a task-required test into
+a no-op and keep it green: the per-case check above runs on the tree that
+ships, so a deleted, weakened or key-less form is a change again. Nor can a
+later round put the text back in production to make an old test pass: for
+every literal of a `moved_literal` question answered yes, the tree that
+ships is read again, and a production file that holds the literal again
+where the run had removed it is `existing_behaviour.literal_restored`, a
+reason of `unconverged` naming the file and the literal. That is what T9
+benches 4–6 shipped as `done`. Neither is a reading: both are counts and
+string presence on code.
+
+The same classification runs wherever a base-form case can break: on the
+tree the re-drive starts from and on the tree that ships
+(`_check_existing_behaviour`), and on every acceptance repair round and
+re-drive group that commits (`_ratchet_exec(base_form=True)`). A case a
+round broke whose causes are all answered yes and whose form in the round's
+commit passes the check is not the round's change; otherwise it is, and the
+round is rolled back as before. A question first met in a round is asked
+there (the answer is the run's, reused); an open one is not stopped on in a
+round, only before finalize.
+
+Measured: replayed on the recorded runs (no model, the classification and
+the per-case check), 4134b78c's 13 cases all `moved_literal` and all pass
+the check; e0d101e3's 272: 200 `moved_literal` (192 pass the check: 2 the
+run renamed, 6 assert a reworded value under another key), 42 more
+`mock_missing_export`, 30 neither (among them 9 `translations-parity`
+cases whose base form fails because the run added byte-identical en/es
+values — a keep-both fix exists, and they stay regressions). K1, K2 and
+the two-up grid: no cause. Benched (lane BF, pre-registered, six samples
+per case, on the recorded runs' phase 5): both e0d101e3 questions and
+4134b78c's settled `yes` with verified quotes in every sample, the
+task-required sets exactly the replay's (234 and 13), no moved text back in
+production, 4134b78c ending `done`; the same tree under a responsive-layout
+task answered `no` to both questions 6/6; K1, K2 and the two-up grid were
+never asked and ended fixed or blocking 6/6. A sweep's blocking cases fell
+from bench 7b's 216/255 to e0d101e3's 38 before the re-drive (30 with no
+cause, 8 the run's own update failed the check), 27 to 29 on the tree that
+ships, and 4134b78c's 0. The question costs about $0.10
+of opus per cause.
 
 Known limits: a moved text inside a larger literal (a CSS selector) or with
 its case changed (`includes("transferir")`) is not classified, so such a case
-still gets its rounds.
+still gets its rounds. JS/TS only: the facts script reads its literals and
+assertions; elsewhere no case has a cause.
 
 **What neither catches.** A round that undoes a required item in production
 code while keeping every test green: in T9 bench 4 an opus round on
@@ -21971,7 +22070,7 @@ the evidence, and its answer is applied by code:
    `high` answered report-wins or unsettled 6/6, sonnet 2/6; the band-aid
    and responsive-header questions and four narrow controls 6/6 each, every
    code/task/report quote verifying. So it runs on opus at `high` (§12).
-2. **Three sources ask it.**
+2. **Four sources ask it.**
    - **(a) The plan against the items, explicit conflicts only.** Once the
      plan is scheduled and before its specs are written, a tool-less
      `plan_item_checker` on opus at `high` reads the required items and
@@ -22017,6 +22116,15 @@ the evidence, and its answer is applied by code:
      does; `no` keeps the conflict rule; an open question stops the run
      there (a resume rolls the in-flight group back, and the answer decides
      the same verdict the next time it is read).
+   - **(d) A base-form cause** (§8 *A broken base-form case whose cause is
+     a change the run made is a question first*). One question per cause
+     of a run's broken base-form cases — the text it moved into the message
+     files, a module export its code now reads that the base tests' mocks
+     lack — built by code from the facts: does the task ask for that change?
+     `yes` makes each case of the cause task-required when the run's own
+     form of it still asserts the new behaviour; `no` keeps it a
+     regression; an open question keeps it from any round and is asked
+     before finalize.
 3. **A settled verdict is applied.** For (a), `yes` amends the plan: each
    conflicting quoted span is struck from its field and replaced by the
    ruling, and a `verify` criterion containing it is dropped, before the

@@ -171,7 +171,7 @@ def test_an_exclusive_verdict_keeps_the_fix_and_the_test_update(
     # On the tree that ships the case's base form still fails, and it is
     # task-required: listed, not counted.
     asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st,
-                                                 w._caps()))
+                                                 w._caps(), {}, {}))
     eb = w.st.data["existing_behaviour"]
     assert eb["changed"] == []
     [row] = eb["task_required"]

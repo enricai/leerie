@@ -439,14 +439,40 @@ def test_no_moved_literal_without_a_message_file_the_run_changed(leerie,
         r, base, head, [{"kind": "string", "text": "Sin cambios"}]) == []
 
 
-def test_a_moved_literal_case_gets_no_round_and_is_listed(leerie, tmp_path,
-                                                         monkeypatch):
+MOVED_EVIDENCE = {"literal": "Enviar ahora", "kind": "string", "ci": False,
+                  "file": "src/campaign-list.tsx",
+                  "message_file": "messages/es.json", "key": "Email.sendNow"}
+MOVED_QID = "intent-base-form-moved-literal"
+
+
+def _moved_world(leerie, tmp_path, monkeypatch, answer: str | None,
+                 run_form: str = ""):
+    """CASE_A pins text the run moved into the message files (its cause),
+    with the cause's question answered `answer` (None: open) and the run's
+    form of the case checked as `run_form` ("" = it still asserts the new
+    behaviour); CASE_B has no cause."""
     w = _world(leerie, tmp_path, monkeypatch, cases=(CASE_A, CASE_B))
-    w.st.data["existing_behaviour"]["moved_literal"] = {CASE_A: [
-        {"literal": "Enviar ahora", "kind": "string",
-         "file": "src/campaign-list.tsx", "message_file": "messages/es.json",
-         "key": "Email.sendNow"}]}
+    eb = w.st.data["existing_behaviour"]
+    eb["moved_literal"] = {CASE_A: [dict(MOVED_EVIDENCE)]}
+    eb["causes"] = {CASE_A: [dict(MOVED_EVIDENCE, kind="moved_literal",
+                                  literal_kind="string")]}
+    eb["run_form"] = {CASE_A: run_form}
+    w.st.data["intent_questions"] = {MOVED_QID: {
+        "qid": MOVED_QID, "source": "base_form", "question": "q",
+        "context": {"literals": [["Enviar ahora", "string",
+                                  "src/campaign-list.tsx", False]]}}}
+    if answer is not None:
+        w.st.data.setdefault("answers", {})[MOVED_QID] = answer
+    leerie._apply_base_form_rulings(w.st, eb)
     w.st.save()
+    return w
+
+
+def test_a_case_whose_causes_question_is_open_gets_no_round(
+        leerie, tmp_path, monkeypatch):
+    """Its base form passes only if the run's change is undone: while the
+    task's answer is open it gets no round, and the run stops on it."""
+    w = _moved_world(leerie, tmp_path, monkeypatch, None)
     w.edits = [lambda w: w.write("export const a = 1; // PIN_B\n")]
     w.run()
     (call,) = w.calls
@@ -454,17 +480,73 @@ def test_a_moved_literal_case_gets_no_round_and_is_listed(leerie, tmp_path,
     assert CASE_B in note and CASE_A not in note
     d = _driven(w)
     assert d["cases"] == [CASE_B] and d["fixed"] == [CASE_B]
-    # The PR lists it, with the literal and where it went.
     w.st.data["tracked_test_report"] = {"files": [{"file": PIN,
                                                    "removed": ["x"]}]}
     lines = "\n".join(leerie._pr_tracked_test_lines(w.st.data))
-    assert ("existing test pins text the run moved to the message files: "
-            f"`{CASE_A}`") in lines
-    assert "`Enviar ahora` -> `Email.sendNow` in `messages/es.json`" in lines
-    # The run still stops on it: never accepted.
+    assert ("whether the task changes what it pins is an open question "
+            f"(`{MOVED_QID}`): `{CASE_A}`") in lines
     leerie._decide_outcome(w.st, any_commits=True)
     assert any("existing_behaviour_changed" in r and CASE_A in r
                for r in w.st.data["outcome_reasons"])
+
+
+def test_a_case_whose_cause_the_task_did_not_ask_for_gets_its_round(
+        leerie, tmp_path, monkeypatch):
+    """`no`: the text should not have moved, so putting it back is the fix —
+    the case is a regression and gets the round that keeps both."""
+    w = _moved_world(leerie, tmp_path, monkeypatch, "no")
+    w.edits = [lambda w: w.write("export const a = 1; // PINNED\n")]
+    w.run()
+    (call,) = w.calls
+    note = _note(call)
+    assert CASE_A in note and CASE_B in note
+
+
+def test_a_case_the_task_changes_with_a_kept_update_is_task_required(
+        leerie, tmp_path, monkeypatch):
+    """`yes`, and the run's form of the case still asserts the new
+    behaviour: task-required — no round, listed with its cause, not counted
+    by the outcome."""
+    w = _moved_world(leerie, tmp_path, monkeypatch, "yes")
+    eb = w.st.data["existing_behaviour"]
+    assert [r["id"] for r in eb["changed"]] == [CASE_B]
+    (tr,) = eb["task_required"]
+    assert tr["id"] == CASE_A and tr["cause"] == ["moved_literal"]
+    assert tr["qids"] == [MOVED_QID]
+    w.edits = [lambda w: w.write("export const a = 1; // PIN_B\n")]
+    w.run()
+    (call,) = w.calls
+    assert CASE_A not in _note(call)
+    w.st.data["tracked_test_report"] = {"files": [{"file": PIN,
+                                                   "removed": ["x"]}]}
+    lines = "\n".join(leerie._pr_tracked_test_lines(w.st.data))
+    assert ("existing test changed because the task changes what it pins "
+            f"(moved_literal; `{MOVED_QID}`): `{CASE_A}`") in lines
+    w.st.data["existing_behaviour"]["changed"] = []
+    leerie._decide_outcome(w.st, any_commits=True)
+    assert not any("existing_behaviour_changed" in r
+                   for r in w.st.data.get("outcome_reasons") or [])
+
+
+def test_a_case_the_task_changes_with_a_weakened_update_stays_a_change(
+        leerie, tmp_path, monkeypatch):
+    """`yes`, but the run's form of the case asserts less: not an update the
+    answer allows. It stays a change, gets no round (its only round undoes
+    the task), and the PR says why."""
+    why = "the run's form of it makes 0 assertion(s) where the base form made 1"
+    w = _moved_world(leerie, tmp_path, monkeypatch, "yes", run_form=why)
+    eb = w.st.data["existing_behaviour"]
+    assert {r["id"] for r in eb["changed"]} == {CASE_A, CASE_B}
+    assert eb["cause_unkept"] == {CASE_A: why}
+    w.edits = [lambda w: w.write("export const a = 1; // PIN_B\n")]
+    w.run()
+    (call,) = w.calls
+    assert CASE_A not in _note(call)
+    w.st.data["tracked_test_report"] = {"files": [{"file": PIN,
+                                                   "removed": ["x"]}]}
+    lines = "\n".join(leerie._pr_tracked_test_lines(w.st.data))
+    assert (f"the task changes what this existing test pins, but {why}: "
+            f"`{CASE_A}`") in lines
 
 
 def test_the_classification_reads_the_base_forms_ast(leerie, tmp_path,
