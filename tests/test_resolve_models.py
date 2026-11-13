@@ -35,7 +35,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "contract_extractor", "falsifier", "verifiability_classifier",
            "delivery_ratchet", "forbidden_command_extractor",
            "observability_judge", "contradiction_judge", "intent_resolver",
-           "plan_item_checker")
+           "plan_item_checker", "tool_discovery")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -95,6 +95,8 @@ DEFAULTS = {
     # with evidence, else asked*): opus, as benched (B2, B1).
     "intent_resolver": "opus",
     "plan_item_checker": "opus",
+    # Names the tools a repository's steps run (DESIGN §6½): the default.
+    "tool_discovery": "sonnet",
 }
 
 

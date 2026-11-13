@@ -2157,6 +2157,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "reconciler": "medium",
     "plan_overlap_judge": "medium",
     "provision": "medium",
+    "tool_discovery": "medium",
     "integrator": "medium",
     "pr_writer": "medium",
     "dep_capture": "medium",
@@ -2385,7 +2386,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "falsifier", "verifiability_classifier", "delivery_ratchet",
                 "forbidden_command_extractor", "observability_judge",
                 "contradiction_judge",
-                "intent_resolver", "plan_item_checker")
+                "intent_resolver", "plan_item_checker", "tool_discovery")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2416,7 +2417,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "verifiability_classifier", "delivery_ratchet",
     "forbidden_command_extractor", "observability_judge",
     "contradiction_judge",
-    "intent_resolver", "plan_item_checker",
+    "intent_resolver", "plan_item_checker", "tool_discovery",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2524,6 +2525,17 @@ _REQUIRES_ITEM = {
         "reason": {"type": "string"},
     },
 }
+
+
+TOOL_DISCOVERY_USER_PROMPT = (
+    "The repository is your working directory. Read how it is installed, "
+    "built and tested, and name every tool those steps run, at the version "
+    "the repository states. Return only the JSON object per your schema.")
+
+# A tool the run installs through mise (`SCHEMAS["tool_discovery"]`): a
+# registry short name, and a version mise reads as one — never a range.
+TOOL_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]*$"
+TOOL_VERSION_PATTERN = r"^(latest|lts|[0-9][0-9A-Za-z._+-]*)$"
 
 
 def _confidence_schema(axes: list[str]) -> dict:
@@ -4372,6 +4384,35 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "confidence": _confidence_schema(["recipe_correctness"]),
+        },
+    },
+    "tool_discovery": {
+        # The tools a repository's install, build and test steps run, as
+        # the worker reads them from the repository (DESIGN §6½ *The tools
+        # a repository needs are read from it*). Each becomes one entry of
+        # the run's mise configuration, beneath the repository's own pins;
+        # `_check_tool_discovery_output` holds every name to mise's
+        # registry. Version syntax is mise's: an exact version, a prefix,
+        # `latest` or `lts` — never a range.
+        "type": "object",
+        "required": ["tools"],
+        "properties": {
+            "tools": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["tool", "version", "evidence"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "tool": {"type": "string",
+                                 "pattern": TOOL_NAME_PATTERN},
+                        "version": {"type": "string",
+                                    "pattern": TOOL_VERSION_PATTERN},
+                        "evidence": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+            "confidence": _confidence_schema(["tool_completeness"]),
         },
     },
     "plan_overlap_judge": {
@@ -26100,7 +26141,9 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                      str(run_dir / CLAUDE_CONFIG_TEMPLATE),
                      # What `MISE_OVERRIDE_CONFIG_FILENAMES` names in a Go
                      # repository's run: mise reads it on every call.
-                     str(run_dir / MISE_OVERRIDES_NAME)]
+                     str(run_dir / MISE_OVERRIDES_NAME),
+                     # What `MISE_GLOBAL_CONFIG_FILE` names: the run's tools.
+                     str(run_dir / MISE_TOOLS_NAME)]
     if schema_key in _COMMITTING_WORKERS:
         rw.append(str(cwd_r))
         git_rw, git_ro = _tree_git_dirs(cwd_r, run_dir)
@@ -27135,6 +27178,7 @@ def _measurement_grants(st: "State", tree: str | Path,
     # may lie beneath it.
     home = os.path.realpath(os.environ.get("HOME") or Path.home())
     ro: list[str] = [str(ROOT), str(run_dir / MISE_OVERRIDES_NAME),
+                     str(run_dir / MISE_TOOLS_NAME),
                      *_measured_git_reads(t, run_dir, dirs)]
     if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
         ro.append(home)
@@ -34081,6 +34125,170 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     return override_path
 
 
+# The run's own tools file: the tools the repository needs as the
+# `tool_discovery` worker read them, the configuration mise reads beneath
+# every repository's own (`MISE_GLOBAL_CONFIG_FILE`; DESIGN §6½ *The tools a
+# repository needs are read from it*).
+MISE_TOOLS_NAME = "mise-tools.toml"
+
+_MISE_REGISTRY_TIMEOUT = 30
+_mise_registry_cache: frozenset[str] | None = None
+
+
+def _mise_registry_names() -> frozenset[str]:
+    """Every short name in mise's registry (`mise registry`'s first
+    column), read once per process. mise's own data, run from `/`, which
+    holds no configuration: not a command of the repository's. Empty when
+    mise cannot be run."""
+    global _mise_registry_cache
+    if _mise_registry_cache is None:
+        try:
+            r = subprocess.run(["mise", "registry"], cwd="/",
+                               capture_output=True, text=True, check=False,
+                               timeout=_MISE_REGISTRY_TIMEOUT)
+            out = r.stdout if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        _mise_registry_cache = frozenset(
+            line.split()[0] for line in out.splitlines() if line.split())
+    return _mise_registry_cache
+
+
+def _check_tool_discovery_output(result: dict,
+                                 registry: frozenset[str]) -> list[str]:
+    """The names in a `tool_discovery` answer that mise's registry does not
+    hold, one issue each: the worker is asked again about those."""
+    issues: list[str] = []
+    for t in result.get("tools") or []:
+        name = t.get("tool") if isinstance(t, dict) else None
+        if isinstance(name, str) and name not in registry:
+            near = sorted(n for n in registry if name in n or n in name)[:8]
+            issues.append(
+                f"UNKNOWN_TOOL {name!r}: not a name in mise's registry"
+                + (f" (registry names containing it or contained in it: "
+                   f"{', '.join(near)})" if near else "")
+                + " — name the tool as mise's registry does, or leave it "
+                "out if it is not a tool the repository's steps run")
+    return issues
+
+
+def _mise_tools_toml(tools: list[dict], registry: frozenset[str]) -> str:
+    """The run's tools file: one `[tools]` entry per registry name the
+    worker gave, first occurrence wins. Name and version match the schema's
+    patterns, so neither needs escaping beyond TOML's quotes."""
+    seen: dict[str, str] = {}
+    name_re = re.compile(TOOL_NAME_PATTERN)
+    ver_re = re.compile(TOOL_VERSION_PATTERN)
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name, ver = t.get("tool"), t.get("version")
+        if (isinstance(name, str) and isinstance(ver, str)
+                and name in registry and name not in seen
+                and name_re.match(name) and ver_re.match(ver)):
+            seen[name] = ver
+    body = "".join(f'"{n}" = "{v}"\n' for n, v in seen.items())
+    return ("# The tools this repository's steps run, as leerie's "
+            "tool_discovery worker\n# read them (DESIGN §6½). Beneath "
+            "every pin of the repository's own.\n[tools]\n" + body)
+
+
+def _use_run_tools_file(env: MutableMapping[str, str],
+                        path: str | Path | None) -> None:
+    """Point mise at the run's tools file (`MISE_GLOBAL_CONFIG_FILE`):
+    every later command — `mise install`, every confined command, every
+    worker — reads it beneath the repository's own configuration."""
+    if path:
+        env["MISE_GLOBAL_CONFIG_FILE"] = str(path)
+
+
+def _resume_provision_env(st: "State",
+                          env: MutableMapping[str, str]) -> None:
+    """On `resume`, lay into `env` the mise configuration the run's
+    provisioning chose for every later command: the synthesized go
+    override, when there is one, and the run's tools file (DESIGN §6½
+    *The tools a repository needs are read from it*)."""
+    prov = st.data.get("provision") or {}
+    override = prov.get("override_file")
+    if override:
+        env["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
+    _use_run_tools_file(env, prov.get("tools_file"))
+
+
+async def _discover_tools(st: "State", caps: dict, models: dict[str, str],
+                          efforts: dict[str, str | None]) -> None:
+    """Phase 1½'s tool discovery (DESIGN §6½ *The tools a repository needs
+    are read from it*): the `tool_discovery` worker reads the repository
+    and names every tool its install, build and test steps run; each name
+    mise's registry holds becomes an entry of `<run-dir>/mise-tools.toml`,
+    which mise reads beneath the repository's own pins. A name the registry
+    does not hold is asked about again (`_check_tool_discovery_output`),
+    and never written. A worker that fails leaves the run on the
+    repository's own pins, as before this step existed."""
+    prov = st.data.setdefault("provision", {})
+    registry = _mise_registry_names()
+    if not registry:
+        log("  tool discovery skipped: mise's registry could not be read")
+        prov["tools"] = []
+        st.save()
+        return
+    sys_prompt = _load_prompt("tool_discovery")
+    parts: list[str] = [TOOL_DISCOVERY_USER_PROMPT]
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt="\n\n".join(parts),
+            system_prompt=sys_prompt,
+            schema_key="tool_discovery",
+            cwd=_judgment_cwd(st),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            autonomous=False,
+            caps=caps, st=st,
+            model=models.get("tool_discovery", MODEL_DEFAULT),
+            effort=efforts.get("tool_discovery"),
+            sid="tool_discovery",
+        )
+
+    async def _on_fb(fb: str) -> dict:
+        if len(parts) > 1:
+            parts[-1] = fb
+        else:
+            parts.append(fb)
+        return {}
+
+    try:
+        result, warnings = await _run_checked_loop(
+            invoke=_invoke,
+            check=lambda r: _check_tool_discovery_output(r, registry),
+            name="tool_discovery",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_fb,
+        )
+    except WorkerError as e:
+        result, warnings = None, [_brief_worker_exc(e)]
+    for w in warnings:
+        log(f"  tool_discovery: {w}")
+    if result is None:
+        log("  tool discovery produced no answer; the run uses the "
+            "repository's own pins only")
+        prov["tools"] = []
+        st.save()
+        return
+    tools = list((result or {}).get("tools") or [])
+    text = _mise_tools_toml(tools, registry)
+    path = st.run_dir / MISE_TOOLS_NAME
+    _write_beneath(st.run_dir, path, text.encode())
+    prov["tools"] = tools
+    prov["tools_file"] = str(path)
+    st.save()
+    _use_run_tools_file(os.environ, path)
+    named = [f"{t.get('tool')}@{t.get('version')}" for t in tools
+             if isinstance(t, dict) and t.get("tool") in registry]
+    log(f"  tools the repository needs: {', '.join(named) or '(none)'}")
+
+
 def _trust_run_mise_configs(env: MutableMapping[str, str],
                             run_dir: Path) -> None:
     """Make mise trust every configuration file beneath `run_dir`
@@ -36293,6 +36501,11 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     like any other (DESIGN §6½ *Who runs that install*). Five ordered steps
     (DESIGN §6½):
 
+      0. Tool discovery (`_discover_tools`): the tools the repository's
+         steps run, read from it by the `tool_discovery` worker, written
+         to the run's tools file, which mise reads beneath the
+         repository's own pins (DESIGN §6½ *The tools a repository needs
+         are read from it*).
       1. The provisioning checkout: a throwaway checkout of the planning
          tree's commit (`_judge_checkout`), never the user's checkout.
          Steps 2–4 run in it (`_provision_hook_and_toolchain`).
@@ -36337,6 +36550,9 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     if not planning:
         die("phase 1½: no planning worktree to provision from (it is made "
             "before phase 1)")
+    # The tools the repository needs, read from it, before mise installs
+    # (DESIGN §6½ *The tools a repository needs are read from it*).
+    await _discover_tools(st, caps, models, efforts)
     try:
         async with _judge_checkout(st, Path(planning), "provision") as tree:
             await _provision_hook_and_toolchain(tree, log_dir, st)
@@ -80183,9 +80399,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # provision.recipe is already persisted, but downstream
         # implementer/conformer subprocesses still need it to find the
         # synthesized go pin.
-        override = (st.data.get("provision") or {}).get("override_file")
-        if override:
-            os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
+        _resume_provision_env(st, os.environ)
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
     else:

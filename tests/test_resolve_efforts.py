@@ -312,6 +312,9 @@ def test_judgment_workers_pinned_set(leerie):
         # Types how the run can observe each item's parts (DESIGN §8 *A met
         # is only what the run could observe*), benched at medium (RT).
         "observability_judge",
+        # Names the tools a repository's steps run (DESIGN §6½ *The tools a
+        # repository needs are read from it*), benched at medium (LG2).
+        "tool_discovery",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'
