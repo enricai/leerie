@@ -71,25 +71,23 @@ def test_corepack_is_bounded_and_never_floats(leerie):
     assert leerie._COREPACK_PIN_ENV["COREPACK_ENABLE_DOWNLOAD_PROMPT"] == "0"
 
 
-def test_a_measured_pythons_user_base_is_its_trees_and_writable(leerie, run):
-    """pip falls back to the user site when the system one is not writable;
-    under the grant that must be the tree's own store, not `$HOME` (review
-    round 19 exec H2). Real Landlock: Python's user base, where that install
-    lands, resolves inside the tree's stores and can be written."""
+def test_a_measured_pythons_user_base_is_the_homes(leerie, run):
+    """pip falls back to the user site when the system one is not writable.
+    That is the home's `~/.local` again (DESIGN §6 *Every confined process
+    has its own home*, 4): no variable moves it, since a tree's install
+    keeps it in the tree home layer. Real Landlock: Python's user base is
+    the default one."""
     view = run["wts"][f"{run['run_dir'].name}-view-staging"]
     g = leerie._measurement_grants(_state(run), view)
     env = dict(os.environ)
     leerie._tree_store_env(env, view)
     env.update(dict(g.env))
-    base = run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / view.name / "pyuser"
-    assert env["PYTHONUSERBASE"] == str(base)
+    assert "PYTHONUSERBASE" not in env
+    base = os.path.join(env["HOME"], ".local")
     got = _probe(leerie, g, f"""
-user base is the trees|test "$(python3 -c 'import site; print(site.getuserbase())')" = {base}
-write user site|mkdir -p {base}/lib && echo x > {base}/lib/planted
-write HOME|echo x > $HOME/planted-by-measurement
+user base is the homes|test "$(python3 -c 'import site; print(site.getuserbase())')" = {base}
 """, env)
-    assert got["user base is the trees"] and got["write user site"]
-    assert not got["write HOME"]
+    assert got["user base is the homes"]
 
 
 def test_no_measurement_carries_a_package_manager_setting(leerie, run):

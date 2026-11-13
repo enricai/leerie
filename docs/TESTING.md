@@ -8735,3 +8735,15 @@ toolchain kind's home writes are seen at `~` by the next measurement.
 `tests/test_home_leerie_ownership.py` pins the image's home made root-owned
 before `useradd` (a launch died "git user.email is not configured" without
 it, the home 0700 and owned by an uid rootless does not map).
+The tree home layer (DESIGN §6 *Every confined process has its own home*, 4):
+`tests/test_confined_home.py` pins that no store variable moves what an install
+keeps beneath `~` (`PYTHONUSERBASE`, `CARGO_HOME`, `WORKON_HOME`,
+`DOTNET_CLI_HOME`, `BUNDLE_USER_HOME`) and `_with_user_scripts` is gone; the
+install kind in a run tree writes `<tree-stores>/<tree>/home` as its home's
+upper, every other kind reads it on top of its home once made, the toolchain
+kind and another tree never; and in the container an install's
+`~/.local/bin/kept` runs from the next measurement, lands in the layer on disk,
+never in the real home, and is absent from another tree.
+`tests/test_worker_sees_tree_install.py` runs, where isolation works, a script
+leerie's install put in `~/.local/bin` from the falsifier's confined process.
+`tests/test_user_scripts_on_path.py` is removed with `_with_user_scripts`.

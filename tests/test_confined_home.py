@@ -139,6 +139,45 @@ def test_the_shim_is_asked_for_the_home_only_when_isolated(
     assert argv.index("--home") < argv.index("--")
 
 
+# --------------------------------------------------- the tree home layer
+
+
+def test_no_variable_moves_what_an_install_keeps_beneath_home(leerie):
+    """DESIGN §6 *Every confined process has its own home*, 4: pip's user
+    base, cargo, pipenv's environments, the .NET CLI and bundler homes are
+    no stores: the tree home layer keeps them."""
+    gone = {"PYTHONUSERBASE", "CARGO_HOME", "WORKON_HOME", "DOTNET_CLI_HOME",
+            "BUNDLE_USER_HOME"}
+    assert not gone & set(leerie._STORE_VARS)
+    assert not gone & leerie._TREE_STORE_VARS
+    assert not hasattr(leerie, "_with_user_scripts")
+
+
+def test_a_trees_install_writes_its_layer_and_the_rest_read_it(
+        leerie, run, homes):
+    h, layer = homes
+    view = _view(run)
+    tree_home = (run["run_dir"] / "worktrees" / ".stores" / "tree-stores"
+                 / view.name / leerie.TREE_HOME_NAME)
+    m = leerie._measurement_grants(_st(run), view, leerie.MEASURE_KIND)
+    # No layer until the install has made it.
+    assert m.home_upper == "" and m.home_layers == (str(layer.resolve()),)
+    i = leerie._measurement_grants(_st(run), view, leerie.INSTALL_KIND)
+    assert i.home_upper == str(tree_home)
+    assert tree_home.is_dir() and leerie._home_work(tree_home).is_dir()
+    assert i.home_layers == (str(layer.resolve()),)
+    m = leerie._measurement_grants(_st(run), view, leerie.MEASURE_KIND)
+    assert m.home_upper == ""
+    assert m.home_layers == (str(tree_home), str(layer.resolve()))
+    t = leerie._measurement_grants(_st(run), view, leerie.TOOLCHAIN_KIND)
+    assert t.home_upper == "" and t.home_layers == ()
+    # Another tree reads none of it.
+    other = run["wts"]["wt-a"]
+    o = leerie._measurement_grants(_st(run), other, leerie.MEASURE_KIND)
+    assert str(tree_home) not in o.home_layers
+    assert leerie._home_argv(i)[-2:] == ["--home-upper", str(tree_home)]
+
+
 def test_the_toolchain_install_keeps_its_home_writes_in_the_layer(
         leerie, run, homes):
     """Under the real shim (Landlock; not isolated on this host): the
@@ -149,17 +188,17 @@ def test_the_toolchain_install_keeps_its_home_writes_in_the_layer(
     view = _view(run)
     g = leerie._measurement_grants(_st(run), view, leerie.TOOLCHAIN_KIND)
     env = {**os.environ, "npm_config_store_dir": "/nowhere",
-           "CARGO_HOME": "/nowhere"}
+           "PIP_CACHE_DIR": "/nowhere"}
     rc, tail = asyncio.run(leerie._run_streaming(
         ["bash", "-c", 'mkdir -p "$HOME/.rustup" && echo kept > '
          '"$HOME/.rustup/marker" && echo "HOME=$HOME" && '
-         'echo "CARGO=${CARGO_HOME-unset} NPM=${npm_config_store_dir-unset}"'],
+         'echo "PIP=${PIP_CACHE_DIR-unset} NPM=${npm_config_store_dir-unset}"'],
         grants=g, cwd=str(view), env=env, timeout=60, verbosity="quiet",
         tail_lines=20))
     assert rc == 0, tail
     assert (layer / ".rustup" / "marker").read_text() == "kept\n"
     assert f"HOME={layer.resolve()}" in tail, tail
-    assert "CARGO=unset NPM=unset" in tail, tail
+    assert "PIP=unset NPM=unset" in tail, tail
 
 
 # ------------------------------------------------------ the real container
@@ -300,6 +339,25 @@ rc, tail = cmd('mkdir -p ~/.cargo/bin && echo tool > ~/.cargo/bin/t && '
 out["toolchain"] = {"rc": rc, "tail": tail}
 rc, tail = cmd('cat /home/leerie/.cargo/bin/t')
 out["after_toolchain"] = {"rc": rc, "tail": tail}
+# 6. A tree's install keeps what it writes beneath `~`; the next command in
+# the tree reads it, the real home does not get it, another tree does not.
+rc, tail = cmd('mkdir -p ~/.local/bin && printf "#!/bin/sh\\necho KEPT\\n" '
+               '> ~/.local/bin/kept && chmod +x ~/.local/bin/kept',
+               kind=leerie.INSTALL_KIND)
+out["tree_install"] = {"rc": rc, "tail": tail}
+rc, tail = cmd('~/.local/bin/kept; echo x > ~/.local/bin/scribble')
+out["tree_measure"] = {"rc": rc, "tail": tail}
+layer = (run_dir / "worktrees" / ".stores" / "tree-stores" / wt.name
+         / leerie.TREE_HOME_NAME)
+out["tree_layer"] = sorted(os.listdir(layer / ".local" / "bin"))
+out["tree_real_home"] = os.path.exists(HOME / ".local" / "bin" / "kept")
+wt2 = run_dir / "worktrees" / f"{RUN}-other"
+g("worktree", "add", "-q", "--detach", str(wt2), "main", cwd=repo)
+rc, tail = asyncio.run(leerie._run_streaming(
+    ["bash", "-c", "test -e ~/.local/bin/kept && echo SEEN || echo ABSENT"],
+    grants=leerie._measurement_grants(st, wt2, leerie.MEASURE_KIND),
+    cwd=str(wt2), timeout=60, verbosity="quiet", tail_lines=5))
+out["tree_other"] = tail
 print("RESULT " + json.dumps(out), flush=True)
 '''
 
@@ -380,3 +438,11 @@ def test_the_real_container_gives_each_process_its_own_home(tmp_path):
     assert t["rc"] == 0 and "HOME=/leerie-toolchains/home" in t["tail"], got
     a = got["after_toolchain"]
     assert a["rc"] == 0 and a["tail"].strip().endswith("tool"), got
+    # The tree home layer (DESIGN §6 *Every confined process has its own
+    # home*, 4).
+    assert got["tree_install"]["rc"] == 0, got
+    assert got["tree_measure"]["rc"] == 0, got
+    assert "KEPT" in got["tree_measure"]["tail"], got
+    assert got["tree_layer"] == ["kept"], got
+    assert got["tree_real_home"] is False, got
+    assert got["tree_other"].strip().endswith("ABSENT"), got

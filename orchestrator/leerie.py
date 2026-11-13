@@ -6641,8 +6641,11 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
 # run; the run's workers share `<run-dir>/worktrees/.stores/cache/<name>`
 # (`_worker_cache_env`). No store is shared across runs or repositories.
 # Every installer the provision recipe can name is covered: pnpm, npm, yarn
-# (classic and berry), bun, corepack, pip, uv, poetry, pipenv, go, cargo,
-# bundler, composer, dotnet.
+# (classic and berry), bun, corepack, pip, uv, poetry, go, bundler,
+# composer, dotnet. What an install keeps beneath `~` (pip's `--user`
+# packages, cargo's crates, pipenv's environments, the .NET CLI and bundler
+# homes) is no store: it is the tree home layer's (`_tree_home_layer`; DESIGN
+# §6 *Every confined process has its own home*).
 _STORE_VARS: dict[str, str] = {
     "npm_config_store_dir": "pnpm-store",
     "npm_config_cache_dir": "pnpm-cache",
@@ -6654,20 +6657,11 @@ _STORE_VARS: dict[str, str] = {
     "PIP_CACHE_DIR": "pip",
     "UV_CACHE_DIR": "uv",
     "POETRY_CACHE_DIR": "poetry",
-    "WORKON_HOME": "virtualenvs",
     "GOMODCACHE": "go-mod",
     "GOCACHE": "go-build",
-    "CARGO_HOME": "cargo",
     "BUNDLE_PATH": "bundle",
     "COMPOSER_CACHE_DIR": "composer",
     "NUGET_PACKAGES": "nuget",
-    # Where a user-level install lands when the system location is not
-    # writable: pip's user site, the .NET CLI's home, bundler's home. Without
-    # them each falls back to `$HOME`, which no measurement grant writes
-    # (review round 19 exec H2: every pip recipe failed in every view).
-    "PYTHONUSERBASE": "pyuser",
-    "DOTNET_CLI_HOME": "dotnet-home",
-    "BUNDLE_USER_HOME": "bundle-home",
     # Where a browser-suite runner's own browser download lands (DESIGN §8 *A
     # repository's browser suite is a channel the run provisions*): a store
     # (a private temp directory is an empty copy in a sandbox), and one of
@@ -6697,19 +6691,19 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
             env[f"pnpm_config_{k}"] = v
 
 
-# The stores of one tree, one set per tree (DESIGN §6 *Which stores an
-# install may share*): where an install puts the tree's own environment
-# (pip's user base, bundler's path and home, pipenv's environments, the
-# .NET CLI home) and what the tree's build writes as it builds (uv's install
-# of the project, cargo's lock, Go's build cache, NuGet's restore, pnpm's
-# metadata cache). Two trees at two commits never share an environment, and
-# a view whose tip moves starts them empty. Set, for every command leerie
+# The stores of one tree, one set per tree (DESIGN §6 *Every confined
+# process has its own home*, 5): what the tree's builds and tests write as
+# they run and the next command reads (uv's install of the project, Go's
+# build cache, NuGet's restore, pnpm's metadata cache), bundler's path
+# (whose default is the toolchain's gem directory) and the browsers a
+# browser suite downloads. Two trees at two commits never share them, and a
+# view whose tip moves starts them empty. What an install keeps beneath `~`
+# is the tree home layer's (`_tree_home_layer`), not a store's. Set, for every command leerie
 # runs in a tree under `<run-dir>/worktrees/`, to
 # `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>` (`_tree_store_env`).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
-    "UV_CACHE_DIR", "CARGO_HOME", "BUNDLE_PATH", "NUGET_PACKAGES",
-    "GOCACHE", "WORKON_HOME", "npm_config_cache_dir", "PYTHONUSERBASE",
-    "DOTNET_CLI_HOME", "BUNDLE_USER_HOME",
+    "UV_CACHE_DIR", "BUNDLE_PATH", "NUGET_PACKAGES", "GOCACHE",
+    "npm_config_cache_dir",
     # A browser-suite runner's browser, which the tree's install fetches:
     # a worker started in the tree runs that browser (DESIGN §8 *A
     # repository's browser suite is a channel the run provisions*).
@@ -6744,14 +6738,12 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     if found is None:
         return
     root = found[1]
-    user_base = env.get("PYTHONUSERBASE")
     for var in _TREE_STORE_VARS:
         dst = root / _STORE_VARS[var]
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
     _with_pnpm_spellings(env)
-    _with_user_scripts(env, user_base)
 
 
 def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
@@ -6774,6 +6766,26 @@ def _installed_tree_stores(cwd: str | Path | None) -> Path | None:
     if found is None or os.path.realpath(found[0]) not in _DEPS_INSTALLED:
         return None
     return found[1]
+
+
+TREE_HOME_NAME = "home"
+
+
+def _home_work(upper: Path) -> Path:
+    """The overlay work directory beside a home upper on disk: on its
+    filesystem, outside it (overlayfs requires both)."""
+    return upper.with_name(upper.name + ".work")
+
+
+def _tree_home_layer(cwd: str | Path | None) -> Path | None:
+    """The tree home layer of the run tree `cwd` lies in (DESIGN §6 *Every
+    confined process has its own home*, 4): `<run-dir>/worktrees/.stores/
+    tree-stores/<tree>/home`, beside that tree's stores and discarded with
+    them; None outside every run tree. The install kind writes it as its
+    home's upper; every other command in the tree reads it beneath its own
+    home."""
+    found = _tree_stores_dir(cwd)
+    return None if found is None else found[1] / TREE_HOME_NAME
 
 
 def _granted_tree_stores(grants: "WorkerGrants | None",
@@ -6803,25 +6815,6 @@ _COREPACK_PIN_ENV: dict[str, str] = {
 }
 
 
-def _with_user_scripts(env: MutableMapping[str, str],
-                       previous: str | None) -> None:
-    """Put the console scripts of the pip user base `env` names on its
-    `PATH`, last, in place of those of the base it replaced (`previous`):
-    pip installs a package's scripts in `<user base>/bin`, which only `PATH`
-    finds, and the image puts the default base's `~/.local/bin` last for
-    that (DESIGN §6 *Which stores an install may share*). Last, so a
-    user-installed script never shadows a tool the image holds. A base
-    leerie did not move is left alone."""
-    base = env.get("PYTHONUSERBASE") or ""
-    if base == (previous or "") or "PATH" not in env:
-        return
-    old = os.path.join(previous, "bin") if previous else None
-    new = os.path.join(base, "bin")
-    parts = [p for p in env["PATH"].split(os.pathsep)
-             if p and p != old and p != new]
-    env["PATH"] = os.pathsep.join([*parts, new])
-
-
 def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at the run's own store,
     `<run-dir>/worktrees/.stores/stores/<name>` (`_stores_home`,
@@ -6839,9 +6832,7 @@ def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     _with_pnpm_spellings(env)
     # Not `PATH`: this is the orchestrator's own environment, and leerie's
     # unconfined process never resolves a program from a store directory
-    # (DESIGN §6 *Which stores an install may share*; review round 23). A
-    # confined command gets the user base's scripts in its own environment
-    # (`_run_streaming`).
+    # (DESIGN §6 *Which stores an install may share*; review round 23).
 
 
 def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
@@ -6862,7 +6853,6 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
         cache = _stores_home(run_dir) / WORKER_CACHE_DIR
     out = {**env, **_cache_vars(cache)}
     _with_pnpm_spellings(out)
-    _with_user_scripts(out, env.get("PYTHONUSERBASE"))
     return out
 
 
@@ -11731,10 +11721,6 @@ async def _run_streaming(
             # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
             # share*).
             env = _tree_stores_for(env if env is not None else os.environ, cwd)
-            # And the console scripts of whichever user base it has, on its
-            # own `PATH`, last — never on the orchestrator's (DESIGN §6
-            # *Which stores an install may share*).
-            _with_user_scripts(env, None)
             gate_r: int | None = None
             gate_w: int | None = None
             if cgroup_sid is not None:
@@ -25591,6 +25577,9 @@ class WorkerGrants(NamedTuple):
     # DESIGN §6 *Every confined process has its own home*); empty, none.
     home: str = ""
     home_layers: tuple[str, ...] = ()
+    # The home's upper on disk instead of a `tmpfs`, kept after the process:
+    # a tree's install writes its tree home layer so (`_tree_home_layer`).
+    home_upper: str = ""
     # Variables removed from the process's environment after `env` is
     # laid over it (`_grant_env`): the store variables, for the toolchain
     # kind.
@@ -26168,12 +26157,18 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # fetches) through the egress proxy.
     own_home = _confined_home(env)
     layer = _toolchain_home()
+    layers = (layer,) if own_home and layer else ()
+    # A tree leerie installed for: the worker reads what that install kept
+    # beneath `~` (DESIGN §6 *Every confined process has its own home*, 4).
+    tree_home = _tree_home_layer(cwd_r) if tree_stores is not None else None
+    if own_home and tree_home is not None and tree_home.is_dir():
+        layers = (str(tree_home), *layers)
     return WorkerGrants(
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
         egress=True, link=str(run_dir / TREES_DIRNAME), home=own_home,
-        home_layers=(layer,) if own_home and layer else ())
+        home_layers=layers)
 
 
 # DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
@@ -26270,6 +26265,8 @@ def _home_argv(grants: WorkerGrants) -> list[str]:
     argv = ["--home", grants.home, "--home-bytes", str(HOME_UPPER_BYTES)]
     for layer in grants.home_layers:
         argv += ["--home-layer", layer]
+    if grants.home_upper:
+        argv += ["--home-upper", grants.home_upper]
     return argv
 
 
@@ -26366,6 +26363,10 @@ MISE_CACHE_NAME = "cache"
 INSTALL_KIND = "install"
 MEASUREMENT_KINDS = (MEASURE_KIND, INSTALL_KIND, SETUP_HOOK_KIND,
                      TOOLCHAIN_KIND)
+# The kind that writes a run tree's home layer (DESIGN §6 *Every confined
+# process has its own home*, 4): an install's writes beneath `~` are kept for
+# the tree's later commands; every other kind only reads the layer.
+TREE_HOME_WRITERS = frozenset({INSTALL_KIND})
 MEASURE_DIRNAME = "measure"
 # Where `_tree_store_env` puts a run tree's own installer stores.
 TREE_STORES_DIRNAME = "tree-stores"
@@ -27121,12 +27122,14 @@ def _measurement_grants(st: "State", tree: str | Path,
     stores = _stores_home(run_dir) / RUN_STORES_DIRNAME
     _mkdir_private(stores, run_dir)
     rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own), str(stores)]
+    tree_home: Path | None = None
     if t.parent == (run_dir / "worktrees").resolve():
         # The tree's own stores (`_tree_store_env`), which no other tree
         # reads.
         tree_stores = _stores_home(run_dir) / TREE_STORES_DIRNAME / t.name
         _mkdir_private(tree_stores, run_dir)
         rw.append(str(tree_stores))
+        tree_home = tree_stores / TREE_HOME_NAME
     # Leerie's install (the AST scripts) and the home, named as a worker's
     # are: `/tmp` is not in the reads outside the state root, and either
     # may lie beneath it.
@@ -27183,6 +27186,17 @@ def _measurement_grants(st: "State", tree: str | Path,
     own_home = _confined_home()
     layers: tuple[str, ...] = (layer,) if own_home and layer else ()
     drop: tuple[str, ...] = ()
+    upper = ""
+    if own_home and tree_home is not None and kind != TOOLCHAIN_KIND:
+        # The tree home layer (DESIGN §6 *Every confined process has its own
+        # home*, 4): the install keeps what it writes beneath `~` there;
+        # every other command in the tree reads it beneath its own home.
+        if kind in TREE_HOME_WRITERS:
+            _mkdir_private(tree_home, run_dir)
+            _mkdir_private(_home_work(tree_home), run_dir)
+            upper = str(tree_home)
+        elif tree_home.is_dir():
+            layers = (str(tree_home), *layers)
     if kind == TOOLCHAIN_KIND:
         # A toolchain is the host's, a store one run's: the install sees no
         # store, and reads no layer it writes.
@@ -27201,7 +27215,7 @@ def _measurement_grants(st: "State", tree: str | Path,
                             + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND,
         link=str(run_dir.resolve() / TREES_DIRNAME), home=own_home,
-        home_layers=layers, drop=drop)
+        home_layers=layers, drop=drop, home_upper=upper)
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:

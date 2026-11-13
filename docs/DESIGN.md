@@ -4326,7 +4326,7 @@ confinement failure stops the run; it is never a result*).
 | its own home | `$HOME`, as a worker's (*Every confined process has its own home*) | write |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
-| the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
+| the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/`; its `home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
@@ -5496,34 +5496,65 @@ Only the toolchain install writes a layer others read.**
    trusted as `MISE_DATA_DIR` already is — every run executes the
    toolchains there — so a key or a file a repository's toolchain install
    could plant in it is no capability that install did not already have.
-4. *What stays redirected, and why.* A store variable moves a tool's writes
-   out of the home for a reason the private home does not remove: it must
-   outlive the command. The run's stores (`_STORE_VARS`) are shared by every
-   command of the run so one install feeds the next; a tree's own stores
-   (`_TREE_STORE_VARS`: pip's user base, bundler's path and home, the .NET
-   CLI home, uv, cargo, Go's build cache, NuGet, pipenv, pnpm's metadata
-   cache) carry an install's result to the build and test that follow it in
-   that tree, which a private home, gone when the install ends, would not;
-   the tree's private temp directory (`TMPDIR`, `XDG_CACHE_HOME`) and its
-   measurement directory (`XDG_STATE_HOME`, `MISE_STATE_DIR`) the same.
-   Each stays. What existed only because the home was read-only goes:
-   `GNUPGHOME` at a new directory per grant (the private home's `~/.gnupg`
-   is that, a copy of the operator's staged keyring in which nothing a
-   command imports outlives it). The rule for a new variable: one that only
-   makes a tool's write beneath `~` succeed is never added; one is added
-   only when the write must outlive the command or be shared.
-5. *The target: a tree home layer, and no per-tool variable.* The tree
-   store variables are still a list of tools — pip's, bundler's, the .NET
-   CLI's, cargo's — kept only because a private home ends with its command.
-   The shape that ends the list is the toolchain layer one level down: each
-   tree gets a tree home layer, written only by that tree's install step,
-   and stacked between the toolchain layer and the pristine home in every
-   later build and test command in that tree; discarded with the tree's
-   stores when the view moves (*A view moves to the next tip when the
-   install's inputs are unchanged*). Whatever an install keeps beneath `~`
-   then reaches the commands after it, for every tool, and the per-tree
-   variables go. It ships after this, and after the Rust change; a variable
-   that must stay then is named with its own reason.
+4. *A tree's install keeps what it writes beneath `~`: the tree home
+   layer.* *Designed 2026-11-13 (lane HC, the second step).* A private home
+   ends with its command, so an install's writes beneath `~` — pip's `--user`
+   packages, cargo's registry, a pipenv environment, the .NET CLI's home —
+   would not reach the build and test after it in the same tree. Through
+   the first step a list of variables moved each of those out of the home
+   (`PYTHONUSERBASE`, `CARGO_HOME`, `WORKON_HOME`, `DOTNET_CLI_HOME`,
+   `BUNDLE_USER_HOME`), one tool at a time; and one of them broke a tool:
+   mise's Rust shim looks for `cargo` in `$CARGO_HOME/bin`, so with
+   `CARGO_HOME` a store, `cargo` was "not a valid shim" in every command
+   (measured on a real Rust run once its toolchain installed). The shape
+   that ends the list is the toolchain layer one level down. Each run tree
+   (`<run-dir>/worktrees/<tree>`) has a tree home layer,
+   `<run-dir>/worktrees/.stores/tree-stores/<tree>/home` (`_tree_home_layer`):
+   - the install kind run in that tree has it as its home's upper, on disk
+     (`--home-upper`), so whatever the install writes beneath `~` is kept;
+   - every other command leerie runs in that tree, and a worker started in
+     a tree leerie installed for, has it as the top lower layer of its own
+     home, above the toolchain layer and the pristine home: it reads what
+     the install kept at its ordinary path, and its own writes stay
+     private;
+   - it is the tree's own stores' (`tree-stores/<tree>/`), so it is
+     discarded with them whenever a view's tip moves, and another tree
+     never sees it.
+   No tool is named: whatever an install keeps beneath `~` reaches the
+   commands after it. So the five variables go, from the run's stores, the
+   workers' caches and the tree's stores alike, and leerie no longer puts a
+   user base's `bin` on `PATH` (`_with_user_scripts` goes: the image's
+   `PATH` already ends with `~/.local/bin`, the default user base's).
+   Rust's `cargo` then resolves: mise finds it in `~/.cargo/bin`, the
+   toolchain layer's, and the crates a tree's install fetches are in that
+   tree's layer.
+5. *What stays redirected, and why.* Each variable that stays moves a write
+   for a reason the tree layer does not cover:
+   - the run's package stores and download caches (`_STORE_VARS`), shared by
+     every command of the run so one download feeds every tree;
+   - in a tree, uv's cache, Go's build cache, NuGet's packages and pnpm's
+     metadata cache (`UV_CACHE_DIR`, `GOCACHE`, `NUGET_PACKAGES`,
+     `npm_config_cache_dir`): the tree's builds and tests write them as they
+     run, not only its install (`uv run` installs the project, `go test`
+     caches results, `dotnet build` restores), and the next command reads
+     them; the tree layer is written only by the install, so a build's
+     writes there would end with the build;
+   - `BUNDLE_PATH`: bundler's default is the gem directory of the Ruby it
+     runs under, which is the toolchain cache's, never a tree's to write;
+   - `PLAYWRIGHT_BROWSERS_PATH`: its default lies beneath `XDG_CACHE_HOME`,
+     the tree's private temp directory, which a worker started in the tree
+     does not share (DESIGN §8 *A repository's browser suite is a channel
+     the run provisions*);
+   - the tree's private temp directory (`TMPDIR`, `XDG_CACHE_HOME`) and its
+     measurement directory (`XDG_STATE_HOME`, `MISE_STATE_DIR`): a
+     command's scratch and state, short and private to the tree (*A
+     confined command's scratch is short and private*).
+   What existed only because the home was read-only went with the first
+   step: `GNUPGHOME` at a new directory per grant. The rule for a new
+   variable: one that only makes a tool's write beneath `~` succeed, or
+   carries an install's result to the commands after it, is never added;
+   one is added only when a command other than the install writes it and a
+   later one reads it, or when it is shared beyond one tree.
 
 **Invariant: no upper outlives its process tree, on any exit path.** The
 upper is a `tmpfs` mounted inside the confined process's own mount
@@ -5534,7 +5565,12 @@ with the container's PID 1) or the container's kill — with no removal
 leerie runs and nothing for a sweep to find. Nothing is kept for debugging
 and no later process reuses one: a re-ask or a resume starts from the
 pristine home again, as it starts with an empty `/tmp`. Tested on the real
-path: leftover mounts and bytes counted after each exit path.
+path: leftover mounts and bytes counted after each exit path. The one upper on
+disk is a tree's install's, and that is the tree home layer (4), kept for
+the tree's later commands by design: it lies in the tree's own stores, so it
+goes when the view's tip moves and when the run's process releases the run
+directory (`_release_run_dir` removes `worktrees/.stores`); a crashed
+process's goes when the run directory is next released or pruned.
 
 **Invariant: an upper is bounded, and running out is a finding that names
 the process.** The upper's `tmpfs` is mounted with a size
@@ -9061,6 +9097,16 @@ store variables there, not `PATH`): leerie's unconfined process never
 resolves a program from a store directory, which a confined command writes
 (review round 23 isolation, an observation f0ce3e56 opened).
 
+*Superseded in part 2026-11-13* by *Every confined process has its own
+home* (4, 5): pip's user base, cargo, pipenv's environments, the .NET CLI
+home and bundler's home are no longer stores. A tree's install writes them
+beneath `~` into the tree home layer, which every later command in the tree
+reads; no variable moves them, and no user base's `bin` is put on `PATH`
+(the default base's `~/.local/bin` is already last on the image's). The
+per-tree class keeps uv, bundler's path, NuGet, Go's build cache, pnpm's
+metadata cache and the Playwright browsers, each for the reason given
+there.
+
 **A worker started in a tree leerie installed for runs on that tree's
 stores.** Leerie prepares some trees for a worker: the acceptance writer's
 and the surrogate fixer's checkouts, each falsifier lane, the set audit's
@@ -9100,7 +9146,11 @@ its tree. A tree leerie never installs for — a subtask's worktree and
 staging, which leerie measures only through their committed views (§8
 *Every measurement reads the committed view*), and every judge checkout —
 keeps its workers on their side's cache, where those workers' own installs
-land.
+land. Since 2026-11-13 such a worker also has the tree's home layer as
+the top lower layer of its own home (*Every confined process has its own
+home*, 4): what the install kept beneath `~` — pip's `--user` packages,
+cargo's crates — it reads at its ordinary path, and what it writes there is
+its own.
 
 The measurement grant gives a confined install exactly this: the run's
 stores and its own tree's `tree-stores` writable (*Leerie's runs of the
@@ -11499,10 +11549,9 @@ the CI parity baseline, the browser suite unable to start).
    A tool the workers run goes in `~/.local/bin`: the hook writes it, and
    every worker reads it and has it on `PATH`. The rest of the hook's
    environment belongs to its checkout:
-   - *pip's user base.* `pip install --user` installs into the checkout's
-     user base (`<run-dir>/worktrees/.stores/tree-stores/<tree>/pyuser`, §6 *Which stores an
-     install may share*), which no worker reads; a worker has its own
-     (`_worker_cache_env`). A Python tool goes in with
+   - *pip's user base.* `pip install --user` installs into the hook's own
+     home, which ends with it (§6 *Every confined process has its own
+     home*); no worker reads it. A Python tool goes in with
      `pip install --target ~/.local/bin/.<tool> <tool>` and a launcher
      script at `~/.local/bin/<tool>` that sets `PYTHONPATH` to that
      directory and runs `python3 -m <module>`. The image has no

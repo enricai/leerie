@@ -11,10 +11,12 @@ two functions that never agreed on a tree.
 
 The rule: for a tree leerie installed for, the environment `_invoke` gives a
 worker there and the one `_run_streaming` gives leerie's commands there name
-the same per-tree store for every `_TREE_STORE_VARS` variable, `PATH`
-carries that user base's `bin`, and the grant names the stores as it names
-the tree. Then, executed: a worker's confined process runs by name a script
-an install put in the tree's user base (real Landlock, host), and a real
+the same per-tree store for every `_TREE_STORE_VARS` variable, the grant
+names the stores as it names the tree, and the worker's home has the tree
+home layer on top (DESIGN §6 *Every confined process has its own home*, 4:
+no variable moves a user base since). Then, executed where isolation works:
+a worker's confined process runs by name a script an install put in
+`~/.local/bin`, and a real
 `pip install` of pytest followed by the worker running `pytest` and
 `import pytest` (container, where isolation works)."""
 from __future__ import annotations
@@ -130,12 +132,16 @@ def test_worker_and_install_name_the_same_tree_stores(
     # Every other store stays the worker's side cache, never leerie's.
     for var in (set(leerie._STORE_VARS) - leerie._TREE_STORE_VARS):
         assert Path(wenv[var]).is_relative_to(cache), var
-    # The user base's scripts are on PATH, last of the stores' bins, and
-    # the cache's user base bin is gone from it.
-    path = wenv["PATH"].split(os.pathsep)
-    assert f"{stores / 'pyuser'}/bin" in path
-    assert f"{cache / 'pyuser'}/bin" not in path
-    assert path.index(f"{stores / 'pyuser'}/bin") > path.index("/usr/bin")
+    # No variable moves a user base (DESIGN §6 *Every confined process has
+    # its own home*, 4): what the install kept beneath `~` is the tree home
+    # layer, which the worker's own home has on top once it exists.
+    assert "PYTHONUSERBASE" not in wenv
+    layer = stores / leerie.TREE_HOME_NAME
+    assert g.home_layers[:1] != (str(layer),)
+    layer.mkdir(parents=True, exist_ok=True)
+    g2 = _grants(leerie, run, lane, schema_key, getattr(leerie, tools))
+    if g2.home:
+        assert g2.home_layers[0] == str(layer)
 
 
 def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
@@ -156,29 +162,34 @@ def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
 # --- executed under the worker's grant -----------------------------------------
 
 
-@needs_landlock
-@skip_without_landlock
+@needs_isolation
 def test_a_worker_runs_a_script_leeries_install_put_in_the_tree(
         leerie, run, stores_env, installed, monkeypatch):
     """Leerie's install-kind command writes a console script where pip's
-    user scheme puts one; the falsifier's own confined process, with the
-    environment `_invoke` gives it, runs it by name in that tree."""
+    user scheme puts one, `~/.local/bin`, which is the tree home layer
+    (DESIGN §6 *Every confined process has its own home*, 4); the
+    falsifier's own confined process, with the environment `_invoke` gives
+    it, runs it by name in that tree, and the real home holds nothing."""
+    monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
     lane = _lane(run)
     st = _St(run["user"], run["run_dir"])
     log = run["run_dir"] / "logs" / "tree-install.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     rc, tail = asyncio.run(leerie._run_streaming(
-        ["bash", "-c", 'mkdir -p "$PYTHONUSERBASE/bin" && printf '
-         '"#!/bin/sh\\necho SCRIPT-RAN\\n" > "$PYTHONUSERBASE/bin/'
-         'leerie-fake-runner" && chmod +x "$PYTHONUSERBASE/bin/'
+        ["bash", "-c", 'mkdir -p "$HOME/.local/bin" && printf '
+         '"#!/bin/sh\\necho SCRIPT-RAN\\n" > "$HOME/.local/bin/'
+         'leerie-fake-runner" && chmod +x "$HOME/.local/bin/'
          'leerie-fake-runner"'],
         grants=leerie._measurement_grants(st, lane, leerie.INSTALL_KIND),
         cwd=str(lane), timeout=60, log_path=log, label="install",
         verbosity="quiet"))
     assert rc == 0, tail
+    assert not (Path(os.environ["HOME"]) / ".local" / "bin"
+                / "leerie-fake-runner").exists()
     installed(lane)
     g = _grants(leerie, run, lane, "falsifier", leerie.ACT_TOOLS)
     wenv = _worker_env(leerie, run, lane, g)
+    wenv["PATH"] = f"{wenv['PATH']}:{os.environ['HOME']}/.local/bin"
     r = subprocess.run(leerie._confined_argv(g, ["leerie-fake-runner"]),
                        cwd=str(lane), env=wenv, capture_output=True,
                        text=True, timeout=60)
