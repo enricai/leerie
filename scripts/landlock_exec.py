@@ -1381,9 +1381,11 @@ def join_session_keyring() -> None:
 WORKER_VIEW = "/.leerie-worker-view"
 # The top-level entries a worker view takes from the container whatever the
 # worker root holds: the kernel's, the run's mounts and the private ones.
+# Every top-level target the launcher mounts is one: a worker root built on
+# leerie's image holds its own empty copy of each, which would hide the mount.
 CONTAINER_ENTRIES = frozenset({"dev", "proc", "sys", "run", "tmp", "home",
                                "work", "inspect", "leerie-state",
-                               "leerie-host"})
+                               "leerie-host", "leerie-toolchains"})
 # The files of `/etc` the view takes from the container: the runtime mounts
 # them when the container starts, so no image snapshot holds them, and they
 # are the run's name service (`localhost` resolves through `hosts`).

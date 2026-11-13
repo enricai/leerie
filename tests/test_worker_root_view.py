@@ -522,3 +522,61 @@ def test_localhost_resolves_and_answers_in_the_worker_view(wroot):
     assert _MARK in r.stdout                     # the repository's root
     assert "getent=0" in r.stdout and "localhost" in r.stdout
     assert "ping" in r.stdout
+
+
+# --- the container's mounts are the container's in the view ----------------
+
+
+def _launcher_mount_targets() -> set[str]:
+    """Every container path the launcher passes to `-v SRC:TARGET[:opts]`,
+    read from its source (a mechanical string)."""
+    import re
+    src = (REPO_ROOT / "leerie").read_text()
+    out = set()
+    for m in re.finditer(r'-v\s+"[^"]*?:(/[^":]*)', src):
+        out.add(m.group(1))
+    return out
+
+
+def test_every_top_level_mount_of_the_launcher_is_the_containers():
+    """A worker root built on leerie's image holds its own copy of each
+    top-level directory the launcher mounts over in the container; taken
+    from the worker root, it hides the mount. `/leerie-toolchains` (#387)
+    was missing, so on 0.69.0 and 0.70.0 every `mise install` in a
+    repository with an image wrote an empty read-only copy and failed with
+    "Read-only file system". `/opt` is the view's own merge, which takes
+    each `/opt/leerie-*` from the container."""
+    targets = _launcher_mount_targets()
+    assert "/leerie-toolchains" in targets and "/leerie-state" in targets
+    tops = {t.strip("/").split("/")[0] for t in targets}
+    missing = sorted(t for t in tops - {"opt"}
+                     if t not in LL.CONTAINER_ENTRIES)
+    assert not missing, missing
+    assert all(t.startswith("/opt/leerie-") for t in targets
+               if t.split("/")[1] == "opt"), targets
+
+
+_OURS = sorted(n for n in LL.CONTAINER_ENTRIES
+               if n not in ("dev", "proc", "sys")
+               and os.path.isdir("/" + n) and not os.path.islink("/" + n))
+
+
+@iso
+@pytest.mark.parametrize("name", _OURS)
+def test_a_container_entry_the_worker_root_also_holds_is_the_containers(
+        wroot, name):
+    """Through the real shim: the worker root holds its own `/<name>` with
+    a marker; the view shows the container's, and a write grant beneath it
+    is writable there. In leerie's container this covers
+    `/leerie-toolchains`, where the toolchain install writes."""
+    (wroot / name).mkdir(exist_ok=True)
+    (wroot / name / _MARK).write_text("x")
+    w = wroot.parent / "w"
+    r = _shim(["--isolate", "--worker-root", str(wroot), "--rw", str(w),
+               "--rw", "/dev/null", "--ro", "/"],
+              ["sh", "-c", f"cat /etc/mark; echo; "
+               f"test -e /{name}/{_MARK} && echo worker-roots || echo ours"],
+              w)
+    assert r.returncode == 0, r.stderr
+    assert _MARK in r.stdout                     # the repository's root
+    assert "ours" in r.stdout and "worker-roots" not in r.stdout
