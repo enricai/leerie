@@ -546,7 +546,7 @@ def test_no_bare_proc_kill_outside_terminate_proc_tree(leerie):
     descendants (Claude Code's Bash tool runs in its own POSIX session,
     so `killpg(claude_p_pgid)` alone does not reach it).
 
-    A regression that puts `proc.kill()` back into `run_proc` or
+    A regression that puts `proc.kill()` back into `_run_proc` or
     `_invoke`'s exception handlers would silently re-leak the
     detached descendants. This test pins that against drift."""
     src = LEERIE_PY.read_text()
@@ -572,12 +572,12 @@ def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
     `_terminate_proc_tree`. Source-pin to catch the case where someone
     refactors and accidentally drops one of the four handlers."""
     src = LEERIE_PY.read_text()
-    # `run_proc`: from its def to the matching `return subprocess.CompletedProcess`
+    # `_run_proc`: from its def to the matching `return subprocess.CompletedProcess`
     m_run = re.search(
-        r"async def run_proc\(.*?\n    return subprocess\.CompletedProcess",
+        r"async def _run_proc\(.*?\n    return subprocess\.CompletedProcess",
         src, re.DOTALL,
     )
-    assert m_run, "could not locate run_proc body in leerie.py"
+    assert m_run, "could not locate _run_proc body in leerie.py"
     run_proc_body = m_run.group(0)
     # `_invoke` is a top-level `async def`. Bound on the next top-level
     # def (also flush-left) so we don't bleed into _capture_call or
@@ -589,7 +589,7 @@ def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
     assert m_inv, "could not locate _invoke body in leerie.py"
     invoke_body = m_inv.group(0)
 
-    for label, body in [("run_proc", run_proc_body), ("_invoke", invoke_body)]:
+    for label, body in [("_run_proc", run_proc_body), ("_invoke", invoke_body)]:
         # Each function must terminate the proc tree on TimeoutError
         # and on the catch-all BaseException. Count occurrences rather
         # than slicing nested blocks (which is brittle to inner

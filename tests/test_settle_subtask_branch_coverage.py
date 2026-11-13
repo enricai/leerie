@@ -433,9 +433,9 @@ def _conflicted_staging(tmp_path):
 
 
 def _stub_run_proc_fail_on_matching_arg(leerie_mod, monkeypatch, needle):
-    """Return an rc=1 fake result for the first `run_proc` call whose argv
-    contains `needle`; delegate every other call to the real `run_proc`."""
-    real = leerie_mod.run_proc
+    """Return an rc=1 fake result for the first `_run_proc` call whose argv
+    contains `needle`; delegate every other call to the real `_run_proc`."""
+    real = leerie_mod._run_proc
 
     class _FakeResult:
         def __init__(self):
@@ -447,7 +447,7 @@ def _stub_run_proc_fail_on_matching_arg(leerie_mod, monkeypatch, needle):
         if needle in cmd:
             return _FakeResult()
         return await real(cmd, **kw)
-    monkeypatch.setattr(leerie_mod, "run_proc", _stub)
+    monkeypatch.setattr(leerie_mod, "_run_proc", _stub)
 
 
 def test_rescue_returns_none_when_add_fails(leerie, tmp_path, monkeypatch):

@@ -221,7 +221,7 @@ def test_main_turns_hooks_off_before_anything_spawns(leerie):
     assert before, "nothing precedes it: the rule checked nothing"
     assert _spawns(module, before) == set(), before
     # The rule sees a spawn where there is one.
-    assert _spawns(module, {"run_proc"})
+    assert _spawns(module, {"_run_proc"})
 
 
 def test_a_worker_spawn_gets_the_hooks_back(leerie, tmp_path, monkeypatch,

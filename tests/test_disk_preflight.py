@@ -87,9 +87,9 @@ class TestPreflightDiskCheck:
 
         async def _fake_run_proc(*a, **k):
             called.append(a)
-            raise AssertionError("run_proc must not run when disk is low")
+            raise AssertionError("_run_proc must not run when disk is low")
 
-        monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+        monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
         monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
         with mock.patch.object(leerie.shutil, "disk_usage",
                                 return_value=_fake_usage(0.01)):
@@ -111,10 +111,10 @@ class TestPreflightDiskCheck:
                 return mock.Mock(returncode=0, stdout="")
             if argv[:2] == ["git", "show-ref"]:
                 return mock.Mock(returncode=1, stdout="")
-            raise AssertionError(f"unexpected run_proc call: {argv}")
+            raise AssertionError(f"unexpected _run_proc call: {argv}")
 
         monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
-        monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+        monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
         monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
         with mock.patch.object(leerie.shutil, "disk_usage",
                                 return_value=_fake_usage(0.90)):
@@ -152,7 +152,7 @@ class TestPhaseExecuteDiskLowSpace:
         with mock.patch.object(leerie, "_run_script",
                                 new=mock.AsyncMock(
                                     return_value=mock.Mock(returncode=0, stderr=""))), \
-             mock.patch.object(leerie, "run_proc",
+             mock.patch.object(leerie, "_run_proc",
                                 new=mock.AsyncMock(return_value=mock.Mock(returncode=0))), \
              mock.patch.object(leerie, "_capture_conformance_baseline",
                                 new=mock.AsyncMock()), \
@@ -177,7 +177,7 @@ class TestPhaseExecuteDiskLowSpace:
         with mock.patch.object(leerie, "_run_script",
                                 new=mock.AsyncMock(
                                     return_value=mock.Mock(returncode=0, stderr=""))), \
-             mock.patch.object(leerie, "run_proc",
+             mock.patch.object(leerie, "_run_proc",
                                 new=mock.AsyncMock(return_value=mock.Mock(returncode=0))), \
              mock.patch.object(leerie.shutil, "disk_usage",
                                 return_value=_fake_usage(0.90)):

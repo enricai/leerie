@@ -817,7 +817,7 @@ class TestRecaptureEndToEnd:
 
         stub_dir = tmp_path / "stubs"
         stub_dir.mkdir()
-        _make_claude_stub(stub_dir, {"setup_packages": [], "language_installs": []})
+        _make_claude_stub(stub_dir, {"setup_packages": []})
 
         result = _run_real_config_arm_with_state(
             user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
@@ -842,7 +842,7 @@ class TestRecaptureEndToEnd:
 
         stub_dir = tmp_path / "stubs"
         stub_dir.mkdir()
-        _make_claude_stub(stub_dir, {"setup_packages": ["git"], "language_installs": []})
+        _make_claude_stub(stub_dir, {"setup_packages": ["git"]})
 
         # Without --force: run is skipped (sentinel present), exits 0 (no-op).
         result_no_force = _run_real_config_arm_with_state(
@@ -891,7 +891,7 @@ class TestRecaptureEndToEnd:
 
         stub_dir = tmp_path / "stubs"
         stub_dir.mkdir()
-        _make_claude_stub(stub_dir, {"setup_packages": [], "language_installs": []})
+        _make_claude_stub(stub_dir, {"setup_packages": []})
 
         result = _run_real_config_arm_with_state(
             user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
@@ -916,7 +916,7 @@ class TestRecaptureEndToEnd:
 
         stub_dir = tmp_path / "stubs"
         stub_dir.mkdir()
-        _make_claude_stub(stub_dir, {"setup_packages": [], "language_installs": []})
+        _make_claude_stub(stub_dir, {"setup_packages": []})
 
         result = _run_real_config_arm_with_state(
             user_repo, ["--recapture"], tmp_path, state_dir=state_dir,

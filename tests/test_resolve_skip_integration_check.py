@@ -159,7 +159,7 @@ def test_skip_flag_off_still_invokes_the_gate(leerie, tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "_restore_tree", no_restore)
     judge_checkout_in_place(leerie, monkeypatch)
 

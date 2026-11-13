@@ -2997,7 +2997,7 @@ def test_a_resumed_round_after_a_lost_commit_is_measured_again(
 def test_branch_head_sha_never_raises(leerie, tmp_path, monkeypatch):
     async def eagain(*a, **k):
         raise BlockingIOError(11, "Resource temporarily unavailable")
-    monkeypatch.setattr(leerie, "run_proc", eagain)
+    monkeypatch.setattr(leerie, "_run_proc", eagain)
     assert asyncio.run(leerie._branch_head_sha(str(tmp_path))) == ""
 
 
@@ -3012,7 +3012,7 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
     staging = _staging(st, repo)
     before = _git(staging, "rev-parse", "HEAD")
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
-    real = leerie.run_proc
+    real = leerie._run_proc
     repaired, failed = [], []
 
     async def eagain_once(argv, *a, **k):
@@ -3023,7 +3023,7 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
             failed.append(1)
             raise BlockingIOError(11, "Resource temporarily unavailable")
         return await real(argv, *a, **k)
-    monkeypatch.setattr(leerie, "run_proc", eagain_once)
+    monkeypatch.setattr(leerie, "_run_proc", eagain_once)
 
     async def commits_then_fails(**kw):
         (Path(kw["cwd"]) / "calc.py").write_text(

@@ -8,7 +8,7 @@ thing.
 
 This file drives all three end to end against a real git repo and a real
 `State`, stubbing only the genuinely external edges (`claude_p`,
-`_run_script`, `run_proc`'s `git show-ref` verification, `capture_repo_deps`)
+`_run_script`, `_run_proc`'s `git show-ref` verification, `capture_repo_deps`)
 so the surrounding orchestration logic — payload assembly, truncation,
 budget gating, log-line branches, the strict-output-proxy summary — runs
 for real.
@@ -354,7 +354,7 @@ def _stub_finalize_subprocesses(leerie, monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
 
     async def _noop_capture(*a, **k):
         return None
@@ -375,7 +375,7 @@ def _finalize_ready_state(st):
 
 @pytest.fixture(scope="session")
 def pristine_run_proc(leerie):
-    """leerie's genuine `run_proc`, captured before this module's autouse
+    """leerie's genuine `_run_proc`, captured before this module's autouse
     stub can replace it.
 
     Session-scoped on purpose: higher-scoped fixtures are instantiated
@@ -383,7 +383,7 @@ def pristine_run_proc(leerie):
     this sees the real attribute. A test that wants the real git call back
     re-installs this over the stub.
     """
-    return leerie.run_proc
+    return leerie._run_proc
 
 
 class TestEmptyRunBranchAgainstRealGit:
@@ -391,7 +391,7 @@ class TestEmptyRunBranchAgainstRealGit:
     with the REAL `git rev-list` running against a REAL repository.
 
     That distinction is the whole point of this class. The sibling class
-    stubs `run_proc` wholesale, so the git command never executes — and the
+    stubs `_run_proc` wholesale, so the git command never executes — and the
     command is precisely where the defect lived: the guard originally ran in
     `leerie_dir` (the STATE root, not a git repo at all), which made it fail
     open and never fire, except when the state root happened to sit inside
@@ -420,7 +420,7 @@ class TestEmptyRunBranchAgainstRealGit:
     @staticmethod
     def _install_real_git(monkeypatch, leerie, pristine_run_proc, scripts,
                           repo):
-        """Real `run_proc`; only the shell scripts stay stubbed.
+        """Real `_run_proc`; only the shell scripts stay stubbed.
 
         `chdir(repo)` mirrors production: leerie runs with the process cwd
         set to the user's checkout. The guard's count runs in the run's own
@@ -436,7 +436,7 @@ class TestEmptyRunBranchAgainstRealGit:
         async def _fake_compose(*a, **k):
             return None
 
-        monkeypatch.setattr(leerie, "run_proc", pristine_run_proc)
+        monkeypatch.setattr(leerie, "_run_proc", pristine_run_proc)
         monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
         monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
 
@@ -519,7 +519,7 @@ class TestEmptyRunBranchIsNoWorkNotAnError:
                 script_calls.append(name)
             return subprocess.CompletedProcess(["bash", name], 0, "", "")
 
-        monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+        monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
         monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
 
     def test_empty_branch_routes_to_the_no_work_terminal(
@@ -723,7 +723,7 @@ def test_phase_finalize_cleanup_deletes_no_branch_so_nothing_rechecks_it(
     async def _run_script(name, *args, **_kw):
         scripts.append((name, *args))
         return subprocess.CompletedProcess(["bash", name], 0, "", "")
-    monkeypatch.setattr(leerie, "run_proc", _failing_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", _failing_run_proc)
     monkeypatch.setattr(leerie, "_run_script", _run_script)
 
     asyncio.run(leerie.phase_finalize(

@@ -142,7 +142,7 @@ def test_zombie_reaper_does_not_steal_unregistered_subprocess_status(leerie):
     """THE regression test. The reaper must not steal the exit status of an
     asyncio child that was NEVER registered anywhere.
 
-    This is the production failure (DESIGN §6 *Zombie reaping*): `run_proc`
+    This is the production failure (DESIGN §6 *Zombie reaping*): `_run_proc`
     does not register its pids, and even `_invoke` cannot register during the
     window between `fork()` and asyncio's `os.pidfd_open()`. A scanning reaper
     took `preflight`'s own `git config user.email` pid on 40/40 real runs,
@@ -318,7 +318,7 @@ async def m():
     # raises (ProcessLookupError / CancelledError) because the child is gone
     # before it can be waited on. Report either failure shape as non-"7".
     try:
-        r = await lp.run_proc(["sh", "-c", "exit 7"])
+        r = await lp._run_proc(["sh", "-c", "exit 7"])
         print(r.returncode)
     except BaseException as e:
         print(f"RAISED:{type(e).__name__}")
@@ -332,7 +332,7 @@ asyncio.run(m())
     assert out.returncode == 0, f"probe failed: {out.stderr[-2000:]}"
     rc = out.stdout.strip().splitlines()[-1]
     assert rc == "7", (
-        f"run_proc reported {rc!r}, expected '7' — the child's exit status was "
+        f"_run_proc reported {rc!r}, expected '7' — the child's exit status was "
         "lost to kernel auto-reaping (verified failure modes without the fix: "
         "rc=255, or RAISED:ProcessLookupError). _restore_sigchld_default() must "
         "restore SIGCHLD to SIG_DFL before any subprocess is spawned.")

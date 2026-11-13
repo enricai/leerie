@@ -2004,7 +2004,7 @@ STOP_ON_REPO_CHANGE_FILE = SOURCE_OF_TRUTH_FILE
 REPO_MAP_CACHE_DIR = "repo-map-cache"
 
 # capture_deps preference (DESIGN §6½). Controls whether phase_finalize
-# scans logs and writes setup_packages / triggers the language-dep bake.
+# scans logs and records setup_packages for the repository image's apt layer.
 # Default True. Resolution order: LEERIE_CAPTURE_DEPS env →
 # capture_deps in .leerie/config.toml → True.
 CAPTURE_DEPS_ENV = "LEERIE_CAPTURE_DEPS"
@@ -3196,33 +3196,12 @@ _FORBIDDEN_COMMANDS_ARRAY_SCHEMA: dict = {
     },
 }
 
-# DESIGN §6½ *A capture names packages and managers, never commands*. What
-# a `dep_capture` worker may record, checked in its schema, again in code
-# before a capture is recorded or applied (`_capture_problems`), and by the
-# launcher before it writes a Dockerfile line: a Debian package name (no
-# version, release or architecture suffix), a manager leerie bakes, a plain
-# relative path. The command a manager's bake runs is leerie's own, never
-# the capture's.
+# DESIGN §6½ *A capture names packages, never commands*. What a `dep_capture`
+# worker may record, checked in its schema, again in code before a capture
+# is recorded or applied (`_capture_problems`), and by the launcher before it
+# writes a Dockerfile line: a Debian package name (no version, release or
+# architecture suffix).
 DEBIAN_PACKAGE_PATTERN = r"^[a-z0-9][a-z0-9+.-]+$"
-CAPTURE_MANAGER_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
-CAPTURE_INPUT_PATTERN = r"^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*/?$"
-# Equal to the launcher generator's `_INSTALL_COMMANDS`
-# (tests/test_capture_validation.py).
-BAKE_INSTALL_COMMANDS: dict[str, str] = {
-    "pnpm": "pnpm install --frozen-lockfile",
-    "yarn": "yarn install --frozen-lockfile",
-    "npm": "npm ci",
-    "uv": "uv sync",
-    "poetry": "poetry install",
-    "pipenv": "pipenv install",
-    "pip": "pip install -r requirements.txt",
-    "pip3": "pip install -r requirements.txt",
-    "go": "go mod download",
-    "cargo": "cargo fetch",
-    "bundle": "bundle install",
-    "composer": "composer install --no-interaction",
-    "dotnet": "dotnet restore",
-}
 
 
 # The kinds of objection a re-drive implementer may raise against a shown
@@ -4335,43 +4314,18 @@ SCHEMAS: dict[str, dict] = {
         # frameworks. Code enforces via this schema; the worker decides
         # content; _write_config_toml_keys writes it deterministically.
         "type": "object",
-        "required": ["setup_packages", "language_installs"],
+        "required": ["setup_packages"],
         "properties": {
             "setup_packages": {
                 # apt packages for the warm apt layer in .leerie/Dockerfile.
                 # A Debian package name and nothing else (DESIGN §6½ *A
-                # capture names packages and managers, never commands*): the
-                # launcher writes each one into an apt `RUN` line, so a
-                # word like `&&` would be shell. Checked again in code
-                # (`_capture_problems`) and by the launcher.
+                # capture names packages, never commands*): the launcher
+                # writes each one into an apt `RUN` line, so a word like `&&`
+                # would be shell. Checked again in code (`_capture_problems`)
+                # and by the launcher.
                 "type": "array",
                 "items": {"type": "string",
                           "pattern": DEBIAN_PACKAGE_PATTERN},
-            },
-            "language_installs": {
-                # Per-manager install commands the Dockerfile bakes in via
-                # COPY + RUN layers. `copy_inputs` are repo-relative paths
-                # COPYed in before the RUN (e.g. requirements.txt,
-                # package.json). Hallucinated paths are validated against
-                # the repo and skipped; the RUN is still emitted.
-                "type": "array",
-                # The manager chooses the command, from leerie's own table
-                # (`BAKE_INSTALL_COMMANDS`); a `command` the worker writes
-                # is never run.
-                "items": {
-                    "type": "object",
-                    "required": ["manager", "command"],
-                    "properties": {
-                        "manager": {"type": "string",
-                                    "pattern": CAPTURE_MANAGER_PATTERN},
-                        "command": {"type": "string", "minLength": 1},
-                        "copy_inputs": {
-                            "type": "array",
-                            "items": {"type": "string",
-                                      "pattern": CAPTURE_INPUT_PATTERN},
-                        },
-                    },
-                },
             },
             "dockerfile_notes": {"type": ["string", "null"]},
         },
@@ -6389,7 +6343,7 @@ async def _terminate_proc_tree(proc: asyncio.subprocess.Process) -> None:
     cannot, once they exit.
 
     Idempotent and exception-safe: this runs only from `_invoke`'s and
-    `run_proc`'s `except` blocks (abnormal-exit paths). Success-path
+    `_run_proc`'s `except` blocks (abnormal-exit paths). Success-path
     cleanup of detached backgrounded subprocesses (Claude Code's Bash
     tool with `run_in_background: true`) is handled separately by
     `_DescendantTracker`, because by the time a clean `claude -p` exit
@@ -6720,11 +6674,6 @@ _STORE_VARS: dict[str, str] = {
     # the tree's own (`_TREE_STORE_VARS`).
     "PLAYWRIGHT_BROWSERS_PATH": "playwright-browsers",
 }
-# The repository image's bake target (DESIGN *Persistent out-of-repo dependency bake*): a
-# variable already pointing beneath it names dependencies leerie built into
-# the image, which the recipe no longer installs, so neither side moves it.
-# Keeping a worker from writing there is the worker's write boundary.
-_BAKED_ROOT = "/opt/"
 # pnpm 10 reads its settings only as `npm_config_<key>`, pnpm 11 only as
 # `pnpm_config_<key>` (measured: each ignores the other's spelling for
 # `store-dir`). The store variables are set under both
@@ -6786,8 +6735,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
     tree is one of a run's (`_tree_stores_dir`): `<run-dir>/
     tree-stores/<tree>/<name>`, made here 0700 (`_mkdir_private`), like
-    every directory leerie makes for a measurement. A baked value is kept.
-    A `cwd` outside every run tree leaves `env` as it is. The one choice of
+    every directory leerie makes for a measurement. A `cwd` outside every run tree leaves `env` as it is. The one choice of
     a tree's stores: leerie's commands there and a worker started in a tree
     leerie installed for (`_installed_tree_stores`) both get it (DESIGN §6
     *A worker started in a tree leerie installed for runs on that tree's
@@ -6798,8 +6746,6 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     root = found[1]
     user_base = env.get("PYTHONUSERBASE")
     for var in _TREE_STORE_VARS:
-        if (env.get(var) or "").startswith(_BAKED_ROOT):
-            continue
         dst = root / _STORE_VARS[var]
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)
@@ -6864,11 +6810,10 @@ def _with_user_scripts(env: MutableMapping[str, str],
     pip installs a package's scripts in `<user base>/bin`, which only `PATH`
     finds, and the image puts the default base's `~/.local/bin` last for
     that (DESIGN §6 *Which stores an install may share*). Last, so a
-    user-installed script never shadows a tool the image baked. A base
-    leerie did not move, or one beneath the bake root, is left alone."""
+    user-installed script never shadows a tool the image holds. A base
+    leerie did not move is left alone."""
     base = env.get("PYTHONUSERBASE") or ""
-    if (base == (previous or "") or base.startswith(_BAKED_ROOT)
-            or "PATH" not in env):
+    if base == (previous or "") or "PATH" not in env:
         return
     old = os.path.join(previous, "bin") if previous else None
     new = os.path.join(base, "bin")
@@ -6880,8 +6825,7 @@ def _with_user_scripts(env: MutableMapping[str, str],
 def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at the run's own store,
     `<run-dir>/worktrees/.stores/stores/<name>` (`_stores_home`,
-    `RUN_STORES_DIRNAME`), made here (a value
-    beneath the image's bake root `_BAKED_ROOT` is kept). Every command
+    `RUN_STORES_DIRNAME`), made here. Every command
     leerie runs in the run reads and writes them, and nothing outside the
     run does: no store is shared across runs or repositories (DESIGN §6
     *The stores a view installs from are leerie's*). A worker's environment
@@ -6889,8 +6833,6 @@ def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     them."""
     root = _stores_home(run_dir) / RUN_STORES_DIRNAME
     for var, name in _STORE_VARS.items():
-        if (env.get(var) or "").startswith(_BAKED_ROOT):
-            continue
         d = root / name
         _mkdir_private(d, Path(run_dir))
         env[var] = str(d)
@@ -6906,9 +6848,8 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
                       cache: Path | None = None) -> dict[str, str]:
     """A copy of `env` whose every store and cache is in the worker's
     cache set `cache` (default the fixers' side's,
-    `<run-dir>/worktrees/.stores/cache/`): `<cache>/<name>` (a baked value
-    is kept, as
-    `_leerie_stores` keeps it) and `XDG_CACHE_HOME` at `<cache>/xdg`. One
+    `<run-dir>/worktrees/.stores/cache/`): `<cache>/<name>` and
+    `XDG_CACHE_HOME` at `<cache>/xdg`. One
     set per side of the run, not per worker (`_worker_cache_dir`): what a
     worker leaves in a cache can mislead only another worker of its side,
     never a measurement, and nothing a held-out-side worker's processes
@@ -6919,7 +6860,7 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
     installs from are leerie's*)."""
     if cache is None:
         cache = _stores_home(run_dir) / WORKER_CACHE_DIR
-    out = {**env, **_cache_vars(env, cache)}
+    out = {**env, **_cache_vars(cache)}
     _with_pnpm_spellings(out)
     _with_user_scripts(out, env.get("PYTHONUSERBASE"))
     return out
@@ -7193,11 +7134,11 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     # error here (the idempotent case), never an exception.
     repo = str(Path(leerie_dir) / RUN_REPO_NAME)
     try:
-        await run_proc(["git", "--git-dir", repo, "worktree", "remove",
+        await _run_proc(["git", "--git-dir", repo, "worktree", "remove",
                         "--force", str(worktree)], timeout=240)
     except subprocess.TimeoutExpired:
         log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
-    await run_proc(["git", "--git-dir", repo, "branch", "-D", branch])
+    await _run_proc(["git", "--git-dir", repo, "branch", "-D", branch])
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
     # Its tree repository goes too, untaken: the branch is deleted, and the
     # retry's tree is made afresh from the run repository (DESIGN §6 *A
@@ -7230,7 +7171,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
             await asyncio.to_thread(_drop_view, Path(leerie_dir), worktree)
         return
     try:
-        await run_proc(["git", "--git-dir",
+        await _run_proc(["git", "--git-dir",
                         str(Path(leerie_dir) / RUN_REPO_NAME),
                         "worktree", "remove", "--force", str(worktree)],
                        timeout=240)
@@ -11444,7 +11385,7 @@ def resolve_heal_success_threshold(repo_root: Path,
     return HEAL_SUCCESS_THRESHOLD_DEFAULT
 
 
-async def run_proc(cmd: list[str], *, cwd: str | None = None,
+async def _run_proc(cmd: list[str], *, cwd: str | None = None,
                    timeout: float | None = None,
                    env: dict[str, str] | None = None,
                    pass_fds: tuple[int, ...] = (),
@@ -11493,7 +11434,7 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
         # orphan subtree. Terminate the process group then re-raise.
         await _terminate_proc_tree(proc)
         raise
-    # Success path needs no descendant sweep: `run_proc` is used for short
+    # Success path needs no descendant sweep: `_run_proc` is used for short
     # synchronous commands (git, smoke tests, cleanup helpers) that do not
     # background tool calls the way `claude -p` workers do via Claude Code's
     # Bash tool. The detached-session leak class addressed by
@@ -11683,7 +11624,7 @@ async def _run_streaming(
 ) -> tuple[int, str]:
     """Run a subprocess with stdout+stderr streamed live, persisted to a
     log file, and tailed for error reporting. Use this instead of
-    `run_proc` for *long-running* commands where:
+    `_run_proc` for *long-running* commands where:
 
       - the user should see progress in real time (no silent multi-minute
         hangs while a buffered pipe fills),
@@ -11691,11 +11632,11 @@ async def _run_streaming(
       - the last N lines should be available in any exception we raise.
 
     Returns `(returncode, tail)`. On timeout raises
-    `subprocess.TimeoutExpired` (same shape `run_proc` raises) with
+    `subprocess.TimeoutExpired` (same shape `_run_proc` raises) with
     `output` populated with the captured tail so callers can include it
     in their error message. On any other exception, terminates the
     process tree via `_terminate_proc_tree` (same exception-safety
-    contract as `run_proc`).
+    contract as `_run_proc`).
 
     `verbosity`:
       - "quiet": no stdout echo; log file still gets every line.
@@ -11706,9 +11647,9 @@ async def _run_streaming(
     when multiple commands write to the same log file (provision.log
     accumulates `mise install`, `.leerie-setup.sh`, etc.).
 
-    The DRY counterpart to `run_proc`: identical contract for the
+    The DRY counterpart to `_run_proc`: identical contract for the
     process-group/exception-safety story, different I/O shape. Pick
-    `run_proc` for short captures (git plumbing, smoke tests) where
+    `_run_proc` for short captures (git plumbing, smoke tests) where
     the synchronous-collect shape is what the caller wants; pick
     `_run_streaming` for anything that might run long enough that a
     silent terminal would mislead the user.
@@ -11919,7 +11860,7 @@ async def _run_streaming(
 async def _gather_or_cancel(*aws):
     """Like asyncio.gather, but on the first exception cancel every other
     in-flight task and await its finalization before re-raising. Paired with
-    run_proc's child-killing exception handler, this terminates in-flight
+    _run_proc's child-killing exception handler, this terminates in-flight
     `claude -p` subprocesses immediately on a failed-run abort instead of
     letting them burn the worker budget for up to worker_timeout_sec."""
     tasks = [asyncio.ensure_future(a) for a in aws]
@@ -11961,7 +11902,7 @@ async def _run_script(name: str, *args: str,
            # Named, never discovered (safe.bareRepository=explicit): the
            # scripts' repository-level git goes through `leerie_repo_git`.
            "LEERIE_GIT_DIR": str(_run_repo(st))}
-    return await run_proc(["bash", str(SCRIPTS / name), *args],
+    return await _run_proc(["bash", str(SCRIPTS / name), *args],
                           cwd=str(_run_repo(st)), env=env,
                           timeout=RUN_SCRIPT_TIMEOUT)
 
@@ -13045,7 +12986,7 @@ async def _base_tree_sha(repo_root: str, st: "State") -> str:
     ref = await asyncio.to_thread(_working_branch_ref, repo_root, st)
     if ref is not None:
         try:
-            r = await run_proc(["git", *_tree_git_args(repo_root), "rev-parse", "--verify", "--quiet",
+            r = await _run_proc(["git", *_tree_git_args(repo_root), "rev-parse", "--verify", "--quiet",
                                 ref], cwd=repo_root)
         except OSError:
             r = None
@@ -13135,7 +13076,7 @@ async def _snapshot_repo_state(repo_root: str) -> dict:
 
     async def _out(*argv: str) -> str:
         nonlocal ok
-        r = await run_proc(list(argv), cwd=repo_root)
+        r = await _run_proc(list(argv), cwd=repo_root)
         if r.returncode != 0:
             ok = False
             return ""
@@ -13145,7 +13086,7 @@ async def _snapshot_repo_state(repo_root: str) -> dict:
     # a wholly untracked directory as `dir/`, as status would show it.
     u_args, u_env = await asyncio.to_thread(
         functools.partial(_untracked_cmd, repo_root, directory=True))
-    u = await run_proc(["git", *u_args], env=u_env)
+    u = await _run_proc(["git", *u_args], env=u_env)
     if u.returncode != 0:
         ok = False
     # `--no-optional-locks`: status would otherwise refresh the user's
@@ -13832,7 +13773,7 @@ async def _preflight_repo() -> None:
     """
     # 1. git user identity — missing config causes implementer commits to fail
     for key in ("user.email", "user.name"):
-        r = await run_proc(["git", "config", key])
+        r = await _run_proc(["git", "config", key])
         # rc=255 is asyncio's "could not read the child's exit status"
         # sentinel, not git's verdict — git exits 0 (set) or 1 (unset), never
         # 255. Without this branch the check below misreports a broken
@@ -13856,7 +13797,7 @@ async def _preflight_repo() -> None:
                 f"Run: git config --global {key} \"<value>\"")
 
     # 2. working tree must be clean — a dirty tree produces ambiguous diffs
-    r = await run_proc(["git", "--no-optional-locks", "status", "--porcelain",
+    r = await _run_proc(["git", "--no-optional-locks", "status", "--porcelain",
                         "--untracked-files=no"])
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
@@ -13881,7 +13822,7 @@ async def _preflight_repo() -> None:
     # 3. external 'leerie' branch — a bare branch named 'leerie' occupies
     #    the ref path that leerie's namespaced branches (leerie/runs/*,
     #    leerie/subtasks/*) need as a directory in git's loose ref store.
-    r = await run_proc(["git", "show-ref", "--verify", "--quiet",
+    r = await _run_proc(["git", "show-ref", "--verify", "--quiet",
                         "refs/heads/leerie"])
     if r.returncode == 0:
         die("a branch named 'leerie' exists in this repository. "
@@ -20174,32 +20115,15 @@ def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     return _normalize_setup_packages(merged)
 
 
-def _dump_language_installs(entries: list[dict]) -> str:
-    """JSON-encode `language_installs` for TOML persistence, single-quote-safe.
-
-    The value is stored as a JSON string inside `.leerie/config.toml`.
-    `_toml_value` wraps a `"`-containing value in a TOML *literal* (`'...'`)
-    string, which cannot itself contain a `'`. A captured install command may
-    carry single quotes (e.g. `pip install 'requests[security]'`,
-    `gem install -v '~> 7.0'`), which would otherwise break the literal wrapper
-    and yield invalid TOML. Escaping them as the JSON escape `\\u0027` keeps the
-    value free of literal `'` while `json.loads` (both readers) recovers the
-    original quote — so the round-trip is lossless and the file is valid TOML."""
-    return json.dumps(entries, separators=(",", ":")).replace("'", "\\u0027")
-
-
 def _toml_value(val: str) -> str:
     """Render `val` as a TOML string literal.
 
-    A value containing `"` — notably the JSON-encoded `language_installs`
-    (`[{"manager":"pip",...}]`) — would terminate a basic (`"..."`) string
-    early and produce invalid TOML. TOML *literal* strings (`'...'`) process no
-    escapes, so wrap such values in single quotes. This requires the value to
-    contain no literal `'` — guaranteed for `language_installs` by
-    `_dump_language_installs` (which escapes `'`→`\\u0027`) and trivially true
-    for `setup_packages` (apt names have no quotes). Both readers (`_read_toml_key`
-    and the launcher's flat-TOML regex) already `.strip("'")`, so this
-    round-trips cleanly with no unescaping. Plain values keep the `"..."` form."""
+    A value containing `"` would terminate a basic (`"..."`) string early and
+    produce invalid TOML. TOML *literal* strings (`'...'`) process no escapes,
+    so such a value without a `'` is wrapped in single quotes. Both readers
+    (`_read_toml_key` and the launcher's flat-TOML regex) already
+    `.strip("'")`, so this round-trips cleanly with no unescaping. Plain
+    values keep the `"..."` form."""
     if '"' in val and "'" not in val:
         return f"'{val}'"
     return f'"{val}"'
@@ -20319,90 +20243,12 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
-# Node subcommands that install from an existing lockfile. `add`/`remove`/
-# `up`/`dlx` are deliberately absent: they change what is installed, so they
-# are never the per-worktree relink residual however they are flagged.
-_NODE_INSTALL_SUBCOMMANDS = frozenset({"install", "i", "ci"})
-
-
-def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
-    """Filter language_installs to only the residual that cannot be baked.
-
-    Per DESIGN §6½ and the out-of-repo bake redesign: Python/Ruby/Rust/Go deps
-    bake entirely to /opt/venv, /opt/bundle, CARGO_HOME, GOMODCACHE — workers
-    resolve them with zero install. Node/pnpm's store is baked read-only, but
-    the in-repo node_modules symlink tree must be recreated per worktree
-    (irreducible ~223ms offline-relink). So config.toml holds ONLY that Node
-    offline-relink residual; everything else is filtered out.
-
-    Returns a filtered copy; the input is unchanged.
-    """
-    # Managers whose installs bake entirely (no residual)
-    BAKEABLE_MANAGERS = frozenset([
-        "pip", "pip3", "uv",        # Python → /opt/venv
-        "bundle", "gem",             # Ruby → /opt/bundle
-        "cargo",                     # Rust → CARGO_HOME/CARGO_TARGET_DIR
-        "go",                        # Go → GOMODCACHE/GOCACHE
-    ])
-    # Node managers: keep only offline-relink commands
-    NODE_MANAGERS = frozenset(["pnpm", "npm", "yarn"])
-
-    residual = []
-    for entry in language_installs:
-        manager = entry.get("manager", "")
-        command = entry.get("command", "") or ""  # Guard against explicit None
-
-        # Filter out bakeable managers entirely
-        if manager in BAKEABLE_MANAGERS:
-            continue
-
-        # For Node managers, keep only offline-relink commands
-        if manager in NODE_MANAGERS:
-            # The irreducible residual is the offline/frozen-lockfile relink
-            # of an *install* — e.g. "pnpm install --offline
-            # --frozen-lockfile". Two independent conditions, both needed:
-            #
-            #   subcommand  the flags alone are not enough. "pnpm add
-            #               left-pad --frozen-lockfile" carries a pinned
-            #               flag but mutates the dependency set over the
-            #               network; re-running it per worktree is the
-            #               opposite of a relink. Same for remove/up/dlx.
-            #   flag        OR, not AND: the three managers spell this
-            #               differently (pnpm wants both, "npm install
-            #               --offline" and "yarn install --frozen-lockfile"
-            #               each stand alone), so requiring both would
-            #               drop two of the three.
-            #
-            # Token membership, not substring: "--offline" appearing
-            # inside a package name or a path must not count.
-            try:
-                toks = shlex.split(command)
-            except ValueError:      # unbalanced quotes in a captured line
-                continue
-            if len(toks) < 2 or toks[1] not in _NODE_INSTALL_SUBCOMMANDS:
-                continue
-            if "--offline" in toks or "--frozen-lockfile" in toks:
-                residual.append(entry)
-            continue
-
-        # Any other manager: leerie bakes only `BAKE_INSTALL_COMMANDS`,
-        # each with its own command, so nothing else is ever recorded
-        # (DESIGN §6½ *A capture names packages and managers, never
-        # commands*).
-        if manager in BAKE_INSTALL_COMMANDS:
-            residual.append(entry)
-
-    return residual
-
-
-def _capture_problems(setup_packages: object, language_installs: object
-                      ) -> list[str]:
+def _capture_problems(setup_packages: object) -> list[str]:
     """Why a capture cannot be recorded or applied, each named; [] when it
-    can (DESIGN §6½ *A capture names packages and managers, never
-    commands*): every `setup_packages` item a Debian package name, every
-    `language_installs` entry a manager leerie bakes and plain relative
-    input paths. The same rules as `SCHEMAS["dep_capture"]`, here because a
-    capture file is read back and the schema is not the only writer."""
+    can (DESIGN §6½ *A capture names packages, never commands*): every
+    `setup_packages` item a Debian package name. The same rule as
+    `SCHEMAS["dep_capture"]`, here because a capture file is read back and
+    the schema is not the only writer."""
     out: list[str] = []
     if not isinstance(setup_packages, list):
         out.append("setup_packages is not a list")
@@ -20412,37 +20258,7 @@ def _capture_problems(setup_packages: object, language_installs: object
                 and re.fullmatch(DEBIAN_PACKAGE_PATTERN, p)):
             out.append(f"setup_packages item {p!r} is not a Debian "
                        "package name")
-    if not isinstance(language_installs, list):
-        out.append("language_installs is not a list")
-        language_installs = []
-    for e in language_installs:
-        if not isinstance(e, dict):
-            out.append(f"language_installs entry {e!r} is not an object")
-            continue
-        m = e.get("manager")
-        if not (isinstance(m, str) and m in BAKE_INSTALL_COMMANDS):
-            out.append(f"language_installs manager {m!r} is not one leerie "
-                       f"bakes ({', '.join(sorted(BAKE_INSTALL_COMMANDS))})")
-        ins = e.get("copy_inputs", [])
-        if not isinstance(ins, list):
-            out.append(f"language_installs copy_inputs {ins!r} is not a list")
-            continue
-        for ci in ins:
-            if not (isinstance(ci, str)
-                    and re.fullmatch(CAPTURE_INPUT_PATTERN, ci)
-                    and ".." not in ci.split("/")):
-                out.append(f"language_installs input {ci!r} is not a plain "
-                           "relative path")
     return out
-
-
-def _table_installs(language_installs: list[dict]) -> list[dict]:
-    """Each entry as leerie records it: its manager, the command leerie's
-    table gives that manager (never the capture's own), and its inputs."""
-    return [{"manager": e["manager"],
-             "command": BAKE_INSTALL_COMMANDS[e["manager"]],
-             "copy_inputs": list(e.get("copy_inputs") or [])}
-            for e in language_installs]
 
 
 CAPTURED_DEPS_FILE = "captured-deps.json"
@@ -20450,18 +20266,16 @@ CAPTURED_DEPS_APPLIED_FILE = "captured-deps.applied.json"
 
 
 def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
-                               language_installs: list[dict],
                                replace: bool) -> dict[str, str]:
     """Merge one capture into `cfg_path` as it is now (DESIGN §6½): union /
     never-clobber, or wholesale replace for `--recapture --force`. Returns
     the keys written. A capture `_capture_problems` refuses writes nothing:
     refused whole, never trimmed to what passes."""
-    problems = _capture_problems(setup_packages, language_installs)
+    problems = _capture_problems(setup_packages)
     if problems:
         log("capture: refused, nothing written to "
             f"{cfg_path}: " + "; ".join(problems))
         return {}
-    language_installs = _table_installs(language_installs)
     updates: dict[str, str] = {}
     if setup_packages:
         if replace:
@@ -20477,35 +20291,12 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
             merged = _merge_setup_packages(existing, setup_packages)
             if merged is not None:
                 updates["setup_packages"] = merged
-    if language_installs:
-        # JSON-in-TOML because TOML has no inline array type compatible with
-        # the flat _read_toml_key/_write_config_toml_keys surface.
-        if replace:
-            # Wholesale replace: the fresh capture is authoritative — drop
-            # managers no longer present. Filter empty-manager junk (mirrors the
-            # union path below) and gate on the filtered list being non-empty so
-            # an empty-item capture never blanks a good config.
-            kept = [e for e in language_installs if e.get("manager")]
-            if kept:
-                updates["language_installs"] = _dump_language_installs(kept)
-        else:
-            existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
-            try:
-                existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
-            except (json.JSONDecodeError, ValueError):
-                existing_list = []
-            existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
-            new_entries = [e for e in language_installs
-                           if e.get("manager") and e["manager"] not in existing_managers]
-            if new_entries:
-                merged_list = existing_list + new_entries
-                updates["language_installs"] = _dump_language_installs(merged_list)
     if updates:
         _write_config_toml_keys(cfg_path, updates)
-        pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
-        li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
-        log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
-            "run `git add .leerie/ && git commit` to bake next run")
+        log(f"capture: dep_capture wrote setup_packages="
+            f"{updates['setup_packages']!r} to {cfg_path}; "
+            "run `git add .leerie/ && git commit` to build it into the "
+            "next run's image")
         return updates
     elif replace:
         # Under --force, an empty capture must not blank a good config.
@@ -20516,18 +20307,17 @@ def _merge_capture_into_config(cfg_path: Path, setup_packages: list[str],
 
 
 def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
-                    language_installs: list[dict], replace: bool) -> None:
+                    replace: bool) -> None:
     """Append one capture to `<record_in>/captured-deps.json` for the
     operator to apply (`apply_captured_deps`). Nothing is recorded for an
     empty one, nor for one `_capture_problems` refuses."""
-    if not setup_packages and not language_installs:
+    if not setup_packages:
         log("capture: dep_capture found no deps to record")
         return
-    problems = _capture_problems(setup_packages, language_installs)
+    problems = _capture_problems(setup_packages)
     if problems:
         log("capture: refused, nothing recorded: " + "; ".join(problems))
         return
-    language_installs = _table_installs(language_installs)
     path = record_in / CAPTURED_DEPS_FILE
     try:
         entries = json.loads(path.read_text()) if path.is_file() else []
@@ -20537,27 +20327,18 @@ def _record_capture(record_in: Path, from_run: str, setup_packages: list[str],
         entries = []
     entries.append({"from_run": from_run,
                     "setup_packages": list(setup_packages),
-                    "language_installs": list(language_installs),
                     "replace": bool(replace)})
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     tmp.write_text(json.dumps(entries, indent=1) + "\n")
     os.replace(tmp, path)
-    log(f"capture: recorded {len(setup_packages)} setup_packages and "
-        f"{len(language_installs)} language installs in {path}; review and "
-        f"apply them with `leerie config --apply-capture {record_in.name}`")
+    log(f"capture: recorded {len(setup_packages)} setup_packages in {path}; "
+        f"review and apply them with `leerie config --apply-capture {record_in.name}`")
 
 
 def _config_capture_problems(cfg: Path) -> list[str]:
-    """`_capture_problems` of what `cfg` holds now: its `setup_packages`
-    items and its `language_installs`, which must be a JSON list."""
-    pkgs = _split_setup_packages(_read_toml_key(cfg, "setup_packages") or "")
-    raw = _read_toml_key(cfg, "language_installs") or ""
-    try:
-        installs = json.loads(raw) if raw else []
-    except ValueError:
-        return (_capture_problems(pkgs, [])
-                + [f"language_installs {raw!r} is not a JSON list"])
-    return _capture_problems(pkgs, installs)
+    """`_capture_problems` of the `setup_packages` items `cfg` holds now."""
+    return _capture_problems(
+        _split_setup_packages(_read_toml_key(cfg, "setup_packages") or ""))
 
 
 def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
@@ -20583,8 +20364,7 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
         log(f"capture: could not read {path} ({e}); kept for a later apply")
         return 0
     problems = [p for e in entries
-                for p in (_capture_problems(e.get("setup_packages") or [],
-                                            e.get("language_installs") or [])
+                for p in (_capture_problems(e.get("setup_packages") or [])
                           if isinstance(e, dict) else [f"{e!r}"])]
     if problems:
         die(f"capture: {path} is refused, nothing was applied: "
@@ -20598,7 +20378,7 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
         if held:
             die(f"capture: {path} is refused, nothing was applied: the "
                 f"merged value would keep what {cfg} already holds, and "
-                "that is not a capture leerie bakes: " + "; ".join(held)
+                "that is not a capture leerie records: " + "; ".join(held)
                 + ". Fix or remove those entries in .leerie/config.toml "
                 "and apply again.")
     try:
@@ -20607,8 +20387,7 @@ def apply_captured_deps(run_dir: Path, repo_root: Path) -> int:
         before = ""
     for e in entries:
         _merge_capture_into_config(
-            cfg, list(e.get("setup_packages") or []),
-            list(e.get("language_installs") or []), bool(e.get("replace")))
+            cfg, list(e.get("setup_packages") or []), bool(e.get("replace")))
     try:
         after = _read_text_beneath(root, cfg, limit=READ_LIMIT_CONFIG)
     except OSError:
@@ -20652,8 +20431,7 @@ async def capture_repo_deps(
     replace=False (default, every automatic seam): union / never-clobber —
     only new packages/managers are added, existing entries are preserved.
     replace=True (only the operator-driven `--recapture --force` path):
-    wholesale-replace the persisted setup_packages + language_installs from the
-    fresh capture. A capture that yields nothing under replace leaves the
+    wholesale-replace the persisted setup_packages from the fresh capture. A capture that yields nothing under replace leaves the
     existing values untouched (never blanks a good config with an empty run).
     """
     if not resolve_capture_deps(repo_root):
@@ -20721,28 +20499,12 @@ async def capture_repo_deps(
         sid="dep-capture",
     )
     setup_packages: list[str] = result.get("setup_packages") or []
-    language_installs_captured: list[dict] = result.get("language_installs") or []
-
-    # Filter to residual-only (DESIGN §6½): the worker captures everything, but
-    # config.toml holds only deps that cannot be baked (Node offline-relink).
-    # Python/Ruby/Rust/Go bake entirely; their installs are filtered out.
-    language_installs = _filter_residual_deps(language_installs_captured)
-
-    # Log what was captured vs. what will be written (makes filtering observable)
-    if language_installs_captured:
-        filtered_count = len(language_installs_captured) - len(language_installs)
-        if filtered_count > 0:
-            log(f"capture: captured {len(language_installs_captured)} language installs, "
-                f"filtered {filtered_count} bakeable (writing {len(language_installs)} residual)")
-        else:
-            log(f"capture: captured {len(language_installs_captured)} language installs "
-                f"(all residual, none filtered)")
     if setup_packages:
         log(f"capture: captured {len(setup_packages)} setup_packages")
 
     if record_in is not None:
         _record_capture(Path(record_in), Path(str(log_dir)).parent.name,
-                        setup_packages, language_installs, replace)
+                        setup_packages, replace)
     else:
         log("capture: no run directory to record the capture in; "
             "nothing recorded")
@@ -21074,7 +20836,7 @@ def run_rebaser(
     # a program the checkout chose*, part 4): the worktree is the run
     # branch, which no operator has merged.
     pre_rebase_sha_r = asyncio.run(
-        run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/"))
+        _run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/"))
     if pre_rebase_sha_r.returncode != 0:
         return {
             "status": "failed",
@@ -21869,7 +21631,7 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     # NUL-separated: git quotes a name holding a byte outside ASCII, and the
     # quoted form matched no protected prefix (DESIGN §6 *A path is the file
     # it names, not its spelling*).
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
          f"{run_branch}..HEAD"],
         cwd=worktree,
@@ -21895,11 +21657,11 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     # A pair both of whose spellings the run branch already had is not this
     # subtask's; when git cannot list the run branch the check is skipped,
     # like the diff above.
-    base = await run_proc(
+    base = await _run_proc(
         ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
          "--name-only", run_branch], cwd=worktree)
     if base.returncode == 0:
-        ours = await run_proc(
+        ours = await _run_proc(
             ["git", *_tree_git_args(worktree), "ls-tree", "-r", "-z",
              "--name-only", "HEAD"], cwd=worktree)
         head = {f for f in ours.stdout.split("\0") if f} \
@@ -21970,7 +21732,7 @@ async def check_merge_committed(staging: Path) -> str | None:
     worker claimed success while leaving the worktree in a broken mid-merge
     state. This is the integrator-side analogue of `check_branch_has_commits`:
     it catches a worker lying about having finished."""
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(staging), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
         cwd=str(staging),
     )
@@ -21978,7 +21740,7 @@ async def check_merge_committed(staging: Path) -> str | None:
         return ("the staging worktree is still mid-merge (MERGE_HEAD exists) — "
                 "the integrator did not complete the merge commit")
     # also reject a worktree left with staged-but-uncommitted conflict edits
-    s = await run_proc(
+    s = await _run_proc(
         ["git", *_tree_git_args(staging), "diff", "--cached", "--name-only"],
         cwd=str(staging),
     )
@@ -21991,7 +21753,7 @@ async def check_merge_committed(staging: Path) -> str | None:
 async def check_integrator_commit(staging: Path) -> str | None:
     """Return an error if the integrator's merge commit touched .leerie/ files.
     The integrator should only touch project files, never coordination artifacts."""
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(staging), "show", "--name-only", "-z",
          "--format=", "HEAD"],
         cwd=str(staging),
@@ -22013,7 +21775,7 @@ async def _rebase_state_dirs(worktree: Path) -> list[str] | None:
     `<worktree>/.git/`."""
     present = []
     for name in ("rebase-merge", "rebase-apply"):
-        r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "--git-path", name],
+        r = await _run_proc(["git", *_tree_git_args(worktree), "rev-parse", "--git-path", name],
                            cwd="/")
         if r.returncode != 0:
             return None
@@ -22031,7 +21793,7 @@ def _is_conflict_marker(line: str, size: int) -> bool:
 
 
 async def _conflict_marker_size(worktree: Path, path: str) -> int:
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "--literal-pathspecs", "check-attr", "-z",
          "conflict-marker-size", "--", path],
         cwd="/")
@@ -22054,7 +21816,7 @@ async def _introduced_conflict_markers(
     with `--text` and the same rule applied here, except real binaries (a NUL
     in the first 8000 bytes, merge's own test), which merge never writes
     markers into."""
-    check = await run_proc(
+    check = await _run_proc(
         ["git", *_tree_git_args(worktree), "-c", "core.quotePath=off", "diff", "--no-color",
          "--no-renames", "--check", since, "--"],
         cwd="/")
@@ -22065,7 +21827,7 @@ async def _introduced_conflict_markers(
         r"^(.+):(\d+): leftover conflict marker$", check.stdout,
         re.MULTILINE)}
 
-    numstat = await run_proc(
+    numstat = await _run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--numstat", "-z", "--no-renames", since, "--"],
         cwd="/")
     if numstat.returncode != 0:
@@ -22080,7 +21842,7 @@ async def _introduced_conflict_markers(
         except OSError:  # deleted by the rebase, or a link
             continue
         size = await _conflict_marker_size(worktree, path)
-        diff = await run_proc(
+        diff = await _run_proc(
             ["git", *_tree_git_args(worktree), "--literal-pathspecs", "diff", "--text", "--no-textconv",
              "--no-ext-diff", "--no-color", "--no-renames", "-U0", since,
              "--", path],
@@ -22153,7 +21915,7 @@ async def check_rebaser_worktree_state(
         return (f"rebaser claimed {status!r} but worktree is still "
                 f"mid-rebase ({in_progress[0]} present) — abort did not "
                 f"complete")
-    r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/")
+    r = await _run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd="/")
     if r.returncode != 0:
         return f"could not verify worktree HEAD after rebaser claimed {status!r}"
     current_sha = r.stdout.strip()
@@ -22182,7 +21944,7 @@ async def _branch_has_commits_ahead(worktree: str,
         return False  # worktree gone — can't determine, treat as no commits
     base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
-        r = await run_proc(
+        r = await _run_proc(
             ["git", *_tree_git_args(worktree), "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
@@ -22213,7 +21975,7 @@ async def check_branch_has_commits(sid: str, worktree: str,
         return None  # worktree gone — can't determine, don't block
     base = await _branch_commit_for_tree_async(worktree, parent_branch)
     try:
-        r = await run_proc(
+        r = await _run_proc(
             ["git", *_tree_git_args(worktree), "log", f"{base}..HEAD", "--oneline"],
             cwd=worktree,
         )
@@ -22237,7 +21999,7 @@ async def _scan_conflict_markers(staging: Path) -> str | None:
     if not staging.exists():
         return None
     try:
-        r = await run_proc(
+        r = await _run_proc(
             ["git", *_tree_git_args(staging), "grep", "-l", "^<<<<<<< ", "HEAD"],
             cwd=str(staging),
         )
@@ -27024,13 +26786,10 @@ def _new_private_tmp(prefix: str) -> Path:
     return d
 
 
-def _cache_vars(env: Mapping[str, str], cache: Path) -> dict[str, str]:
-    """Every `_STORE_VARS` variable at `cache/<name>` (one beneath the
-    image's bake root `_BAKED_ROOT` in `env` is left out: leerie built it
-    into the image) and `XDG_CACHE_HOME` at `cache/xdg`; the pnpm store and
-    `xdg` are made."""
-    out = {var: str(cache / name) for var, name in _STORE_VARS.items()
-           if not (env.get(var) or "").startswith(_BAKED_ROOT)}
+def _cache_vars(cache: Path) -> dict[str, str]:
+    """Every `_STORE_VARS` variable at `cache/<name>` and `XDG_CACHE_HOME`
+    at `cache/xdg`; the pnpm store and `xdg` are made."""
+    out = {var: str(cache / name) for var, name in _STORE_VARS.items()}
     out["XDG_CACHE_HOME"] = str(cache / "xdg")
     _with_pnpm_spellings(out)
     for d in (cache / "xdg", cache / "pnpm-store"):
@@ -27486,7 +27245,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     `cmd` must already contain `--output-format stream-json --verbose`
     — `claude_p` adds those.
 
-    Errors / cancellation follow `run_proc`'s contract: timeout raises
+    Errors / cancellation follow `_run_proc`'s contract: timeout raises
     `subprocess.TimeoutExpired`, cancellation kills the child and
     re-raises. A worker that exits without emitting any `result` event
     raises `WorkerError` — same error class callers already handle.
@@ -28578,7 +28337,7 @@ def _restore_sigchld_default() -> None:
     their exit status is gone before anyone can read it. asyncio's
     `PidfdChildWatcher` then `waitpid`s a pid that no longer exists, catches
     `ChildProcessError`, and invents **returncode 255 with empty stdout**
-    (CPython `asyncio/unix_events.py`). Every worker and every `run_proc` call
+    (CPython `asyncio/unix_events.py`). Every worker and every `_run_proc` call
     goes through asyncio, so an inherited SIG_IGN silently corrupts the first
     subprocess's result.
 
@@ -34413,7 +34172,7 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
 
     # Capture resolved versions. `mise ls --current --json` is the
     # documented machine-readable view; `mise current --json` does NOT
-    # exist (verified against mise.usage.kdl). Bounded via `run_proc` —
+    # exist (verified against mise.usage.kdl). Bounded via `_run_proc` —
     # an unbounded `communicate()` here would hang provisioning forever
     # if the mise-managed shim ever blocked (the same unguarded-
     # communicate() shape fixed for `mise install` above).
@@ -34421,7 +34180,7 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
         # A confined command: under the execution lock, as `_run_streaming`.
         async with _exec_lock().shared():
             with _shim_refusals("mise ls --current --json") as refusal_fd:
-                result = await run_proc(
+                result = await _run_proc(
                     _confined_argv(grants,
                                    ["mise", "ls", "--current", "--json"],
                                    refusal_fd=refusal_fd),
@@ -44256,47 +44015,6 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
     st.save()
 
 
-def _is_baked_ecosystem_command(command: list[str]) -> bool:
-    """Return True if this install command is for an ecosystem whose
-    dependencies are baked into the image at `/opt/*`, making the per-run
-    install unnecessary (DESIGN §6½ "Persistent out-of-repo dependency bake").
-
-    Ecosystems with zero per-run install:
-      - Python (pip, uv, poetry, pipenv) → baked to /opt/venv
-      - Ruby (bundle) → baked to /opt/bundle
-      - Rust (cargo) → baked to CARGO_HOME + CARGO_TARGET_DIR
-      - Go (go) → baked to GOMODCACHE + GOCACHE
-
-    Ecosystems with irreducible residual:
-      - Node/pnpm → requires offline relink (NOT filtered here; handled separately)
-      - npm/yarn → full offline install (still network-free, kept for now)
-    """
-    if not command:
-        return False
-
-    cmd0 = command[0]
-
-    # Python: pip, pip3, python -m pip, uv, poetry, pipenv
-    if cmd0 in ("pip", "pip3", "uv", "poetry", "pipenv"):
-        return True
-    if cmd0 in ("python", "python3") and len(command) >= 3 and command[1:3] == ["-m", "pip"]:
-        return True
-
-    # Ruby: bundle
-    if cmd0 == "bundle":
-        return True
-
-    # Rust: cargo
-    if cmd0 == "cargo":
-        return True
-
-    # Go: go
-    if cmd0 == "go":
-        return True
-
-    return False
-
-
 _PROVISION_TIMEOUT_DEFAULT_S = 1800.0
 
 
@@ -44338,13 +44056,9 @@ def _format_provision_recipe_section(recipe: list[dict],
     in their own worktrees (DESIGN §6½ "Worker-driven install"). This
     function is the prompt-injection helper that hands the recipe to
     workers verbatim — no per-worker variation, same string in every
-    prompt.
-
-    For repos with baked dependencies (Python to /opt/venv, Ruby to /opt/bundle,
-    Rust/Go with warmed caches), install commands for those ecosystems are
-    filtered out — workers inherit the bake with zero install cost. Only Node/pnpm
-    retains the offline relink residual (DESIGN §6½ "Persistent out-of-repo
-    dependency bake").
+    prompt. Every install and build entry is shown: the repository image
+    holds no dependency, so a worker's tree has only what an install in it
+    made (DESIGN §6½ *The repository image holds no dependency*).
     """
     install_entries = [e for e in recipe
                        if e.get("kind") in ("install", "build")
@@ -44352,50 +44066,28 @@ def _format_provision_recipe_section(recipe: list[dict],
     if not install_entries:
         return None
 
-    # Filter out baked ecosystem installs (Python, Ruby, Rust, Go).
-    # Keep Node offline relink and any other commands (npm/yarn, build steps).
-    filtered_entries = []
-    for e in install_entries:
-        cmd = e.get("command", [])
-        if e.get("kind") == "install" and _is_baked_ecosystem_command(cmd):
-            # Baked ecosystem — skip this install
-            continue
-        # Keep: build commands, Node offline relink, npm/yarn, anything else
-        filtered_entries.append(e)
-
-    if not filtered_entries:
-        return None
-
     lines = ["", "PROVISION_RECIPE:"]
     if audience == "implementer":
         lines.append(
-            "  The following residual install/build commands could not be "
-            "baked into the image and may need to run in your worktree. "
-            "Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
-            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
-            "you inherit them with zero install. This list holds only what "
-            "remains: Node's offline relink, build steps, or other unbaked "
-            "commands. Decide whether your subtask needs them — if yes, run "
+            "  The following install/build commands may need to run in your "
+            "worktree, which starts with no installed dependencies. "
+            "Decide whether your subtask needs them — if yes, run "
             "them via Bash in the order shown. These are advisory: skip them "
             "if your subtask is purely documentation, config, or otherwise "
             "doesn't touch buildable code."
         )
     elif audience == "conformer":
         lines.append(
-            "  Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
-            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
-            "your worktree inherits them with zero install. The following "
-            "residual commands are what could not be baked (Node offline "
-            "relink, build steps, etc.). The orchestrator applies these "
-            "itself before it measures build/lint/tests, so you do not "
-            "need them for the BLT_RESULTS: block. They are listed because "
+            "  The following commands are the repository's install and "
+            "build steps. The orchestrator applies these itself before it "
+            "measures build/lint/tests, so you do not need them for the BLT_RESULTS: block. They are listed because "
             "a *targeted* command of your own may still need the deps "
             "present — run them, in the order shown, if one fails "
             "diagnosing something missing."
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
-    for i, e in enumerate(filtered_entries, 1):
+    for i, e in enumerate(install_entries, 1):
         # An `env` entry (e.g. _normalize_node_threadpool's thread-pool
         # caps) is rendered as a shell-style `VAR=val` prefix so a worker
         # copying this line into its own Bash call still gets the cap —
@@ -44883,7 +44575,7 @@ async def _changed_files(tree: str, base_ref: str) -> list[str]:
     the current run-branch tip (`scripts/new-worktree.sh`) and integration
     happens only at a wave boundary, so `<run_branch>..HEAD` is the subtask's
     own diff in every wave."""
-    r = await run_proc(["git", *_tree_git_args(tree), "diff", "-z", "--name-only",
+    r = await _run_proc(["git", *_tree_git_args(tree), "diff", "-z", "--name-only",
                         f"{base_ref}..HEAD"], cwd=tree)
     if r.returncode != 0:
         return []
@@ -46111,7 +45803,7 @@ async def _branch_head_sha(worktree: str) -> str:
     caller about to decide a rollback must not see as an exception. Used as
     the rollback target before the conformer adds commits."""
     try:
-        r = await run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=worktree)
+        r = await _run_proc(["git", *_tree_git_args(worktree), "rev-parse", "HEAD"], cwd=worktree)
     except OSError:
         return ""
     if r.returncode != 0:
@@ -46141,12 +45833,12 @@ async def _create_empty_subtask_branch(repo_root: str, run_id: str,
     branch (a resume re-entering `_settle_subtask`) is left exactly where it
     is, never repointed, since by then it may carry commits."""
     branch = _compute_subtask_branch(run_id, sid)
-    exists = await run_proc(
+    exists = await _run_proc(
         ["git", *_git_at(repo_root), "rev-parse", "--verify", "--quiet",
          f"refs/heads/{branch}"])
     if exists.returncode == 0:
         return True
-    r = await run_proc(["git", *_git_at(repo_root), "branch", branch,
+    r = await _run_proc(["git", *_git_at(repo_root), "branch", branch,
                         _compute_run_branch(run_id)])
     if r.returncode != 0:
         # Named, not swallowed: the caller falls through to the implementer on
@@ -46169,7 +45861,7 @@ async def _merge_base_sha(worktree: str, a: str, b: str) -> str:
     clobber report on every run whose final conformer committed anything)."""
     if not a or not b:
         return ""
-    r = await run_proc(["git", *_tree_git_args(worktree), "merge-base", a, b], cwd=worktree)
+    r = await _run_proc(["git", *_tree_git_args(worktree), "merge-base", a, b], cwd=worktree)
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -46189,7 +45881,7 @@ async def _protected_paths_since(worktree: str,
     add to staging."""
     if not before_sha:
         return []
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
          f"{before_sha}..HEAD"],
         cwd=worktree,
@@ -46209,7 +45901,7 @@ async def _blob_sha(worktree: str, ref: str, path: str) -> str | None:
     `<ref>:<path>` string to stdout *and* exits non-zero, so naive
     callers capture a bogus value; `--verify -q` exits cleanly with empty
     stdout instead."""
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "rev-parse", "--verify", "-q", f"{ref}:{path}"],
         cwd=worktree,
     )
@@ -46236,7 +45928,7 @@ async def _clobbered_owned_files(worktree: str, base_ref: str,
       blob and is not flagged."""
     if not base_ref or not impl_head:
         return []
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "diff", "--name-only", f"{base_ref}..{impl_head}"],
         cwd=worktree,
     )
@@ -46371,10 +46063,10 @@ async def _fresh_status(prefix: list[str], env: dict[str, str] | None
         e = dict(os.environ if env is None else env)
         e.update(GIT_INDEX_FILE=os.path.join(d, "index"),
                  GIT_OPTIONAL_LOCKS="0")
-        rt = await run_proc(["git", *prefix, "read-tree", "HEAD"], env=e)
+        rt = await _run_proc(["git", *prefix, "read-tree", "HEAD"], env=e)
         if rt.returncode != 0:
             return rt
-        return await run_proc(["git", *prefix, "status", "--porcelain",
+        return await _run_proc(["git", *prefix, "status", "--porcelain",
                                "--untracked-files=no"], env=e)
 
 
@@ -46412,13 +46104,13 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
             await asyncio.to_thread(_restore_settings, tree)
         prefix, env = await asyncio.to_thread(_git_view, tree)
         settings = await asyncio.to_thread(_settings_dirt, tree)
-        r = await run_proc(["git", *prefix, "status", "--porcelain",
+        r = await _run_proc(["git", *prefix, "status", "--porcelain",
                             "--untracked-files=no"], env=env)
         fresh = await _fresh_status(prefix, env)
-        flags = await run_proc(["git", *prefix, "ls-files", "-v", "-z"],
+        flags = await _run_proc(["git", *prefix, "ls-files", "-v", "-z"],
                                env=env)
         others_args, others_env = _untracked_cmd(tree)
-        others = await run_proc(["git", *others_args], env=others_env)
+        others = await _run_proc(["git", *others_args], env=others_env)
     except OSError:
         return None
     if any(x.returncode != 0 for x in (r, fresh, flags, others)):
@@ -46433,7 +46125,7 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
     lines += [f"?? {p}" for p in others.stdout.split("\0") if p]
     if branch:
         try:
-            cur = await run_proc(["git", *_tree_git_args(tree), "symbolic-ref", "-q", "HEAD"],
+            cur = await _run_proc(["git", *_tree_git_args(tree), "symbolic-ref", "-q", "HEAD"],
                                  cwd=str(tree))
         except OSError:
             return None
@@ -46444,7 +46136,7 @@ async def _tree_dirt(tree: str | Path, *, branch: str | None = None,
                             else "detached") + ")")
     if base:
         try:
-            anc = await run_proc(["git", *_tree_git_args(tree), "merge-base", "--is-ancestor",
+            anc = await _run_proc(["git", *_tree_git_args(tree), "merge-base", "--is-ancestor",
                                   base, "HEAD"], cwd=str(tree))
         except OSError:
             return None
@@ -46462,7 +46154,7 @@ async def _ref_sha(repo: str | Path | None, branch: str) -> str:
     if not repo:
         return ""
     try:
-        r = await run_proc(["git", *_git_at(repo), "rev-parse", "--verify",
+        r = await _run_proc(["git", *_git_at(repo), "rev-parse", "--verify",
                             "-q", f"refs/heads/{branch}"])
     except OSError:
         return ""
@@ -46478,7 +46170,7 @@ async def _fork_point(st: "State", sid: str) -> str:
     if not await _ref_sha(_run_repo(st), sub):
         return await _ref_sha(_run_repo(st), run)
     try:
-        r = await run_proc(["git", *_git_at(_run_repo(st)),
+        r = await _run_proc(["git", *_git_at(_run_repo(st)),
                             "merge-base", f"refs/heads/{sub}",
                             f"refs/heads/{run}"])
     except OSError:
@@ -46600,7 +46292,7 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
     `conformance_warnings`, never trigger rollback."""
     if not before_sha:
         return []
-    r = await run_proc(
+    r = await _run_proc(
         ["git", *_tree_git_args(worktree), "log", "--format=%s", f"{before_sha}..HEAD"],
         cwd=worktree,
     )
@@ -47860,7 +47552,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             if tests_paths or _fixed_claims:
                 phase_files: set[str] = set()
                 try:
-                    _pd = await run_proc(
+                    _pd = await _run_proc(
                         ["git", *_tree_git_args(worktree), "diff", "--name-only", "-z",
                          f"{impl_head_sha}..HEAD"], cwd=worktree)
                     if _pd.returncode == 0:
@@ -48616,7 +48308,7 @@ async def _worktree_tree_sha(tree: str) -> str | None:
     (`_tree_dirt`)."""
     if await _tree_dirt(tree) != []:
         return None
-    r = await run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
+    r = await _run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
     if r.returncode != 0:
         return None
     return r.stdout.strip() or None
@@ -48629,7 +48321,7 @@ async def _committed_tree_sha(tree: str) -> str | None:
     all a test run's own `__pycache__/` or report file — is part of it.
     None only when git fails. `_worktree_tree_sha` stays the identity of a
     *measurement*, where an untracked file can change what a run collects."""
-    r = await run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
+    r = await _run_proc(["git", *_tree_git_args(tree), "rev-parse", "HEAD^{tree}"], cwd=tree)
     if r.returncode != 0:
         return None
     return r.stdout.strip() or None
@@ -49044,21 +48736,18 @@ _INSTALL_INPUT_NAMES = frozenset({
 _INSTALL_INPUT_DIRS = frozenset({"patches"})
 
 
-def _install_key(repo: Path, tip: str, recipe: list, copy_inputs:
-                 list[str]) -> str | None:
+def _install_key(repo: Path, tip: str, recipe: list) -> str | None:
     """The install key of `tip` (DESIGN §8 *A view moves to the next tip
     when the install's inputs are unchanged*): the recipe's `install`
     entries (command, working directory, environment) and the git blob of
     every install input at `tip` — a tracked file named in
-    `_INSTALL_INPUT_NAMES`, under a `_INSTALL_INPUT_DIRS` directory, or at
-    or under a `copy_inputs` path — read from the run repository. None when
-    git cannot list the tip."""
+    `_INSTALL_INPUT_NAMES` or under a `_INSTALL_INPUT_DIRS` directory — read
+    from the run repository. None when git cannot list the tip."""
     r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-z",
                         "--full-tree", tip], capture_output=True,
                        check=False, timeout=60)
     if r.returncode != 0:
         return None
-    named = {c.strip("/") for c in copy_inputs if c}
     h = hashlib.sha256()
     for e in recipe:
         if e.get("kind") == "install" and e.get("command"):
@@ -49072,23 +48761,9 @@ def _install_key(repo: Path, tip: str, recipe: list, copy_inputs:
         path = os.fsdecode(raw)
         parts = path.split("/")
         if (parts[-1] in _INSTALL_INPUT_NAMES
-                or any(d in _INSTALL_INPUT_DIRS for d in parts[:-1])
-                or any(path == n or path.startswith(n + "/") for n in named)):
+                or any(d in _INSTALL_INPUT_DIRS for d in parts[:-1])):
             h.update(raw + b" " + meta + b"\0")
     return h.hexdigest()
-
-
-def _copy_inputs_of(repo_root: Path) -> list[str]:
-    """The dependency capture's `copy_inputs` (`.leerie/config.toml`
-    `language_installs`), every entry's."""
-    raw = _read_toml_key(Path(repo_root) / CAPTURE_DEPS_CONFIG,
-                         "language_installs") or ""
-    try:
-        entries = json.loads(raw) if raw else []
-    except ValueError:
-        return []
-    return [c for e in entries if isinstance(e, dict)
-            for c in (e.get("copy_inputs") or []) if isinstance(c, str)]
 
 
 def _ignored_paths(tree: str | Path) -> set[str] | None:
@@ -49253,8 +48928,7 @@ async def _record_view_install(st: "State", view_key: str) -> None:
             continue
         recipe = (st.data.get("provision") or {}).get("recipe") or []
         reg = await asyncio.to_thread(_view_repo, st, tree_key)
-        ikey = (await asyncio.to_thread(
-            _install_key, reg, tip, recipe, _copy_inputs_of(st.repo_root))
+        ikey = (await asyncio.to_thread(_install_key, reg, tip, recipe)
                 if reg is not None else None)
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
@@ -49295,7 +48969,7 @@ async def _view_tree_sha(st: "State", tree: str | Path) -> str | None:
     if ref is None:
         return await _committed_tree_sha(str(tree))
     reg = await asyncio.to_thread(_view_repo, st, tree) or Path(tree)
-    got = await run_proc(["git", *_git_at(reg), "rev-parse", "--verify",
+    got = await _run_proc(["git", *_git_at(reg), "rev-parse", "--verify",
                           "-q", f"refs/heads/{ref}^{{tree}}"])
     return got.stdout.strip() if got.returncode == 0 else None
 
@@ -49338,9 +49012,7 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     made = _VIEW_INSTALLS.get(os.path.realpath(wt))
     if have and have[1].is_dir() and made is not None:
         recipe = (st.data.get("provision") or {}).get("recipe") or []
-        now_key = await asyncio.to_thread(
-            _install_key, reg, tip, recipe,
-            _copy_inputs_of(st.repo_root))
+        now_key = await asyncio.to_thread(_install_key, reg, tip, recipe)
         if now_key is not None and now_key == made[0] and \
                 await asyncio.to_thread(_move_view, reg, wt, tip, made[1]):
             _VIEWS[key] = (tip, wt)
@@ -49552,7 +49224,7 @@ async def _carried_selection(st: "State", tree: str, tree_sha: str,
         reach_from[measured] = set()
         if measured == tree_sha:
             continue
-        got = await run_proc(["git", *_tree_git_args(tree), "diff",
+        got = await _run_proc(["git", *_tree_git_args(tree), "diff",
                               "--name-only", "--no-renames", "-z", measured,
                               tree_sha], cwd=tree)
         if got.returncode != 0:
@@ -49620,7 +49292,7 @@ async def _near_selection(st: "State", tree: str, tree_sha: str, pre_sha: str,
     head = await _branch_head_sha(tree)
     if not ledger or not head:
         return None
-    got = await run_proc(["git", *_tree_git_args(tree), "diff", "--name-only",
+    got = await _run_proc(["git", *_tree_git_args(tree), "diff", "--name-only",
                           "--no-renames", "-z", pre_sha, tree_sha], cwd=tree)
     if got.returncode != 0:
         return None
@@ -52437,11 +52109,11 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     except OSError as e:
         out["error"] = f"{type(e).__name__}: {e}"
     out["passed"] = out["rc"] == 0
-    st_ = await run_proc(["git", *_tree_git_args(tree), "status", "--porcelain",
+    st_ = await _run_proc(["git", *_tree_git_args(tree), "status", "--porcelain",
                           "--untracked-files=no"], cwd=str(tree))
     if st_.returncode != 0 or st_.stdout.strip():
         out["dirty"] = True
-        await run_proc(["git", *_tree_git_args(tree), "checkout", "--", "."], cwd=str(tree))
+        await _run_proc(["git", *_tree_git_args(tree), "checkout", "--", "."], cwd=str(tree))
     return out
 
 
@@ -52970,7 +52642,7 @@ async def _ci_touched(staging: Path, a: str, b: str) -> list[str]:
     unknown."""
     if not a or not b:
         return []
-    d = await run_proc(["git", *_tree_git_args(staging), "diff",
+    d = await _run_proc(["git", *_tree_git_args(staging), "diff",
                         "--name-only", f"{a}..{b}"], cwd=str(staging))
     return [x for x in d.stdout.splitlines() if x.strip()]
 
@@ -63571,7 +63243,7 @@ def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
 
 
 async def _git_out(cwd: Path, *args: str) -> str:
-    p = await run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
+    p = await _run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
     return p.stdout if p.returncode == 0 else ""
 
 
@@ -73470,7 +73142,7 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
                 branch=_compute_subtask_branch(st.run_id, sid))
         elif pre and st.repo_root:
             ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
-            ok = (await run_proc(["git", "--git-dir", str(_run_repo(st)),
+            ok = (await _run_proc(["git", "--git-dir", str(_run_repo(st)),
                                   "update-ref", ref, pre])).returncode == 0
             # A tree repository the tree outlived would hand the round's
             # commits back at the next take (`leerie_tree` takes a stale
@@ -73696,7 +73368,7 @@ async def _changed_line_numbers(tree: Path, base_ref: str,
                                 path: str) -> list[int]:
     """New-side line numbers `base_ref..HEAD` changed in `path`, from the
     `-U0` hunk headers."""
-    r = await run_proc(["git", *_tree_git_args(tree), "--literal-pathspecs", "diff", "-U0",
+    r = await _run_proc(["git", *_tree_git_args(tree), "--literal-pathspecs", "diff", "-U0",
                         f"{base_ref}..HEAD", "--", path], cwd=str(tree))
     out: set[int] = set()
     for line in r.stdout.splitlines() if r.returncode == 0 else []:
@@ -74248,7 +73920,7 @@ async def _redrive_uncovered_subtasks(
             if r.get("status") == "complete":
                 results[s] = r
                 if pre[s]:
-                    diff = await run_proc(
+                    diff = await _run_proc(
                         ["git", *_git_at(_run_repo(st)), "diff", "--name-only",
                          f"{pre[s]}..refs/heads/"
                          f"{_compute_subtask_branch(st.run_id, s)}"])
@@ -74384,7 +74056,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             + "; ".join(f"`{shlex.join(a)}` runs `{f}`" for a, f in refused))
         log(f"  {sid}: settle by execution — none: {record['why']}")
         return _done()
-    pre = await run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
+    pre = await _run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
                           "--untracked-files=no"], cwd=worktree)
     if pre.returncode != 0 or pre.stdout.strip():
         # Never run over uncommitted work: the clean-tree check below could
@@ -74499,7 +74171,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             verdict = "none"
             record["why"] = f"a verify command was not run — {e}"
         if verdict == "pass":
-            post = await run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
+            post = await _run_proc(["git", *_tree_git_args(worktree), "status", "--porcelain",
                                    "--untracked-files=no"], cwd=worktree)
             changed = (post.stdout.splitlines() if post.returncode == 0
                        else [])
@@ -74671,7 +74343,7 @@ async def _sibling_deliveries(worktree: str, sid: str,
     `integrate.sh` wrote and `git diff --name-only` output."""
     if not planned or not Path(worktree).exists():
         return []
-    log_p = await run_proc(["git", *_tree_git_args(worktree), "log", "--first-parent", "--merges",
+    log_p = await _run_proc(["git", *_tree_git_args(worktree), "log", "--first-parent", "--merges",
                             "--format=%H%x09%P%x09%s", "HEAD"], cwd=worktree)
     if log_p.returncode != 0:
         return []
@@ -74685,7 +74357,7 @@ async def _sibling_deliveries(worktree: str, sid: str,
         first_parent = parents.split()[0] if parents.split() else ""
         if not other or other == sid or not first_parent:
             continue
-        diff = await run_proc(["git", *_tree_git_args(worktree), "diff", "--name-only", first_parent,
+        diff = await _run_proc(["git", *_tree_git_args(worktree), "diff", "--name-only", first_parent,
                                sha], cwd=worktree)
         if diff.returncode != 0:
             continue
@@ -75392,7 +75064,7 @@ async def _network_reach(host: str, port: int, *,
         # The credential goes in the environment, never argv (`ps`).
         env = {**os.environ, "LEERIE_PROBE_PROXY_AUTH": proxy[2]}
     try:
-        r = await run_proc(argv, timeout=_NETWORK_PROBE_HARD_SEC, env=env)
+        r = await _run_proc(argv, timeout=_NETWORK_PROBE_HARD_SEC, env=env)
     except (subprocess.TimeoutExpired, OSError):
         return "unknown"
     word = r.stdout.strip()
@@ -75413,7 +75085,7 @@ async def _repo_mentions(worktree: str, ref: str, kind: str,
     for k in keys:
         cmd += ["-e", k]
     try:
-        r = await run_proc(cmd + [ref, "--"], timeout=60)
+        r = await _run_proc(cmd + [ref, "--"], timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode not in (0, 1):
@@ -75500,7 +75172,7 @@ async def _env_template_local_service(worktree: str, ref: str,
     not external*): a local host (`_network_local_host`), a service the
     repository's compose file defines, or a sqlite Prisma datasource."""
     try:
-        ls = await run_proc(["git", *_tree_git_args(worktree), "ls-tree", "-r",
+        ls = await _run_proc(["git", *_tree_git_args(worktree), "ls-tree", "-r",
                              "--name-only", ref], timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return ""
@@ -75513,7 +75185,7 @@ async def _env_template_local_service(worktree: str, ref: str,
     texts: dict[str, str] = {}
     for p in paths:
         try:
-            r = await run_proc(["git", *_tree_git_args(worktree), "show",
+            r = await _run_proc(["git", *_tree_git_args(worktree), "show",
                                 f"{ref}:{p}"], timeout=60)
         except (subprocess.TimeoutExpired, OSError):
             continue
@@ -76253,7 +75925,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # Mechanical checks on the implementer's output.
             run_branch = await _branch_commit_for_tree_async(
                 worktree, _compute_run_branch(st.run_id))
-            diff_proc = await run_proc(
+            diff_proc = await _run_proc(
                 ["git", *_tree_git_args(worktree), "diff", "--name-only", run_branch],
                 cwd=worktree)
             actual_files = set(diff_proc.stdout.strip().splitlines()
@@ -76450,7 +76122,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # `blocked` if residuals remain.
             #
             # The broad try/except is load-bearing: `_run_conformance_phase`
-            # calls `run_proc` → `asyncio.create_subprocess_exec`, which
+            # calls `_run_proc` → `asyncio.create_subprocess_exec`, which
             # raises `FileNotFoundError` when `cwd` is missing. Catching
             # everything here preserves the advisory framing for exceptions;
             # the strict-conformer check runs AFTER this block on the
@@ -76700,7 +76372,7 @@ def _next_rescue_ref(staging: Path, run_id: str, sid: str) -> str | None:
     `refs/leerie/*` keeps no reflog). A flat `…/<sid>` ref an older leerie
     wrote cannot also be a directory, so beside one the name is
     `…/<sid>.<n>`. None when git cannot list the refs. Plain
-    `subprocess.run`, like the git-dir probe, outside the pinned `run_proc`
+    `subprocess.run`, like the git-dir probe, outside the pinned `_run_proc`
     sequence."""
     base = f"refs/leerie/rescue/{run_id}/{sid}"
     # The rescue refs are the run repository's (DESIGN §6 *A repository per
@@ -76762,15 +76434,15 @@ async def _rescue_integrator_work(staging: Path, sid: str,
     rescue_index = rescue_dir / f"leerie-rescue-index-{sid}"
     env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
     try:
-        seed = await run_proc(["git", *_tree_git_args(staging), "read-tree", "HEAD"],
+        seed = await _run_proc(["git", *_tree_git_args(staging), "read-tree", "HEAD"],
                               cwd=str(staging), env=env)
         if seed.returncode != 0:
             return None
-        staged = await run_proc(["git", *_tree_git_args(staging), "add", "-A"],
+        staged = await _run_proc(["git", *_tree_git_args(staging), "add", "-A"],
                                 cwd=str(staging), env=env)
         if staged.returncode != 0:
             return None
-        tree = await run_proc(["git", *_tree_git_args(staging), "write-tree"], cwd=str(staging), env=env)
+        tree = await _run_proc(["git", *_tree_git_args(staging), "write-tree"], cwd=str(staging), env=env)
         if tree.returncode != 0 or not tree.stdout.strip():
             return None
         tree_sha = tree.stdout.strip()
@@ -76778,12 +76450,12 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         # integrator crashed before changing anything. Returning a ref here
         # would be a lie the caller repeats to the operator ("resolution
         # rescued to ...") while pointing at an empty diff.
-        head_tree = await run_proc(["git", *_tree_git_args(staging), "rev-parse", "HEAD^{tree}"],
+        head_tree = await _run_proc(["git", *_tree_git_args(staging), "rev-parse", "HEAD^{tree}"],
                                    cwd=str(staging))
         if (head_tree.returncode == 0
                 and head_tree.stdout.strip() == tree_sha):
             return None
-        commit = await run_proc(
+        commit = await _run_proc(
             ["git", *_tree_git_args(staging), "commit-tree", tree_sha, "-p", "HEAD",
              "-m", f"leerie: rescued {sid} integrator resolution"],
             cwd=str(staging), env=env)
@@ -76802,7 +76474,7 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         # live in the repo, not the index, and the temp file is about to go.
         # The empty old value makes it create-only: a rescue ref is never
         # overwritten (round-3 review L3).
-        stored = await run_proc(
+        stored = await _run_proc(
             ["git", *_git_at(run_repo or staging), "update-ref", "-m",
              f"leerie: rescued {sid} integrator resolution", ref,
              commit.stdout.strip(), ""])
@@ -76837,7 +76509,7 @@ _SYNTHETIC_GIT_ENV = {"GIT_AUTHOR_NAME": "leerie",
 async def _git_text(cwd: str | Path, *args: str) -> str | None:
     """stdout of `git <args>` in `cwd`, or None when it exits non-zero."""
     try:
-        r = await run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
+        r = await _run_proc(["git", *_tree_git_args(cwd), *args], cwd=str(cwd))
     except OSError:
         return None
     return r.stdout if r.returncode == 0 else None
@@ -76991,7 +76663,7 @@ async def _overlay_other_side(tree: Path, other: str, base: str,
         if code.startswith("D"):
             _unlink_beneath(tree, target)
             continue
-        content = await run_proc(["git", *_tree_git_args(tree), "show", f"{other}:{path}"],
+        content = await _run_proc(["git", *_tree_git_args(tree), "show", f"{other}:{path}"],
                                  cwd=str(tree))
         if content.returncode == 0:
             _write_beneath(tree, target, content.stdout.encode())
@@ -77254,7 +76926,7 @@ async def _settled_head_integrated(staging: Path, st: "State",
     head = (st.data.get("settled_heads") or {}).get(sid)
     if not head:
         return True
-    r = await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor", head, "HEAD"],
+    r = await _run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor", head, "HEAD"],
                        cwd=str(staging))
     return r.returncode == 0
 
@@ -77289,7 +76961,7 @@ async def _ancestor_codes(staging: Path, refs: list[str],
     codes: list[int] = []
     for ref in refs:
         try:
-            r = await run_proc(["git", *at, "merge-base", "--is-ancestor",
+            r = await _run_proc(["git", *at, "merge-base", "--is-ancestor",
                                 ref, rev])
         except OSError:
             return None
@@ -77402,7 +77074,7 @@ async def _integration_judge_verdict(
     crashed every round."""
     repo_root = Path(os.getcwd())
     sys_prompt_judge = _load_prompt("integration_judge")
-    merge_diff = (await run_proc(["git", *_tree_git_args(staging), "show", "--format=%B", rev],
+    merge_diff = (await _run_proc(["git", *_tree_git_args(staging), "show", "--format=%B", rev],
                                  cwd=str(staging))).stdout
     intent = incoming.get("intent", "")
 
@@ -77469,7 +77141,7 @@ async def _synthetic_merge(staging: Path, head: str, p1: str, p2: str,
     """A merge object of `head`'s tree over both parents, on no ref, so the
     repaired result is judged as one whole merge."""
     msg = await _git_text(staging, "log", "-1", "--format=%B", message_of)
-    r = await run_proc(["git", *_tree_git_args(staging), "commit-tree", f"{head}^{{tree}}", "-p", p1,
+    r = await _run_proc(["git", *_tree_git_args(staging), "commit-tree", f"{head}^{{tree}}", "-p", p1,
                         "-p", p2, "-m", (msg or "").strip() or "merge"],
                        cwd=str(staging),
                        env={**os.environ, **_SYNTHETIC_GIT_ENV})
@@ -77643,7 +77315,7 @@ async def _run_integration_judge_gate(
         # read as a back-out (an amended merge looks the same, review round
         # 2 M1). Restored, the tree matches the record and is judged again.
         rec_merge = str(rec["merge_commit_sha"])
-        anc = await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
+        anc = await _run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
                               rec_merge, "HEAD"], cwd=str(staging))
         if anc.returncode == 1:
             log(f"  integration gate for {sid}: the recorded merge "
@@ -77885,7 +77557,7 @@ async def _integration_repair_round(
     if unclean:
         entry["unclean_tree"] = unclean[:_UNCLEAN_LINES_MAX]
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
-    descends = (await run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
+    descends = (await _run_proc(["git", *_tree_git_args(staging), "merge-base", "--is-ancestor",
                                 merge_sha, head], cwd=str(staging))
                 ).returncode == 0
     clean = not unclean
@@ -78072,14 +77744,14 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
         merged[f] = render(value)
     for f, text in merged.items():
         _write_beneath(staging, staging / f, text.encode())
-    add = await run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "add", "--", *files],
+    add = await _run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "add", "--", *files],
                          cwd=str(staging))
-    commit = (await run_proc(["git", *_tree_git_args(staging), "commit", "--no-edit"],
+    commit = (await _run_proc(["git", *_tree_git_args(staging), "commit", "--no-edit"],
                              cwd=str(staging))
               if add.returncode == 0 else add)
     if commit.returncode != 0 or await check_merge_committed(staging):
         # Put the conflict back exactly as git left it for the integrator.
-        await run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "checkout", "-m", "--",
+        await _run_proc(["git", *_tree_git_args(staging), "--literal-pathspecs", "checkout", "-m", "--",
                         *files], cwd=str(staging))
         log(f"  {sid}: JSON key merge could not commit "
             f"({commit.stderr.strip()[:200]}); leaving it to the integrator")
@@ -78096,7 +77768,7 @@ async def _set_integration_subject(staging: Path, sid: str,
     message: tree and parents are kept, and the integrator's own message
     becomes the body. True when HEAD carries the subject afterwards."""
     want = f"{_INTEGRATE_SUBJECT_PREFIX}{sid}"
-    info = await run_proc(["git", *_tree_git_args(staging), "log", "-1", "--format=%P%x00%s%x00%B",
+    info = await _run_proc(["git", *_tree_git_args(staging), "log", "-1", "--format=%P%x00%s%x00%B",
                            "HEAD"], cwd=str(staging))
     if info.returncode != 0:
         return False
@@ -78107,7 +77779,7 @@ async def _set_integration_subject(staging: Path, sid: str,
         log(f"  {sid}: HEAD is not this integration's merge; its subject "
             "is left as it is")
         return False
-    r = await run_proc(["git", *_tree_git_args(staging), "commit", "--amend",
+    r = await _run_proc(["git", *_tree_git_args(staging), "commit", "--amend",
                         "--no-verify", "--allow-empty", "-m", want, "-m",
                         body.strip() or subject], cwd=str(staging))
     if r.returncode != 0:
@@ -78159,14 +77831,14 @@ async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
     # staging's repository for the merge.
     ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
     at = _git_at(_run_repo(st))
-    tip = (await run_proc(["git", *at, "rev-parse", "--verify", "-q",
+    tip = (await _run_proc(["git", *at, "rev-parse", "--verify", "-q",
                            ref])).stdout.strip()
     # Only ever forward: a head the branch is not under would merge some
     # other commit under this sid and orphan the branch's own work.
-    if tip and head and (tip == head or (await run_proc(
+    if tip and head and (tip == head or (await _run_proc(
             ["git", *at, "merge-base", "--is-ancestor", tip,
              head])).returncode == 0):
-        await run_proc(["git", *at, "update-ref", ref, head, tip])
+        await _run_proc(["git", *at, "update-ref", ref, head, tip])
     else:
         log(f"  {sid}: settled head {head[:12] or '?'} does not descend from "
             f"its branch ({tip[:12] or 'missing'}) — branch left where it is")
@@ -78569,7 +78241,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # never a branch name a worker can move. Recorded once, at the cut —
     # nothing is integrated before this save.
     if not st.data.get("base_sha"):
-        cut = await run_proc(["git", "--git-dir", str(_run_repo(st)),
+        cut = await _run_proc(["git", "--git-dir", str(_run_repo(st)),
                               "rev-parse", "--verify", "-q",
                               f"refs/heads/{_compute_run_branch(st.run_id)}"
                               "^{commit}"])
@@ -79885,7 +79557,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         # `leerie_dir`, the STATE root, which is no git repository: the
         # count would fail there, the `returncode == 0` guard below would
         # fail open, and the check would silently never fire.
-        ahead = await run_proc(
+        ahead = await _run_proc(
             ["git", "--git-dir", str(_run_repo(st)), "rev-list", "--count",
              f"{base}..{_compute_run_branch(st.run_id)}"])
         if ahead.returncode == 0 and ahead.stdout.strip() == "0":
@@ -79985,7 +79657,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         pr_end_state=_format_pr_end_state_section(st.data),
     )
 
-    # Capture-and-bake hook (DESIGN §6½). Non-fatal: any error is
+    # Capture hook (DESIGN §6½). Non-fatal: any error is
     # swallowed so capture failure never blocks a run from completing.
     try:
         await capture_repo_deps(
@@ -80604,7 +80276,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 # already carries full run identity, not just the terminal
                 # state's own {finished_at, no_push, no_verify} fields. None
                 # of the values below depend on phase_classify having run.
-                head_proc = await run_proc(
+                head_proc = await _run_proc(
                     ["git", "rev-parse", "--abbrev-ref", "HEAD"])
                 working_branch = (head_proc.stdout.strip()
                                   if head_proc.returncode == 0 else "")
@@ -82696,7 +82368,7 @@ def main() -> int | None:
         # so the user can resume. The explicit "throw this away"
         # gesture is `scripts/cleanup.sh --run-id <id> --branches`,
         # not Ctrl-C. asyncio.run already cancelled pending tasks and
-        # _invoke's / run_proc's BaseException handlers killed
+        # _invoke's / _run_proc's BaseException handlers killed
         # in-flight child processes (DESIGN §6).
         abnormal = True
         full_purge = False

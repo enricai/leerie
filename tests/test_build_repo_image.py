@@ -135,18 +135,6 @@ nerdctl() {{
       for _bt in "$LEERIE_STATE_HOST_DIR"/.image-build/*/base.tar; do
         [ -e "$_bt" ] && echo "$_bt" >> "$NERDCTL_LOG.tar-at-build"
       done
-      # NERDCTL_FAIL_LANG_LAYER: a build whose -f file holds a language-dep
-      # layer (its `# copy-input-shas:` line) fails, as a layer that does not
-      # build would (builtins only).
-      if [ -n "${{NERDCTL_FAIL_LANG_LAYER:-}}" ]; then
-        local _a _prev="" _f="" _l
-        for _a in "$@"; do [ "$_prev" = -f ] && _f="$_a"; _prev="$_a"; done
-        if [ -n "$_f" ]; then
-          while IFS= read -r _l; do
-            case "$_l" in "# copy-input-shas:"*) return 1 ;; esac
-          done < "$_f"
-        fi
-      fi
       _stub_build_done "$@"
       return "${{NERDCTL_BUILD_RC:-0}}"
       ;;
@@ -617,13 +605,14 @@ def test_base_image_build_error_sentinel_in_launcher():
 
 
 # ---------------------------------------------------------------------------
-# Out-of-repo dependency bake (DESIGN §6½, IMPLEMENTATION.md §0.5):
-# Python/Ruby/Rust/Go install to /opt/* instead of the inherited /work
-# WORKDIR, plus the $_sp gating-bug fix. Runs the FULL Dockerfile-generation
-# block (not just build_repo_image) via the same _run_harness pattern —
-# `.leerie/config.toml` and dependency-manifest fixtures under USER_REPO
-# trigger the real auto-generation path, and the resulting
-# Dockerfile the launch builds (`_built`, from `$_REPO_DF_GEN`) is asserted directly.
+# The repository image holds no dependency (DESIGN §6½, IMPLEMENTATION.md
+# §0.5): the generated file is an apt layer when `.leerie/config.toml`
+# declares setup_packages, and nothing else; no lockfile and no manager
+# triggers a build. Runs the FULL Dockerfile-generation block (not just
+# build_repo_image) via the same _run_harness pattern — `.leerie/config.toml`
+# and dependency-manifest fixtures under USER_REPO drive the real
+# auto-generation path, and the Dockerfile the launch builds (`_built`,
+# from `$_REPO_DF_GEN`) is asserted directly.
 # ---------------------------------------------------------------------------
 
 def _write_config_toml(leerie_dir: Path, setup_packages: str = "") -> None:
@@ -659,215 +648,104 @@ def _built(tmp_path: Path) -> Path:
     return tmp_path / "built.Dockerfile"
 
 
-def test_python_bakes_to_opt_venv(tmp_path):
-    """Load-bearing: a Python fixture (uv.lock, no setup_packages) bakes to
-    /opt/venv with the correct WORKDIR/ENV, not a /work-targeting RUN."""
+# Every lockfile 0.65.0's generator keyed a dependency layer on: Ruby, Rust,
+# Go and Node (pnpm).
+_LOCKFILES = {
+    "Gemfile": 'source "https://rubygems.org"\ngem "rack"\n',
+    "Gemfile.lock": "GEM\n  specs:\n    rack (3.1.8)\n",
+    "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n',
+    "Cargo.lock": "version = 3\n",
+    "go.mod": "module example.com/x\n\ngo 1.23\n",
+    "go.sum": "",
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+}
+
+
+def _lockfile_repo(tmp_path: Path, setup_packages: str) -> tuple[Path, Path]:
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "uv.lock").write_text("")
-    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    _write_config_toml(leerie_dir, setup_packages=setup_packages)
+    for name, text in _LOCKFILES.items():
+        (user_repo / name).write_text(text)
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    return user_repo, state_dir
 
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
 
+def test_lockfiles_and_setup_packages_generate_only_the_apt_layer(tmp_path):
+    """The repository image holds no dependency (DESIGN §6½ *The repository
+    image holds no dependency*): a tree holding Gemfile.lock, Cargo.lock,
+    go.mod/go.sum and pnpm-lock.yaml, with setup_packages, generates the
+    sentinel, `ARG`/`FROM`/`USER root` and one apt `RUN`, nothing else —
+    no `COPY`, `WORKDIR`, `ENV` or other `RUN`. The launch runs the
+    repository image's two builds once (no fallback build), and the record
+    is `<key> <digest>`. Falsified against 0.65.0's launcher: its file held
+    a `# copy-input-shas:` comment, `COPY package.json pnpm-lock.yaml ./`
+    and `RUN pnpm install --frozen-lockfile` (with no pnpm lockfile, its
+    next pick was `RUN go mod download`, then `cargo fetch`, then `bundle
+    install` — none of whose runtimes the base holds)."""
+    user_repo, state_dir = _lockfile_repo(tmp_path, "jq")
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir)
+    assert r.returncode == 0, r.stderr
     df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/python-build" in df, df
-    assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
-    assert "ENV PATH=/opt/venv/bin:$PATH" in df, df
-    assert "RUN python3 -m venv /opt/venv" in df, df
-    assert "RUN /opt/venv/bin/python3 -m pip install uv" in df, df
-    assert "RUN uv sync --active" in df, df
-    # Must NOT emit a bare install RUN against the inherited /work WORKDIR.
-    assert "RUN uv sync\n" not in df, df
+    assert df == (
+        "# leerie-generated: do not edit (regenerated from .leerie/config.toml)\n"
+        "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
+        "    jq \\\n"
+        "    && rm -rf /var/lib/apt/lists/*\n"), df
+    assert len(_take_builds(tmp_path)) == 2, r.stderr
+    key = (state_dir / ".dockerfile-hash").read_text()
+    assert re.fullmatch(r"\S+ sha256:\S+\n", key), key
 
 
-def test_poetry_bakes_to_opt_venv_no_active_flag(tmp_path):
-    """Poetry bakes to /opt/venv via VIRTUAL_ENV detection alone — NO --active
-    flag (unlike uv). Live-verified: poetry (unlike uv) correctly detects and
-    installs into an active VIRTUAL_ENV with no special flag; confirmed via a
-    real `poetry install` against a real /opt/venv-equivalent venv, which
-    landed the dependency in the target venv rather than poetry's own
-    default cache-dir-managed virtualenv."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "poetry.lock").write_text("")
-    (user_repo / "pyproject.toml").write_text('[tool.poetry]\nname = "x"\n')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/python-build" in df, df
-    assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
-    assert "RUN /opt/venv/bin/python3 -m pip install poetry" in df, df
-    # No --active flag for poetry (that's uv-specific) — a bare "poetry
-    # install" resolves correctly via VIRTUAL_ENV alone.
-    assert "RUN poetry install\n" in df, df
-    assert "--active" not in df, df
+def test_lockfiles_without_setup_packages_build_no_image(tmp_path):
+    """No lockfile triggers a repository image: with the same lockfiles and
+    no setup_packages, nothing is generated and nothing is built (the base
+    image runs). Falsified against 0.65.0's launcher: it generated a
+    `RUN pnpm install --frozen-lockfile` layer and built it."""
+    user_repo, state_dir = _lockfile_repo(tmp_path, "")
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir)
+    assert r.returncode == 0, r.stderr
+    assert not _built(tmp_path).exists()
+    assert _take_builds(tmp_path) == []
+    assert not (state_dir / ".dockerfile-hash").exists()
 
 
-def test_pipenv_bakes_to_opt_venv(tmp_path):
-    """Pipenv bakes to /opt/venv via VIRTUAL_ENV detection alone, same as
-    poetry. Live-verified: `pipenv install` against a real /opt/venv
-    equivalent prints "Pipenv found itself running within a virtual
-    environment, so it will automatically use that environment" and the
-    dependency lands in that venv."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "Pipfile.lock").write_text("")
-    (user_repo / "Pipfile").write_text("[packages]\n")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/python-build" in df, df
-    assert "ENV VIRTUAL_ENV=/opt/venv" in df, df
-    assert "RUN /opt/venv/bin/python3 -m pip install pipenv" in df, df
-    assert "RUN pipenv install\n" in df, df
+def test_a_lockfile_change_rebuilds_nothing(tmp_path):
+    """The image reads no lockfile, so a lockfile bump leaves its key, and
+    the image, as they were: the next launch runs no build. Falsified
+    against 0.65.0's launcher: the bump changed the generated file's
+    `# copy-input-shas:` line, the key, and rebuilt."""
+    user_repo, state_dir = _lockfile_repo(tmp_path, "jq")
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir)
+    assert r.returncode == 0, r.stderr
+    key = (state_dir / ".dockerfile-hash").read_text()
+    _take_builds(tmp_path)
+    for name in ("Gemfile.lock", "Cargo.lock", "go.sum", "pnpm-lock.yaml"):
+        (user_repo / name).write_text(_LOCKFILES[name] + "# bumped\n")
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir,
+                             {"NERDCTL_INSPECT_RC": "0"})
+    assert r.returncode == 0, r.stderr
+    assert _take_builds(tmp_path) == [], r.stderr
+    assert (state_dir / ".dockerfile-hash").read_text() == key
 
 
-def test_rust_bakes_to_opt_cargo_target_with_dummy_source(tmp_path):
-    """Rust bakes to CARGO_TARGET_DIR=/opt/cargo-target via a discardable
-    dummy src/main.rs (cargo cannot fetch/build with zero source files)."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "Cargo.lock").write_text("")
-    (user_repo / "Cargo.toml").write_text('[package]\nname = "x"\n')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/rust-build" in df, df
-    assert "ENV CARGO_TARGET_DIR=/opt/cargo-target" in df, df
-    assert "src/main.rs" in df, df
-    assert "cargo fetch" in df, df
-    assert "cargo build --offline" in df, df
-    # The dummy source must be discarded, never left for /work.
-    assert "rm -rf src" in df, df
-    # Regression guard: the bake must NOT build the release profile. Cargo
-    # keys its build cache by profile (debug/ vs release/ under
-    # CARGO_TARGET_DIR) — a --release bake shares nothing with the
-    # debug-profile `cargo build`/`cargo test` workers actually run.
-    # Reproduced live during implementation: baking with --release left a
-    # real worktree's `cargo build` fully recompiling every dependency
-    # ("Compiling serde", not "Fresh serde"); dropping it fixed the cache
-    # hit. See DESIGN §6½.
-    assert "--release" not in df, df
-
-
-def test_go_bakes_to_opt_go_cache_with_dummy_source(tmp_path):
-    """Go bakes to GOCACHE=/opt/go-cache via a discardable dummy .go file
-    (go build ./... against zero .go files is a silent no-op that warms
-    nothing — go mod download alone only warms GOMODCACHE)."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "go.mod").write_text("module x\n\ngo 1.21\n")
-    (user_repo / "go.sum").write_text("")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/go-build" in df, df
-    assert "ENV GOCACHE=/opt/go-cache" in df, df
-    assert "_leerie_dummy.go" in df, df
-    assert "go mod download" in df, df
-    assert "go build ./..." in df, df
-    # The dummy source must be discarded, never left for /work.
-    assert "rm -f _leerie_dummy.go" in df, df
-
-
-def test_ruby_bakes_to_opt_bundle(tmp_path):
-    """Ruby bakes to /opt/bundle via BUNDLE_PATH/BUNDLE_APP_CONFIG env,
-    emitted BEFORE the bundle install RUN line."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "Gemfile.lock").write_text("")
-    (user_repo / "Gemfile").write_text('source "https://rubygems.org"\n')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "WORKDIR /opt/ruby-build" in df, df
-    env_idx = df.index("ENV BUNDLE_PATH=/opt/bundle")
-    config_idx = df.index("ENV BUNDLE_APP_CONFIG=/opt/bundle")
-    run_idx = df.index("RUN bundle install")
-    assert env_idx < run_idx and config_idx < run_idx, df
-
-
-def test_node_pnpm_still_targets_work_unchanged(tmp_path):
-    """Node/pnpm is deliberately unchanged: node_modules must live in the
-    repo tree for resolution, so no /opt/* WORKDIR/ENV is emitted for it."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "pnpm-lock.yaml").write_text("")
-    (user_repo / "package.json").write_text("{}")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df = _built(tmp_path).read_text()
-    assert "pnpm install --frozen-lockfile" in df, df
-    assert "/opt/" not in df, df
-
-
-# ---------------------------------------------------------------------------
-# $_sp gating-bug fix: a lockfile-only repo (no setup_packages) must still
-# generate a Dockerfile with the language-dep layer.
-# ---------------------------------------------------------------------------
-
-def test_gating_fix_lockfile_without_setup_packages_still_generates(tmp_path):
-    """Regression: previously `if [ -n "$_sp" ]` skipped generation entirely
-    for a repo with a lockfile but no setup_packages."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir, setup_packages="")
-    (user_repo / "uv.lock").write_text("")
-    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result.returncode == 0, result.stderr
-
-    df_path = _built(tmp_path)
-    assert df_path.exists(), "Dockerfile must be generated for a lockfile-only repo"
-    df = df_path.read_text()
-    assert "RUN uv sync" in df, df
-    # No setup_packages → no apt-get layer at all.
-    assert "apt-get install" not in df, df
+def test_a_generated_image_that_does_not_build_stops_the_launch(tmp_path):
+    """A generated file whose build fails stops the launch with the build's
+    error, after one build and with nothing recorded: there is no fallback
+    file to build. Falsified against 0.65.0's launcher: it built a second
+    file (the apt-only fallback) after the first failed."""
+    user_repo, state_dir = _lockfile_repo(tmp_path, "jq")
+    r = _generate_dockerfile(tmp_path, user_repo, state_dir,
+                             {"NERDCTL_BUILD_RC": "1"})
+    assert r.returncode != 0, r.stderr
+    assert "per-repo container image build failed" in r.stderr, r.stderr
+    assert "apt-only" not in r.stderr, r.stderr
+    assert len(_take_builds(tmp_path)) == 1, r.stderr
+    assert not (state_dir / ".dockerfile-hash").exists()
 
 
 def test_gating_fix_bare_requirements_txt_does_not_trigger(tmp_path):
@@ -923,46 +801,11 @@ def test_gating_fix_neither_setup_packages_nor_lockfile_no_generation(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Cache-invalidation regression: a lockfile bump still changes the emitted
-# Dockerfile's COPY-input SHA comment (and thus .dockerfile-hash) even
-# against the new /opt/* bake target.
-# ---------------------------------------------------------------------------
-
-def test_lockfile_bump_still_changes_hash_against_opt_target(tmp_path):
-    """A dependency-input change must still invalidate .dockerfile-hash even
-    though the install target moved from /work to /opt/venv."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    _write_config_toml(leerie_dir)
-    (user_repo / "uv.lock").write_text("original-lockfile-content\n")
-    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result1 = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result1.returncode == 0, result1.stderr
-    hash1 = (state_dir / ".dockerfile-hash").read_text()
-    assert "/opt/venv" in _built(tmp_path).read_text()
-
-    # Nothing is removed between launches: the file is generated on every
-    # launch, never kept in the checkout.
-    assert sorted(p.name for p in leerie_dir.iterdir()) == ["config.toml"]
-    (user_repo / "uv.lock").write_text("bumped-lockfile-content-changed\n")
-
-    result2 = _generate_dockerfile(tmp_path, user_repo, state_dir)
-    assert result2.returncode == 0, result2.stderr
-    hash2 = (state_dir / ".dockerfile-hash").read_text()
-
-    assert hash1 != hash2, "lockfile bump did not change .dockerfile-hash"
-
-
-# ---------------------------------------------------------------------------
 # Review round 35, execution R35E-1: leerie's generated Dockerfile is tested
-# only by its own build (DESIGN §6½ *Language deps*). A separate probe build
-# ran on every launch, before the rebuild check; under `--no-cache` it
-# reinstalled every language dependency each launch and threw it away.
-# ensure_base_in_worker_ns keeps its save+load-through-files rule (N1).
+# only by its own build. A separate probe build ran on every launch, before
+# the rebuild check; under `--no-cache` it reinstalled every language
+# dependency each launch and threw it away. ensure_base_in_worker_ns keeps
+# its save+load-through-files rule (N1).
 # ---------------------------------------------------------------------------
 
 def _lang_repo(tmp_path: Path) -> tuple[Path, Path]:
@@ -988,15 +831,13 @@ def _take_builds(tmp_path: Path) -> list[str]:
 def test_an_up_to_date_generated_image_runs_no_build(tmp_path):
     """A launch whose generated file, context, version and base match the
     recorded image runs no build at all; the one that builds runs the
-    repository image's two builds and nothing else. Its record carries no
-    `apt-only` mark, and its reuse says nothing of a fallback (the converse
-    of review round 36's X3). Falsified: the probe restored (the first
-    launch runs 3 builds, the second 1); the mark written for every
-    generated image (fails)."""
+    repository image's two builds and nothing else, and its record is
+    `<key> <digest>`. Falsified: the probe restored (the first launch runs 3
+    builds, the second 1)."""
     user_repo, state_dir = _lang_repo(tmp_path)
     r = _generate_dockerfile(tmp_path, user_repo, state_dir)
     assert r.returncode == 0, r.stderr
-    assert "COPY " in _built(tmp_path).read_text()
+    assert "apt-get install" in _built(tmp_path).read_text()
     assert len(_take_builds(tmp_path)) == 2, r.stderr
     key = (state_dir / ".dockerfile-hash").read_text()
     assert re.fullmatch(r"\S+ sha256:\S+\n", key), key
@@ -1005,47 +846,7 @@ def test_an_up_to_date_generated_image_runs_no_build(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "up-to-date (" in r.stderr and "skipping build" in r.stderr, \
         r.stderr
-    assert "apt-only" not in r.stderr, r.stderr
     assert _take_builds(tmp_path) == []
-
-
-def test_a_language_layer_that_does_not_build_falls_back_once(tmp_path):
-    """When the generated file's own build fails, the launch builds it
-    without the language-dep layer and records that image under the
-    generated file's key, marked `apt-only`: the next launch, which
-    generates the same file, reuses it and runs no build, and says, on
-    every such launch, that the image is the apt-only fallback and which
-    file to remove to retry (review round 36, execution X3). Falsified:
-    the fallback image recorded under its own file's key (the second
-    launch rebuilds); the probe restored (the second launch runs it); the
-    mark not written, or the reuse warning removed (no warning on the
-    second and third launches)."""
-    user_repo, state_dir = _lang_repo(tmp_path)
-    hash_file = state_dir / ".dockerfile-hash"
-    fail = {"NERDCTL_FAIL_LANG_LAYER": "1"}
-    r = _generate_dockerfile(tmp_path, user_repo, state_dir, fail)
-    assert r.returncode == 0, r.stderr
-    assert "falling back to apt-only bake" in r.stderr, r.stderr
-    assert "for this run" not in r.stderr, r.stderr
-    assert f"remove {hash_file}" in r.stderr, r.stderr
-    builds = _take_builds(tmp_path)
-    assert len(builds) == 3, builds
-    df = _built(tmp_path).read_text()
-    assert "COPY " not in df and "apt-get install" in df and " jq " in df, df
-    key = hash_file.read_text()
-    assert re.fullmatch(r"\S+ sha256:\S+ apt-only\n", key), key
-    for _ in range(2):
-        r = _generate_dockerfile(tmp_path, user_repo, state_dir,
-                                 {**fail, "NERDCTL_INSPECT_RC": "0"})
-        assert r.returncode == 0, r.stderr
-        assert "up-to-date (" in r.stderr and "skipping build" in r.stderr, \
-            r.stderr
-        assert "image is the apt-only fallback" in r.stderr, r.stderr
-        assert f"remove {hash_file}" in r.stderr, r.stderr
-        assert _take_builds(tmp_path) == []
-        assert hash_file.read_text() == key
-    assert "COPY " in _built(tmp_path).read_text()
-
 
 
 def _copy_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -1159,36 +960,3 @@ def test_a_base_copy_that_fails_stops_the_launch_with_its_error(tmp_path, case):
     if case in ("disk", "size", "no-base"):
         assert not any(" save " in l for l in lines), lines
 
-
-# must point at /opt/bundle only when the Dockerfile actually baked there,
-# else keep the pre-existing cache-mount fallback path.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Regression guard: the already-shipped consumer-half functions
-# (_is_baked_ecosystem_command, _format_provision_recipe_section,
-# _filter_residual_deps) must remain untouched by this feature — per
-# prompts/fix-dep-capture-bake.md's explicit constraint.
-#
-# `_is_node_offline_relink` was a fourth entry here and has been removed:
-# it had no callers anywhere. `_filter_residual_deps` tests the same
-# condition inline and deliberately more broadly (pnpm wants both
-# --offline and --frozen-lockfile; npm and yarn each stand on one), so the
-# pnpm-only helper was superseded rather than orphaned by a lost call
-# site. Pinning the existence of a function nothing calls only guarantees
-# it stays dead. The constraint above was scoped to that feature's work,
-# which shipped long ago.
-# ---------------------------------------------------------------------------
-
-def test_consumer_half_functions_present_and_unmodified_markers():
-    """These three functions must still exist with their documented
-    docstrings/behavior — a byte-for-byte diff check belongs in `git diff`
-    at review time (see the plan's Verification section), but this test
-    guards that they were not accidentally deleted or renamed."""
-    orch_text = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
-    for fn in (
-        "def _is_baked_ecosystem_command(",
-        "def _format_provision_recipe_section(",
-        "def _filter_residual_deps(",
-    ):
-        assert fn in orch_text, f"{fn} missing from orchestrator/leerie.py"

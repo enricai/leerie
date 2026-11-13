@@ -119,8 +119,8 @@ def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
 def test_reset_passes_a_bounded_timeout_to_run_proc_for_worktree_remove(
         leerie, monkeypatch):
     """`_reset_subtask_worktree`'s `git worktree remove` call previously
-    called `run_proc` with no `timeout` (defaults to None / unbounded at
-    leerie.py's run_proc), so a hung removal could block a wave forever —
+    called `_run_proc` with no `timeout` (defaults to None / unbounded at
+    leerie.py's _run_proc), so a hung removal could block a wave forever —
     same hang class 505007d fixed for cleanup.sh/_run_script. It must pass
     an explicit bounded timeout for the `git worktree remove` call."""
     captured = {}
@@ -129,14 +129,14 @@ def test_reset_passes_a_bounded_timeout_to_run_proc_for_worktree_remove(
         if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd:
             captured.update(kwargs)
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
 
     asyncio.run(leerie._reset_subtask_worktree(
         "sid-x", Path("/tmp/leerie-dir"), "run-id"))
 
     assert captured.get("timeout") is not None, (
         "_reset_subtask_worktree must pass an explicit, non-None timeout "
-        "to run_proc for the `git worktree remove` call"
+        "to _run_proc for the `git worktree remove` call"
     )
     assert captured["timeout"] > 0
 
@@ -150,7 +150,7 @@ def test_reset_survives_a_worktree_remove_timeout(leerie, monkeypatch):
         if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 240)
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
 
     # Should not raise.
     asyncio.run(leerie._reset_subtask_worktree(

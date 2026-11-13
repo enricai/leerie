@@ -301,24 +301,38 @@ no id each stop the launch before any build with what failed, 6 cases) — is
 tested via bash-harness subprocess tests with stubbed `git`, `nerdctl` and
 `buildctl`.
 
-Leerie's generated Dockerfile is tested only by its own build (DESIGN §6½
-*Language deps*; review round 35, execution R35E-1), in
-`tests/test_build_repo_image.py`: a launch whose generated file, context,
-version and base match the recorded image runs no build at all, and the
-one that builds runs the repository image's two builds and nothing else
-(`test_an_up_to_date_generated_image_runs_no_build`); when the generated
-file's build fails (a stub `nerdctl` that fails a file holding a
-`# copy-input-shas:` line, builtins only), the launch warns, builds the
-file without the language-dep layer, and records that image under the
-generated file's key, so the next launch runs no build and keeps the key
-(`test_a_language_layer_that_does_not_build_falls_back_once`). Both fail
-at the parent tree, where a probe build ran on every launch before the
-rebuild check (3 builds and then 1). Review round 36 (execution X3): the
-fallback's record carries the `apt-only` mark, its warning names the
-`.dockerfile-hash` path to remove and no longer says "for this run", and
-the next two launches each warn that the image is the apt-only fallback;
-an image whose layer built is recorded unmarked and reused without that
-warning (in `test_an_up_to_date_generated_image_runs_no_build`).
+Leerie's generated Dockerfile is tested only by its own build (DESIGN §6½;
+review round 35, execution R35E-1), in `tests/test_build_repo_image.py`: a
+launch whose generated file, context, version and base match the recorded
+image runs no build at all, and the one that builds runs the repository
+image's two builds and nothing else
+(`test_an_up_to_date_generated_image_runs_no_build`).
+
+*The repository image holds no dependency* (DESIGN §6½; OPEN-ISSUES #23) is
+pinned on the launcher side by running the launcher's real per-repo image
+block, cache-mount section and shim function, with only `nerdctl` stubbed.
+`tests/test_build_repo_image.py`: a tree holding Gemfile.lock, Cargo.lock,
+go.mod/go.sum and pnpm-lock.yaml, with `setup_packages`, generates exactly
+the sentinel, `ARG`/`FROM`/`USER root` and one apt `RUN`, built once and
+recorded as `<key> <digest>`
+(`test_lockfiles_and_setup_packages_generate_only_the_apt_layer`); the same
+lockfiles without `setup_packages` generate and build nothing
+(`test_lockfiles_without_setup_packages_build_no_image`); a lockfile bump
+rebuilds nothing (`test_a_lockfile_change_rebuilds_nothing`); a generated
+file whose build fails stops the launch after one build, with no fallback
+(`test_a_generated_image_that_does_not_build_stops_the_launch`).
+`tests/test_resolve_repo_image_tag.py::test_lockfiles_without_setup_packages_resolve_no_tag`
+checks the tag side. `tests/test_dockerfile_bake_from_capture.py`: a
+config.toml still holding `language_installs`/`bake_language_deps`
+generates the same bytes as one without them, and is noted once.
+`tests/test_launcher_cache_mounts.py` runs the launcher's cache-mount
+section: the container gets mise-data only, with no Bundler mount, no
+`BUNDLE_*` variable and no `~/.cache/leerie/bundle` directory.
+`tests/test_worker_root_view.py`: `apply_worker_env` never overrides a
+variable leerie set, so a stage's `BUNDLE_PATH=/opt/bundle` loses to the
+run's store, through the function and, in the container profile, through
+the real shim. Each was falsified against 0.65.0's launcher and shim (the
+shim-level one skips on a host that cannot build the isolation).
 
 A generated Dockerfile is leerie's output, never the repository's (DESIGN
 §6½; OPEN-ISSUES #18), in `tests/test_launcher_per_repo_image.py`: a
@@ -1206,7 +1220,7 @@ another passed fd exits 126 without running the command (3 cases); a shim
 started inside a session whose controlling terminal is the pty (as
 `_ts_script_run` starts it) cannot open `/dev/tty` (plain and `--isolate`);
 a shim leading a session that has one exits 126; and `_run_streaming`,
-`run_proc` and `_ts_script_run`, with the shim taken out, give the command
+`_run_proc` and `_ts_script_run`, with the shim taken out, give the command
 `/dev/null` while the test process's fd 0 is a pty. The `--isolate` cases
 skip on a host that cannot build a sandbox; run in the `leerie:0.43.0`
 image (the test file under a stub `pytest`), both pass, and with
@@ -1336,8 +1350,7 @@ single owner of that extraction, which has two importers (this file and
 The capture engine (DESIGN §6½) — `_gather_dep_manifests` (the
 manifests-first PRIMARY corpus), `_extract_depcap_commands` (the
 install-filtered SECONDARY command hint), `_is_install_command` (the
-install-verb filter), `_toml_value`/`_dump_language_installs`
-(single-quote-safe TOML persistence), `_merge_setup_packages`,
+install-verb filter), `_toml_value` (quote-safe TOML persistence), `_merge_setup_packages`,
 `capture_repo_deps` (async, with stubbed `claude_p`), the idempotency
 sentinel (`dep_capture_done` state field + `<run_dir>/dep_capture.done`
 file), and `_backstop_capture_prior_runs` (skips runs with sentinel,
@@ -1364,17 +1377,15 @@ exclusion (e.g. `grep "apt-get install …"` is dropped) are pinned in
 `tests/test_capture_deps.py` (`TestIsInstallCommand`,
 `test_filters_to_install_shaped_only`,
 `test_excludes_install_verb_inside_text_tool_pattern`), alongside
-`_gather_dep_manifests` (`TestGatherDepManifests`) and `_toml_value` /
-`_dump_language_installs` (`TestTomlValue`, including the both-quote
-single-quoted-command TOML-validity regression).
+`_gather_dep_manifests` (`TestGatherDepManifests`) and `_toml_value`
+(`TestTomlValue`).
 
 `tests/test_capture_deps.py` covers the integration against a synthetic
 JSONL fixture in the `_iter_log_tool_use` shape: absence pins
 (`TestRegexPathAbsent`) that assert the four deleted regex-path symbols no
 longer exist on the module (so the regex path can never silently return);
 command extraction, budget ceiling truncation, merger union/no-op/
-never-clobber, schema-validated worker output → setup_packages +
-language_installs write, committed-Dockerfile skip, write-failure
+never-clobber, schema-validated worker output → setup_packages write, committed-Dockerfile skip, write-failure
 non-fatal, and opt-out. It also pins the `--recapture --force`
 wholesale-replace path (`replace=True` drops deps no longer captured; an
 empty capture leaves the existing config untouched) alongside the default
@@ -1393,14 +1404,39 @@ env + config-file opt-out (worker not invoked), committed `.leerie/Dockerfile`
 guard (worker not invoked), missing logs dir silent no-op, and non-fatal
 write failure. A `TestDepCaptureReplace` class covers the `replace=True`
 (`--recapture --force`) path: wholesale-overwrite of
-`setup_packages`/`language_installs` (stale deps dropped), an empty
-capture leaving the config untouched, and — the regression pin for the
-empty-item blanking bug — a schema-valid empty-item capture
-(`setup_packages=[""]`, empty-manager `language_installs`) not blanking a
-good config.
+`setup_packages` (stale packages dropped), an empty capture leaving the
+config untouched, and — the regression pin for the empty-item blanking
+bug — a schema-valid empty-item capture (`setup_packages=[""]`) not
+blanking a good config.
 
-The `dep_capture` schema contract — required fields, `language_installs`
-item shape, valid/invalid instance acceptance, `minLength:1` on
+*No dependency is baked* (DESIGN §6½ *The repository image holds no
+dependency*). `tests/test_provision_recipe_section.py` executes the real
+prompt builders (`_implementer_base_prompt`,
+`_append_conformer_context_sections`) on a persisted polyglot recipe
+(bundle install, uv sync, cargo fetch, go mod download, pip install, pnpm
+install, a pnpm build): every entry appears, numbered, in recipe order, and
+neither prompt says "bake", /opt/venv or /opt/bundle; the implementer and
+conformer system prompts name no /opt/venv. On 0.65.0 the section held only
+the pnpm lines and said "could not be baked".
+`tests/test_store_classes.py::test_an_install_into_an_image_path_lands_in_the_trees_store`
+runs a real process through `_run_streaming` with `BUNDLE_PATH=/opt/bundle`
+coming in and finds its write in `tree-stores/<tree>/bundle` (on 0.65.0:
+EACCES on /opt/bundle); `test_every_store_variable_is_split`,
+`test_a_command_in_a_run_tree_gets_that_trees_own_stores` and
+`tests/test_user_scripts_on_path.py::test_a_base_beneath_opt_is_no_exception`
+pin that no /opt value is kept on any side. The dep_capture tests
+(`test_capture_deps.py::test_an_answers_language_installs_are_never_recorded`,
+`::test_apply_of_an_earlier_record_takes_its_packages_only`,
+`test_dep_capture_worker.py::test_only_setup_packages_written`,
+`::test_an_earlier_malformed_install_key_does_not_refuse_the_apply`,
+`test_capture_validation.py::test_schema_names_no_manager_and_no_command`)
+pin that an answer or an earlier `captured-deps.json` holding
+`language_installs` records and applies `setup_packages` only, and that an
+earlier malformed key no longer refuses an apply. Each was falsified
+against 8064e9b3. The worker change was benched (lane LG, PREREG sha256
+a171b0ae…, 60 samples, OLD and NEW identical on 3 real runs and 2 controls).
+
+The `dep_capture` schema contract — required fields, valid/invalid instance acceptance, `minLength:1` on
 package/manager/command (empty-string rejection), JSON round-trip, and
 wiring checks (`WORKER_TYPES` exclusion, effort/model defaults) — is
 pinned in `tests/test_dep_capture_schema.py` (mirrors
@@ -3936,7 +3972,9 @@ deliberately more broadly — pnpm needs both `--offline` and
 `--frozen-lockfile`, while `npm install --offline` and `yarn install
 --frozen-lockfile` each stand alone, so the pnpm-only helper could not
 replace it). That third one had a test pinning its *existence*, which only
-guaranteed it stayed dead; retiring that pin is what let it go. Dead code
+guaranteed it stayed dead; retiring that pin is what let it go.
+(`_filter_residual_deps` itself went with the dependency bake on
+2026-11-12.) Dead code
 matters more here than in a normal repo because the stated design goal is
 that the whole control flow reads top-to-bottom in one sitting, and an
 unused helper reads as live — two of these three were removed gates, where
@@ -7909,9 +7947,8 @@ sample's probe never counts for the next.
   and differently on each export, with the same key. Every build is given
   `--no-cache` and `--build-arg BUILDKIT_SYNTAX=` the one pinned frontend
   (`LEERIE_DOCKERFILE_FRONTEND`, `docker/dockerfile:1@sha256:<64 hex>`):
-  the base build, both of `build_repo_image`'s, the three builds of a
-  generated file whose language-dep layer fails (the layer's, then the
-  apt-only file's two), and `build-push.sh` on the remote builder and on
+  the base build, both of `build_repo_image`'s, the two builds of a
+  generated file, and `build-push.sh` on the remote builder and on
   `--local-build` (2). The frontend is pulled into the namespace
   BuildKit's worker reads before the base build and before a repository
   build, and `ensure_frontend_in_worker_ns` pulls only when absent and
@@ -8220,15 +8257,12 @@ sample's probe never counts for the next.
   two launcher pins run the span (a git install: the short sha; no git:
   empty, status 0).
 - `tests/test_capture_validation.py` — E2's proof turned around: the schema,
-  `_filter_residual_deps`, `_capture_problems`, `_record_capture`,
-  `_merge_capture_into_config`, `apply_captured_deps`, the launcher's apt
-  layer (no glob expansion either) and the generator each refuse the
-  hostile capture; the generator runs `_INSTALL_COMMANDS[manager]`, equal
-  to `BAKE_INSTALL_COMMANDS`; nothing in a run's exit or fetch applies a
-  capture, and `config --apply-capture <run>` applies one with a diff. A2:
-  the generator reads the committed tree (a committed `.npmrc` link and an
-  untracked `.npmrc` are neither read nor copied; one linked to
-  `/proc/self/pagemap` no longer stops the launch) and hashes by blob id.
+  `_capture_problems`, `_record_capture`, `_merge_capture_into_config`,
+  `apply_captured_deps` and the launcher's apt layer (no glob expansion
+  either) each refuse the hostile capture; nothing in a run's exit or fetch
+  applies a capture, and `config --apply-capture <run>` applies one with a
+  diff. (The generator's dependency layer, and with it A2's committed-tree
+  reads, went with the dependency bake on 2026-11-12.)
 - `tests/committed_tree.py` — the harnesses that write a lockfile into a
   test checkout commit it first, since the generator reads `HEAD`.
 - Review round 29 (execution H1, L3, L4).
@@ -8243,10 +8277,11 @@ sample's probe never counts for the next.
   worker root holds beneath `/home/leerie` that the container's lacks is
   named (the base's own entries and a linked `home` are not), and the entry
   stops naming it and the fix. `tests/test_capture_validation.py::test_apply_refuses_a_merge_into_a_value_that_already_fails`
-  (3 cases: barnacle's key names in `setup_packages`, `language_installs`
-  that is not JSON, a manager leerie does not bake): a valid capture is
-  refused, naming the entry, and nothing is written. Falsified on the host:
-  with the two checks removed, the entry test and the 3 cases fail.
+  (2 cases: barnacle's key names in `setup_packages`, a shell word there;
+  since 2026-11-12 an earlier `language_installs` is not read and refuses
+  nothing): a valid capture is refused, naming the entry, and nothing is
+  written. Falsified on the host: with the two checks removed, the entry
+  test and the cases fail.
 
 ## A done task stays done unless its recorded tests regress
 

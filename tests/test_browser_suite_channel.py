@@ -503,10 +503,12 @@ def test_the_runners_browser_is_the_trees_own_store(leerie, tmp_path):
     leerie._tree_store_env(env, lane)
     assert Path(env["PLAYWRIGHT_BROWSERS_PATH"]).parts[-2:] == (
         "falsifier-lane0", "playwright-browsers")
-    # A baked browser (the image's) is kept.
-    baked = {"PLAYWRIGHT_BROWSERS_PATH": "/opt/browsers"}
-    leerie._tree_store_env(baked, lane)
-    assert baked["PLAYWRIGHT_BROWSERS_PATH"] == "/opt/browsers"
+    # A value the image chose (beneath /opt/) is no exception: the image
+    # holds no dependency (DESIGN §6½ *The repository image holds no
+    # dependency*), so the tree's own store is the one its commands use.
+    imaged = {"PLAYWRIGHT_BROWSERS_PATH": "/opt/browsers"}
+    leerie._tree_store_env(imaged, lane)
+    assert imaged["PLAYWRIGHT_BROWSERS_PATH"] == env["PLAYWRIGHT_BROWSERS_PATH"]
 
 
 def test_an_unexpected_error_in_the_suite_check_is_not_swallowed(

@@ -72,7 +72,7 @@ def _capture(machine_runs: Path, run_id: str, pkgs: list[str]) -> None:
     directory on the machine (`_record_capture`)."""
     (machine_runs / run_id / "captured-deps.json").write_text(json.dumps([
         {"from_run": run_id, "setup_packages": pkgs,
-         "language_installs": [], "replace": False}]))
+         "replace": False}]))
 
 
 def _fetch(tmp_path: Path, repo: Path, machine: str, **extra: str):

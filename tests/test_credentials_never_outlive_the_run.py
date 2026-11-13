@@ -140,7 +140,7 @@ async def finalize(st, caps):
 
     async def compose(*a, **k):
         return None
-    m._run_script, m.run_proc = script, proc
+    m._run_script, m._run_proc = script, proc
     m.capture_repo_deps, m._compose_pr_via_llm = capture, compose
     await m.phase_finalize(st.leerie_root, st, no_push=True,
                            no_verify=False, caps=caps, models={}, efforts={})
