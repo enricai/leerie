@@ -106,6 +106,13 @@ def env(leerie, tmp_path, monkeypatch):
     caps.update({"worker_timeout_sec": 120})
     monkeypatch.setattr(leerie, "_cgroup_create", lambda *a, **k: None)
 
+    # `mise install` runs in every provisioned tree (DESIGN §6½ *A
+    # repository's runtimes are the ones mise discovers*); this test's
+    # subject is the recipe, and the host has no mise.
+    async def _mise(tree, log_dir, st_, override_file=None):
+        st_.data.setdefault("provision", {})["mise_versions"] = {}
+    monkeypatch.setattr(leerie, "_run_mise_install", _mise)
+
     async def _gate(caps, **_k):
         return {"waited_sec": 0.0, "timed_out": False, "psi": 1.0,
                 "readable": True}
