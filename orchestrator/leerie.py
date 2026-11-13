@@ -31247,6 +31247,56 @@ def _forbidden_script_derived(entries: list[dict],
         return []
 
 
+def _record_process_constraints(st: "State", union: dict, draws: dict,
+                                sources: list[str],
+                                repo_root: str | Path | None, *,
+                                provisional: bool) -> None:
+    """Derive `state.data["process_constraints"]` from the forbidden-command
+    draws (`_process_constraints`), with each entry's votes and the draws'
+    record. Phase 1 records them `provisional`, with the inputs kept for
+    phase 1½ (`_finalize_process_constraints`): one rule needs the
+    repository's test command, which is read from the repository there
+    (DESIGN §9 *A script's environment is part of what it runs*)."""
+    pc_rec = _process_constraints(
+        union, st.data.get("prescribed_procedure") or {}, sources=sources,
+        repo_root=repo_root)
+    for e in pc_rec["entries"]:
+        e["votes"] = draws["votes"].get(e.get("derived_from", e["command"]),
+                                        0)
+    pc_rec["draws"] = {"draws": draws["draws"], "crashed": draws["crashed"]}
+    if provisional:
+        pc_rec["provisional"] = True
+        pc_rec["inputs"] = {"union": union, "votes": dict(draws["votes"]),
+                            "draws": draws["draws"],
+                            "crashed": draws["crashed"],
+                            "sources": list(sources)}
+    st.data["process_constraints"] = pc_rec
+
+
+def _finalize_process_constraints(st: "State",
+                                  repo_root: str | Path | None) -> None:
+    """Replace phase 1's provisional forbidden-command entries, once, with
+    the ones derived from the same inputs now that the repository's test
+    command is known (phase 1½, after `_discover_blt`). A record that is
+    not provisional is left alone."""
+    pc = st.data.get("process_constraints")
+    if not isinstance(pc, dict) or not pc.get("provisional"):
+        return
+    inp = pc.get("inputs") or {}
+    before = [e.get("command") for e in pc.get("entries") or []]
+    _record_process_constraints(
+        st, inp.get("union") or {},
+        {"votes": inp.get("votes") or {}, "draws": inp.get("draws", 0),
+         "crashed": inp.get("crashed", 0)},
+        list(inp.get("sources") or []), repo_root, provisional=False)
+    st.save()
+    after = [e.get("command") for e in
+             st.data["process_constraints"].get("entries") or []]
+    if after != before:
+        log("  task forbids, with the repository's test command known: "
+            + (", ".join(after) or "(nothing)"))
+
+
 def _forbidden_draw_union(result: dict,
                           samples: list[dict | None]) -> tuple[dict, dict]:
     """The union of every draw's forbidden-command entries (DESIGN §9 *A
@@ -35631,14 +35681,12 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     # check alone decides what is kept (DESIGN §9 *A command the task
     # forbids*, "Several draws, unioned").
     union, draws = _forbidden_draw_union(result, forbid_samples)
-    pc_rec = _process_constraints(
-        union, st.data["prescribed_procedure"], sources=quote_sources,
-        repo_root=repo_root)
-    for e in pc_rec["entries"]:
-        e["votes"] = draws["votes"].get(e.get("derived_from", e["command"]),
-                                        0)
-    pc_rec["draws"] = {"draws": draws["draws"], "crashed": draws["crashed"]}
-    st.data["process_constraints"] = pc_rec
+    # Provisional: the repository's test command is read in phase 1½, and
+    # `_finalize_process_constraints` replaces these entries then (DESIGN
+    # §9 *A script's environment is part of what it runs*).
+    _record_process_constraints(st, union, draws, quote_sources, repo_root,
+                                provisional=True)
+    pc_rec = st.data["process_constraints"]
     if _forbidden_commands(st.data):
         log("  task forbids: " + ", ".join(_forbidden_commands(st.data)))
     derived = [e["command"] for e in pc_rec["entries"]
@@ -36586,6 +36634,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # and test commands are read from it*). Before the recipe is recorded:
     # a resume skips this phase only when both are.
     await _discover_blt(st, caps, models, efforts, repo_root, recipe)
+    _finalize_process_constraints(st, repo_root)
 
     prov["recipe"] = recipe
     st.save()
