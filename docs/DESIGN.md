@@ -20561,6 +20561,21 @@ Three layers follow, each derived from that one list:
     so the runner in any environment runs what the task forbade. `"test":
     "cross-env TZ=UTC vitest run"` still derives `vitest run`, and a
     worker's `npx vitest run` is refused (review M2);
+    which script is the test command is a fact about the repository, not
+    about the body: the same `dotenv -e .env.test -- vitest run` is how the
+    suite runs when it is `test`'s body, and a database the task forbids
+    when it is `test:db`'s. Since the repository's commands are read from
+    it in phase 1½ (§6½ *A repository's build, lint and test commands are
+    read from it*), and the entries must bind every worker from phase 1 on
+    (the classification judge and phase 1½'s own workers among them), the
+    entries phase 1 derives are **provisional** — derived without the test
+    command, so this rule cannot fire — and phase 1½ replaces them, once,
+    with the ones derived from the same inputs and the test command read
+    from the repository, before any later reader. A run resumed before
+    phase 1½ finished re-runs it, and so the replacement. Without the
+    replacement a forbidden `pnpm test` whose body is `dotenv -e .env.test
+    -- vitest run` derives only that wrapped command, and a worker's bare
+    `npx vitest run` — the same suite — is not refused (review M2's hole);
   - or every token of the environment is a test-hygiene assignment, one
     that changes how a run reports or how much memory it gets, never what
     it touches: `TZ`, `CI`, `FORCE_COLOR`, `NO_COLOR`, `LANG`, `LC_*`, and
