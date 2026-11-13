@@ -26139,9 +26139,6 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
                      *([os.path.realpath(cli)] if cli else []),
                      *([home] if home else []),
                      str(run_dir / CLAUDE_CONFIG_TEMPLATE),
-                     # What `MISE_OVERRIDE_CONFIG_FILENAMES` names in a Go
-                     # repository's run: mise reads it on every call.
-                     str(run_dir / MISE_OVERRIDES_NAME),
                      # What `MISE_GLOBAL_CONFIG_FILE` names: the run's tools.
                      str(run_dir / MISE_TOOLS_NAME)]
     if schema_key in _COMMITTING_WORKERS:
@@ -27177,8 +27174,7 @@ def _measurement_grants(st: "State", tree: str | Path,
     # are: `/tmp` is not in the reads outside the state root, and either
     # may lie beneath it.
     home = os.path.realpath(os.environ.get("HOME") or Path.home())
-    ro: list[str] = [str(ROOT), str(run_dir / MISE_OVERRIDES_NAME),
-                     str(run_dir / MISE_TOOLS_NAME),
+    ro: list[str] = [str(ROOT), str(run_dir / MISE_TOOLS_NAME),
                      *_measured_git_reads(t, run_dir, dirs)]
     if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
         ro.append(home)
@@ -33814,317 +33810,6 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
     st.save()
 
 
-# Regex for extracting the `go 1.X[.Y]` directive from a go.mod file.
-# Matches the canonical form documented at https://go.dev/ref/mod#go-mod-file-go .
-_GO_MOD_VERSION_RE = re.compile(r"^\s*go\s+(\d+(?:\.\d+){0,2})\s*$", re.MULTILINE)
-
-
-def _existing_mise_toml_path(repo_root: Path) -> Path | None:
-    """Return the path to whichever of `mise.toml` or `.mise.toml`
-    exists in the repo root, or None if neither does. Prefers the
-    non-dotted form when both exist — matches mise's documented
-    discovery precedence
-    (https://mise.jdx.dev/configuration.html: "Paths which start
-    with `mise` can be dotfiles, e.g.: `.mise.toml`").
-    """
-    for name in ("mise.toml", ".mise.toml"):
-        p = repo_root / name
-        if _regular_file_beneath(repo_root, p):
-            return p
-    return None
-
-
-def _go_already_pinned(repo_root: Path) -> bool:
-    """Return True if the repo already specifies a Go version mise would
-    pick up — via `.go-version`, a `go` entry in `.tool-versions`, or a
-    `[tools] go = "..."` in `mise.toml`/`.mise.toml`. In any of these
-    cases leerie should NOT synthesize an override; the existing pin wins.
-    """
-    if _regular_file_beneath(repo_root, repo_root / ".go-version"):
-        return True
-    tv = repo_root / ".tool-versions"
-    if _regular_file_beneath(repo_root, tv):
-        try:
-            for line in _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG).splitlines():
-                stripped = line.strip()
-                if stripped.startswith("#") or not stripped:
-                    continue
-                # `.tool-versions` is whitespace-separated: `tool version`.
-                parts = stripped.split()
-                if parts and parts[0].lower() == "go":
-                    return True
-        except OSError:
-            pass
-    mt = _existing_mise_toml_path(repo_root)
-    if mt is not None:
-        try:
-            content = _read_text_beneath(repo_root, mt, limit=READ_LIMIT_CONFIG)
-            # Cheap text-level check — TOML parsing here would pull in
-            # tomllib but the heuristic is sufficient: any `go =` line
-            # under a [tools] section indicates a pin.
-            if re.search(r"(?m)^\s*go\s*=", content):
-                return True
-        except OSError:
-            pass
-    return False
-
-
-# Strip leading `v` or `V` (any number) from `.nvmrc`/`.node-version`
-# values; mise expects bare semver. Compiled once at module load.
-_LEADING_V_RE = re.compile(r"^[vV]+")
-
-
-# Idiomatic version files mise reads natively *when discovery walks
-# the repo* — but NOT when `MISE_OVERRIDE_CONFIG_FILENAMES` is set
-# (verified against mise discussions #6598 / #7058). When the override
-# fires (because leerie synthesized a go pin), every idiomatic file the
-# repo committed for some OTHER language is silently dropped — workers
-# end up running on the image-baked LTS instead of the pinned version.
-# So when the override fires, leerie scans these files and injects their
-# pins into the override's `[tools]` section.
-_IDIOMATIC_VERSION_FILES = (
-    # (filename, mise tool key, value transformer)
-    (".nvmrc", "node", lambda s: _LEADING_V_RE.sub("", s)),
-    (".node-version", "node", lambda s: _LEADING_V_RE.sub("", s)),
-    (".python-version", "python", lambda s: s),
-    (".ruby-version", "ruby", lambda s: s),
-)
-
-
-# asdf-compatible names (used by `.tool-versions`) that mise treats as
-# aliases for its canonical tool names. Without this map, a repo with
-# `.nvmrc` (injects `node`) plus `.tool-versions` carrying
-# `nodejs 20.11.0` would end up with both `node` and `nodejs` in the
-# override — mise treats both as the same tool, producing ambiguous
-# resolution. Normalize asdf names BEFORE checking already_pinned.
-_ASDF_TOOL_ALIASES = {
-    "nodejs": "node",
-    "python3": "python",
-}
-
-
-def _existing_mise_toml_tool_keys(text: str | None) -> set[str]:
-    """Return the set of tool keys pinned by a `[tools]` section in the
-    given mise.toml text. Used by `_synth_mise_go_override` to avoid
-    re-pinning a tool the repo already wired up explicitly. Heuristic
-    line-level scan — full TOML parsing would pull in tomllib and the
-    set of forms we care about (top-level `[tools]` table, simple
-    `<key> =` lines) is tiny.
-    """
-    if not text:
-        return set()
-    keys: set[str] = set()
-    in_tools = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_tools = (stripped == "[tools]")
-            continue
-        if not in_tools:
-            continue
-        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=", line)
-        if m:
-            keys.add(m.group(1))
-    return keys
-
-
-def _read_idiomatic_pins(repo_root: Path,
-                          already_pinned: set[str]) -> list[tuple[str, str]]:
-    """Return [(tool, version), ...] for every idiomatic version file in
-    `repo_root` whose tool is NOT already in `already_pinned`.
-
-    Used to bridge the `MISE_OVERRIDE_CONFIG_FILENAMES` semantic: when
-    the override is set, mise reads ONLY the listed files; idiomatic
-    discovery is suppressed. Leerie must therefore copy the pins forward
-    explicitly. See DESIGN §6½ "Per-repo dependency provisioning."
-
-    `.tool-versions` is parsed line-by-line (asdf-compatible format:
-    `<tool> <version>` per line, comments with `#`).
-
-    `rust-toolchain.toml` is intentionally out of scope — the file's
-    `[toolchain] channel = "..."` shape needs more care than a regex
-    sweep, and the rare repo that committed only rust-toolchain.toml
-    can add a `mise.toml` or commit `.tool-versions` instead.
-    """
-    pins: list[tuple[str, str]] = []
-    for filename, tool, transform in _IDIOMATIC_VERSION_FILES:
-        if tool in already_pinned:
-            continue
-        path = repo_root / filename
-        if not _regular_file_beneath(repo_root, path):
-            continue
-        try:
-            raw = _read_text_beneath(repo_root, path, limit=READ_LIMIT_CONFIG).strip()
-        except OSError:
-            continue
-        if not raw:
-            continue
-        version = transform(raw.splitlines()[0].strip())
-        if not version:
-            continue
-        pins.append((tool, version))
-        already_pinned.add(tool)
-    # .tool-versions: asdf-compatible, multiple tools per file.
-    # asdf and mise sometimes disagree on tool names (asdf calls Node
-    # `nodejs`, mise calls it `node`). Normalize via _ASDF_TOOL_ALIASES
-    # before the dedup check so we don't pin both `node` AND `nodejs`
-    # (which mise treats as the same tool — ambiguous resolution).
-    tv = repo_root / ".tool-versions"
-    if _regular_file_beneath(repo_root, tv):
-        try:
-            content = _read_text_beneath(repo_root, tv, limit=READ_LIMIT_CONFIG)
-        except OSError:
-            content = ""
-        for line in content.splitlines():
-            stripped = line.split("#", 1)[0].strip()
-            if not stripped:
-                continue
-            parts = stripped.split()
-            if len(parts) < 2:
-                continue
-            raw_tool, version = parts[0], parts[1]
-            tool = _ASDF_TOOL_ALIASES.get(raw_tool, raw_tool)
-            if tool in already_pinned:
-                continue
-            pins.append((tool, version))
-            already_pinned.add(tool)
-    return pins
-
-
-# The run's synthesized mise configuration (`_synth_mise_go_override`):
-# every confined worker and measurement reads it (DESIGN §6 I5).
-MISE_OVERRIDES_NAME = "mise-overrides.toml"
-
-
-def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
-    """If `go.mod` exists and no other Go pin is in place, write a mise
-    override file that pins the Go version mise should install. Returns
-    the absolute path to the override file (so the caller can export
-    `MISE_OVERRIDE_CONFIG_FILENAMES` before invoking `mise install`),
-    or None if no synthesis was needed.
-
-    `MISE_OVERRIDE_CONFIG_FILENAMES` REPLACES the default config
-    discovery rather than merging with it (verified against mise docs
-    and discussions #4136 / #8510 / #6598 / #7058). When the override
-    is set, mise reads ONLY the listed files — both `mise.toml` AND
-    idiomatic files (`.nvmrc`, `.python-version`, etc.) are otherwise
-    silently dropped. This helper preserves both:
-
-      - Existing `mise.toml` content is read and the `go = "X"` pin
-        is inserted into its `[tools]` section (no duplicate header).
-      - Idiomatic version files in the repo root (`.nvmrc`,
-        `.node-version`, `.python-version`, `.ruby-version`,
-        `.tool-versions`) are read; any tool NOT already pinned in
-        `mise.toml` gets its pin copied into the override's `[tools]`
-        section alongside the synthesized go pin.
-
-    Without the idiomatic-file copy, a polyglot Go+Node repo with
-    `go.mod` + `.nvmrc: 20.11.0` and no `mise.toml` would silently
-    install only Go; the Node version pinned in `.nvmrc` would drop
-    to the image-baked LTS, defeating the runtime-version guarantee
-    the entire mise layer was built to provide.
-
-    **Known limits of the existing-mise-config scanner:**
-    `_existing_mise_toml_tool_keys` reads tool pins from the canonical
-    `[tools]` section with bare keys (`node = "20"`). Two valid TOML
-    forms are NOT detected — when present, leerie will re-inject pins
-    from idiomatic files alongside the existing ones, producing
-    duplicate keys that mise rejects mid-run:
-
-      - Inline-table form: `tools = { node = "20.11.0" }`
-      - Quoted keys: `[tools]\n"node" = "20.11.0"`
-
-    Both are rare in practice (the canonical form is what mise's
-    docs and `mise use` write). Repos that hit these can switch to
-    the canonical form. A proper fix would need `tomllib` (3.11+
-    stdlib) — leerie's minimum is 3.10 — or a hand-written inline-
-    table parser; neither is justified by current usage.
-
-    See DESIGN §6½ and IMPLEMENTATION §6½ step 3.
-    """
-    gomod = repo_root / "go.mod"
-    if not _regular_file_beneath(repo_root, gomod):
-        return None
-    if _go_already_pinned(repo_root):
-        return None
-    try:
-        text = _read_text_beneath(repo_root, gomod, limit=READ_LIMIT_CONFIG)
-    except OSError:
-        return None
-    m = _GO_MOD_VERSION_RE.search(text)
-    if not m:
-        return None
-    version = m.group(1)
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    override_path = run_dir / MISE_OVERRIDES_NAME
-
-    header_comment = (
-        "# Synthesized by leerie from go.mod (DESIGN §6½).\n"
-        "# mise's go plugin does not parse go.mod itself; idiomatic\n"
-        "# version files (.nvmrc, .python-version, etc.) are copied in\n"
-        "# because MISE_OVERRIDE_CONFIG_FILENAMES suppresses discovery.\n"
-    )
-
-    existing = _existing_mise_toml_path(repo_root)
-    existing_text: str | None = None
-    if existing is not None:
-        try:
-            existing_text = _read_text_beneath(repo_root, existing, limit=READ_LIMIT_CONFIG)
-        except OSError:
-            existing_text = None
-
-    # Build the full set of new pins (go + every idiomatic-file tool
-    # that the existing mise.toml doesn't already pin).
-    already_pinned = _existing_mise_toml_tool_keys(existing_text)
-    already_pinned.add("go")  # we're adding it ourselves below
-    idiomatic_pins = _read_idiomatic_pins(repo_root, already_pinned)
-    new_pin_lines = [f'go = "{version}"'] + [
-        f'{tool} = "{ver}"' for tool, ver in idiomatic_pins
-    ]
-
-    if existing_text is None:
-        # No existing mise.toml — emit a minimal override carrying just
-        # the new pins.
-        body = "[tools]\n" + "\n".join(new_pin_lines) + "\n"
-        override_path.write_text(header_comment + body)
-        return override_path
-
-    # Insert new pin lines into the existing [tools] section if one
-    # exists; otherwise append a fresh [tools] section. We avoid
-    # emitting a duplicate [tools] header (TOML 1.0 §6.5 — "Defining a
-    # table more than once is invalid").
-    lines = existing_text.rstrip("\n").split("\n")
-    out_lines: list[str] = []
-    inserted = False
-    in_tools = False
-    for line in lines:
-        out_lines.append(line)
-        stripped = line.strip()
-        # Detect entering the [tools] table. A subsequent table header
-        # (`[other]`) exits it. Subtables (`[tools.something]`) are also
-        # valid TOML but are out of scope for this synthesis — leerie only
-        # cares about adding scalar keys to the top-level [tools].
-        if not in_tools and stripped == "[tools]":
-            in_tools = True
-            # Insert immediately after the header, before any existing
-            # keys. This is the safe minimal change.
-            out_lines.extend(new_pin_lines)
-            inserted = True
-            in_tools = False  # done — keys after are preserved as-is
-            continue
-    if not inserted:
-        # No [tools] section in the existing file — append one.
-        if out_lines and out_lines[-1].strip() != "":
-            out_lines.append("")
-        out_lines.append("[tools]")
-        out_lines.extend(new_pin_lines)
-
-    override_path.write_text(
-        header_comment + "\n".join(out_lines) + "\n")
-    return override_path
-
-
 # The run's own tools file: the tools the repository needs as the
 # `tool_discovery` worker read them, the configuration mise reads beneath
 # every repository's own (`MISE_GLOBAL_CONFIG_FILE`; DESIGN §6½ *The tools a
@@ -34205,13 +33890,9 @@ def _use_run_tools_file(env: MutableMapping[str, str],
 def _resume_provision_env(st: "State",
                           env: MutableMapping[str, str]) -> None:
     """On `resume`, lay into `env` the mise configuration the run's
-    provisioning chose for every later command: the synthesized go
-    override, when there is one, and the run's tools file (DESIGN §6½
-    *The tools a repository needs are read from it*)."""
+    provisioning chose for every later command: the run's tools file
+    (DESIGN §6½ *The tools a repository needs are read from it*)."""
     prov = st.data.get("provision") or {}
-    override = prov.get("override_file")
-    if override:
-        env["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
     _use_run_tools_file(env, prov.get("tools_file"))
 
 
@@ -34293,12 +33974,10 @@ def _trust_run_mise_configs(env: MutableMapping[str, str],
                             run_dir: Path) -> None:
     """Make mise trust every configuration file beneath `run_dir`
     (`MISE_TRUSTED_CONFIG_PATHS`, which trusts a directory's whole subtree):
-    the trees the run checks out and its synthesized override
-    (`MISE_OVERRIDES_NAME`). Without it mise 2026.5.4 refuses an untrusted
-    `mise.toml` ("Config files in … are not trusted"), and `mise install`
-    exits 1 (measured), so a repository pinning its runtimes in `mise.toml`,
-    and every Go repository whose version leerie reads from `go.mod`, died
-    at provision. The value names the run directory alone: nothing outside
+    the trees the run checks out. Without it mise 2026.5.4 refuses an
+    untrusted `mise.toml` ("Config files in … are not trusted"), and `mise
+    install` exits 1 (measured), so a repository pinning its runtimes in
+    `mise.toml` died at provision. The value names the run directory alone: nothing outside
     the run is trusted."""
     env["MISE_TRUSTED_CONFIG_PATHS"] = str(run_dir)
 
@@ -34398,11 +34077,10 @@ async def _mise_install_lock(st: "State") -> AsyncIterator[None]:
 
 
 async def _run_mise_install(repo_root: Path, log_dir: Path,
-                            st: "State",
-                            override_file: Path | None = None) -> None:
-    """Invoke `mise install` at the repo root. If `override_file` is
-    provided, exports `MISE_OVERRIDE_CONFIG_FILENAMES` so mise reads
-    leerie's synthesized config instead of the default discovery walk.
+                            st: "State") -> None:
+    """Invoke `mise install` at the repo root: the repository's own pins,
+    and beneath them the run's tools file (`MISE_GLOBAL_CONFIG_FILE`,
+    `_discover_tools`).
 
     Captures resolved versions via `mise ls --current --json` and stores
     the raw blob at `st.data["provision"]["mise_versions"]` — callers can
@@ -34421,8 +34099,6 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     log_path = log_dir / "provision.log"
 
     env = os.environ.copy()
-    if override_file is not None:
-        env["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override_file)
     # mise's own corepack enable writes beside the first `corepack` on PATH,
     # the image's baked Node, not the version it installed; leerie enables
     # each version into its own bin after the install instead (DESIGN §6
@@ -34431,9 +34107,7 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
 
     # `mise install` with no tool args reads the active config and
     # installs every declared tool. We let the resolver figure out the
-    # set from the repo's .tool-versions / .nvmrc / .python-version /
-    # rust-toolchain.toml / .go-version (the last either committed or
-    # synthesized by _synth_mise_go_override).
+    # set from the repository's own pin files and the run's tools file.
     #
     # Stream output: a first-run install of Python 3.12 / Ruby 3.2 /
     # Rust can take minutes; without streaming the user sees a silent
@@ -36457,37 +36131,15 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
 
 async def _provision_hook_and_toolchain(tree: Path, log_dir: Path,
                                         st: State) -> None:
-    """Phase 1½ steps 2–4 (`phase_provision`) in `tree`, a throwaway
-    checkout of the planning tree's commit: the setup hook, the go override
-    and `mise install`. Never the user's checkout (DESIGN §6 *The explicit
+    """Phase 1½ steps 2–3 (`phase_provision`) in `tree`, a throwaway
+    checkout of the planning tree's commit: the setup hook and `mise
+    install`. Never the user's checkout (DESIGN §6 *The explicit
     channel*)."""
-    prov = st.data.setdefault("provision", {})
     # 2. Setup hook.
     await _run_setup_hook(tree, log_dir, st)
 
-    # 3. Synthesize a mise go override if go.mod lacks a sibling pin.
-    override = _synth_mise_go_override(tree, st.run_dir)
-    if override is not None:
-        log(f"  synthesized mise override at {override.name} "
-            f"(go.mod → .go-version equivalent)")
-    # Persist so a `resume` after this point can re-export the env
-    # var (_orchestrate() re-reads provision state on resume).
-    prov["override_file"] = str(override) if override is not None else None
-    st.save()
-    # Export MISE_OVERRIDE_CONFIG_FILENAMES into the orchestrator's
-    # os.environ now so every downstream subprocess — `mise install`
-    # below, the implementer/conformer `claude -p` workers (which
-    # inherit os.environ via _invoke), and any `mise exec --` they
-    # invoke from their worktrees — sees the synthesized go pin.
-    # Without this, mise's discovery in the worktree wouldn't find the
-    # synth (the override file lives under .leerie/, which isn't in the
-    # worktree's tracked-file set) and `mise exec -- go ...` would
-    # fall through to system PATH where Go isn't installed.
-    if override is not None:
-        os.environ["MISE_OVERRIDE_CONFIG_FILENAMES"] = str(override)
-
-    # 4. mise install + version capture.
-    await _run_mise_install(tree, log_dir, st, override_file=override)
+    # 3. mise install + version capture.
+    await _run_mise_install(tree, log_dir, st)
 
 
 async def phase_provision(repo_root: Path, st: State, caps: dict,
@@ -36508,14 +36160,13 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
          are read from it*).
       1. The provisioning checkout: a throwaway checkout of the planning
          tree's commit (`_judge_checkout`), never the user's checkout.
-         Steps 2–4 run in it (`_provision_hook_and_toolchain`).
+         Steps 2–3 run in it (`_provision_hook_and_toolchain`).
       2. `.leerie-setup.sh` hook if present.
-      3. Synthesize a mise go-override from `go.mod` if needed.
-      4. `mise install`, always: mise reads `mise.toml`/`.tool-versions`
+      3. `mise install`, always: mise reads `mise.toml`/`.tool-versions`
          and every idiomatic version file of every tool it ships
          (enabled by the image's `/etc/mise/config.toml`). Capture
          resolved versions via `mise ls --current --json`.
-      5. Detect install commands: deterministic lockfile table first
+      4. Detect install commands: deterministic lockfile table first
          (emits all matches for polyglot repos), LLM fallback if the
          table abstains. Validate the recipe and persist it to
          st.data["provision"]["recipe"]: every tree leerie measures
@@ -36541,7 +36192,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     log_dir = st.run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. The provisioning checkout. 2–4 run in a throwaway checkout of the
+    # 1. The provisioning checkout. 2–3 run in a throwaway checkout of the
     # planning tree's commit, never in the user's checkout: the hook and
     # `mise` (`mise.lock`, a configured `.venv`) may write their working
     # directory, and the container never writes the user's checkout (DESIGN
@@ -36568,14 +36219,14 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         if version_summary:
             log(f"  resolved versions: {version_summary}")
 
-    # 5a. Detect install commands — table first.
+    # 4a. Detect install commands — table first.
     recipe = _detect_recipe_from_lockfiles(repo_root)
 
     if recipe:
         prov["source"] = "table"
         log(f"  table emitted {len(recipe)} install command(s)")
     else:
-        # 5b. LLM fallback with CRITIC-pattern mechanical feedback loop.
+        # 4b. LLM fallback with CRITIC-pattern mechanical feedback loop.
         log("  table abstained — invoking provision worker")
         fixtures = _gather_provision_fixtures(repo_root)
         sys_prompt = _load_prompt("provision")

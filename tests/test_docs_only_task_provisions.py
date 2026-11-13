@@ -109,7 +109,7 @@ def env(leerie, tmp_path, monkeypatch):
     # `mise install` runs in every provisioned tree (DESIGN §6½ *A
     # repository's runtimes are the ones mise discovers*); this test's
     # subject is the recipe, and the host has no mise.
-    async def _mise(tree, log_dir, st_, override_file=None):
+    async def _mise(tree, log_dir, st_):
         st_.data.setdefault("provision", {})["mise_versions"] = {}
     monkeypatch.setattr(leerie, "_run_mise_install", _mise)
 

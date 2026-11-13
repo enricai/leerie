@@ -834,23 +834,23 @@ def test_progress_marker_with_no_waves_or_categories_reenters_classify(
     assert st.data["started_at"] == "2026-11-01T00:00:00Z"
 
 
-def test_resume_reexports_mise_override_env_var(
+def test_resume_reexports_the_runs_tools_file(
         leerie, monkeypatch, run_dirs, tmp_path):
-    """A resumed run whose original invocation synthesized a mise override
-    file re-exports MISE_OVERRIDE_CONFIG_FILENAMES for downstream
-    implementer/conformer subprocesses — phase_provision itself is
-    skipped on resume (recipe already persisted), so nothing else would
-    set it."""
+    """A resumed run points mise at the tools file its first invocation
+    wrote (MISE_GLOBAL_CONFIG_FILE) for downstream implementer/conformer
+    subprocesses — phase_provision itself is skipped on resume (recipe
+    already persisted), so nothing else would set it."""
     calls: dict = {}
     _stub_common(leerie, monkeypatch, calls)
-    monkeypatch.delenv("MISE_OVERRIDE_CONFIG_FILENAMES", raising=False)
-    override_path = tmp_path / "mise-override.toml"
+    monkeypatch.setenv("MISE_GLOBAL_CONFIG_FILE", "x")
+    monkeypatch.delenv("MISE_GLOBAL_CONFIG_FILE")
+    override_path = tmp_path / "mise-tools.toml"
     override_path.write_text("[tools]\ngo = '1.22'\n")
     persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
     st = _make_state(leerie, run_dirs, {
         "task": "test task", "worker_count": 3,
         "categories": ["bug-fixing"],
-        "provision": {"source": "table", "recipe": [], "override_file": str(override_path)},
+        "provision": {"source": "table", "recipe": [], "tools_file": str(override_path)},
         "plans_after_classify": [],
         "plans_after_plan": persisted_plans,
         "plans_after_reconcile": persisted_plans,
@@ -862,7 +862,7 @@ def test_resume_reexports_mise_override_env_var(
     caps = _caps(leerie)
     args = _args()
     _drive(leerie, args, caps, run_dirs, st)
-    assert os.environ.get("MISE_OVERRIDE_CONFIG_FILENAMES") == str(override_path)
+    assert os.environ.get("MISE_GLOBAL_CONFIG_FILE") == str(override_path)
 
 
 def test_fresh_run_with_no_task_dies(leerie, monkeypatch, run_dirs):
