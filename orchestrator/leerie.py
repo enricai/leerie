@@ -34209,33 +34209,18 @@ def _synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     return override_path
 
 
-# Filenames that signal "this repo pins a runtime version mise should
-# install." Used by `_repo_has_version_signal` to decide whether to
-# invoke `mise install` at all — an unversioned repo runs on the
-# image-baked LTS without bothering mise.
-_MISE_SIGNAL_FILES = (
-    "mise.toml", ".mise.toml",
-    ".tool-versions",
-    ".nvmrc", ".node-version",
-    ".python-version",
-    ".ruby-version",
-    "rust-toolchain.toml",
-    ".go-version",
-)
-
-
-def _repo_has_version_signal(repo_root: Path,
-                              override_file: Path | None) -> bool:
-    """Return True if the repo declares any runtime version pin mise
-    can act on, OR if leerie already synthesized an override file. False
-    means there's nothing for `mise install` to do; the LTS fallback
-    in the image is the right answer."""
-    if override_file is not None:
-        return True
-    for name in _MISE_SIGNAL_FILES:
-        if (repo_root / name).is_file():
-            return True
-    return False
+def _trust_run_mise_configs(env: MutableMapping[str, str],
+                            run_dir: Path) -> None:
+    """Make mise trust every configuration file beneath `run_dir`
+    (`MISE_TRUSTED_CONFIG_PATHS`, which trusts a directory's whole subtree):
+    the trees the run checks out and its synthesized override
+    (`MISE_OVERRIDES_NAME`). Without it mise 2026.5.4 refuses an untrusted
+    `mise.toml` ("Config files in … are not trusted"), and `mise install`
+    exits 1 (measured), so a repository pinning its runtimes in `mise.toml`,
+    and every Go repository whose version leerie reads from `go.mod`, died
+    at provision. The value names the run directory alone: nothing outside
+    the run is trusted."""
+    env["MISE_TRUSTED_CONFIG_PATHS"] = str(run_dir)
 
 
 # `mise ls --current --json` is a metadata read against the already-
@@ -34346,24 +34331,14 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
     Failures propagate to `die()` with the failing tool/version and the
     last 40 lines of mise output.
 
-    No-signals short-circuit: if the repo has zero version pins (no
-    `mise.toml`, `.tool-versions`, idiomatic file, or leerie-synthesized
-    override), this function is a logged no-op. The image-baked LTS
-    Node and Python on PATH then become the workers' runtime. Without
-    this guard, mise's exact behavior for `mise install` with no
-    declared tools is implementation-dependent and could `die()` the
-    whole run with a confusing "no tools to install" message — exactly
-    the case the LTS-fallback story was supposed to handle smoothly.
+    Always run: which files pin a runtime is mise's to know, not a list
+    of leerie's (DESIGN §6½ *A repository's runtimes are the ones mise
+    discovers*). With nothing pinned, `mise install` installs nothing and
+    exits 0 ("all tools are installed", measured on mise 2026.5.4), and
+    `mise ls --current --json` records `{}`.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "provision.log"
-
-    if not _repo_has_version_signal(repo_root, override_file):
-        log("  no version pins detected — workers run on image-baked LTS")
-        prov = st.data.setdefault("provision", {})
-        prov["mise_versions"] = {}
-        st.save()
-        return
 
     env = os.environ.copy()
     if override_file is not None:
@@ -36451,10 +36426,9 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
          Steps 2–4 run in it (`_provision_hook_and_toolchain`).
       2. `.leerie-setup.sh` hook if present.
       3. Synthesize a mise go-override from `go.mod` if needed.
-      4. `mise install` (reads .tool-versions natively
-         and .nvmrc / .python-version / .ruby-version /
-         rust-toolchain.toml via the image-set
-         MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS env). Capture
+      4. `mise install`, always: mise reads `mise.toml`/`.tool-versions`
+         and every idiomatic version file of every tool it ships
+         (enabled by the image's `/etc/mise/config.toml`). Capture
          resolved versions via `mise ls --current --json`.
       5. Detect install commands: deterministic lockfile table first
          (emits all matches for polyglot repos), LLM fallback if the
@@ -82057,6 +82031,13 @@ def main() -> int | None:
     # own stores, which no other run reads (DESIGN §6 *The stores a view
     # installs from are leerie's*).
     _leerie_stores(os.environ, st.run_dir)
+    # mise refuses every configuration file it was not told to trust — a
+    # tree's `mise.toml`, leerie's own synthesized override — and the
+    # refusal fails `mise install` and every shim. Each one beneath the run
+    # directory is the run's: a repository's, or leerie's, read by confined
+    # processes only (DESIGN §6½ *A repository's runtimes are the ones mise
+    # discovers*).
+    _trust_run_mise_configs(os.environ, st.run_dir)
 
     # Persist the orchestrator's own stdout/stderr to
     # <run_dir>/orchestrator.log now that the run dir exists (DESIGN §6).

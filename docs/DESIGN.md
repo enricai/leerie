@@ -10693,7 +10693,7 @@ fresh AWS account with no operator-built artifact. Three strategies:
    `ensure_image()`).** **This is the default this design adopts.**
    On first use leerie bakes an AMI from a stock Debian 13 image so it
    matches the Dockerfile: base packages, `requirements.txt` deps, `gh`,
-   mise with `node@lts`/`python@3.12` and the `lts-current` symlink, the
+   mise with `node@lts`, its system configuration and the `lts-current` symlink, the
    pinned `claude` CLI, the `leerie` user, `/opt/leerie-image/{orchestrator,
    scripts,prompts,.claude-plugin}`, `/work`, the `safe.directory`
    config, the SSM agent, and an `ec2-user` login. Later runs find the
@@ -11323,12 +11323,54 @@ the CI parity baseline, the browser suite unable to start).
 2. **Runtime version resolution.** The orchestrator delegates to a
    polyglot version manager that reads the repo's existing version
    declarations (`.nvmrc`, `.python-version`, `.tool-versions`,
-   `rust-toolchain.toml`, `.go-version`). Matching toolchain versions
-   install into a cache that survives across runs. If a repo declares
-   nothing, the image-baked LTS for Node and Python is the floor — the
-   resolver checks the per-run cache first, falls through to the
-   image-baked layer. Runtime selection has no model in the loop; the
-   version manager's parser is the enforcement.
+   `rust-toolchain.toml`, `.go-version`, `.java-version`, `global.json`,
+   …). Matching toolchain versions install into a cache that survives
+   across runs. If a repo declares no Node, the image-baked LTS Node (the
+   one leerie's own CLI is installed with) is the floor — the resolver
+   checks the per-run cache first, falls through to the image-baked layer;
+   a repo that declares no Python runs on the image's Debian Python.
+   Runtime selection has no model in the loop; the version manager's
+   parser is the enforcement.
+
+   **A repository's runtimes are the ones mise discovers.** *Revised
+   2026-11-12 (the language-agnostic audit's cluster C2).* *Root cause.*
+   Which of a repository's files pin a runtime was a list of leerie's, in
+   three places: the image enabled mise's idiomatic version files for
+   `node,python,ruby,rust` only (`MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`),
+   so a `.go-version`, `.java-version`, `.bun-version`, `.zig-version`
+   or `global.json` was ignored (measured on 0.65.0's image: with that
+   list `mise ls --current` reports only the `.ruby-version` of a tree
+   holding all six; with every tool mise ships enabled, all six); the
+   orchestrator ran `mise install` only when the tree held one of nine
+   named files (`_MISE_SIGNAL_FILES`), so a pin anywhere else was never
+   installed; and the image baked Python 3.12 beside the Node leerie
+   itself needs — not a floor in fact (a tree pinning no Python ran the
+   Debian `python3`, 3.13.5, measured), and a runtime list of leerie's.
+   *Invariant.* Which files pin which runtime is mise's knowledge, never
+   leerie's: the image enables the idiomatic version files of every tool
+   mise ships, read from mise's own registry at image build (every
+   `core:` backend of `mise registry`, written to `/etc/mise/config.toml`
+   by `scripts/mise-system-config.sh`, on the image and on an EC2 bake
+   alike), and the run's provision runs `mise install` in every tree it
+   provisions, whatever files it holds — with nothing pinned it installs
+   nothing and exits 0 (measured on mise 2026.5.4). The image bakes no
+   runtime but leerie's own Node. And mise is told which configuration it
+   may read: every file beneath the run directory
+   (`MISE_TRUSTED_CONFIG_PATHS=<run-dir>`, set on the orchestrator's
+   environment once the run directory exists, `_trust_run_mise_configs`),
+   which every process of the run inherits. Until then mise refused an
+   untrusted `mise.toml` ("Config files in … are not trusted") and `mise
+   install` exited 1, so a repository pinning its runtimes in `mise.toml`
+   died at provision, and so did every Go repository without a
+   `.go-version`: the override leerie synthesizes from `go.mod` was
+   refused the same way (measured on 0.65.0's image and a real launch,
+   lane LG). Trusting the run's trees is no new authority: what mise runs
+   from them runs in confined processes, as the repository's own install
+   and tests do. What mise cannot read stays outside this
+   rule and is named as such: Go's version in `go.mod`, which mise does
+   not parse (step 3's synthesized override, still Go's own code; a typed
+   pin the provision worker reads from the repository is the general
+   form, not made here).
 
    **A repository's pinned runtime is the one its commands run.**
    *Designed 2026-11-04 (barnacle's `.nvmrc`, found proving the corepack

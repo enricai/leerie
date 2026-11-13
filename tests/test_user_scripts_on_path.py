@@ -167,6 +167,7 @@ _LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 # Every function leerie hands `os.environ` itself to, and whether it mutates
 # it. A new one fails the rule until it is classified here.
 _ENVIRON_TAKERS = {"_git_hooks_off": True, "_leerie_stores": True,
+                   "_trust_run_mise_configs": True,
                    "_git_hooks_on": False, "dict": False}
 
 
@@ -207,7 +208,7 @@ def test_nothing_sets_the_orchestrators_path(leerie, tmp_path):
             continue
         env = {"PATH": "/usr/bin:/bin"}
         fn = getattr(leerie, name)
-        fn(env, root) if name == "_leerie_stores" else fn(env)
+        fn(env, root) if name in ("_leerie_stores", "_trust_run_mise_configs") else fn(env)
         assert env["PATH"] == "/usr/bin:/bin", name
         assert str(root) not in env["PATH"]
 

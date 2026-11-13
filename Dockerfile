@@ -216,12 +216,12 @@ STUB
 RUN chmod +x /usr/lib/chromium/chrome_crashpad_handler
 
 # mise — polyglot version manager (formerly rtx). Owns the per-repo
-# runtime version selection (DESIGN §6½). Reads .tool-versions natively
-# and .nvmrc / .python-version / .ruby-version / rust-toolchain.toml
-# via the MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS env below (those
-# files are opt-in in current mise; without the env they are silently
-# ignored). go.mod's `go 1.X` line is NOT parsed by mise; leerie
-# synthesizes a .go-version override at provision time.
+# runtime version selection (DESIGN §6½). Reads mise.toml / .tool-versions
+# natively, and every idiomatic version file of every tool it ships via
+# /etc/mise/config.toml (scripts/mise-system-config.sh, below; those files
+# are opt-in per tool in current mise, silently ignored otherwise). go.mod's
+# `go 1.X` line is NOT parsed by mise; leerie synthesizes a .go-version
+# override at provision time.
 #
 # The mise.run script reads $MISE_VERSION; pin for reproducibility.
 ARG MISE_VERSION=v2026.5.4
@@ -231,11 +231,6 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 
 # mise env directives. ENV survives across RUNs and into the runtime
 # container (a shell `export` inside a RUN would not).
-#
-# IDIOMATIC_VERSION_FILE_ENABLE_TOOLS is load-bearing: mise treats
-# .nvmrc / .python-version / .ruby-version / rust-toolchain.toml as
-# "idiomatic" files that are disabled by default. Without this flag,
-# a repo with `.nvmrc: 20.11.0` would silently run on baked LTS.
 #
 # NODE_COREPACK=false: mise's own `corepack enable` after a Node install
 # writes its shims next to the first `corepack` on PATH, whatever version
@@ -256,7 +251,6 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # survive across runs. SYSTEM_DATA_DIR is where the LTS fallback
 # lives (baked below). The resolver checks DATA_DIR first then falls
 # through to SYSTEM_DATA_DIR (mise.jdx.dev/mise-cookbook/docker.html).
-ENV MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust
 ENV MISE_NODE_COREPACK=false
 ENV MISE_RUBY_COMPILE=false
 ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
@@ -280,11 +274,21 @@ ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV MISE_STATE_DIR=/tmp/.mise-state
 
-# Pre-install LTS Node + Python via `mise install --system`. Lands
-# binaries under /usr/local/share/mise/installs/<tool>/<version>.
-# At runtime mise's resolver falls through to these from the user
-# dir if a repo declares no version. ~150-200 MB image cost.
-RUN mise install --system node@lts python@3.12
+# Idiomatic version files are opt-in per tool in current mise: a repo with
+# `.nvmrc: 20.11.0` would otherwise silently run on the baked LTS. Which
+# tools is mise's own list, read from its registry here, never one of
+# leerie's (DESIGN §6½ *A repository's runtimes are the ones mise
+# discovers*).
+COPY scripts/mise-system-config.sh /usr/local/lib/leerie/mise-system-config.sh
+RUN /usr/local/lib/leerie/mise-system-config.sh
+
+# Pre-install LTS Node via `mise install --system`: leerie's own, the Node
+# the `claude` CLI is installed with below. Lands under
+# /usr/local/share/mise/installs/node/<version>. At runtime mise's resolver
+# falls through to it from the user dir if a repo declares no Node. No other
+# runtime is baked: a repository's are the ones mise discovers from its
+# files, installed by its run into the host's MISE_DATA_DIR.
+RUN mise install --system node@lts
 
 # Stable PATH symlink for the LTS Node bin. `mise install --system
 # node@lts` resolves to a concrete version directory under

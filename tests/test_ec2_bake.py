@@ -85,7 +85,7 @@ def test_env_file_from_real_dockerfile_carries_every_env_line():
 def test_env_file_written_before_mise_install_and_sourced_for_it():
     write = BODY.index('dockerfile_env > "$LEERIE_ENV_FILE"')
     source = BODY.index('. "$LEERIE_ENV_FILE"')
-    install = BODY.index("mise install --system node@lts python@3.12")
+    install = BODY.index("mise install --system node@lts")
     assert write < source < install
 
 
@@ -121,7 +121,7 @@ def test_ec2_user_is_cloud_inits_default_user_with_sudo_and_no_baked_key():
 def test_leerie_user_exists_before_mise_writes_under_its_home():
     # MISE_DATA_DIR is under /home/leerie; creating the user afterwards made
     # `useradd -m` warn and skip the skeleton files (seen on a real bake).
-    assert BODY.index('useradd -u "$LEERIE_UID"') < BODY.index("mise install --system node@lts python@3.12")
+    assert BODY.index('useradd -u "$LEERIE_UID"') < BODY.index("mise install --system node@lts")
     assert BODY.index('useradd -u "$LEERIE_UID"') < BODY.index('. "$LEERIE_ENV_FILE"')
 
 
@@ -151,7 +151,7 @@ def test_ssm_agent_prefers_regional_bucket_then_global_and_is_started():
 
 @pytest.mark.parametrize("needle", [
     "useradd -u \"$LEERIE_UID\"", "git config --system --add safe.directory '*'",
-    "mkdir -p /work", "mkdir -p /inspect", "lts-current", "mise install --system node@lts python@3.12",
+    "mkdir -p /work", "mkdir -p /inspect", "lts-current", "mise install --system node@lts",
     "pip3 install --break-system-packages", "apt-get install -y --no-install-recommends gh",
 ])
 def test_component_step_present(needle):

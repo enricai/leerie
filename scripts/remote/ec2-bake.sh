@@ -104,7 +104,9 @@ set -a
 # shellcheck disable=SC1090
 . "$LEERIE_ENV_FILE"
 set +a
-mise install --system node@lts python@3.12
+# The Dockerfile's mise system configuration (scripts/mise-system-config.sh).
+sh "$BAKE_DIR/scripts/mise-system-config.sh"
+mise install --system node@lts
 
 node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | sed -n 1p)/"
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
