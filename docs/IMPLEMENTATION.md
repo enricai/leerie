@@ -12102,9 +12102,12 @@ branch, after the `_write_run_json(...)` block and before
    `UNKNOWN_TOOL` issue per `tool` absent from `_mise_registry_names()`,
    naming registry names that contain it or that it contains) and
    feedback rounds bounded by `judgment_check_rounds`.
-   `_mise_registry_names()` is the first column of `mise registry`, run
-   from `/` once per process (30 s); empty when mise cannot run, and then
-   discovery is skipped with a log line. `_mise_tools_toml(tools,
+   `await _mise_registry_names(st)` is the first column of `mise
+   registry`, read once per process (30 s), confined like every `mise`
+   leerie runs: `_run_proc(_confined_argv(_measurement_grants(st, tree),
+   …))` in the planning tree (`_judgment_cwd(st)`), under the execution
+   lock shared; empty when mise cannot run, and then discovery is skipped
+   with a log line. `_mise_tools_toml(tools,
    registry)` writes one `"<tool>" = "<version>"` line under `[tools]` per
    registry name, first occurrence wins, to `<run_dir>/mise-tools.toml`
    (`MISE_TOOLS_NAME`, via `_write_beneath`); `_use_run_tools_file(env,

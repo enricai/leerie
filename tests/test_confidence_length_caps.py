@@ -68,7 +68,9 @@ def test_the_derived_worker_set_is_complete(leerie):
     workers = set(_confidence_workers(leerie))
     assert {"conformer", "implementer", "rebaser"} <= workers, (
         f"previously-unguarded workers missing from the derived set: {workers}")
-    assert len(workers) == 10, f"expected 10 confidence workers, got {sorted(workers)}"
+    # 11 since `tool_discovery` (DESIGN §6½ *The tools a repository needs
+    # are read from it*) self-gates on `tool_completeness`.
+    assert len(workers) == 11, f"expected 11 confidence workers, got {sorted(workers)}"
 
 
 # ----- the caps are gone, and must stay gone --------------------------------

@@ -121,6 +121,9 @@ EXEMPT = {
                       "confined: the argv its callers build is literal",
     "_run_mise_install": "`mise ls --current --json`, a literal argv, "
                          "confined through `_confined_argv`",
+    "_mise_registry_names": "`mise registry`, a literal argv naming "
+                            "mise's own listing, confined through "
+                            "`_confined_argv`",
     "_enable_corepack_shims": "a Node version's own `corepack enable "
                               "--install-directory <its bin>`, the step "
                               "mise's implicit enable was, confined as "

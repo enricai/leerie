@@ -12,13 +12,34 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tomllib
 from pathlib import Path
 
 import pytest
 
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
     _St, pytestmark as _landlock_mark, run)
+
+def _tools_toml(text: str) -> dict:
+    """The `[tools]` table of a tools file, read line by line (the file is
+    `"<name>" = "<version>"` lines; `tomllib` is not in Python 3.10)."""
+    out: dict = {}
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = line.strip("[]")
+            out.setdefault(section, {})
+            continue
+        k, v = (x.strip().strip('"') for x in line.split("=", 1))
+        out[section][k] = v
+    return out
+
+
+async def _registry(*_a, **_k):
+    return REGISTRY
+
 
 REGISTRY = frozenset({"python", "uv", "go", "zig", "node", "poetry",
                       "erlang", "elixir"})
@@ -59,7 +80,7 @@ def test_tools_file_holds_registry_names_first_wins(leerie):
          {"tool": "uv", "version": "latest", "evidence": "uv.lock"},
          {"tool": "zig", "version": ">=0.13", "evidence": "a range"}],
         REGISTRY)
-    assert tomllib.loads(text) == {"tools": {"go": "1.22.3",
+    assert _tools_toml(text) == {"tools": {"go": "1.22.3",
                                              "uv": "latest"}}
 
 
@@ -75,7 +96,7 @@ def test_schema_version_is_mises_syntax_never_a_range(leerie, version, ok):
 def test_discovery_asks_again_and_writes_only_known_tools(
         leerie, tmp_path, monkeypatch, no_global_config):
     st = _make_state(leerie, tmp_path)
-    monkeypatch.setattr(leerie, "_mise_registry_names", lambda: REGISTRY)
+    monkeypatch.setattr(leerie, "_mise_registry_names", _registry)
     prompts: list[str] = []
     answers = [
         {"tools": [{"tool": "pyhton", "version": "3", "evidence": "x"},
@@ -96,7 +117,7 @@ def test_discovery_asks_again_and_writes_only_known_tools(
     asyncio.run(leerie._discover_tools(st, caps, {}, {}))
     assert len(prompts) == 2 and "pyhton" in prompts[1]
     path = st.run_dir / leerie.MISE_TOOLS_NAME
-    assert tomllib.loads(path.read_text()) == {
+    assert _tools_toml(path.read_text()) == {
         "tools": {"python": "3", "uv": "latest"}}
     assert os.environ["MISE_GLOBAL_CONFIG_FILE"] == str(path)
     prov = st.data["provision"]
@@ -107,7 +128,7 @@ def test_discovery_asks_again_and_writes_only_known_tools(
 def test_a_failed_worker_leaves_the_repositorys_own_pins(
         leerie, tmp_path, monkeypatch, no_global_config):
     st = _make_state(leerie, tmp_path)
-    monkeypatch.setattr(leerie, "_mise_registry_names", lambda: REGISTRY)
+    monkeypatch.setattr(leerie, "_mise_registry_names", _registry)
 
     async def _boom(**kw):
         raise leerie.WorkerError("crashed")
