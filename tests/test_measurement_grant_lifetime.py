@@ -237,9 +237,9 @@ def test_a_hook_reaches_a_worker_through_local_bin_alone(leerie, run,
                                                          tmp_path,
                                                          monkeypatch):
     """DESIGN §6½ step 1, through the real hook: the recipe's tool is
-    written beneath `~/.local/bin` and a confined worker imports it. The
-    hook's pip user base is its checkout's, a worker's is another and no
-    worker reads the hook's. `core.hooksPath` is set and `.git` is a file,
+    written beneath `~/.local/bin` and a confined worker imports it. No
+    variable moves the hook's pip user base: it is the home's (DESIGN §6
+    *Every confined process has its own home*). `core.hooksPath` is set and `.git` is a file,
     which is what `pre-commit install` and a write to `.git/hooks` meet."""
     home = tmp_path / "home"
     local_bin = home / ".local" / "bin"
@@ -248,7 +248,6 @@ def test_a_hook_reaches_a_worker_through_local_bin_alone(leerie, run,
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "mise-data"))
     monkeypatch.setenv("PATH", f"{os.environ['PATH']}:{local_bin}")
-    monkeypatch.setenv("PYTHONUSERBASE", str(run_dir / "worktrees" / ".stores" / "stores" / "pyuser"))
     tree = _add(run_dir / "repo", run_dir / "worktrees" / f"{run_dir.name}-p")
     hook = tree / ".leerie-setup.sh"
     hook.write_text(
@@ -257,28 +256,25 @@ def test_a_hook_reaches_a_worker_through_local_bin_alone(leerie, run,
         'lib="$HOME/.local/bin/.tool"\n'
         'mkdir -p "$lib"\n'
         'echo "X = 1" > "$lib/tool_mod.py"\n'
-        'echo "$PYTHONUSERBASE" > "$lib/user-base"\n'
+        'echo "${PYTHONUSERBASE-unset}" > "$lib/user-base"\n'
         'git config core.hooksPath > "$lib/hooks-path"\n')
     st = _St(user, run_dir)
     asyncio.run(leerie._run_setup_hook(tree, run_dir / "logs", st))
     assert st.data["provision"]["sh_hook_ran"] is True
     lib = local_bin / ".tool"
 
-    hook_base = (lib / "user-base").read_text().strip()
-    assert hook_base == str(run_dir / "worktrees" / ".stores" / "tree-stores" / tree.name / "pyuser")
-    assert Path(hook_base).is_dir()
+    assert (lib / "user-base").read_text().strip() == "unset"
     assert (lib / "hooks-path").read_text().strip() == str(
         user / ".git" / "hooks")
     assert (tree / ".git").is_file()
 
     cache_env = leerie._worker_cache_env(os.environ, run_dir)
-    assert cache_env["PYTHONUSERBASE"] != hook_base
+    assert "PYTHONUSERBASE" not in cache_env
     assert str(local_bin) in cache_env["PATH"].split(os.pathsep)
     env = {**run["env"], "HOME": str(home)}
     g = _grants(leerie, {**run, "env": env})
     got = _probe(leerie, g, f"""
 import|PYTHONPATH={lib} python3 -c 'import tool_mod'
-hook base|ls {hook_base}
 overwrite|echo x >> {lib / "tool_mod.py"}
 """, env)
-    assert got == {"import": True, "hook base": False, "overwrite": False}
+    assert got == {"import": True, "overwrite": False}
