@@ -113,10 +113,10 @@ def test_its_temp_and_cache_are_its_trees_private_dir(leerie, run):
                if k not in places)
     got = _probe(leerie, g, 'temp write|echo x > "$TMPDIR/t"', env)
     assert got == {"temp write": True}
-    # Its runtime directory and its gpg home are in it too, made with it.
-    gnupg = Path(env["GNUPGHOME"])
-    assert gnupg.parent == tmp
-    assert sorted(os.listdir(tmp)) == sorted(["run", "t", gnupg.name])
+    # Its runtime directory is in it too, made with it; no gpg home is
+    # (DESIGN §6 *Every confined process has its own home*).
+    assert "GNUPGHOME" not in env
+    assert sorted(os.listdir(tmp)) == sorted(["run", "t"])
 
 
 def test_an_installs_git_config_write_is_refused_and_says_so(leerie, run):

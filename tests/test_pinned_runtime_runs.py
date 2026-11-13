@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 EC2_BAKE = REPO_ROOT / "scripts" / "remote" / "ec2-bake.sh"
 VENDOR_BIN = "/opt/leerie-vendor/bin"
-USER_SHIMS = "/home/leerie/.local/share/mise/shims"
+USER_SHIMS = "/leerie-toolchains/mise/shims"
 LTS_BIN = "/usr/local/share/mise/installs/node/lts-current/bin"
 LTS_CLAUDE = f"{LTS_BIN}/claude"
 BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -212,7 +212,7 @@ def test_the_real_container_runs_the_pinned_node(tmp_path):
          "--entrypoint", "bash",
          "-v", f"{REPO_ROOT}:/src:ro", "-v", f"{tmp_path}:/out:ro",
          "--tmpfs", f"/leerie-state:{tmpfs}",
-         "--tmpfs", f"/home/leerie/.local/share/mise:{tmpfs}",
+         "--tmpfs", f"/leerie-toolchains/mise:{tmpfs}",
          image, "-c",
          f"{prep} && exec runuser -u leerie -- env HOME=/home/leerie "
          f"PATH='{path}' /usr/bin/python3 /out/driver.py "

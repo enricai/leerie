@@ -1,5 +1,5 @@
 """The host caches the launcher mounts into the container (DESIGN §6½ *The
-repository image holds no dependency*): the host's toolchains (mise-data),
+repository image holds no dependency*): the host's toolchains (`~/.cache/leerie/toolchains`),
 and nothing else. Package stores are the run's own, in the state mount (§6
 *The stores a view installs from are leerie's*), so no host Bundler cache is
 mounted, and no `BUNDLE_*` variable is passed: until 0.65.0 the launcher
@@ -16,7 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_START = 'mkdir -p "$HOME/.cache/leerie/mise-data"'
+_START = 'mkdir -p "$HOME/.cache/leerie/toolchains/mise"'
 _END = "# --- remote: resolve Fly.io image tag"
 
 
@@ -44,15 +44,19 @@ def _run_section(tmp_path: Path, launcher: Path = REPO_ROOT / "leerie"
 
 
 def test_only_the_toolchain_cache_is_mounted(tmp_path):
-    """The array the container is run with mounts mise-data at the image's
-    `MISE_DATA_DIR`, and holds no bundle mount and no `BUNDLE_*` `-e`; the
+    """The array the container is run with mounts the toolchain cache at
+    `/leerie-toolchains` (the image's `MISE_DATA_DIR` and toolchain home
+    layer, outside the home: DESIGN §6 *Every confined process has its own
+    home*), and holds no bundle mount and no `BUNDLE_*` `-e`; the
     host's bundle cache directory is not even made. Falsified against
     0.65.0's launcher: its array held `-v ~/.cache/leerie/bundle:…`,
     `-e BUNDLE_CACHE_ALL=1` and `-e BUNDLE_PATH=…`, and it made the
     directory."""
     args, home = _run_section(tmp_path)
-    mise = f"{home}/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
-    assert args == ["-v", mise], args
+    tc = f"{home}/.cache/leerie/toolchains:/leerie-toolchains"
+    assert args == ["-v", tc], args
     assert not any("bundle" in a.lower() for a in args), args
-    assert (home / ".cache/leerie/mise-data").is_dir()
+    assert (home / ".cache/leerie/toolchains/mise").is_dir()
+    assert (home / ".cache/leerie/toolchains/home").is_dir()
+    assert not (home / ".cache/leerie/mise-data").exists()
     assert not (home / ".cache/leerie/bundle").exists()

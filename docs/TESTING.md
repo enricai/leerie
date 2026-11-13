@@ -8710,3 +8710,28 @@ and typescript are present, the code the two tests reach and the real facts
 script's assertion spans verify a TS verdict (a quoted `expect` passes, a
 quoted setup line of the case does not). The prompt is pinned to lane B3's
 sha256.
+
+## Every confined process has its own home
+
+`tests/test_confined_home.py` (DESIGN §6 *Every confined process has its own
+home*). On any host: no grant names `GNUPGHOME`; every kind but the toolchain
+kind names `$HOME` and the toolchain home layer beneath it, drops nothing and
+sets no `HOME`; the toolchain kind's `HOME` is the layer, granted for writing,
+with no layer beneath it and every store variable dropped (`_grant_env`
+executed, not read); a worker names its home and the layer; a home beneath
+`/tmp`, or one holding it, asks for no overlay; the shim is asked for the home
+only when isolated; and, under the real shim, a toolchain command writes
+`~/.rustup` into the layer and sees none of the store variables leerie's own
+environment holds. In a leerie container (LEERIE_TEST_CONTAINER_IMAGE, the
+`leerie-container` profile loaded where AppArmor is), over leerie's real
+`_require_confinement`, `_measurement_grants` and `_run_streaming`: a write
+lands in the process's own home (`statfs` an overlay) over the layer's file;
+a second process sees neither; the real home and the layer are unchanged;
+128 MiB written to the home then a normal exit, an error, a timeout, and a
+`SIGKILL` of the shim followed by the tree kill each leave no shared memory
+in the container's cgroup, no mount and nothing in `/tmp`; a home filled
+past a 16 MiB limit raises `ConfinementRefused` naming the home; and the
+toolchain kind's home writes are seen at `~` by the next measurement.
+`tests/test_home_leerie_ownership.py` pins the image's home made root-owned
+before `useradd` (a launch died "git user.email is not configured" without
+it, the home 0700 and owned by an uid rootless does not map).

@@ -35,7 +35,7 @@ def _run_argv_block() -> str:
 
 def test_launcher_creates_the_host_dir_before_mounting_it():
     text = LAUNCHER.read_text()
-    mkdir = text.index('mkdir -p "$HOME/.cache/leerie/mise-data"')
+    mkdir = text.index('mkdir -p "$HOME/.cache/leerie/toolchains/mise"')
     created = text.index('"$_leerie_host_dir"', mkdir)
     mounted = text.index('-v "$_leerie_host_dir:/leerie-host"')
     assert mkdir < created < mounted

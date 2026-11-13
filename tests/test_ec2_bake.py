@@ -136,7 +136,7 @@ def test_cloud_init_is_reset_last():
 
 
 def test_leerie_home_is_leerie_owned_after_its_dirs_are_made():
-    mk = BODY.index("mkdir -p /home/leerie/.local/share/mise")
+    mk = BODY.index("mkdir -p /home/leerie/.local/state/mise")
     chown = BODY.index("chown -R leerie: /home/leerie")
     assert mk < chown
     assert "container-entry.sh's rootful guard" not in BODY

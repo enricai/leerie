@@ -21,6 +21,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 class _Grants:
     env = ()
+    drop = ()
 
 
 GRANTS = _Grants()

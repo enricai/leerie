@@ -11748,7 +11748,7 @@ async def _run_streaming(
                                                  else None)
                                    if fd is not None),
                     cwd=cwd,
-                    env={**_repo_command_env(env), **dict(grants.env)},
+                    env=_grant_env(_repo_command_env(env), grants),
                     # DESIGN §6 *No confined process holds or can open
                     # the operator's terminal*.
                     stdin=asyncio.subprocess.DEVNULL,
@@ -25310,6 +25310,11 @@ _SANDBOX_FIXES: tuple[tuple[str, str], ...] = (
      "*A confined process has its own network*); on Fly, EC2 or Colima the "
      "guest kernel must offer `CONFIG_NET_NS` to unprivileged user "
      "namespaces"),
+    (r"home .* is mounted beneath it|overlay /home[^:]*: EINVAL",
+     "something is mounted beneath the home, which an overlay's lower layer "
+     "cannot hold: the launcher copies the home in and mounts nothing "
+     "beneath it (DESIGN §6 *Every confined process has its own home*); "
+     "an older launcher's mounts are the likely cause"),
     (r"overlay .*: EINVAL",
      "the state root's filesystem cannot be an overlay's lower layer in a "
      "user namespace"),
@@ -25360,7 +25365,14 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
     # The probe reads everything (`/`) and writes only its view and
     # /dev/null; nothing in the run directory but the probe's own directory
     # is named for writing.
-    grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",))
+    # And its own home (DESIGN §6 *Every confined process has its own
+    # home*): the probe writes `home_mark` there, which must not reach the
+    # real home.
+    home = _confined_home()
+    home_mark = f".leerie-probe-{nonce}"
+    grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",), home=home,
+                          home_layers=tuple(
+                              p for p in (_toolchain_home(),) if p and home))
     r: subprocess.CompletedProcess | None = None
     raw = b""
     placed_on_disk = False
@@ -25369,7 +25381,8 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
             argv = _confined_argv(
                 grants,
                 [sys.executable, "-I", "-S", str(SANDBOX_PROBE_SCRIPT),
-                 str(ro_file), rel, *[str(m) for m in marks]],
+                 str(ro_file), rel, *[str(m) for m in marks],
+                 *([home_mark] if home else [])],
                 sandbox=HeldOutSandbox(view=str(view),
                                        place=((str(held), rel),),
                                        report=str(view / "report.json")),
@@ -25380,6 +25393,8 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
             rep.seek(0)
             raw = rep.read()
         placed_on_disk = (view / rel).exists()
+        home_on_disk = bool(home) and os.path.lexists(
+            os.path.join(home, home_mark))
     except (OSError, subprocess.SubprocessError) as e:
         _rmtree_owned(probe)
         die("the confinement check every entry runs (`_require_confinement`) "
@@ -25410,6 +25425,13 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
     except ValueError:
         got = {}
     failed = _sandbox_probe_failures(got, placed_on_disk)
+    if home and got.get("home_written") is not True:
+        failed.append("its home is not writable "
+                      f"({got.get('home_written')!r})")
+    if home_on_disk:
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(home, home_mark))
+        failed.append("a write to its home reached the real home")
     if failed:
         die("the held-out sandbox this runtime built is not isolated: "
             + "; ".join(failed) + f".{fly} Leerie never runs a held-out "
@@ -25564,6 +25586,55 @@ class WorkerGrants(NamedTuple):
     env: tuple[tuple[str, str], ...] = ()
     egress: bool = False
     link: str = ""
+    # The home the shim gives the process a copy of when it isolates it,
+    # and the layers beneath its upper, first on top (`_confined_home`;
+    # DESIGN §6 *Every confined process has its own home*); empty, none.
+    home: str = ""
+    home_layers: tuple[str, ...] = ()
+    # Variables removed from the process's environment after `env` is
+    # laid over it (`_grant_env`): the store variables, for the toolchain
+    # kind.
+    drop: tuple[str, ...] = ()
+
+
+# DESIGN §6 *Every confined process has its own home*: the size of the
+# `tmpfs` each confined process's home writes into. Only pages written are
+# used; a process that fills it is stopped as a finding, never a result.
+HOME_UPPER_BYTES = 1 << 30
+# The toolchain home layer (`/leerie-toolchains/home` in the image): what the
+# toolchain install keeps beneath its home, read by every other confined
+# process through its home's lower layer. Unset (a test, a host harness),
+# there is none.
+TOOLCHAIN_HOME_ENV = "LEERIE_TOOLCHAIN_HOME"
+
+
+def _confined_home(env: Mapping[str, str] | None = None) -> str:
+    """The home each confined process gets its own copy of (DESIGN §6
+    *Every confined process has its own home*): `$HOME`, resolved, or ""
+    when it holds `/tmp` or lies beneath it (a host harness's), which the
+    shim's own `/tmp` would hide."""
+    home = os.path.realpath((env if env is not None else os.environ)
+                            .get("HOME") or Path.home())
+    tmp = Path(os.path.realpath(SHARED_TMP))
+    if tmp.is_relative_to(home) or Path(home).is_relative_to(tmp):
+        return ""
+    return home
+
+
+def _toolchain_home() -> str:
+    """The toolchain home layer (`TOOLCHAIN_HOME_ENV`), resolved, or ""."""
+    v = os.environ.get(TOOLCHAIN_HOME_ENV, "")
+    return os.path.realpath(v) if os.path.isabs(v) else ""
+
+
+def _grant_env(base: Mapping[str, str],
+               grants: "WorkerGrants") -> dict[str, str]:
+    """`base` with the grant's variables laid over it and its `drop`
+    variables removed: the environment a confined command starts with."""
+    out = {**base, **dict(grants.env)}
+    for k in grants.drop:
+        out.pop(k, None)
+    return out
 
 
 # The caps key that marks the host-side seam, set only by
@@ -26095,11 +26166,14 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     # shim.
     # Every worker reaches the API (and WebFetch, and what its shell
     # fetches) through the egress proxy.
+    own_home = _confined_home(env)
+    layer = _toolchain_home()
     return WorkerGrants(
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
-        egress=True, link=str(run_dir / TREES_DIRNAME))
+        egress=True, link=str(run_dir / TREES_DIRNAME), home=own_home,
+        home_layers=(layer,) if own_home and layer else ())
 
 
 # DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
@@ -26187,6 +26261,18 @@ def _shim_refusals(what: str) -> Iterator[int]:
         refusals.check()
 
 
+def _home_argv(grants: WorkerGrants) -> list[str]:
+    """The shim's options for the process's own home (DESIGN §6 *Every
+    confined process has its own home*), or none when the grant names no
+    home."""
+    if not grants.home:
+        return []
+    argv = ["--home", grants.home, "--home-bytes", str(HOME_UPPER_BYTES)]
+    for layer in grants.home_layers:
+        argv += ["--home-layer", layer]
+    return argv
+
+
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                    refusal_fd: int | None = None,
                    sandbox: HeldOutSandbox | None = None,
@@ -26235,6 +26321,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                      str(report_fd)]
         if wr is not None:
             argv += ["--worker-root", wr]
+        argv += _home_argv(grants)
     elif _isolated():
         argv.append("--isolate")
         if grants.egress:
@@ -26249,6 +26336,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
             argv += ["--worker-root", wr] + (["--cli"] if cli else [])
         if grants.link:
             argv += ["--link-root", grants.link]
+        argv += _home_argv(grants)
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -27048,9 +27136,15 @@ def _measurement_grants(st: "State", tree: str | Path,
     if not Path(os.path.realpath(SHARED_TMP)).is_relative_to(home):
         ro.append(home)
     mise_cache: Path | None = None
+    layer = _toolchain_home()
     if kind in (SETUP_HOOK_KIND, TOOLCHAIN_KIND):
         tools = [Path(os.environ.get("MISE_DATA_DIR")
                       or Path.home() / ".local" / "share" / "mise")]
+        if kind == TOOLCHAIN_KIND and layer:
+            # The toolchain install's home is the toolchain home layer
+            # itself: what it keeps beneath `~` is kept with the toolchains
+            # (DESIGN §6 *Every confined process has its own home*).
+            tools.append(Path(layer))
         # mise's install lock and its `incomplete` markers live in its
         # cache: there, they are shared as widely as the installs they
         # guard (DESIGN §6 *One toolchain install at a time on a host*).
@@ -27081,18 +27175,22 @@ def _measurement_grants(st: "State", tree: str | Path,
     _mkdir_private(state, run_dir)
     with contextlib.suppress(FileExistsError):
         os.mkdir(runtime, 0o700)
-    # gpg's home: mise verifies a Node download by importing Node's release
-    # keys, and `~/.gnupg` is not granted. A new one per grant (`mkdtemp`,
-    # 0700), so verification stays on and no key a repository's command
-    # imported is one a later install trusts (DESIGN §6 *A confined
-    # command's scratch is short and private*).
-    gnupg = tempfile.mkdtemp(prefix="gnupg-", dir=tmp)
     env = {"TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
            "MISE_STATE_DIR": str(mise_state), "XDG_CACHE_HOME": tmp,
-           "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime),
-           "GNUPGHOME": gnupg}
+           "XDG_STATE_HOME": str(state), "XDG_RUNTIME_DIR": str(runtime)}
     if mise_cache is not None:
         env["MISE_CACHE_DIR"] = str(mise_cache)
+    own_home = _confined_home()
+    layers: tuple[str, ...] = (layer,) if own_home and layer else ()
+    drop: tuple[str, ...] = ()
+    if kind == TOOLCHAIN_KIND:
+        # A toolchain is the host's, a store one run's: the install sees no
+        # store, and reads no layer it writes.
+        drop = tuple(_STORE_VARS) + tuple(
+            f"pnpm_config_{k}" for k in sorted(_PNPM_SETTINGS))
+        layers = ()
+        if layer:
+            env["HOME"] = layer
     # A measurement reaches nothing outside its own loopback; the kinds
     # that fetch (an install, a toolchain, the setup hook) reach the outside
     # through the egress proxy (DESIGN §6 *A confined process has its own network*, *An install reaches its
@@ -27102,7 +27200,8 @@ def _measurement_grants(st: "State", tree: str | Path,
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND,
-        link=str(run_dir.resolve() / TREES_DIRNAME))
+        link=str(run_dir.resolve() / TREES_DIRNAME), home=own_home,
+        home_layers=layers, drop=drop)
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
@@ -34160,7 +34259,7 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
                                    ["mise", "ls", "--current", "--json"],
                                    refusal_fd=refusal_fd),
                     cwd=str(repo_root),
-                    env={**_repo_command_env(env), **dict(grants.env)},
+                    env=_grant_env(_repo_command_env(env), grants),
                     timeout=MISE_LS_TIMEOUT,
                     pass_fds=(refusal_fd,),
                 )
@@ -64203,7 +64302,7 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             _confined_argv(grants, argv, refusal_fd=refusal_fd),
             cwd=str(tree), stdin=subprocess.DEVNULL, capture_output=True,
             text=text, timeout=timeout, check=False, pass_fds=(refusal_fd,),
-            env={**_ts_script_env(), **dict(grants.env)})
+            env=_grant_env(_ts_script_env(), grants))
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.

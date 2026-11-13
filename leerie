@@ -9113,7 +9113,8 @@ mkdir -p "$HOME/.cache/leerie"
 # process reuses goes once untouched for a day (-mmin +1440; `-mtime +1`
 # meant more than 48 h). `-mmin` tests the entry's OWN mtime, which freezes
 # at staging-completion — the container's writes into $STAGE/.claude/* do
-# NOT bump it — so the keepalive below `touch`es a live $STAGE hourly. Every
+# NOT bump it (the container no longer writes there at all: it copies the
+# stage, DESIGN §6 *Every confined process has its own home*) — so the keepalive below `touch`es a live $STAGE hourly. Every
 # entry type goes: a 0-byte regular `cfg-*` file sat beside the dirs for
 # months under the old `-type d`. Backgrounded so a backlog never delays a
 # launch; holds none of the launcher's stdio, like the keepalive below.
@@ -9527,7 +9528,7 @@ if [ "$_BEDROCK_BEARER_ACTIVE" = "false" ] && detect_bedrock_mode; then
     cp -aR "$HOME/.aws/." "$STAGE/.aws/"
     rm -rf "$STAGE/.aws/cli/cache"
   fi
-  AUTH_MOUNTS+=(-v "$STAGE/.aws:/home/leerie/.aws:ro")
+  # Copied into the home by the entry with the rest of $STAGE (below).
   # Belt-and-suspenders: also inject Bedrock env vars explicitly so
   # claude -p workers activate Bedrock via process.env rather than relying
   # solely on the settings.json env block (which may not be applied by all
@@ -9572,40 +9573,20 @@ PY
   [ -n "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ]  && AUTH_MOUNTS+=(-e "ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL")
 fi
 
-# -- Mount each staged file/dir at its default in-container path. --
-# Files mount as files; dirs mount as dirs. The container sees the
-# normal default paths — no env-var redirection needed.
-#
-# .claude.json is the one exception: it is NOT bind-mounted directly onto
-# /home/leerie/.claude.json. The CLI rewrites that file via a
-# rename()-based atomic write (tmp file + rename() onto the target);
-# rename() onto a bind-mounted single file returns EBUSY, forcing the CLI
-# to fall back to truncate-in-place, which under concurrent workers has a
-# demonstrated empty-file corruption window (N19). Instead, the whole of
-# $STAGE (which already contains the projects-stripped .claude.json — see
-# the STAGE-assembly comment above) is bind-mounted read-only at a
-# staging path, and container-entry.sh copies just .claude.json out of it
-# into place at container start, as a real file inside the container's
-# own filesystem — mirroring the pattern seed-auth.sh/ec2-seed-auth.sh
-# already use for the remote runtimes (tar-copy, never a live bind mount
-# of this file).
-AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-claude-json-src:ro")
-AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/leerie/.claude")
-for relpath in .gitconfig .gitconfig.local .gitignore \
-               .gitignore_global .git-credentials .netrc; do
-  if [ -e "$STAGE/$relpath" ]; then
-    AUTH_MOUNTS+=(-v "$STAGE/$relpath:/home/leerie/$relpath")
-  fi
-done
-if [ -d "$STAGE/.config/git" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.config/git:/home/leerie/.config/git")
-fi
-if [ -d "$STAGE/.ssh" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.ssh:/home/leerie/.ssh")
-fi
-if [ -d "$STAGE/.gnupg" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.gnupg:/home/leerie/.gnupg")
-fi
+# -- The staged home reaches the container as a copy, never a mount. --
+# The whole of $STAGE is mounted read-only at /opt/leerie-home-src, and
+# container-entry.sh copies its dot-entries (`.claude`, `.claude.json`, the
+# git files, `.config/git`, `.netrc`, `.ssh`, `.gnupg`, `.aws`) into
+# /home/leerie as real files of the container's own filesystem before it
+# drops privilege. Nothing is mounted beneath /home/leerie: each confined
+# process gets an overlay copy of the home, and an overlay's lower layer
+# cannot hold a mount; and no write inside the container reaches $STAGE or
+# the host (DESIGN §6 *Every confined process has its own home*). A copied
+# .claude.json also keeps the CLI's atomic rename() working, which a
+# bind-mounted single file breaks (EBUSY, then a non-atomic truncate under
+# concurrent workers: N19). The same tree is what seed-auth.sh /
+# ec2-seed-auth.sh tar-copy to Fly/EC2.
+AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-home-src:ro")
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
@@ -9620,21 +9601,33 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/
 # already work. The host preflight above verified gh auth + origin.
 
 # --- the host's toolchain cache (DESIGN §6½, IMPLEMENTATION §0.5) --------
-# One host-side cache dir survives across runs: mise-data, so mise doesn't
+# One host-side cache dir survives across runs: toolchains, so mise doesn't
 # re-install Node 20.11.0 every time the user runs leerie against a repo
-# with .nvmrc: 20.11.0. A toolchain is not a store. Package stores (pnpm,
+# with .nvmrc: 20.11.0. It holds `mise/` (MISE_DATA_DIR) and `home/`, the
+# toolchain home layer: what a toolchain install keeps beneath its home
+# (rustup's ~/.rustup), read by every confined process through its own
+# home's overlay (DESIGN §6 *Every confined process has its own home*).
+# Mounted at /leerie-toolchains, outside the home, beneath which nothing is
+# mounted. A new directory, not the older ~/.cache/leerie/mise-data: older
+# images, which live runs may still use, mount that one at
+# /home/leerie/.local/share/mise, and a toolchain install records absolute
+# paths, so the two are never one directory; the first run after the
+# upgrade installs its toolchains again. mise-data is removed once no kept
+# image mounts it (DESIGN §6 *Every confined process has its own home*).
+# A toolchain is not a store. Package stores (pnpm,
 # pip, Go, Cargo, Bundler, corepack) are not host caches: they live in the
 # state mount (DESIGN §6 *The stores a view installs from are leerie's*).
 # Created lazily (mkdir -p) on every leerie invocation — cheap on existing
 # dirs, free of failure modes on first run. Concurrency-safety is
 # documented in IMPLEMENTATION §0.5.
 #
-mkdir -p "$HOME/.cache/leerie/mise-data" \
+mkdir -p "$HOME/.cache/leerie/toolchains/mise" \
+         "$HOME/.cache/leerie/toolchains/home" \
          "$LEERIE_STATE_HOST_DIR" \
          "$_leerie_host_dir"
 
 CACHE_MOUNTS=(
-  -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
+  -v "$HOME/.cache/leerie/toolchains:/leerie-toolchains"
   # Package stores and caches are not mounted from the host: the
   # orchestrator points its own commands at the run's `<run-dir>/worktrees/.stores/stores/`
   # and each worker at `<run-dir>/workers/` (DESIGN §6 *The stores a view

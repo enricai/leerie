@@ -13,7 +13,7 @@ over anything a repo's setup hook later puts there. Moving it
 ahead of $PATH would let a user-installed tool silently shadow a baked-in
 binary, which is why the ordering is pinned here rather than just membership.
 
-/home/leerie/.local/share/mise/shims (`MISE_DATA_DIR/shims`): populated by
+/leerie-toolchains/mise/shims (`MISE_DATA_DIR/shims`): populated by
 `mise install` reading a repo's .nvmrc / .python-version / .tool-versions /
 .ruby-version / rust-toolchain.toml (DESIGN §6½ "Worker-driven install").
 Without this dir on PATH, a worker's own ad-hoc Bash commands (e.g.
@@ -74,7 +74,7 @@ def test_user_local_bin_is_last_entry():
 
 def test_mise_user_shims_is_on_path():
     """Per-repo mise-installed runtimes must be reachable by name."""
-    assert "/home/leerie/.local/share/mise/shims" in _env_path_line()
+    assert "/leerie-toolchains/mise/shims" in _env_path_line()
 
 
 def test_mise_user_shims_comes_before_the_baked_lts_node():
@@ -82,7 +82,7 @@ def test_mise_user_shims_comes_before_the_baked_lts_node():
     is only the fallback when nothing is pinned."""
     line = _env_path_line()
     assert (
-        line.index("/home/leerie/.local/share/mise/shims")
+        line.index("/leerie-toolchains/mise/shims")
         < line.index("/usr/local/share/mise/installs/node/lts-current/bin")
     )
 
@@ -91,7 +91,7 @@ def test_mise_user_shims_comes_before_inherited_path():
     """A repo's pinned runtime must win over the generic inherited PATH —
     otherwise it's unreachable without an explicit `mise exec --`."""
     line = _env_path_line()
-    assert line.index("/home/leerie/.local/share/mise/shims") < line.index(
+    assert line.index("/leerie-toolchains/mise/shims") < line.index(
         "$PATH"
     )
 

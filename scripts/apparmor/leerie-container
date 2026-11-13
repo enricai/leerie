@@ -56,6 +56,8 @@ profile leerie-container flags=(attach_disconnected,mediate_deleted) {
   # A held-out sandbox's write grants are overlaid; they lie in the state
   # root.
   mount fstype=overlay overlay -> /leerie-state/**,
+  mount fstype=overlay overlay -> /home/*/,
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/.leerie-home/,
   # Every other mount made read-only.
   remount /,
   remount /**,

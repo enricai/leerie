@@ -21,7 +21,7 @@ ENTRY_SH = REPO_ROOT / "scripts" / "container-entry.sh"
 
 def _dockerfile_home_leerie_block() -> str:
     text = DOCKERFILE.read_text()
-    marker = "RUN mkdir -p /home/leerie/.local/share/mise"
+    marker = "RUN mkdir -p /leerie-toolchains/mise /leerie-toolchains/home"
     end_marker = "chmod 700 /home/leerie/.gnupg"
     start = text.index(marker)
     end = text.index(end_marker, start) + len(end_marker)
@@ -40,8 +40,10 @@ def test_dockerfile_still_locks_down_gnupg_mode():
 
 def test_container_entry_chowns_home_leerie_subdirs_in_rootful_guard():
     block = _entry_sh_rootful_block()
-    assert "chown leerie: /home/leerie " in block or "chown leerie: /home/leerie\n" in block
-    assert "chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg" in block
+    # The whole home: each confined process's home is an overlay of it, and
+    # copying a file up needs to own it (DESIGN §6 *Every confined process
+    # has its own home*).
+    assert "chown -R leerie: /home/leerie " in block
 
 
 def test_tmp_cache_fix_untouched_in_rootful_guard():
@@ -51,3 +53,17 @@ def test_tmp_cache_fix_untouched_in_rootful_guard():
     assert "chown -R leerie: /tmp/.cache" in block
     assert "chmod -R a+rwX /tmp/.cache" in block
     assert "chmod 1777 /tmp/.cache" in block
+
+
+def test_dockerfile_makes_the_home_root_owned_before_useradd():
+    """`useradd -m` on a missing home makes it 0700 and owned by leerie's
+    literal uid, which rootless maps to nobody: the orchestrator then could
+    not read its own `~/.gitconfig` (measured: every launch died "git
+    user.email is not configured"). It existed before only because
+    `MISE_DATA_DIR` lay beneath it; it is now made first, root-owned and
+    0755 (DESIGN §6 *Every confined process has its own home*)."""
+    text = DOCKERFILE.read_text()
+    mk = text.index("RUN mkdir -p /home/leerie && chmod 0755 /home/leerie")
+    useradd = text.index('useradd -u "${HOST_UID}"')
+    assert mk < useradd
+    assert "chown" not in text[mk:useradd]

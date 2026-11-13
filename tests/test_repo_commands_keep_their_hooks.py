@@ -144,7 +144,7 @@ def test_every_repo_command_launch_goes_through_the_repo_env():
                         getattr(f, "id", None))
         return out
     stream_src = ast.unparse(funcs["_run_streaming"])
-    assert "env={**_repo_command_env(env), **dict(grants.env)}" in stream_src
+    assert "env=_grant_env(_repo_command_env(env), grants)" in stream_src
     assert "_run_streaming" in names(funcs["_run_contained"])
     for prim in ("_run_streaming", "_run_contained", "_measure_blt"):
         a = funcs[prim].args
