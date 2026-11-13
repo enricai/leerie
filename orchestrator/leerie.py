@@ -1479,10 +1479,14 @@ KNOWN_TOOLS: frozenset[str] = frozenset(
 )
 
 
-# Memoized per repo: `resolve_blt` reads config, runs inference AND logs a
-# "BLT: config axes=..." line. Called per judgment worker (there are dozens)
-# that would be dozens of identical lines and dozens of redundant file reads.
-_BLT_VERBS_CACHE: dict[str, list[str]] = {}
+# Memoized on what the verbs are derived from: the repository (whose
+# `.leerie/config.toml` declares axes) and the commands read from it
+# (`_DISCOVERED_BLT`, set in phase 1½). `resolve_blt` reads config, runs
+# inference AND logs a "BLT: config axes=..." line; called per judgment
+# worker (there are dozens) that would be dozens of identical lines and
+# dozens of redundant file reads. Keyed on the repository alone, a phase-1
+# worker's empty answer outlived the commands phase 1½ read.
+_BLT_VERBS_CACHE: dict[tuple, list[str]] = {}
 
 
 def _blt_verbs(repo_root: Path) -> list[str]:
@@ -1502,9 +1506,13 @@ def _blt_verbs(repo_root: Path) -> list[str]:
     The verb is the honest granularity — see `_widen_inspect_tools` for why
     widening at all is a bounded concession rather than a safe operation.
 
-    Memoized per repo: `resolve_blt` reads config, runs inference AND logs, so
-    an uncached call per judgment worker would be dozens of identical lines."""
-    key = str(repo_root)
+    Memoized on the repository and the commands read from it
+    (`_BLT_VERBS_CACHE`): `resolve_blt` reads config, runs inference AND
+    logs, so an uncached call per judgment worker would be dozens of
+    identical lines."""
+    found = _DISCOVERED_BLT
+    key = (str(repo_root), None if found is None else tuple(
+        found.get(ax, "") for ax in ("build", "lint", "test")))
     if key in _BLT_VERBS_CACHE:
         return list(_BLT_VERBS_CACHE[key])
     out: list[str] = []

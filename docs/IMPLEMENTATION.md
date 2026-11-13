@@ -1485,7 +1485,10 @@ attempt was rejected.
 
 So `--dangerously-skip-permissions` no longer bypasses permissions for
 these workers; it **widens their allowlist** (`_widen_inspect_tools`) with
-the leading verbs of the repo's own declared build/lint/test commands, as
+the leading verbs of the repo's own build/lint/test commands (declared, or
+read from it in phase 1½; `_blt_verbs`, memoized in `_BLT_VERBS_CACHE` on
+the repository and the commands read from it, so a worker spawned before
+phase 1½ does not fix the answer for every later one), as
 `Bash(<verb>:*)` patterns — the visibility the flag was documented to buy
 (Node/TS repos where the planner reaches for `pnpm`/`tsc`/`biome`/`vitest`/
 `npx`, ~18-19% of whose Bash calls otherwise fail "requires approval" in
