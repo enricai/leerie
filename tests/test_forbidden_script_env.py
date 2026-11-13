@@ -32,6 +32,17 @@ HOOK = Path(__file__).resolve().parent.parent / "scripts" \
     / "forbidden-command-hook.py"
 
 
+@pytest.fixture(autouse=True)
+def _test_command_read(leerie, monkeypatch):
+    """Every fixture here is a pnpm repository whose test command is its
+    `test` script, as phase 1½ reads it (DESIGN §6½ *A repository's build,
+    lint and test commands are read from it*); the entries below are the
+    final ones (DESIGN §9 *A script's environment is part of what it
+    runs*)."""
+    monkeypatch.setattr(leerie, "_DISCOVERED_BLT",
+                        {"build": "", "lint": "", "test": "pnpm run test"})
+
+
 def _pc(leerie, tmp_path: Path, scripts: dict, forbid: str, scope: str):
     (tmp_path / "package.json").write_text(json.dumps(
         {"name": "root", "private": True, "scripts": scripts}))
@@ -461,3 +472,78 @@ def test_the_hook_process_reads_the_env(leerie, tmp_path, cmd, denied):
     pc = _pc(leerie, tmp_path, ENVPROBE, "pnpm run test:db2", "any")
     out = _hook(leerie, pc, cmd)
     assert ('"permissionDecision": "deny"' in out) is denied, (cmd, out)
+
+
+# --- the phase 1 -> 1½ handoff ---------------------------------------------
+
+def test_phase_1_entries_are_provisional_and_phase_1_5_replaces_them(
+        leerie, tmp_path, monkeypatch):
+    """Real path through the handoff: phase 1 derives the entries before
+    the repository's test command is read, so its record is provisional
+    and keeps the test script's env wrapper; `phase_provision` reads the
+    commands (`_discover_blt`) and replaces the record once, with the
+    test script's runner bare — so a worker's `npx vitest run` is refused
+    (review M2)."""
+    import asyncio
+    import contextlib
+    monkeypatch.setattr(leerie, "_DISCOVERED_BLT", None)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package.json").write_text(json.dumps(
+        {"name": "root", "private": True,
+         "scripts": {"test": "dotenv -e .env.test -- vitest run"}}))
+    (repo / "pnpm-lock.yaml").write_text("")
+    (repo / "tests").mkdir()
+    root = tmp_path / ".leerie"
+    (root / "runs" / "_t" / "logs").mkdir(parents=True)
+    st = leerie.State(root, "_t")
+    st.data = {"task": "t", "worker_count": 0,
+               "planning_worktree": str(repo), "prescribed_procedure": {}}
+    st.save()
+    forbid = "pnpm run test"
+    union = {"process_constraints": {"forbidden_commands": [
+        {"command": forbid, "scope": "whole_suite",
+         "evidence_quote": forbid}]}}
+    leerie._record_process_constraints(
+        st, union, {"votes": {forbid: 2}, "draws": 4, "crashed": 0},
+        [f"do not run `{forbid}`"], repo, provisional=True)
+    pc1 = st.data["process_constraints"]
+    assert pc1["provisional"] is True
+    assert [e["command"] for e in pc1["entries"]] == [
+        forbid, "dotenv -e .env.test -- vitest run"]
+    assert not _refused(leerie, "npx vitest run", pc1)
+
+    async def _none(*a, **k):
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _checkout(*a, **k):
+        yield repo
+
+    async def _fake(**kw):
+        assert kw["schema_key"] == "blt_discovery"
+        return {ax: {"command": c, "evidence": "package.json"}
+                for ax, c in (("build", ""), ("lint", ""),
+                              ("test", "pnpm run test"))}
+
+    pnpm = tmp_path / "bin" / "pnpm"
+    pnpm.parent.mkdir()
+    pnpm.write_text("#!/bin/sh\n")
+    pnpm.chmod(0o755)
+    monkeypatch.setenv("PATH", str(pnpm.parent))
+    monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "md"))
+    monkeypatch.setattr(leerie, "_discover_tools", _none)
+    monkeypatch.setattr(leerie, "_judge_checkout", _checkout)
+    monkeypatch.setattr(leerie, "_provision_hook_and_toolchain", _none)
+    monkeypatch.setattr(leerie, "claude_p", _fake)
+    asyncio.run(leerie.phase_provision(repo, st, dict(leerie.DEFAULT_CAPS),
+                                       {}, {}))
+    pc = st.data["process_constraints"]
+    assert "provisional" not in pc and "inputs" not in pc
+    assert [e["command"] for e in pc["entries"]] == [forbid, "vitest run"]
+    assert _refused(leerie, "npx vitest run", pc)
+    assert pc["entries"][0]["votes"] == 2
+    assert pc["draws"] == {"draws": 4, "crashed": 0}
+    # Recorded once: a second call leaves the final record alone.
+    leerie._finalize_process_constraints(st, repo)
+    assert st.data["process_constraints"] == pc
