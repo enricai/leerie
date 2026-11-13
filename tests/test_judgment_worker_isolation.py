@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
 import pathlib
 
 import pytest
@@ -291,6 +292,57 @@ class TestL3AllowlistWidening:
     def _allowed(self, seen) -> str:
         cmd = seen["cmd"]
         return cmd[cmd.index("--allowedTools") + 1]
+
+    def test_a_later_worker_gets_the_verbs_phase_1_5_read(
+            self, leerie, tmp_path, monkeypatch):
+        """Real path across the phase 1 -> 1½ handoff (DESIGN §6½ *A
+        repository's build, lint and test commands are read from it*): a
+        phase-1 judgment worker on a repository declaring nothing fills the
+        verb memo before any command is known, then `_discover_blt` reads
+        the commands, and the next judgment worker is widened with their
+        verbs. Keyed on the repository alone, the memo kept the phase-1
+        answer — no verbs — for every later worker."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "package.json").write_text('{"name": "r"}')
+        monkeypatch.setattr(leerie, "_DISCOVERED_BLT", None)
+        first = _drive(leerie, monkeypatch, tmp_path, schema_key="classifier",
+                       cwd=str(tmp_path / "wt"), repo_root=repo,
+                       skip_perms=True, allowed_tools=leerie.INSPECT_TOOLS)
+        assert self._allowed(first) == leerie.INSPECT_TOOLS
+
+        # Phase 1½: the commands are read from the repository.
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        for prog in ("pnpm", "vitest"):
+            (bindir / prog).write_text("#!/bin/sh\n")
+            (bindir / prog).chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+        monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "md"))
+        root = tmp_path / ".leerie"
+        (root / "runs" / "_t" / "logs").mkdir(parents=True)
+        st = leerie.State(root, "_t")
+        st.data = {"task": "t", "worker_count": 0,
+                   "planning_worktree": str(repo)}
+        st.save()
+        real_claude_p = leerie.claude_p
+
+        async def _blt(**kw):
+            return {"build": {"command": "pnpm run build", "evidence": "x"},
+                    "lint": {"command": "", "evidence": "x"},
+                    "test": {"command": "vitest run", "evidence": "x"}}
+
+        monkeypatch.setattr(leerie, "claude_p", _blt)
+        asyncio.run(leerie._discover_blt(st, dict(leerie.DEFAULT_CAPS), {},
+                                         {}, repo, []))
+        monkeypatch.setattr(leerie, "claude_p", real_claude_p)
+
+        later = _drive(leerie, monkeypatch, tmp_path, schema_key="planner",
+                       cwd=str(tmp_path / "wt"), repo_root=repo,
+                       skip_perms=True, allowed_tools=leerie.INSPECT_TOOLS)
+        allowed = self._allowed(later)
+        for verb in ("pnpm", "vitest"):
+            assert f"Bash({verb}:*)" in allowed, allowed
 
     def test_flag_widens_the_allowlist_with_the_repo_build_verbs(
             self, leerie, tmp_path, monkeypatch):
