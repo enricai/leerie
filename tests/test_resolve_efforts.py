@@ -315,6 +315,9 @@ def test_judgment_workers_pinned_set(leerie):
         # Names the tools a repository's steps run (DESIGN §6½ *The tools a
         # repository needs are read from it*), benched at medium (LG2).
         "tool_discovery",
+        # Reads how a repository builds, lints and tests itself (DESIGN
+        # §6½), benched at medium (LG2).
+        "blt_discovery",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

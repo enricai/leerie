@@ -78,9 +78,13 @@ def test_resolve_blt_no_config_full_inference(leerie, tmp_path):
     assert result == {"build": "", "lint": "", "test": ""}
 
 
-def test_resolve_blt_no_config_inference_values_used(leerie, tmp_path):
-    """No config file but an inferrable repo — inference result is returned."""
-    (tmp_path / "pyproject.toml").write_text("[tool]\nname='x'\n")
+def test_resolve_blt_no_config_inference_values_used(leerie, tmp_path,
+                                                     monkeypatch):
+    """No config file — the commands read from the repository are
+    returned (DESIGN §6½ *A repository's build, lint and test commands are
+    read from it*)."""
+    monkeypatch.setattr(leerie, "_DISCOVERED_BLT",
+                        {"build": "", "lint": "", "test": "pytest"})
     result = leerie.resolve_blt(tmp_path)
     assert result["test"] == "pytest"
     assert result["build"] == ""

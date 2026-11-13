@@ -11899,9 +11899,9 @@ runs ARE resumable and fall through normally. (See *§12*.)
 
 A repo may commit `.leerie/config.toml` with explicit `build`, `lint`,
 and/or `test` keys. When present, these override the corresponding axis
-from `_infer_build_lint_test()`. Missing keys fall through to inference.
-An empty-string value means "not applicable" — same convention as
-today's inference — and is preserved rather than replaced by inference.
+read from the repository (below). Missing keys fall through to that.
+An empty-string value means "not applicable" — the same convention the
+read commands use — and is preserved rather than replaced.
 This is the "CI yaml" analog: the repo author tells leerie exactly how
 to build, lint, and test, the same way they tell GitHub Actions.
 
@@ -11913,6 +11913,36 @@ Resolution is handled by `resolve_blt(repo_root)` (calls
 `_load_blt_config()` first, then fills missing axes from inference),
 which is what both `_run_conformance_phase` and `_run_final_conformance`
 call — neither calls `_infer_build_lint_test` directly any longer.
+
+**A repository's build, lint and test commands are read from it.**
+*Designed 2026-11-13 (OPEN-ISSUES #23, lane LG2).* *Root cause.* An
+undeclared axis came from a table of files to commands
+(`_infer_build_lint_test`: `pyproject.toml` → `pytest`, `go.mod` → `go
+test ./...`, `Cargo.toml` → `cargo test`, …). The table names a command
+and not the environment the repository runs it in. A uv or Poetry
+repository installs its dependencies into an environment its manager
+runs commands in, so after `uv sync` a bare `pytest` is not on `PATH`:
+lane LG2's uv launch ended unconverged on "pytest: command not found"
+with `uv` installed and the install green. And it says nothing for a
+repository it does not list. A Zig repository's `zig build test`, an
+Elixir repository's `mix test` and a Rakefile gem's `rake test` were never
+inferred, so no test ran. LG2's Zig launch ended `done` in both arms with
+no test measured: neither the implementer, the conformer nor the final
+pass ever ran `zig`. *Invariant.* Once the run knows how it installs (the
+recipe), a judgment worker (`blt_discovery`, read-only, in the planning
+tree) reads how the repository builds, lints and tests itself — its CI,
+its manifests' scripts, its build files, its docs — and returns one
+command per axis, run from the root, the way the repository runs it (a
+tool its install put into a project environment is reached through its
+manager's run command), with an empty command for an axis the repository
+has no step for. Code holds each command to one program the run can run
+(the recipe's check, *The §12 carve-out*): no shell operator, no `cd`, a
+program on `mise bin-paths` or the image's `PATH`, or a file the
+repository holds. A command still failing that after the re-asks leaves
+its axis empty: an axis leerie cannot run is not one it measures. The
+answer is recorded with the recipe (`provision.blt`) and applied again on
+`resume`. A declared axis still wins. There is no table. Benched before
+it shipped (lane LG2: ten fixtures, OLD = the table's output).
 
 ### Per-repo container image
 
@@ -12385,8 +12415,10 @@ management.
   inference. Useful for auditing what leerie will actually use on the next
   run without starting one.
 
-- **`leerie config --init`**: Auto-detects BLT commands (the same table
-  used by `_infer_build_lint_test()`) and writes a `.leerie/config.toml`
+- **`leerie config --init`**: Auto-detects BLT commands (a deterministic
+  table of its own, host-side, where no worker runs; a run no longer uses
+  a table, *A repository's build, lint and test commands are read from
+  it*) and writes a `.leerie/config.toml`
   with the detected values as uncommented entries, plus commented-out
   examples for `setup_packages`. No model involved — this is pure
   deterministic detection. The user can then edit the generated file, `git

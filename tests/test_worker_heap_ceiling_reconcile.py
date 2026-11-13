@@ -45,9 +45,17 @@ def _write_config(repo_root, *, test_cmd=None, typecheck_cmd=None):
     (leerie_dir / "config.toml").write_text("\n".join(lines) + "\n")
 
 
+# The module under test, for `_write_node_repo` (set by `repo_root`).
+_MODULE: dict = {}
+
+
 @pytest.fixture
-def repo_root(tmp_path, monkeypatch):
+def repo_root(tmp_path, monkeypatch, leerie):
     monkeypatch.delenv("LEERIE_WORKER_MEMORY_MAX", raising=False)
+    # Restored after each test: `_write_node_repo` sets the commands the
+    # run read from the repository.
+    monkeypatch.setattr(leerie, "_DISCOVERED_BLT", None)
+    monkeypatch.setitem(_MODULE, "leerie", leerie)
     return tmp_path
 
 
@@ -204,14 +212,23 @@ def test_explicit_cli_value_passes_when_it_covers_declared_heap(leerie, repo_roo
 # fixtures below are the shape that actually ships.
 
 def _write_node_repo(repo_root, scripts, *, lockfile="pnpm-lock.yaml"):
-    """A Node repo as `_infer_build_lint_test` sees one: a package.json with
-    scripts, and a lockfile picking the package manager. Deliberately NO
-    `.leerie/config.toml`, so `resolve_blt` falls through to inference and
-    yields `<pm> run <script>` — the indirection under test."""
+    """A Node repo as a run reads one: a package.json with scripts, and a
+    lockfile picking the package manager. Deliberately NO
+    `.leerie/config.toml`, so `resolve_blt` falls through to the commands
+    read from the repository, `<pm> run <script>` — the indirection under
+    test."""
     import json as _json
     (repo_root / "package.json").write_text(
         _json.dumps({"name": "fixture", "scripts": scripts}))
     (repo_root / lockfile).write_text("")
+    # The commands a run reads from such a repository (DESIGN §6½ *A
+    # repository's build, lint and test commands are read from it*): its
+    # package manager running its own scripts.
+    pm = {"pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn",
+          "package-lock.json": "npm"}.get(lockfile, "npm")
+    _MODULE["leerie"]._DISCOVERED_BLT = {
+        "build": f"{pm} run build" if "build" in scripts else "",
+        "lint": "", "test": f"{pm} run test" if "test" in scripts else ""}
 
 
 def test_heap_declared_in_package_json_is_found(leerie, repo_root):

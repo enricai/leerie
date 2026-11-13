@@ -114,6 +114,7 @@ def test_the_provision_loop_feeds_an_unknown_program_back(leerie, tmp_path,
         yield repo
 
     monkeypatch.setattr(leerie, "_discover_tools", _no_tools)
+    monkeypatch.setattr(leerie, "_discover_blt", _no_tools)
     monkeypatch.setattr(leerie, "_judge_checkout", _checkout)
     monkeypatch.setattr(leerie, "_provision_hook_and_toolchain", _no_tools)
     prompts: list[str] = []

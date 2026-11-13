@@ -426,12 +426,12 @@ claims a state directory. Four sub-modes:
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in launcher bash so the
-verb needs no container or orchestrator import; `_infer_axis` mirrors
-`_infer_build_lint_test()`'s precedence by hand (§4, below).
-`tests/test_config_verb.py` runs per-mode unit tests against a
-self-contained bash harness plus a parity guard that diffs the real
-`config)` case arm's inference output against `_infer_build_lint_test()`
-across a fixture matrix, so the two can't silently diverge.
+verb needs no container or orchestrator import. `_infer_axis` is a
+deterministic file table of its own: a starting file for the operator to
+edit, host-side where no worker runs. A run does not use it (a run reads an
+undeclared axis from the repository, `_discover_blt`), so there is no
+parity with the orchestrator to guard. `tests/test_config_verb.py` runs
+per-mode unit tests against a self-contained bash harness.
 
 Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
 format and resolution); §6½ *Per-repo container image* (`setup_packages`,
@@ -5314,7 +5314,7 @@ budget)`, `_sample_workspace_manifests`, `_gather_dep_manifests`,
 `_peel_oversized_file`, `_is_same_document(root, path, text_len, text)`,
 `_glob_task_references` (matches reached through a link dropped),
 `_d1_report_sources`, `_task_file_text` (`resolve_task_argument`; a path
-outside the working directory is the operator's), `_infer_build_lint_test`,
+outside the working directory is the operator's),
 `_js_runner_scoped_templates`, `_package_json_name`,
 `_package_json_scripts`, `_ci_safe_rel`
 (lexical, never resolved), `_ci_config_files`, `_ci_check_problems`,
@@ -5383,51 +5383,43 @@ bytes/token than JSON, so the same text can sit over the cap inside
 `plan.json` but under it as markdown. On large task documents that
 alone isn't enough; the implementer prompt's `offset`/`limit` guidance,
 keyed on `_task_ref_bytes`, is what keeps the read from failing. The
-conformance phase derives its advisory build/lint/test commands
-separately via `_infer_build_lint_test(repo_root)`, best-effort
-discovery via config/lockfiles. Supported families (checked in this
-order; first match wins per axis via
-`out[axis] = out[axis] or "..."`):
+conformance phase derives its build/lint/test commands via
+`_infer_build_lint_test(repo_root)` for any axis `.leerie/config.toml` does
+not declare: the commands the `blt_discovery` worker read from the
+repository this run (`_DISCOVERED_BLT`), empty strings before phase 1½
+and for an axis the repository has no step for. There is no table of
+files to commands (DESIGN §6½ *A repository's build, lint and test
+commands are read from it*).
 
-- **Makefile** → `make` (build)
-- **Node/JS** (`package.json`) → `<pm> run build` (build), `<pm> run test`
-  (test), where `<pm>` is detected from lockfiles: `pnpm-lock.yaml` → `pnpm`,
-  `yarn.lock` → `yarn`, `bun.lockb`/`bun.lock` → `bun`, else `npm`.
-  Precedence mirrors `_detect_recipe_from_lockfiles()`. All PMs use the
-  `<pm> run <script>` form uniformly — bun's bare `bun test` / `bun build`
-  invoke built-in tools rather than package.json scripts
-- **Python** (`pyproject.toml` / `pytest.ini` / `setup.cfg`) → `pytest` (test)
-- **Rust** (`Cargo.toml`) → `cargo build` (build), `cargo test` (test)
-- **Go** (`go.mod`) → `go build ./...` (build), `go test ./...` (test)
-- **Maven** (`pom.xml`) → `mvn package` (build), `mvn test` (test)
-- **Gradle** (`build.gradle` / `build.gradle.kts`) → `./gradlew build` /
-  `./gradlew test` when `gradlew` exists, else `gradle build` / `gradle test`
-- **ESLint** (`.eslintrc.*`) → `npx eslint .` (lint)
-- **Ruff** (`.ruff.toml` / `ruff.toml`) → `ruff check .` (lint)
-- **RuboCop** (`.rubocop.yml` / `.rubocop.yaml`) → `bundle exec rubocop` (lint)
-- **Kotlin/detekt** (`detekt.yml` / `detekt.yaml`) → `detekt` (lint) — build/test
-  are already filled by the Gradle family above; detekt fills only the lint
-  axis. ktlint was considered and rejected as a marker: it has no dedicated
-  config file (driven by `.editorconfig` / the Gradle plugin), so it isn't
-  cleanly file-detectable in this inference style.
-- **C#/.NET** (`*.sln` at root, or `*.csproj` at root as fallback) →
-  `dotnet build` (build), `dotnet test` (test)
-- **PHP** (`phpunit.xml` / `phpunit.xml.dist`) → `vendor/bin/phpunit` (test);
-  (`phpstan.neon` / `phpstan.neon.dist`) → `vendor/bin/phpstan analyse` (lint)
-- **Rails** — `_is_rails_repo(repo_root)` (requires both `Gemfile.lock` and
-  `bin/rails` — the two-file check distinguishes Rails from
-  Sinatra/Grape/etc.) → `bin/rails test` (test)
-
-The short-circuit semantics mean earlier families take precedence: in a
-polyglot Node+Rails repo, `npm run test` wins the test axis while
-`bundle exec rubocop` still fills the lint axis if no ESLint/Ruff config
-exists.
+**Build/lint/test discovery.** `_discover_blt(st, caps, models, efforts,
+repo_root, recipe)`, called by `phase_provision` after the recipe is
+validated and normalized and before it is recorded (so a resume skips the
+phase only when both are). Spawns `blt_discovery`
+(`prompts/blt_discovery.md`, `SCHEMAS["blt_discovery"]`: `build`, `lint`,
+`test`, each `{command, evidence}`, `command` empty for no step) with
+`_blt_discovery_user_prompt(recipe)` (the recipe's non-`none` steps,
+`(<working_dir>) <argv>` one per line, or `(none)`), `cwd=_judgment_cwd(st)`,
+`INSPECT_TOOLS`, `max_turns=30`, `autonomous=False`, through
+`_run_checked_loop` with `check=_blt_command_issues(result, repo_root,
+bin_paths, PATH)`: per non-empty command, `SHELL_OPERATOR` when it holds
+any of `_BLT_SHELL_OPERATORS` (`&&`, `||`, `|`, `;`, `>`, `<`, backtick,
+`$(`), `UNPARSEABLE` when `shlex.split` fails, `NO_PROGRAM` when nothing
+but `NAME=value` words remain or the program is `cd`, else
+`_recipe_program_issues` on the words. An axis whose command still has an
+issue after the rounds is logged and left empty. The three commands are
+recorded at `st.data["provision"]["blt"]`, set as `_DISCOVERED_BLT`, and
+logged; a worker with no answer records three empty commands. Then
+`_resolve_memory_caps(caps, repo_root)` resolves the memory ceiling and
+demand again: the declared Node heap is read from the scripts those
+commands run, which the start-of-run resolution could not see.
+`_resume_provision_env` sets `_DISCOVERED_BLT` from `provision.blt` on
+`resume`. Pinned by `tests/test_blt_discovery.py`.
 
 **Declared BLT commands (`.leerie/config.toml`).** A repo may commit
 `.leerie/config.toml` with explicit `build`, `lint`, and/or `test` keys
-that override the corresponding axis from inference. Missing keys fall
-through to `_infer_build_lint_test()`. An empty-string value means "not
-applicable" (same convention as inference) and is preserved rather than
+that override the corresponding axis read from the repository. Missing
+keys fall through to `_infer_build_lint_test()`. An empty-string value
+means "not applicable" (the same convention) and is preserved rather than
 replaced. The file also accepts a `setup_packages` key (comma-separated
 apt package names) that triggers per-repo Dockerfile auto-generation
 (§6½ *Auto-capture of repo dependencies*); not consumed by BLT resolution.
@@ -7878,7 +7870,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | planned-overlap extra waves (`overlap_extra_waves`) | 3 | `_schedule(plans, overlap_extra_waves)` → `_serialize_planned_overlap` splits same-wave subtasks whose planned `files_likely_touched` intersect into sub-waves, keeping a pair (largest overlap first, then wave, then ids) only while the whole plan's extra waves stay within this cap (DESIGN §5 *Planned file overlap is serialised*). 0 disables. |
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed. |
 | per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived via `_auto_worker_memory_max` → `_worker_memory_ceiling(slice_max)` from the shared `leerie.slice/memory.max` budget alone (broker `slice` verb; `_cgroup_slice_info`): `max(_WORKER_BUILD_PEAK_BYTES, min(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER, slice_max // 2))` — a **fixed isolation ceiling**, deliberately **independent of the live sibling count and of `max_parallel`**, since `memory.max` is a ceiling, not a reservation (DESIGN §6). Falls back to the legacy `/proc/meminfo`-derived basis (`_auto_worker_memory_max_legacy`, VM RAM split across `max_parallel + 1` slots, floored at 8 GiB) only when no broker/slice budget is readable. **Raised to the repo's measured build peak** once the base-health baseline has measured one: `max(ceiling, 1.25 × peak + 0.3 GiB)` (`_apply_blt_peak`; §6 *Spawn-held enrollment and measured sizing*), re-applied on resume. Contention is handled by admission in **two stages**, never by shrinking caps. Stage 1, `_degrade_max_parallel_for_wave(max_parallel, build_peak_bytes=None)`, runs once at wave entry and is synchronous: it returns the largest N in `[1, max_parallel]` with `slice_max - unreclaimable >= demand * N` and sizes the wave's `asyncio.Semaphore` accordingly. Stage 2 is the per-spawn gate: before spawning, `_await_worker_memory_admission` blocks (polling every 5s, up to 10 min) while measured slice headroom (`slice_max - unreclaimable`, never `memory.current`) is below `demand * (1 + in-flight workers)`. Reservations are bounded by worker LIFETIME — the gate returns a token from `_active_admissions` and `_invoke_admitted` releases it in a `finally`. Pinned by `tests/test_memory_admission_degrade.py`. Overridable via `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml` (bypasses the derivation only — the admission gate still runs). Suffixes K/M/G/T accepted. **Reconciled against the repo's own declared Node heap** (`resolve_worker_memory_max`, `_declared_node_heap_bytes`): an explicit `--max-old-space-size` in a `package.json` script overrides Node's host-derived default regardless of container size, so `_declared_node_heap_bytes` follows the package-manager indirection through `scripts`, matching all four V8 spellings via `_pm_script_candidates` (splits on shell separators first — a whitespace split alone misses `"build&&node"`). Deliberately over-inclusive: a missed script under-sizes the cage and OOMs the worker; an extra candidate costs nothing. A declared heap overrides whatever `NODE_OPTIONS` leerie injects for that subprocess (P9), sharing the headroom constant `_NODE_HEAP_HEADROOM_BYTES` = 2432 MiB with P9's own injection so both read one name, not a duplicated literal (`tests/test_resolve_worker_memory_max.py` AST-pins it; `test_node_heap_headroom_is_2432_mib` pins the value). When the resolved cap undershoots `declared heap + headroom`: an auto-derived cap is raised unclamped; an explicit override is refused with an actionable `die()`; when even the whole slice can't fit the declared heap, `die()`s naming the shortfall. Regression: `tests/test_worker_heap_ceiling_reconcile.py`, `tests/test_worker_memory_heap_reconcile.py` | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services are not eligible victims. Enforcement goes through the **cgroup broker** (`scripts/cgroup-broker.py`), driven by the dropped-privilege orchestrator over a descriptor it inherits (no socket path). It creates `<V2_ROOT>/leerie.slice/leerie-w-<sid>` (cgroup **v2** — `V2_ROOT` is `/sys/fs/cgroup` rootful/Fly, or the systemd-delegated user slice under rootless containerd via `LEERIE_CGROUP_V2_ROOT`) or the split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT` (v1/hybrid, never rootless) and sets its `memory.max`. Local nerdctl needs the launcher's cgroup bind-mount (`bind-propagation=rshared` rootful, plain bind rootless) + `--cgroupns=host`; Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy, and `_enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
-| per-worker memory demand estimate (`worker_demand_estimate_bytes`) | resolved once at run start by `resolve_worker_demand_estimate()`: `_WORKER_BUILD_PEAK_BYTES` unless the repo declares a Node heap, else `declared_heap + _NODE_HEAP_HEADROOM_BYTES`. Threaded to both admission surfaces as a parameter, not module state. **Distinct from the ceiling above** — that bounds one worker, this predicts what one will use. | `_degrade_max_parallel_for_wave` shrinks the wave; `_await_worker_memory_admission` blocks the spawn. Both fall back to `_WORKER_BUILD_PEAK_BYTES` when the key is absent, so the three entrypoints that build their own caps (`run_recapture_deps`, `run_rebaser`, `_replay_capture`) are unchanged. |
+| per-worker memory demand estimate (`worker_demand_estimate_bytes`) | resolved at run start, and again once phase 1½ (or a resume) has the build/lint/test commands read from the repository, by `_resolve_memory_caps(caps, repo_root)` — which also resolves the ceiling, from `caps["worker_memory_max_cli"]` (the operator's `--worker-memory-max`, recorded at start) — through `resolve_worker_demand_estimate()`: `_WORKER_BUILD_PEAK_BYTES` unless the repo declares a Node heap, else `declared_heap + _NODE_HEAP_HEADROOM_BYTES`. Threaded to both admission surfaces as a parameter, not module state. **Distinct from the ceiling above** — that bounds one worker, this predicts what one will use. | `_degrade_max_parallel_for_wave` shrinks the wave; `_await_worker_memory_admission` blocks the spawn. Both fall back to `_WORKER_BUILD_PEAK_BYTES` when the key is absent, so the three entrypoints that build their own caps (`run_recapture_deps`, `run_rebaser`, `_replay_capture`) are unchanged. |
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 2048, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX`, never `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input). Raised, never lowered, to `ceil(1.5 × measured pids peak)` once the base-health baseline has measured one (`_apply_blt_peak`; §6 *Spawn-held enrollment and measured sizing*) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Sized against measurement (DESIGN §6 *Detecting PID exhaustion*): leerie's own suite peaks at 33 concurrent PIDs, so 2048 sits well above the workload and a worker near it is leaking rather than testing. Raise it per-repo for suites heavier than the default. |
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. No CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint before the Python orchestrator starts. Best-effort: any read/write failure leaves the slice uncapped. Sets `memory.max` (RAM) only, not `memory.swap.max`. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container*, instead of a VM-wide *global* OOM that would kill unprotected host-session processes and orphan the container. See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. Terminal auth failures (`_is_terminal_auth_failure`, below) never reach this loop. |
