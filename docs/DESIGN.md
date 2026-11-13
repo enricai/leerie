@@ -4327,7 +4327,7 @@ confinement failure stops the run; it is never a result*).
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
 | the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/`; its `home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
-| the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
+| the run's mise configuration | `<run-dir>/mise-overrides.toml`, `<run-dir>/mise-tools.toml` (§6½ *The tools a repository needs are read from it*) | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR` and the toolchain home layer `/leerie-toolchains/home`, which is its `HOME`; no store variable in its environment; `mise-state/` emptied first | write |
@@ -11637,6 +11637,40 @@ the CI parity baseline, the browser suite unable to start).
    not parse (step 3's synthesized override, still Go's own code; a typed
    pin the provision worker reads from the repository is the general
    form, not made here).
+
+   **The tools a repository needs are read from it.** *Designed
+   2026-11-13 (OPEN-ISSUES #23, lane LG2).* *Root cause.* mise installs
+   what a repository pins, and nothing else: a tool its steps run that no
+   file of its pins was not there. A uv repository pinning nothing ended
+   unconverged on "`uv` is not on PATH" (lane LG's fixture, on 0.65.0 and
+   0.67.0 alike), and only a `.tool-versions` naming `uv` made it pass; a
+   Poetry repository is the same, and so is every runtime the image does
+   not carry when the repository states its version only where mise does
+   not look — a Gemfile's `ruby` line, `build.zig.zon`'s minimum, `mix.exs`'s
+   `elixir`, `go.mod`'s `go` line (which leerie read with Go's own code,
+   step 3). Knowing which tools a repository's steps run is reading the
+   repository, and no list of files or managers covers the ones no one
+   listed. *Invariant.* Before mise installs, a judgment worker
+   (`tool_discovery`, read-only, in the planning tree) reads how the
+   repository is installed, built and tested and names every tool those
+   steps run, each at the version the repository states, as typed JSON.
+   Code holds each name to mise's own registry — a name it does not hold
+   is asked about again and is never written — and each version to mise's
+   syntax (an exact version, a prefix, `latest`, `lts`; never a range).
+   The names go into the run's tools file (`<run-dir>/mise-tools.toml`),
+   which mise reads as its global configuration (`MISE_GLOBAL_CONFIG_FILE`,
+   on the orchestrator's environment, so every confined command and every
+   worker reads it too): *beneath* every pin of the repository's own, so a
+   file the repository commits still decides its version (measured on
+   0.65.0's image: a tools file asking `python = "3.12"` beside the tree's
+   `.python-version` 3.11 gives 3.11 in the tree and 3.12 outside it, and
+   `uv = "latest"` puts `uv` on the shims, where `uv run pytest` passes).
+   `mise install` then installs both. A worker that fails leaves the run on
+   the repository's own pins, as before. This is not the §12 carve-out: the
+   answer is never rendered into another worker's prompt, and what it
+   installs is installed by mise into the toolchain cache, under the
+   toolchain kind's grant. Benched before it shipped (lane LG2, eight
+   fixtures, an ecosystem leerie's code never names among them).
 
    **A repository's pinned runtime is the one its commands run.**
    *Designed 2026-11-04 (barnacle's `.nvmrc`, found proving the corepack

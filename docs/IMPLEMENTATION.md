@@ -3771,6 +3771,7 @@ which are specified in their own sections.)
 | `reconciler` | `prompts/reconciler.md` | sonnet | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | eight arrays — `renames` / `added_provides` / `added_subtasks` / `conditional_drops` / `dropped_requires` (resolution; `conditional_drops` drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition; `dropped_requires` removes an over-specified `requires` entry — an aggregate or coarser synonym of what the consumer itself provides — and ALSO plays a cycle-breaking role on retry); `dependency_edges` / `merged_subtasks` (cycle-breaking-only, used on retry when leerie's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
 | `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | sonnet | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
 | `satisfied_probe` | `prompts/satisfied_probe.md` | sonnet | 0 or 1 per subtask (phase 3, before scheduling; skipped when `--skip-satisfied-check`) | `{satisfied: bool, evidence: str, unsatisfied_reason?: "artifact_missing"\|"behavior_gap"\|"partially_met"\|"cannot_verify", equivalent_coverage_exists?: bool, sibling_invalidation_risk?: bool}` — soft-drops subtasks already met on the base tree (pre-schedule base-tree call site: `max_turns=20`; the HEAD-probe helper `_probe_criteria_satisfied_on_head` — serving the no-commit rescue and the provider-subset pre-spawn check — carries `max_turns=40`: the caps differ by consequence, not workload shape — both sites judge one criterion, but a HEAD-probe cap-out had no recovery below the run level (all six attempts for a genuine no-op — two pre-spawn, four rescue — died at turns=21 and killed the run), while a pre-schedule cap-out is retried and at worst fail-safe-keeps the subtask, DESIGN §8); a `satisfied: false` verdict with `unsatisfied_reason: "artifact_missing"`, `equivalent_coverage_exists: true`, **and an explicit `sibling_invalidation_risk: false`** soft-drops the same way (`reason: "equivalent_coverage"`); any other combination, or any field absent, keeps the subtask — the sibling channel stays keep-only by construction. DESIGN §8 *A "not satisfied" verdict carries a typed reason* |
+| `tool_discovery` | `prompts/tool_discovery.md` | sonnet | 1 per fresh run (phase 1½, before `mise install`) | the tools the repository's install/build/test steps run, each at its stated version, held to mise's registry and written to `<run>/mise-tools.toml` (`MISE_GLOBAL_CONFIG_FILE`). See §6½ step 1½ |
 | `provision` | `prompts/provision.md` | sonnet | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See §6½ |
 | `provision_judge` | `prompts/provision_judge.md` | sonnet | 0 or 1 (adversarial re-check of a spawned provision recipe) | `{recipe_would_succeed: bool, defects[], rationale}` — independent verification the recipe would actually install. §6½, DESIGN §8 |
 | `wiring_judge` | `prompts/wiring_judge.md` | sonnet | 0 or 1 (phase 2¾ or later, "A wiring re-check on the fully-merged plan" — semantic check of the reconciled plan's cross-subtask edges) | `{plan_reviewed: bool, wiring_defects[] (each carrying severity: live_defect\|latent_risk — only live_defect gates), rationale}` — independent verification declared edges are the right ones, not just structurally resolvable. DESIGN §5, §8 |
@@ -4989,7 +4990,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `PR_SET_NO_NEW_PRIVS` and `landlock_restrict_self`; raises `OSError`
   naming the failed step.
 - Every worker also gets `ro` `<run>/mise-overrides.toml`
-  (`MISE_OVERRIDES_NAME`, written by `_synth_mise_go_override`).
+  (`MISE_OVERRIDES_NAME`, written by `_synth_mise_go_override`) and
+  `<run>/mise-tools.toml` (`MISE_TOOLS_NAME`, written by `_discover_tools`).
 - **Measurements** (DESIGN §6 *Leerie's runs of the repository's commands
   are confined too*). `WorkerGrants(rw, ro, env=())`: `env` is the
   `(name, value)` pairs the grant names, laid over the command's
@@ -5018,7 +5020,7 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_reads_outside(state_root, tmp=False)` (no grant names `/tmp`: an
   isolated command's own is the shim's), leerie's install `ROOT`, `os.environ["HOME"]` (realpath;
   left out when it holds `SHARED_TMP`),
-  `<run>/mise-overrides.toml` and `_measured_git_reads(tree, run_dir)`
+  `<run>/mise-overrides.toml`, `<run>/mise-tools.toml` and `_measured_git_reads(tree, run_dir)`
   (`git rev-parse --path-format=absolute --git-dir --git-common-dir`:
   common dir the run repository → it whole; a tree repository → it and
   `<run>/repo/objects`; a git dir inside the tree (a clone) →
@@ -12086,6 +12088,34 @@ branch, after the `_write_run_json(...)` block and before
    checkout, which is read-only in the container (DESIGN §6 *The explicit
    channel*). A missing planning worktree or a checkout that cannot be
    made `die()`s.
+1½. **Tool discovery.** `_discover_tools(st, caps, models, efforts)`,
+   called by `phase_provision` before the provisioning checkout (DESIGN
+   §6½ *The tools a repository needs are read from it*). Spawns the
+   `tool_discovery` worker (`prompts/tool_discovery.md`,
+   `SCHEMAS["tool_discovery"]`: `tools[]` of `{tool, version, evidence}`,
+   `tool` matching `TOOL_NAME_PATTERN` and `version`
+   `TOOL_VERSION_PATTERN` — an exact version, a prefix, `latest` or
+   `lts`; optional `confidence` on `tool_completeness`) with
+   `TOOL_DISCOVERY_USER_PROMPT`, `cwd=_judgment_cwd(st)`, `INSPECT_TOOLS`,
+   `max_turns=30`, `autonomous=False`, through `_run_checked_loop` with
+   `check=_check_tool_discovery_output(result, registry)` (one
+   `UNKNOWN_TOOL` issue per `tool` absent from `_mise_registry_names()`,
+   naming registry names that contain it or that it contains) and
+   feedback rounds bounded by `judgment_check_rounds`.
+   `_mise_registry_names()` is the first column of `mise registry`, run
+   from `/` once per process (30 s); empty when mise cannot run, and then
+   discovery is skipped with a log line. `_mise_tools_toml(tools,
+   registry)` writes one `"<tool>" = "<version>"` line under `[tools]` per
+   registry name, first occurrence wins, to `<run_dir>/mise-tools.toml`
+   (`MISE_TOOLS_NAME`, via `_write_beneath`); `_use_run_tools_file(env,
+   path)` sets `MISE_GLOBAL_CONFIG_FILE` on `os.environ`, so `mise install`
+   (step 4), every confined command and every worker read it beneath the
+   repository's own pins. Recorded at `st.data["provision"]["tools"]` (the
+   worker's list) and `["tools_file"]`; on `resume`, `_resume_provision_env(st, env)` re-applies `tools_file`
+   (and the go override's `override_file`). A worker that returns no
+   answer (`_run_checked_loop` gives `None`, or a `WorkerError`) logs and
+   leaves the run on the repository's own pins (`tools: []`, no file). Pinned by
+   `tests/test_tool_discovery.py`.
 2. **Setup hook.** `_run_setup_hook(repo_root, log_dir, st)` execs
    `<repo>/.leerie-setup.sh` if present (10-min timeout, streams to
    `<state-root>/runs/<id>/logs/setup-hook.log`). Idempotent via
