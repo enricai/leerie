@@ -133,6 +133,12 @@ def env(leerie, tmp_path, monkeypatch):
         assert kw["schema_key"] == "ci_checks", kw["schema_key"]
         return {"checks": [check], "excluded": []}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    async def _no_blt(*a, **k):
+        return None
+    # The build/lint/test discovery is its own worker (tests/
+    # test_blt_discovery.py), not the subject here.
+    monkeypatch.setattr(leerie, "_discover_blt", _no_blt)
     return {"repo": repo, "run_dir": run_dir, "staging": staging, "st": st,
             "caps": caps, "calls": calls}
 

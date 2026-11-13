@@ -488,6 +488,11 @@ DEFAULT_CAPS = {
     # resolved at run start by resolve_worker_demand_estimate, which raises
     # it only for a repo declaring its own Node heap (N14-16).
     "worker_demand_estimate_bytes": None,
+    # The operator's `--worker-memory-max`, kept so the ceiling and demand
+    # above can be resolved again once phase 1½ has read the repository's
+    # build/lint/test commands (`_resolve_memory_caps`): the declared Node
+    # heap is read from the scripts those commands run.
+    "worker_memory_max_cli": None,
     # Whether the operator set the global wall-clock ceiling anywhere (N25).
     # Declared here for the same reason as the row above — it is resolved at
     # run start rather than configured — and because `resolve_worker_timeout`
@@ -2158,6 +2163,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "plan_overlap_judge": "medium",
     "provision": "medium",
     "tool_discovery": "medium",
+    "blt_discovery": "medium",
     "integrator": "medium",
     "pr_writer": "medium",
     "dep_capture": "medium",
@@ -2386,7 +2392,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "falsifier", "verifiability_classifier", "delivery_ratchet",
                 "forbidden_command_extractor", "observability_judge",
                 "contradiction_judge",
-                "intent_resolver", "plan_item_checker", "tool_discovery")
+                "intent_resolver", "plan_item_checker", "tool_discovery",
+                "blt_discovery")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2418,6 +2425,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "forbidden_command_extractor", "observability_judge",
     "contradiction_judge",
     "intent_resolver", "plan_item_checker", "tool_discovery",
+    "blt_discovery",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2526,6 +2534,27 @@ _REQUIRES_ITEM = {
     },
 }
 
+
+_BLT_AXIS_SCHEMA: dict = {"type": "object", "required": ["command", "evidence"],
+                  "additionalProperties": False,
+                  "properties": {"command": {"type": "string"},
+                                 "evidence": {"type": "string"}}}
+def _blt_discovery_user_prompt(recipe: list) -> str:
+    """The `blt_discovery` worker's user prompt: the repository is its
+    working directory, and the install steps the run ran in every tree it
+    measures (`provision.recipe`), one per line."""
+    steps = [f"  ({e.get('working_dir') or '.'}) "
+             + " ".join(e.get("command") or [])
+             for e in recipe or []
+             if isinstance(e, dict) and e.get("kind") != "none"
+             and e.get("command")]
+    return ("The repository is your working directory. Before any build, "
+            "lint or test command runs, the run installs its dependencies "
+            "with these steps (working directory, then command):\n"
+            + ("\n".join(steps) if steps else "  (none)")
+            + "\n\nSay how the repository builds, lints and tests itself: "
+            "one command each, run from its root. Return only the JSON "
+            "object per your schema.")
 
 TOOL_DISCOVERY_USER_PROMPT = (
     "The repository is your working directory. Read how it is installed, "
@@ -4385,6 +4414,21 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "confidence": _confidence_schema(["recipe_correctness"]),
+        },
+    },
+    "blt_discovery": {
+        # How the repository builds, lints and tests itself, as the worker
+        # reads it from the repository (DESIGN §6½ *A repository's build,
+        # lint and test commands are read from it*). An empty `command`
+        # means the repository has no such step. Each non-empty command's
+        # program is held to what the run can run (`_blt_command_issues`).
+        "type": "object",
+        "required": ["build", "lint", "test"],
+        "additionalProperties": False,
+        "properties": {
+            "build": _BLT_AXIS_SCHEMA,
+            "lint": _BLT_AXIS_SCHEMA,
+            "test": _BLT_AXIS_SCHEMA,
         },
     },
     "tool_discovery": {
@@ -33969,13 +34013,145 @@ def _use_run_tools_file(env: MutableMapping[str, str],
         env["MISE_GLOBAL_CONFIG_FILE"] = str(path)
 
 
+_BLT_SHELL_OPERATORS = ("&&", "||", "|", ";", ">", "<", "`", "$(")
+
+
+def _blt_command_issues(found: dict, repo_root: Path, bin_paths: list[str],
+                        path: str) -> list[str]:
+    """Issues with a `blt_discovery` answer: a command with a shell operator
+    or a `cd` (leerie runs one command from the root), one that does not
+    split as words, or one whose program the run cannot run
+    (`_recipe_program_issues`, after any leading `NAME=value`)."""
+    issues: list[str] = []
+    for ax in ("build", "lint", "test"):
+        cmd = ((found.get(ax) or {}).get("command") or "").strip()
+        if not cmd:
+            continue
+        if any(op in cmd for op in _BLT_SHELL_OPERATORS):
+            issues.append(f"SHELL_OPERATOR: {ax} command {cmd!r} — give one "
+                          "command, run from the repository root")
+            continue
+        try:
+            words = shlex.split(cmd)
+        except ValueError:
+            issues.append(f"UNPARSEABLE: {ax} command {cmd!r}")
+            continue
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]
+        if not words or words[0] == "cd":
+            issues.append(f"NO_PROGRAM: {ax} command {cmd!r} — give one "
+                          "command, run from the repository root")
+            continue
+        for issue in _recipe_program_issues(
+                [{"kind": "build", "command": words, "working_dir": "."}],
+                repo_root, bin_paths, path):
+            issues.append(issue.replace("recipe[0]", f"the {ax} command"))
+    return issues
+
+
+async def _discover_blt(st: "State", caps: dict, models: dict[str, str],
+                        efforts: dict[str, str | None],
+                        repo_root: Path, recipe: list) -> None:
+    """Phase 1½'s build/lint/test discovery (DESIGN §6½ *A repository's
+    build, lint and test commands are read from it*): the `blt_discovery`
+    worker reads how the repository builds, lints and tests itself, told
+    the install steps the run runs first; each command's program is held to
+    what the run can run (`_blt_command_issues`, asked again on a miss).
+    Recorded at `provision.blt` and set as `_DISCOVERED_BLT`. A worker that
+    gives no answer leaves every undeclared axis empty, as it was for a
+    repository the old table did not know."""
+    global _DISCOVERED_BLT
+    prov = st.data.setdefault("provision", {})
+    parts: list[str] = [_blt_discovery_user_prompt(recipe)]
+    bin_paths = list(prov.get("bin_paths") or [])
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt="\n\n".join(parts),
+            system_prompt=_load_prompt("blt_discovery"),
+            schema_key="blt_discovery",
+            cwd=_judgment_cwd(st),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            autonomous=False,
+            caps=caps, st=st,
+            model=models.get("blt_discovery", MODEL_DEFAULT),
+            effort=efforts.get("blt_discovery"),
+            sid="blt_discovery",
+        )
+
+    async def _on_fb(fb: str) -> dict:
+        if len(parts) > 1:
+            parts[-1] = fb
+        else:
+            parts.append(fb)
+        return {}
+
+    try:
+        result, warnings = await _run_checked_loop(
+            invoke=_invoke,
+            check=lambda r: _blt_command_issues(
+                r, repo_root, bin_paths, os.environ.get("PATH", "")),
+            name="blt_discovery",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_fb,
+        )
+    except WorkerError as e:
+        result, warnings = None, [_brief_worker_exc(e)]
+    for w in warnings:
+        log(f"  blt_discovery: {w}")
+    found = {ax: (((result or {}).get(ax) or {}).get("command") or "").strip()
+             for ax in ("build", "lint", "test")}
+    if result is not None and _blt_command_issues(
+            result, repo_root, bin_paths, os.environ.get("PATH", "")):
+        # Still unrunnable after the re-asks: an axis leerie cannot run is
+        # not one it measures.
+        bad = {ax for ax in found
+               if _blt_command_issues({ax: {"command": found[ax]}},
+                                      repo_root, bin_paths,
+                                      os.environ.get("PATH", ""))}
+        for ax in sorted(bad):
+            log(f"  blt_discovery: {ax} command {found[ax]!r} cannot run "
+                "here; the axis is left empty")
+            found[ax] = ""
+    prov["blt"] = found
+    st.save()
+    _DISCOVERED_BLT = dict(found)
+    log("  the repository's own commands: " + ", ".join(
+        f"{ax}={found[ax] or '(none)'}" for ax in ("build", "lint", "test")))
+    _resolve_memory_caps(caps, repo_root)
+
+
+def _resolve_memory_caps(caps: dict, repo_root: Path) -> None:
+    """Resolve the per-worker memory ceiling and demand estimate (N14-16)
+    against the Node heap the repository's build/lint/test commands
+    declare. Run at start, and again once phase 1½ (or a resume) has the
+    commands read from the repository: before that an undeclared axis has
+    no command, and so no script to read a heap from (DESIGN §6½ *A
+    repository's build, lint and test commands are read from it*)."""
+    declared = _declared_node_heap_bytes(repo_root)
+    caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
+        repo_root, caps["max_parallel"], caps.get("worker_memory_max_cli"),
+        declared_heap_bytes=declared)
+    # What a worker of THIS repo is expected to actually use — distinct from
+    # the ceiling above, and what both admission surfaces size on (N14-16).
+    caps["worker_demand_estimate_bytes"] = resolve_worker_demand_estimate(
+        declared)
+
+
 def _resume_provision_env(st: "State",
                           env: MutableMapping[str, str]) -> None:
     """On `resume`, lay into `env` the mise configuration the run's
     provisioning chose for every later command: the run's tools file
-    (DESIGN §6½ *The tools a repository needs are read from it*)."""
+    (DESIGN §6½ *The tools a repository needs are read from it*) and the
+    build, lint and test commands read from the repository (DESIGN §6½)."""
+    global _DISCOVERED_BLT
     prov = st.data.get("provision") or {}
     _use_run_tools_file(env, prov.get("tools_file"))
+    if isinstance(prov.get("blt"), dict):
+        _DISCOVERED_BLT = {ax: str(prov["blt"].get(ax) or "")
+                           for ax in ("build", "lint", "test")}
 
 
 async def _discover_tools(st: "State", caps: dict, models: dict[str, str],
@@ -36404,6 +36580,12 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # host's full core count and exhaust the worker's pids.max cgroup cap
     # (N22). See _normalize_node_threadpool.
     recipe = _normalize_node_threadpool(recipe)
+
+    # How the repository builds, lints and tests itself, read from it once
+    # the run knows how it installs (DESIGN §6½ *A repository's build, lint
+    # and test commands are read from it*). Before the recipe is recorded:
+    # a resume skips this phase only when both are.
+    await _discover_blt(st, caps, models, efforts, repo_root, recipe)
 
     prov["recipe"] = recipe
     st.save()
@@ -44543,94 +44725,22 @@ def _format_convention_docs_section(repo_root: Path) -> str | None:
             f"{_format_rules_paths(rules_files, repo_root)}")
 
 
-def _is_rails_repo(repo_root: Path) -> bool:
-    """True when the repo is a Rails application. Requires both a
-    Gemfile.lock (rules out plain scripts) and bin/rails (the canonical
-    file generated by `rails new`, absent in Sinatra/Grape/etc.)."""
-    return ((repo_root / "Gemfile.lock").is_file()
-            and (repo_root / "bin" / "rails").is_file())
+# The build, lint and test commands the run read from the repository
+# (`_discover_blt`; DESIGN §6½ *A repository's build, lint and test commands
+# are read from it*), set by phase 1½ and again on `resume`; None before.
+_DISCOVERED_BLT: dict[str, str] | None = None
 
 
 def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
-    """Best-effort guess at the repo's build / lint / test commands. Returns
-    a dict with keys 'build', 'lint', 'test' — empty string when no command
-    could be inferred for that axis. The conformer is told an empty string
-    means "not applicable; report ran=false." This is a *suggestion* the
-    worker may override based on what it sees in the repo."""
-    out = {"build": "", "lint": "", "test": ""}
-    if (repo_root / "Makefile").is_file():
-        # Don't assume specific targets — the conformer reads the Makefile
-        # and picks. We just signal "a Makefile exists."
-        out["build"] = "make"
-    if (repo_root / "package.json").is_file():
-        # Lockfile-aware PM detection — precedence mirrors
-        # _detect_recipe_from_lockfiles (pnpm > yarn > bun > npm).
-        # `<pm> run build` / `<pm> run test` uniformly: bun's bare
-        # `bun test` / `bun build` invoke built-in tools, not
-        # package.json scripts.
-        if (repo_root / "pnpm-lock.yaml").is_file():
-            pm = "pnpm"
-        elif (repo_root / "yarn.lock").is_file():
-            pm = "yarn"
-        elif (repo_root / "bun.lockb").is_file() or \
-             (repo_root / "bun.lock").is_file():
-            pm = "bun"
-        else:
-            pm = "npm"
-        out["build"] = out["build"] or f"{pm} run build"
-        out["test"] = out["test"] or f"{pm} run test"
-    if (repo_root / "pyproject.toml").is_file() or \
-       (repo_root / "pytest.ini").is_file() or \
-       (repo_root / "setup.cfg").is_file():
-        out["test"] = out["test"] or "pytest"
-    if (repo_root / "Cargo.toml").is_file():
-        out["build"] = out["build"] or "cargo build"
-        out["test"] = out["test"] or "cargo test"
-    if (repo_root / "go.mod").is_file():
-        out["build"] = out["build"] or "go build ./..."
-        out["test"] = out["test"] or "go test ./..."
-    if (repo_root / "pom.xml").is_file():
-        out["build"] = out["build"] or "mvn package"
-        out["test"] = out["test"] or "mvn test"
-    if (repo_root / "build.gradle").is_file() or \
-       (repo_root / "build.gradle.kts").is_file():
-        if (repo_root / "gradlew").is_file():
-            out["build"] = out["build"] or "./gradlew build"
-            out["test"] = out["test"] or "./gradlew test"
-        else:
-            out["build"] = out["build"] or "gradle build"
-            out["test"] = out["test"] or "gradle test"
-    if (repo_root / ".eslintrc").is_file() or \
-       (repo_root / ".eslintrc.json").is_file() or \
-       (repo_root / ".eslintrc.js").is_file() or \
-       (repo_root / ".eslintrc.cjs").is_file() or \
-       (repo_root / ".eslintrc.yaml").is_file() or \
-       (repo_root / ".eslintrc.yml").is_file():
-        out["lint"] = out["lint"] or "npx eslint ."
-    if (repo_root / ".ruff.toml").is_file() or \
-       (repo_root / "ruff.toml").is_file():
-        out["lint"] = out["lint"] or "ruff check ."
-    if (repo_root / ".rubocop.yml").is_file() or \
-       (repo_root / ".rubocop.yaml").is_file():
-        out["lint"] = out["lint"] or "bundle exec rubocop"
-    if (repo_root / "detekt.yml").is_file() or \
-       (repo_root / "detekt.yaml").is_file():
-        out["lint"] = out["lint"] or "detekt"
-    if _glob_beneath(repo_root, "*.sln"):
-        out["build"] = out["build"] or "dotnet build"
-        out["test"] = out["test"] or "dotnet test"
-    elif _glob_beneath(repo_root, "*.csproj"):
-        out["build"] = out["build"] or "dotnet build"
-        out["test"] = out["test"] or "dotnet test"
-    if (repo_root / "phpunit.xml").is_file() or \
-       (repo_root / "phpunit.xml.dist").is_file():
-        out["test"] = out["test"] or "vendor/bin/phpunit"
-    if (repo_root / "phpstan.neon").is_file() or \
-       (repo_root / "phpstan.neon.dist").is_file():
-        out["lint"] = out["lint"] or "vendor/bin/phpstan analyse"
-    if _is_rails_repo(repo_root):
-        out["test"] = out["test"] or "bin/rails test"
-    return out
+    """The repository's build / lint / test commands where its
+    `.leerie/config.toml` declares none: the ones the `blt_discovery` worker
+    read from it this run (`_DISCOVERED_BLT`). Empty strings — not
+    applicable — for an axis the repository has no step for, and for every
+    axis before phase 1½ has read them. There is no table of files to
+    commands: which command a repository runs, and through which manager,
+    is the repository's to say (DESIGN §6½)."""
+    found = _DISCOVERED_BLT or {}
+    return {ax: (found.get(ax) or "") for ax in ("build", "lint", "test")}
 
 
 async def _changed_files(tree: str, base_ref: str) -> list[str]:
@@ -80618,12 +80728,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # call the answers file was silently dropped — the re-spawned
         # worker would re-ask the same question forever. See P5-1.
         _absorb_supplied_answers(args, st, leerie_dir)
-        # Re-export the mise override env var if the original run
-        # synthesized one. phase_provision (below) is skipped when
-        # provision.recipe is already persisted, but downstream
-        # implementer/conformer subprocesses still need it to find the
-        # synthesized go pin.
+        # phase_provision (below) is skipped when provision.recipe is
+        # already persisted, but every later command still needs what it
+        # chose: the run's tools file and the build/lint/test commands read
+        # from the repository — and the memory ceiling resolved against
+        # the Node heap those commands declare.
         _resume_provision_env(st, os.environ)
+        if isinstance((st.data.get("provision") or {}).get("blt"), dict):
+            _resolve_memory_caps(caps, Path(os.getcwd()))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
     else:
@@ -82301,14 +82413,8 @@ def main() -> int | None:
     #
     # Resolved once here, not inside the resolver, so the ceiling and the
     # admission demand estimate share one scan (and one log line).
-    _declared_heap = _declared_node_heap_bytes(Path(os.getcwd()))
-    caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
-        Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max,
-        declared_heap_bytes=_declared_heap)
-    # What a worker of THIS repo is expected to actually use — distinct from
-    # the ceiling above, and what both admission surfaces size on (N14-16).
-    caps["worker_demand_estimate_bytes"] = resolve_worker_demand_estimate(
-        _declared_heap)
+    caps["worker_memory_max_cli"] = args.worker_memory_max
+    _resolve_memory_caps(caps, Path(os.getcwd()))
 
     # Resolve source-of-truth and per-worker model preferences once per run.
     # Both die() on a bad value so typos in leerie.toml or env vars are

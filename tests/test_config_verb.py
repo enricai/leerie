@@ -217,7 +217,7 @@ def test_init_no_nerdctl_run(tmp_path):
 
 def test_init_uses_inferred_blt_from_pyproject(tmp_path):
     """--init infers `pytest` for the test axis when pyproject.toml is present
-    (matches _infer_build_lint_test(): a bare tests/ dir alone is NOT a
+    (the launcher's own table: a bare tests/ dir alone is NOT a
     signal — pyproject.toml / pytest.ini / setup.cfg are)."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
@@ -597,23 +597,13 @@ def test_config_arm_exits_before_nerdctl_run():
 
 
 # ---------------------------------------------------------------------------
-# Parity guard: the REAL launcher `config)` arm's inference must match
-# orchestrator/leerie.py::_infer_build_lint_test() exactly.
+# The REAL launcher `config)` arm's own table, pinned per stack.
 #
-# `_extract_config_arm` is defined near the top of this file (shared with
-# the per-mode tests (a)-(d) above). These tests extract the actual
-# `config)` case-arm body out of the shipped `leerie` launcher — the same
-# extract-from-launcher pattern test_resolve_repo_image_tag.py uses — wrap
-# it in a minimal dispatcher, run `config --init` against a fixture repo,
-# and diff the written build/lint/test values against
-# _infer_build_lint_test()'s output for that same fixture (obtained
-# in-process via the `leerie` fixture from conftest.py).
-#
-# If the launcher's `_infer_axis` is ever reverted to the old thin table
-# (Makefile/package.json/pyproject+pytest only), these tests fail on every
-# fixture outside that thin table's coverage (Rails, Cargo, go.mod, gradle,
-# dotnet, php, eslint, ruff) — the drift can no longer land silently.
-# ---------------------------------------------------------------------------
+# `config --init` writes a starting `.leerie/config.toml` from a deterministic
+# file table of its own, host-side where no worker runs. A run no longer
+# uses a table (it reads an undeclared axis from the repository, DESIGN §6½
+# *A repository's build, lint and test commands are read from it*), so the
+# arm is pinned to the values below rather than to the orchestrator.
 
 
 def _run_real_config_arm(
@@ -678,11 +668,9 @@ def _infer_via_real_launcher(user_repo: Path, tmp_path: Path) -> dict[str, str]:
     return out
 
 
-# One fixture-builder per stack the Python inferrer covers (mirrors the
-# `if` chain in _infer_build_lint_test / _is_rails_repo, orchestrator/
-# leerie.py:12525-12600). Each entry writes exactly the marker files for
-# one stack so the parity assertion is unambiguous about which axis each
-# stack is expected to drive.
+# One fixture-builder per stack the launcher's table covers. Each entry
+# writes exactly the marker files for one stack so the assertion is
+# unambiguous about which axis each stack is expected to drive.
 _PARITY_FIXTURES: dict[str, Callable[[Path], None]] = {
     "makefile": lambda repo: (repo / "Makefile").write_text("build:\n\techo hi\n"),
     "package_json": lambda repo: (repo / "package.json").write_text("{}\n"),
@@ -719,84 +707,66 @@ _PARITY_FIXTURES: dict[str, Callable[[Path], None]] = {
 }
 
 
+_PARITY_EXPECTED: dict[str, dict[str, str]] = {
+    'cargo': {'build': 'cargo build', 'lint': '', 'test': 'cargo test'},
+    'detekt': {'build': '', 'lint': 'detekt', 'test': ''},
+    'dotnet_csproj': {'build': 'dotnet build', 'lint': '', 'test': 'dotnet test'},
+    'dotnet_sln': {'build': 'dotnet build', 'lint': '', 'test': 'dotnet test'},
+    'eslint': {'build': '', 'lint': 'npx eslint .', 'test': ''},
+    'go_mod': {'build': 'go build ./...', 'lint': '', 'test': 'go test ./...'},
+    'gradle_kts_with_wrapper': {'build': './gradlew build', 'lint': '', 'test': './gradlew test'},
+    'gradle_no_wrapper': {'build': 'gradle build', 'lint': '', 'test': 'gradle test'},
+    'makefile': {'build': 'make', 'lint': '', 'test': ''},
+    'maven': {'build': 'mvn package', 'lint': '', 'test': 'mvn test'},
+    'package_json': {'build': 'npm run build', 'lint': '', 'test': 'npm run test'},
+    'phpstan': {'build': '', 'lint': 'vendor/bin/phpstan analyse', 'test': ''},
+    'phpunit': {'build': '', 'lint': '', 'test': 'vendor/bin/phpunit'},
+    'pyproject_pytest': {'build': '', 'lint': '', 'test': 'pytest'},
+    'rails': {'build': '', 'lint': '', 'test': 'bin/rails test'},
+    'rubocop': {'build': '', 'lint': 'bundle exec rubocop', 'test': ''},
+    'ruff': {'build': '', 'lint': 'ruff check .', 'test': ''}}
+
+
 @pytest.mark.parametrize("fixture_name", sorted(_PARITY_FIXTURES))
-def test_config_inference_matches_infer_build_lint_test(fixture_name, tmp_path, leerie):
-    """For every stack _infer_build_lint_test() covers, the REAL launcher's
-    `config --init` arm must produce the identical build/lint/test values."""
+def test_config_init_writes_its_tables_values(fixture_name, tmp_path):
+    """For every stack the launcher's table covers, the REAL launcher's
+    `config --init` arm writes the pinned build/lint/test values."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
     _PARITY_FIXTURES[fixture_name](user_repo)
 
-    expected = leerie._infer_build_lint_test(user_repo)
+    expected = _PARITY_EXPECTED[fixture_name]
     actual = _infer_via_real_launcher(user_repo, tmp_path)
 
-    assert actual.get("build", "") == expected["build"], (
-        f"[{fixture_name}] build mismatch: launcher={actual.get('build', '')!r} "
-        f"vs _infer_build_lint_test={expected['build']!r}"
-    )
-    assert actual.get("lint", "") == expected["lint"], (
-        f"[{fixture_name}] lint mismatch: launcher={actual.get('lint', '')!r} "
-        f"vs _infer_build_lint_test={expected['lint']!r}"
-    )
-    assert actual.get("test", "") == expected["test"], (
-        f"[{fixture_name}] test mismatch: launcher={actual.get('test', '')!r} "
-        f"vs _infer_build_lint_test={expected['test']!r}"
-    )
+    for axis in ("build", "lint", "test"):
+        assert actual.get(axis, "") == expected[axis], (
+            f"[{fixture_name}] {axis}: launcher={actual.get(axis, '')!r} "
+            f"vs pinned={expected[axis]!r}")
 
 
-def test_config_inference_matches_on_polyglot_repo(tmp_path, leerie):
-    """A repo matching several stacks at once (first-set-wins per axis) must
-    still resolve identically between the launcher and the Python table."""
+def test_config_inference_on_polyglot_repo(tmp_path):
+    """A repo matching several stacks at once: first-set-wins per axis."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
     (user_repo / "Makefile").write_text("build:\n\techo hi\n")
     (user_repo / "package.json").write_text("{}\n")
     (user_repo / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
     (user_repo / "ruff.toml").write_text("line-length = 100\n")
-
-    expected = leerie._infer_build_lint_test(user_repo)
     actual = _infer_via_real_launcher(user_repo, tmp_path)
+    assert actual.get("build", "") == "make"
+    assert actual.get("lint", "") == "ruff check ."
+    assert actual.get("test", "") == "npm run test"
 
-    assert actual.get("build", "") == expected["build"]
-    assert actual.get("lint", "") == expected["lint"]
-    assert actual.get("test", "") == expected["test"]
 
-
-def test_config_inference_matches_on_empty_repo(tmp_path, leerie):
+def test_config_inference_on_empty_repo(tmp_path):
     """A repo with no recognizable markers infers empty strings on every
-    axis in both the launcher and the Python table."""
+    axis."""
     user_repo = tmp_path / "repo"
     user_repo.mkdir()
-
-    expected = leerie._infer_build_lint_test(user_repo)
     actual = _infer_via_real_launcher(user_repo, tmp_path)
-
-    assert actual.get("build", "") == expected["build"] == ""
-    assert actual.get("lint", "") == expected["lint"] == ""
-    assert actual.get("test", "") == expected["test"] == ""
-
-
-def test_config_inference_parity_detects_reverted_launcher_inferrer(tmp_path, leerie):
-    """Sanity-check the parity guard itself: if the launcher's `_infer_axis`
-    is reverted to the pre-config-001 thin table (Makefile/package.json/
-    pyproject+pytest only), this test must fail on a stack the thin table
-    never covered — proving the guard is load-bearing, not a tautology."""
-    user_repo = tmp_path / "repo"
-    user_repo.mkdir()
-    (user_repo / "Cargo.toml").write_text('[package]\nname = "x"\n')
-
-    expected = leerie._infer_build_lint_test(user_repo)
-    assert expected["build"] == "cargo build"
-    assert expected["test"] == "cargo test"
-
-    # Simulate the pre-config-001 thin table's blindness to Cargo: it would
-    # have inferred nothing for a Cargo-only repo.
-    reverted_actual = {"build": "", "lint": "", "test": ""}
-    assert reverted_actual["build"] != expected["build"], (
-        "the pre-config-001 thin table would have (wrongly) agreed with "
-        "_infer_build_lint_test() on Cargo — the parity guard would not "
-        "have caught the regression it exists to catch"
-    )
+    assert actual.get("build", "") == ""
+    assert actual.get("lint", "") == ""
+    assert actual.get("test", "") == ""
 
 
 # ---------------------------------------------------------------------------
