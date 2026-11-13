@@ -203,7 +203,7 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -385,7 +385,7 @@ def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -471,7 +471,7 @@ def test_vague_defect_does_not_gate(leerie, tmp_path, monkeypatch):
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
@@ -610,7 +610,7 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
 
     async def _run():
@@ -1213,7 +1213,7 @@ def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, m
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
 
     async def _run():
@@ -1417,7 +1417,7 @@ def test_integrator_crash_then_recovery_logs_warning_and_still_integrates(
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
 
     caps = _caps(leerie)
@@ -1529,7 +1529,7 @@ def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
     monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
     # _run_integration_judge_gate resolves the citation against
     # Path(os.getcwd()), not `staging` — match that so the citation clears.

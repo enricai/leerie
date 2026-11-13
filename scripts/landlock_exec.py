@@ -1232,9 +1232,6 @@ _ENV_KEPT_OUT = frozenset({"PATH", "HOME", "TMPDIR", "PWD", "OLDPWD",
                            "SHLVL", "_", "HOSTNAME", "NO_PROXY", "no_proxy",
                            "NODE_USE_ENV_PROXY"})
 _ENV_KEPT_OUT_PREFIXES = ("LEERIE_", "CLAUDE", "ANTHROPIC_")
-# A variable beneath it names what the worker stage built (the image's bake
-# root, `_BAKED_ROOT` in the orchestrator): the worker stage's value wins.
-_BAKED_ROOT = "/opt/"
 VIEW_ENV = "LEERIE_WORKER_VIEW"
 WORKER_ROOT_ENV = "LEERIE_WORKER_ROOT"
 _PR_CAP_AMBIENT = 47
@@ -1359,11 +1356,11 @@ def worker_env_changes(worker_root: str) -> tuple[dict[str, str], list[str]]:
 def apply_worker_env(env: "os._Environ[str] | dict[str, str]",
                      changes: tuple[dict[str, str], list[str]]) -> None:
     """Lay the worker stage's changes over `env`: a variable the caller did
-    not set, or one naming what the stage built (beneath `/opt/`); its
-    `PATH` entries first."""
+    not set (one leerie set, a store above all, is leerie's: DESIGN §6½ *The
+    repository image holds no dependency*); its `PATH` entries first."""
     changed, added = changes
     for k, v in changed.items():
-        if k not in env or v.startswith(_BAKED_ROOT):
+        if k not in env:
             env[k] = v
     if added:
         rest = [p for p in env.get("PATH", "").split(":")

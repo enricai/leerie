@@ -4,8 +4,9 @@ Stubs _invoke (not claude_p directly) with a fixed structured_output
 envelope, mirroring test_phase_judge.py's _JUDGE_ENVELOPE pattern.
 
 Covers:
-  - schema-validated worker output (setup_packages + language_installs)
-    written to .leerie/config.toml via _write_config_toml_keys
+  - schema-validated worker output (setup_packages) written to
+    .leerie/config.toml via _write_config_toml_keys; nothing else (the
+    repository image holds no dependency, DESIGN §6½)
   - warm repo (all deps already present) → no write (mtime unchanged)
   - LEERIE_CAPTURE_DEPS=0 → opt-out, worker not invoked
   - capture_deps = false in config.toml → opt-out, worker not invoked
@@ -40,13 +41,6 @@ _DEP_CAPTURE_ENVELOPE = {
     "result": "{}",
     "structured_output": {
         "setup_packages": ["postgresql", "libpq-dev"],
-        "language_installs": [
-            {
-                "manager": "pnpm",
-                "command": "pnpm install --offline --frozen-lockfile",
-                "copy_inputs": ["package.json", "pnpm-lock.yaml"],
-            }
-        ],
         "dockerfile_notes": None,
     },
     "usage": {"input_tokens": 400, "output_tokens": 100},
@@ -183,25 +177,12 @@ class TestDepCaptureWorkerWritePath:
         assert "setup_packages" in content
         assert "postgresql" in content
 
-    def test_writes_language_installs(self, leerie, tmp_path, monkeypatch):
-        """Residual language_installs from worker written to config.toml (feat-003)."""
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        st = _make_fake_state(leerie, tmp_path, ["pnpm install --offline"])
-        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-        _patch_invoke(leerie, monkeypatch)
-
-        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
-
-        cfg = repo / ".leerie" / "config.toml"
-        assert cfg.exists(), "config.toml not written"
-        content = cfg.read_text()
-        assert "language_installs" in content
-        assert "pnpm" in content
-
-    def test_both_setup_packages_and_language_installs_written(
+    def test_only_setup_packages_written(
             self, leerie, tmp_path, monkeypatch):
-        """Both keys written in a single pass from the worker envelope (residual)."""
+        """The capture writes `setup_packages` and no install key, whatever
+        the run's workers installed — even from an answer that still names
+        one (the field an earlier schema had, here the offline relink an
+        earlier leerie kept)."""
         repo = tmp_path / "repo"
         repo.mkdir()
         st = _make_fake_state(leerie, tmp_path, [
@@ -209,13 +190,21 @@ class TestDepCaptureWorkerWritePath:
             "pnpm install --offline",
         ])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-        _patch_invoke(leerie, monkeypatch)
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            **_DEP_CAPTURE_ENVELOPE["structured_output"],
+            "language_installs": [
+                {"manager": "pnpm",
+                 "command": "pnpm install --offline --frozen-lockfile",
+                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]}],
+        }
+        _patch_invoke(leerie, monkeypatch, envelope=env)
 
         _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = (repo / ".leerie" / "config.toml").read_text()
         assert "setup_packages" in content
-        assert "language_installs" in content
+        assert "language_installs" not in content and "pnpm" not in content
 
     def test_structured_output_shape_matches_dep_capture_schema(
             self, leerie, tmp_path, monkeypatch):
@@ -226,7 +215,6 @@ class TestDepCaptureWorkerWritePath:
         for field in schema.get("required", []):
             assert field in output, f"structured_output missing required field: {field}"
         assert isinstance(output["setup_packages"], list)
-        assert isinstance(output["language_installs"], list)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +239,6 @@ class TestDepCaptureNeverClobber:
         warm_envelope = dict(_DEP_CAPTURE_ENVELOPE)
         warm_envelope["structured_output"] = {
             "setup_packages": ["postgresql", "libpq-dev"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
 
@@ -276,7 +263,6 @@ class TestDepCaptureNeverClobber:
         partial_envelope = dict(_DEP_CAPTURE_ENVELOPE)
         partial_envelope["structured_output"] = {
             "setup_packages": ["git", "wget"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
 
@@ -291,38 +277,27 @@ class TestDepCaptureNeverClobber:
         assert "curl" in content
         assert "wget" in content
 
-    def test_language_installs_existing_manager_not_replaced(
+    def test_an_earlier_install_key_is_left_as_written(
             self, leerie, tmp_path, monkeypatch):
-        """Existing language_installs manager entry is never overwritten."""
+        """A `language_installs` line an earlier leerie wrote is neither read
+        nor rewritten by an apply: only `setup_packages` is merged."""
         repo = tmp_path / "repo"
         leerie_dir = repo / ".leerie"
         leerie_dir.mkdir(parents=True)
-        existing = [{"manager": "pip",
-                     "command": "pip install -r requirements.txt",
-                     "copy_inputs": ["requirements.txt"]}]
-        inner_json = json.dumps(existing, separators=(",", ":"))
+        held = ("language_installs = '[{\"manager\":\"pip\","
+                "\"command\":\"pip install -r requirements.txt\"}]'\n")
         cfg = leerie_dir / "config.toml"
-        cfg.write_text(f'language_installs = "{inner_json}"\n')
+        cfg.write_text(held)
 
-        conflict_envelope = dict(_DEP_CAPTURE_ENVELOPE)
-        conflict_envelope["structured_output"] = {
-            "setup_packages": [],
-            "language_installs": [
-                {"manager": "pip", "command": "pip install -e .",
-                 "copy_inputs": ["setup.py"]},
-            ],
-            "dockerfile_notes": None,
-        }
-
-        st = _make_fake_state(leerie, tmp_path, ["pip install -e ."])
+        st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-        _patch_invoke(leerie, monkeypatch, envelope=conflict_envelope)
+        _patch_invoke(leerie, monkeypatch)
 
         _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS)
 
         content = cfg.read_text()
-        # Original pip command must still be there (not replaced).
-        assert "requirements.txt" in content
+        assert content.startswith(held)
+        assert 'setup_packages = "postgresql libpq-dev"' in content
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +324,6 @@ class TestDepCaptureReplace:
         env = dict(_DEP_CAPTURE_ENVELOPE)
         env["structured_output"] = {
             "setup_packages": ["postgresql", "libpq-dev"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
 
@@ -366,47 +340,6 @@ class TestDepCaptureReplace:
         assert "stale-pkg" not in content, (
             "replace=True must drop packages no longer captured")
 
-    def test_replace_overwrites_language_installs_dropping_stale_manager(
-            self, leerie, tmp_path, monkeypatch):
-        """replace=True: a manager no longer captured is dropped (feat-003 residual)."""
-        repo = tmp_path / "repo"
-        leerie_dir = repo / ".leerie"
-        leerie_dir.mkdir(parents=True)
-        existing = [
-            {"manager": "pnpm", "command": "pnpm install --offline",
-             "copy_inputs": ["package.json"]},
-            {"manager": "cargo", "command": "cargo build",
-             "copy_inputs": ["Cargo.toml"]},
-        ]
-        cfg = leerie_dir / "config.toml"
-        cfg.write_text(
-            f'language_installs = "{json.dumps(existing, separators=(",", ":"))}"\n')
-
-        env = dict(_DEP_CAPTURE_ENVELOPE)
-        env["structured_output"] = {
-            "setup_packages": [],
-            # Fresh capture: only pnpm (cargo is gone, pip filtered as bakeable).
-            "language_installs": [
-                {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
-                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
-            ],
-            "dockerfile_notes": None,
-        }
-
-        st = _make_fake_state(leerie, tmp_path, ["pnpm install --offline"])
-        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-        _patch_invoke(leerie, monkeypatch, envelope=env)
-
-        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
-            replace=True)
-
-        raw = leerie._read_toml_key(cfg, "language_installs")
-        managers = {e["manager"] for e in json.loads(raw)}
-        assert managers == {"pnpm"}, (
-            f"replace=True must drop stale managers; got {managers}")
-        # And the surviving pnpm entry is the freshly-captured command.
-        assert "pnpm-lock.yaml" in raw
-
     def test_replace_empty_capture_leaves_existing_untouched(
             self, leerie, tmp_path, monkeypatch):
         """replace=True with an empty capture must NOT blank a good config."""
@@ -421,7 +354,6 @@ class TestDepCaptureReplace:
         env = dict(_DEP_CAPTURE_ENVELOPE)
         env["structured_output"] = {
             "setup_packages": [],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
 
@@ -438,8 +370,8 @@ class TestDepCaptureReplace:
 
     def test_replace_empty_item_capture_does_not_blank_config(
             self, leerie, tmp_path, monkeypatch):
-        """A schema-valid empty-*item* capture (setup_packages=[""], an
-        empty-manager language_install) must NOT blank a good config under
+        """A schema-valid empty-*item* capture (setup_packages=[""]) must NOT
+        blank a good config under
         replace=True. Regression pin: a truthy list of empty strings passes the
         `if setup_packages:` guard but renders to "" — the write must be gated on
         the rendered value, not list truthiness."""
@@ -447,11 +379,7 @@ class TestDepCaptureReplace:
         leerie_dir = repo / ".leerie"
         leerie_dir.mkdir(parents=True)
         cfg = leerie_dir / "config.toml"
-        good_li = [{"manager": "pip", "command": "pip install -r requirements.txt",
-                    "copy_inputs": ["requirements.txt"]}]
-        cfg.write_text(
-            'setup_packages = "postgresql libpq-dev"\n'
-            f'language_installs = "{json.dumps(good_li, separators=(",", ":"))}"\n')
+        cfg.write_text('setup_packages = "postgresql libpq-dev"\n')
         mtime_before = cfg.stat().st_mtime
         content_before = cfg.read_text()
 
@@ -459,7 +387,6 @@ class TestDepCaptureReplace:
         env["structured_output"] = {
             # Empty *items*, not an empty list — a truthy list.
             "setup_packages": ["", ""],
-            "language_installs": [{"manager": "", "command": ""}],
             "dockerfile_notes": None,
         }
 
@@ -476,7 +403,6 @@ class TestDepCaptureReplace:
             "empty-item capture under replace=True blanked a good config")
         # Belt-and-suspenders: the good values must still be intact.
         assert "postgresql" in cfg.read_text()
-        assert "requirements.txt" in cfg.read_text()
 
     def test_default_is_union_not_replace(
             self, leerie, tmp_path, monkeypatch):
@@ -490,7 +416,6 @@ class TestDepCaptureReplace:
         env = dict(_DEP_CAPTURE_ENVELOPE)
         env["structured_output"] = {
             "setup_packages": ["postgresql", "libpq-dev"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
 
@@ -743,12 +668,12 @@ def test_worker_budget_exhausted_skips_worker(leerie, tmp_path, monkeypatch):
     assert not (repo / ".leerie" / "config.toml").exists()
 
 
-def test_malformed_existing_language_installs_json_refuses_the_apply(
+def test_an_earlier_malformed_install_key_does_not_refuse_the_apply(
         leerie, tmp_path, monkeypatch):
-    """A corrupted existing `language_installs` TOML value (invalid JSON):
-    a merge keeps what the file holds, so the apply is refused, naming it,
-    and the file is left as it is — never silently replaced by the fresh
-    capture (review round 29, execution L4)."""
+    """A corrupted `language_installs` value an earlier leerie left is not
+    read any more, so it neither refuses the apply nor is rewritten: the
+    merge's validity check reads `setup_packages` only (review round 29,
+    execution L4, which still holds for that key)."""
     repo = tmp_path / "repo"
     leerie_dir = repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -757,13 +682,14 @@ def test_malformed_existing_language_installs_json_refuses_the_apply(
 
     st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
     monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-    _patch_invoke(leerie, monkeypatch)  # default envelope carries a pnpm entry
+    _patch_invoke(leerie, monkeypatch)
 
-    with pytest.raises(SystemExit):
-        _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS,
-                            efforts=_EFFORTS)
+    _capture_then_apply(leerie, repo, st, caps=_CAPS, models=_MODELS,
+                        efforts=_EFFORTS)
 
-    assert cfg.read_text() == 'language_installs = "not-valid-json{["\n'
+    content = cfg.read_text()
+    assert content.startswith('language_installs = "not-valid-json{["\n')
+    assert 'setup_packages = "postgresql libpq-dev"' in content
 
 
 def test_replace_true_worker_invoked_with_empty_capture_logs_unchanged(
@@ -783,7 +709,6 @@ def test_replace_true_worker_invoked_with_empty_capture_logs_unchanged(
     env = dict(_DEP_CAPTURE_ENVELOPE)
     env["structured_output"] = {
         "setup_packages": [],
-        "language_installs": [],
         "dockerfile_notes": None,
     }
 

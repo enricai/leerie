@@ -69,16 +69,25 @@ def test_worker_env_changes_are_what_the_stages_changed(tmp_path):
     assert added == ["/opt/venv/bin", "/x/bin"]
 
 
-def test_apply_worker_env_keeps_the_callers_values_but_a_bake(tmp_path):
-    env = {"PATH": "/a:/b", "JAVA_HOME": "/mine",
-           "BUNDLE_PATH": "/home/leerie/.cache/leerie/bundle"}
+def test_apply_worker_env_keeps_every_value_the_caller_set(tmp_path):
+    """A worker stage's variable is taken only when the confined command's
+    environment does not set it: a store variable leerie set (the run's
+    `BUNDLE_PATH`) is kept even when the stage points it beneath `/opt/`,
+    where an image install would sit read-only, so a subtask that adds a
+    dependency installs it into the run's store (DESIGN §6½ *The repository
+    image holds no dependency*). A variable the caller did not set is still
+    taken, and the stage's `PATH` entries still go first. Falsified against
+    0.65.0's shim: `BUNDLE_PATH` became `/opt/bundle` (the `_BAKED_ROOT`
+    carve-out)."""
+    store = "/leerie-state/runs/r/worktrees/.stores/tree-stores/t/bundle"
+    env = {"PATH": "/a:/b", "JAVA_HOME": "/mine", "BUNDLE_PATH": store}
     LL.apply_worker_env(env, ({"JAVA_HOME": "/theirs",
                                "BUNDLE_PATH": "/opt/bundle", "NEW": "1"},
                               ["/opt/venv/bin", "/b"]))
     assert env == {"PATH": "/opt/venv/bin:/b:/a",
                    "JAVA_HOME": "/mine",          # the caller set it
-                   "BUNDLE_PATH": "/opt/bundle",  # what the stage built
-                   "NEW": "1"}
+                   "BUNDLE_PATH": store,          # the run's store
+                   "NEW": "1"}                    # the caller did not
 
 
 def test_env_file_is_read_without_following_a_link(tmp_path):
@@ -345,7 +354,8 @@ def wroot(tmp_path):
     _env_file(root / LL.BASE_ENV_FILE, {"PATH": "/usr/bin:/bin"})
     _env_file(root / LL.WORKER_ENV_FILE,
               {"PATH": "/opt/venv/bin:/usr/bin:/bin",
-               "VIRTUAL_ENV": "/opt/venv", "LEERIE_X": "1"})
+               "VIRTUAL_ENV": "/opt/venv", "LEERIE_X": "1",
+               "BUNDLE_PATH": "/opt/bundle"})
     (tmp_path / "w").mkdir()
     return root
 
@@ -356,6 +366,27 @@ def _shim(opts: list[str], cmd: list[str], cwd: Path,
         [sys.executable, "-I", "-S", str(SHIM), *opts, "--", *cmd],
         cwd=str(cwd), capture_output=True, text=True, timeout=120,
         env=env)
+
+
+@iso
+def test_a_store_the_run_set_wins_over_the_worker_stages(wroot):
+    """Through the real shim: the worker stage sets `BUNDLE_PATH=/opt/bundle`
+    (an image install, read-only), the confined command's environment sets
+    the run's store — the command sees the store; with none set it sees the
+    stage's. Falsified against 0.65.0's shim: the first command saw
+    `/opt/bundle`."""
+    w = wroot.parent / "w"
+    opts = ["--isolate", "--worker-root", str(wroot), "--rw", str(w),
+            "--rw", "/dev/null", "--ro", "/"]
+    base = {"PATH": "/usr/bin:/bin"}
+    store = str(w / "bundle")
+    r = _shim(opts, ["sh", "-c", "echo B=$BUNDLE_PATH"], w,
+              env={**base, "BUNDLE_PATH": store})
+    assert r.returncode == 0, r.stderr
+    assert f"B={store}\n" in r.stdout, r.stdout
+    r = _shim(opts, ["sh", "-c", "echo B=$BUNDLE_PATH"], w, env=base)
+    assert r.returncode == 0, r.stderr
+    assert "B=/opt/bundle\n" in r.stdout, r.stdout
 
 
 @iso

@@ -35,13 +35,16 @@ def _tree(tmp_path) -> tuple[Path, Path]:
 def test_a_command_in_a_run_tree_gets_that_trees_own_stores(leerie,
                                                             tmp_path):
     run, t = _tree(tmp_path)
-    env = {"GOCACHE": "/opt/go-cache", "UV_CACHE_DIR": "/shared/uv"}
+    # A value an image chose, beneath /opt/ where a bake used to put
+    # dependencies, is moved like any other: the image holds no dependency
+    # (DESIGN §6½ *The repository image holds no dependency*).
+    env = {"GOCACHE": "/opt/go-cache", "BUNDLE_PATH": "/opt/bundle",
+           "UV_CACHE_DIR": "/shared/uv"}
     leerie._tree_store_env(env, t / "sub")
     root = run / "worktrees" / ".stores" / "tree-stores" / t.name
-    for var in leerie._TREE_STORE_VARS - {"GOCACHE"}:
+    for var in leerie._TREE_STORE_VARS:
         assert env[var] == str(root / leerie._STORE_VARS[var]), var
         assert Path(env[var]).is_dir()
-    assert env["GOCACHE"] == "/opt/go-cache"            # baked: kept
     assert env["pnpm_config_cache_dir"] == env["npm_config_cache_dir"]
     other = {"UV_CACHE_DIR": "/shared/uv"}
     leerie._tree_store_env(other, tmp_path)               # no run tree
@@ -83,6 +86,32 @@ def test_run_streaming_runs_a_repo_command_with_its_trees_stores(
     assert rc == 0
     got = json.loads(out.read_text())
     assert got["UV_CACHE_DIR"] == str(run / "worktrees" / ".stores" / "tree-stores" / t.name / "uv")
+
+
+def test_an_install_into_an_image_path_lands_in_the_trees_store(
+        leerie, tmp_path):
+    """A command whose environment arrives with `BUNDLE_PATH=/opt/bundle`
+    (what a 0.65.0 bake set) writes its install into the tree's own,
+    writable store, not into the image's read-only path; a variable that is
+    no store (`VIRTUAL_ENV`) is passed through as it came (DESIGN §6½ *The
+    repository image holds no dependency*)."""
+    run, t = _tree(tmp_path)
+    log = tmp_path / "l.log"
+    incoming = {**os.environ, "BUNDLE_PATH": "/opt/bundle",
+                "VIRTUAL_ENV": "/opt/venv"}
+    script = ("import os,pathlib\n"
+              "d=pathlib.Path(os.environ['BUNDLE_PATH'])/'gems'\n"
+              "d.mkdir(parents=True)\n"
+              "(d/'rack.gemspec').write_text(os.environ['VIRTUAL_ENV'])\n")
+    rc, tail = asyncio.run(leerie._run_streaming(
+        [sys.executable, "-c", script],
+        grants=leerie.WorkerGrants(("/",), ()),
+        cwd=str(t), env=incoming, timeout=60, log_path=log, label="t",
+        verbosity="quiet"))
+    assert rc == 0, tail
+    gem = (run / "worktrees" / ".stores" / "tree-stores" / t.name / "bundle"
+           / "gems" / "rack.gemspec")
+    assert gem.read_text() == "/opt/venv"
 
 
 def _fake(bindir: Path, name: str, rec: Path) -> None:

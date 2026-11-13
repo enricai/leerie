@@ -32,7 +32,7 @@ So this file exists to *run* the branch. The sentinel goes on
 `_enforce_and_record_cgroup_containment`, which is the first call after the
 seed's `st.save()` — stopping there needs no other stubs at all, since
 `preflight`, `_select_active_oauth_token`, `_backstop_capture_prior_runs`, the
-`run_proc` HEAD shell-out and `run.json` init all sit after it.
+`_run_proc` HEAD shell-out and `run.json` init all sit after it.
 
 The whole-module companion guard is `tests/test_no_undefined_names.py`.
 """

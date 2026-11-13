@@ -23,9 +23,9 @@ def test_nonexistent_staging_returns_none_without_shelling_out(
     missing = tmp_path / "does-not-exist"
 
     async def _boom(*a, **k):
-        raise AssertionError("run_proc should not be called")
+        raise AssertionError("_run_proc should not be called")
 
-    monkeypatch.setattr(leerie, "run_proc", _boom)
+    monkeypatch.setattr(leerie, "_run_proc", _boom)
     result = asyncio.run(leerie._scan_conflict_markers(missing))
     assert result is None
 
@@ -71,6 +71,6 @@ def test_oserror_from_run_proc_is_caught_and_returns_none(
     async def _raise_oserror(*a, **k):
         raise OSError("git binary not found")
 
-    monkeypatch.setattr(leerie, "run_proc", _raise_oserror)
+    monkeypatch.setattr(leerie, "_run_proc", _raise_oserror)
     result = asyncio.run(leerie._scan_conflict_markers(repo))
     assert result is None

@@ -76,7 +76,7 @@ def _drive(leerie, tmp_path, monkeypatch, *, data, on_install=None,
     monkeypatch.setenv("MISE_NODE_COREPACK", "true")   # the 0.44.1 image's
     monkeypatch.setattr(leerie, "_measurement_grants", lambda *a: GRANTS)
     monkeypatch.setattr(leerie, "_run_streaming", fake_streaming)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "_confined_argv", lambda g, a, **kw: a)
     monkeypatch.setattr(leerie, "_exec_lock", lambda: _Lock())
     repo = tmp_path / "repo"

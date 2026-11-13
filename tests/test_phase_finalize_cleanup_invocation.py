@@ -26,8 +26,8 @@ import pytest
 
 
 def test_run_script_passes_a_bounded_timeout_to_run_proc(leerie, monkeypatch):
-    """`_run_script` previously called `run_proc` with no `timeout`
-    (defaults to None / unbounded at leerie.py's run_proc), so a hung
+    """`_run_script` previously called `_run_proc` with no `timeout`
+    (defaults to None / unbounded at leerie.py's _run_proc), so a hung
     cleanup.sh/finalize.sh could block the orchestrator forever. It must
     now pass an explicit bounded timeout."""
     captured = {}
@@ -35,14 +35,14 @@ def test_run_script_passes_a_bounded_timeout_to_run_proc(leerie, monkeypatch):
     async def fake_run_proc(cmd, **kwargs):
         captured.update(kwargs)
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
 
     run_dir = Path("/state-root/runs/r1")
     st = types.SimpleNamespace(run_dir=run_dir)
     asyncio.run(leerie._run_script("cleanup.sh", "--run-id", "r1", st=st))
 
     assert captured.get("timeout") is not None, (
-        "_run_script must pass an explicit, non-None timeout to run_proc"
+        "_run_script must pass an explicit, non-None timeout to _run_proc"
     )
     assert captured["timeout"] > 0
     # In the run's own repository, with the state root passed absolute
@@ -160,7 +160,7 @@ def test_phase_finalize_survives_a_cleanup_sh_timeout(
         return None
 
     monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
     monkeypatch.setattr(leerie, "capture_repo_deps", _noop_capture)
 
     leerie_root = tmp_path / ".leerie"

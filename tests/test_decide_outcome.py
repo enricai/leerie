@@ -181,7 +181,7 @@ def test_phase_finalize_records_the_outcome_in_run_json(
         return None
 
     monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
     monkeypatch.setattr(leerie, "capture_repo_deps", _noop)
     leerie_root = tmp_path / ".leerie"
     (leerie_root / "runs" / "r1").mkdir(parents=True)

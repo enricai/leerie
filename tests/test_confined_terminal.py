@@ -241,7 +241,7 @@ def test_run_streaming_gives_no_terminal(unconfined, fd0_is_a_terminal,
 
 
 def test_run_proc_gives_no_terminal(unconfined, fd0_is_a_terminal, tmp_path):
-    r = asyncio.run(unconfined.run_proc(_FD0, cwd=str(tmp_path), timeout=60))
+    r = asyncio.run(unconfined._run_proc(_FD0, cwd=str(tmp_path), timeout=60))
     assert r.returncode == 0 and r.stdout.strip() == "/dev/null", r
 
 

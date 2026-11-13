@@ -1544,7 +1544,7 @@ def _quiet_host_pressure(request, monkeypatch):
 
 
 def judge_checkout_in_place(leerie, monkeypatch) -> None:
-    """For a test that fakes git itself (`run_proc` stubbed, a made-up
+    """For a test that fakes git itself (`_run_proc` stubbed, a made-up
     commit): `_judge_checkout` yields the given tree instead of adding a
     real checkout of a commit that does not exist. Where the judge reads is
     not such a test's subject; tests/test_pr_review_runs_outside_staging.py

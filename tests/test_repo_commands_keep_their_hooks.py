@@ -114,7 +114,7 @@ def test_leeries_own_git_still_runs_hooks_off(leerie, tmp_path, leerie_env):
     (hooks / "post-commit").write_text(
         f"#!/bin/sh\ntouch {tmp_path}/fired\n")
     (hooks / "post-commit").chmod(0o755)
-    asyncio.run(leerie.run_proc(["git", "commit", "-q", "--allow-empty",
+    asyncio.run(leerie._run_proc(["git", "commit", "-q", "--allow-empty",
                                  "-m", "leerie"], cwd=str(r)))
     assert not (tmp_path / "fired").exists()
 
@@ -216,7 +216,7 @@ def test_leeries_scripts_that_load_tree_code_are_confined():
     are confined too*)."""
     tree = ast.parse((REPO_ROOT / "orchestrator" / "leerie.py").read_text())
     spawners = {"Popen", "run", "create_subprocess_exec", "check_output",
-                "call", "check_call", "run_proc"}
+                "call", "check_call", "_run_proc"}
     bad = []
     for n in ast.walk(tree):
         if not isinstance(n, ast.Call) or not n.args:

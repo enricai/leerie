@@ -706,7 +706,7 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
 
 def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkeypatch):
     """The conformance phase is documented as 'never raises a workflow
-    error.' But underlying `run_proc` calls `asyncio.create_subprocess_exec`,
+    error.' But underlying `_run_proc` calls `asyncio.create_subprocess_exec`,
     which raises FileNotFoundError when cwd is missing. The _settle_subtask
     splice has a broad try/except specifically to honor the advisory
     contract for any unexpected exception — including this one. Verify the

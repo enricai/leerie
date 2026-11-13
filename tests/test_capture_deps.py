@@ -3,9 +3,11 @@
 Covers: absence pins for deleted regex-path symbols (_parse_apt_intents,
 _capture_installs_from_logs, _LANG_INSTALL_RE, _APT_INSTALL_RE),
 _merge_setup_packages, _extract_depcap_commands,
-capture_repo_deps (writes setup_packages + language_installs via stubbed
-claude_p, committed-Dockerfile skip, write-failure non-fatal, opt-out),
-resolve_capture_deps.
+capture_repo_deps (writes setup_packages via stubbed claude_p, and only
+those: an answer's language installs are never recorded or applied — the
+repository image holds no dependency, DESIGN §6½ *The repository image holds
+no dependency*; committed-Dockerfile skip, write-failure non-fatal,
+opt-out), resolve_capture_deps.
 """
 from __future__ import annotations
 
@@ -373,28 +375,8 @@ class TestTomlValue:
         except ImportError:  # pragma: no cover
             import tomli as tomllib
         v = '[{"manager":"pip","command":"pip install -r requirements.txt"}]'
-        line = f"language_installs = {leerie._toml_value(v)}\n"
-        assert tomllib.loads(line)["language_installs"] == v
-
-    def test_dump_language_installs_handles_single_quotes(self, leerie):
-        """A1: a command with BOTH " (JSON) and ' (shell-quoted arg) must still
-        produce valid TOML — the single quote is escaped so the literal wrapper
-        stays intact and json.loads recovers it."""
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib
-        entries = [
-            {"manager": "pip", "command": "pip install 'requests[security]'",
-             "copy_inputs": ["requirements.txt"]},
-            {"manager": "gem", "command": "gem install rails -v '~> 7.0'"},
-        ]
-        dumped = leerie._dump_language_installs(entries)
-        assert "'" not in dumped  # no literal single quote survives
-        line = f"language_installs = {leerie._toml_value(dumped)}\n"
-        parsed = tomllib.loads(line)          # strict TOML must accept it
-        assert json.loads(parsed["language_installs"]) == entries
-
+        line = f"some_key = {leerie._toml_value(v)}\n"
+        assert tomllib.loads(line)["some_key"] == v
 
 # ---------------------------------------------------------------------------
 # Helpers shared by capture_repo_deps tests
@@ -454,130 +436,14 @@ _FAKE_MODELS = {"dep_capture": "sonnet"}
 _FAKE_EFFORTS: dict = {"dep_capture": None}
 
 
-def _fake_claude_p_result(setup_packages=None, language_installs=None):
+def _fake_claude_p_result(setup_packages=None):
     """Return a coroutine that resolves to a fixed dep_capture structured output."""
     result = {
         "setup_packages": setup_packages or [],
-        "language_installs": language_installs or [],
         "dockerfile_notes": None,
     }
     return AsyncMock(return_value=result)
 
-
-# ---------------------------------------------------------------------------
-# _filter_residual_deps — unit tests for residual-only filtering
-# ---------------------------------------------------------------------------
-
-class TestFilterResidualDeps:
-    """Unit tests for _filter_residual_deps (residual-only filtering logic)."""
-
-    def test_filters_bakeable_managers_entirely(self, leerie):
-        """Python/Ruby/Rust/Go managers filtered out (bake entirely)."""
-        language_installs = [
-            {"manager": "pip", "command": "pip install -r requirements.txt", "copy_inputs": []},
-            {"manager": "pip3", "command": "pip3 install django", "copy_inputs": []},
-            {"manager": "uv", "command": "uv sync", "copy_inputs": []},
-            {"manager": "bundle", "command": "bundle install", "copy_inputs": []},
-            {"manager": "gem", "command": "gem install rails", "copy_inputs": []},
-            {"manager": "cargo", "command": "cargo fetch", "copy_inputs": []},
-            {"manager": "go", "command": "go mod download", "copy_inputs": []},
-        ]
-        result = leerie._filter_residual_deps(language_installs)
-        assert result == [], "All bakeable managers should be filtered out"
-
-    def test_keeps_node_offline_relink_only(self, leerie):
-        """Node managers: keep only offline/frozen-lockfile commands."""
-        language_installs = [
-            {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile", "copy_inputs": []},
-            {"manager": "pnpm", "command": "pnpm install", "copy_inputs": []},  # Full install, filtered
-            {"manager": "npm", "command": "npm install --offline", "copy_inputs": []},
-            {"manager": "npm", "command": "npm install", "copy_inputs": []},  # Full install, filtered
-            {"manager": "yarn", "command": "yarn install --frozen-lockfile", "copy_inputs": []},
-            {"manager": "yarn", "command": "yarn install", "copy_inputs": []},  # Full install, filtered
-        ]
-        result = leerie._filter_residual_deps(language_installs)
-        assert len(result) == 3, "Only offline/frozen-lockfile commands kept"
-        assert all("--offline" in e["command"] or "--frozen-lockfile" in e["command"]
-                   for e in result), "All kept entries must have offline/frozen-lockfile"
-
-    def test_drops_node_mutations_that_carry_a_lockfile_flag(self, leerie):
-        """A pinned flag is not enough — the command must be an install.
-
-        `pnpm add left-pad --frozen-lockfile` carries `--frozen-lockfile`
-        and so passed the flag-only test, landing in .leerie/config.toml as
-        an "irreducible residual" that every worktree then re-runs. An
-        `add` mutates the dependency set over the network; that is the
-        opposite of the offline relink the residual exists for. Same for
-        remove/up/dlx."""
-        mutations = [
-            {"manager": "pnpm", "command": "pnpm add left-pad --frozen-lockfile"},
-            {"manager": "pnpm", "command": "pnpm remove left-pad --offline"},
-            {"manager": "yarn", "command": "yarn up --frozen-lockfile"},
-            {"manager": "pnpm", "command": "pnpm dlx codemod --offline"},
-        ]
-        assert leerie._filter_residual_deps(mutations) == []
-
-    def test_keeps_npm_ci_which_is_an_install(self, leerie):
-        """The subcommand check must not be so narrow it drops a real
-        install: `npm ci` is the lockfile-exact install form."""
-        entries = [{"manager": "npm", "command": "npm ci --offline"}]
-        assert len(leerie._filter_residual_deps(entries)) == 1
-
-    def test_flag_must_be_a_token_not_a_substring(self, leerie):
-        """`--offline` inside a package name is not the flag."""
-        entries = [{"manager": "pnpm", "command": "pnpm add my--offline-pkg"}]
-        assert leerie._filter_residual_deps(entries) == []
-
-    def test_malformed_command_is_dropped_not_raised(self, leerie):
-        """Commands are captured from logs, so an unbalanced quote is
-        reachable input; `shlex.split` raises on it."""
-        entries = [{"manager": "pnpm", "command": 'pnpm install --offline "x'}]
-        assert leerie._filter_residual_deps(entries) == []
-
-    def test_preserves_unknown_managers(self, leerie):
-        """Unknown managers preserved as-is (conservative)."""
-        language_installs = [
-            {"manager": "poetry", "command": "poetry install", "copy_inputs": []},
-            {"manager": "pipenv", "command": "pipenv install", "copy_inputs": []},
-        ]
-        result = leerie._filter_residual_deps(language_installs)
-        assert len(result) == 2, "Unknown managers preserved"
-        assert result == language_installs, "Input unchanged for unknown managers"
-
-    def test_handles_none_command_gracefully(self, leerie):
-        """Entry with command: None is handled (no TypeError on 'in' operator)."""
-        language_installs = [
-            {"manager": "pnpm", "command": None, "copy_inputs": []},
-            {"manager": "pnpm", "command": "pnpm install --offline", "copy_inputs": []},
-            {"manager": "pip", "command": None, "copy_inputs": []},
-        ]
-        # Should not raise TypeError
-        result = leerie._filter_residual_deps(language_installs)
-        # Entry with None command and pnpm manager: no offline/frozen flags, filtered out
-        # Entry with --offline: kept
-        # Entry with pip and None: filtered (bakeable)
-        assert len(result) == 1, "Only offline pnpm entry kept"
-        assert result[0]["command"] == "pnpm install --offline"
-
-    def test_empty_input_returns_empty(self, leerie):
-        """Empty input returns empty list."""
-        result = leerie._filter_residual_deps([])
-        assert result == []
-
-    def test_returns_new_list_input_unchanged(self, leerie):
-        """Returns a new list; input is unchanged."""
-        language_installs = [
-            {"manager": "pip", "command": "pip install django", "copy_inputs": []},
-        ]
-        original = language_installs.copy()
-        result = leerie._filter_residual_deps(language_installs)
-        assert language_installs == original, "Input list unchanged"
-        assert result is not language_installs, "Returns new list"
-
-
-# ---------------------------------------------------------------------------
-# capture_repo_deps — integration tests using tmp_path repos
-# ---------------------------------------------------------------------------
 
 class TestCaptureRepoDeps:
     """Integration tests for capture_repo_deps (async, stubbed claude_p)."""
@@ -594,7 +460,6 @@ class TestCaptureRepoDeps:
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -607,45 +472,65 @@ class TestCaptureRepoDeps:
         assert "postgresql" in content
         assert "setup_packages" in content
 
-    def test_writes_language_installs(self, leerie, tmp_path, monkeypatch):
-        """Residual language_installs (Node offline-relink) written to config.toml."""
+    def test_an_answers_language_installs_are_never_recorded(
+            self, leerie, tmp_path, monkeypatch):
+        """A worker answer that still carries `language_installs` (the field
+        an earlier schema had) records and applies its `setup_packages` and
+        nothing else: no manager, command or input reaches the run's record
+        or `.leerie/config.toml` (DESIGN §6½ *The repository image holds no
+        dependency*)."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        st = _make_fake_state(tmp_path, ["pnpm install --offline --frozen-lockfile"])
+        st = _make_fake_state(tmp_path, ["apt-get install -y libvips-dev",
+                                         "bundle install"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-
         worker_result = {
-            "setup_packages": [],
+            "setup_packages": ["libvips-dev"],
             "language_installs": [
-                {"manager": "pnpm", "command": "pnpm install --offline --frozen-lockfile",
-                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
+                {"manager": "bundle", "command": "bundle install",
+                 "copy_inputs": ["Gemfile", "Gemfile.lock"]},
             ],
             "dockerfile_notes": None,
         }
-        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
+        rec = Path(st.run_dir)
+        with patch.object(leerie, "claude_p",
+                          new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS, models=_FAKE_MODELS,
+                efforts=_FAKE_EFFORTS, record_in=rec))
+        (entry,) = json.loads((rec / leerie.CAPTURED_DEPS_FILE).read_text())
+        assert entry == {"from_run": rec.name,
+                         "setup_packages": ["libvips-dev"],
+                         "replace": False}
+        leerie.apply_captured_deps(rec, repo)
+        content = (repo / ".leerie" / "config.toml").read_text()
+        assert 'setup_packages = "libvips-dev"' in content
+        for word in ("language_installs", "bundle", "Gemfile"):
+            assert word not in content, word
 
+    def test_apply_of_an_earlier_record_takes_its_packages_only(
+            self, leerie, tmp_path):
+        """A `captured-deps.json` an earlier leerie recorded (each entry
+        with `language_installs`, as 0.65.0 wrote them) applies its
+        `setup_packages` and writes no `language_installs` key."""
+        repo = tmp_path / "repo"
+        (repo / ".leerie").mkdir(parents=True)
         cfg = repo / ".leerie" / "config.toml"
-        assert cfg.exists()
+        cfg.write_text('build = "make"\n')
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / leerie.CAPTURED_DEPS_FILE).write_text(json.dumps([{
+            "from_run": "run", "setup_packages": ["ffmpeg"],
+            "language_installs": [
+                {"manager": "pnpm",
+                 "command": "pnpm install --frozen-lockfile",
+                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]}],
+            "replace": False}], indent=1))
+        assert leerie.apply_captured_deps(run, repo) == 1
         content = cfg.read_text()
-        assert "language_installs" in content
-        assert "pnpm" in content
-        # Bug C regression: the JSON-encoded value contains `"`; the written
-        # config must be VALID TOML (single-quoted literal), not a basic string
-        # that the inner quotes terminate early.
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover - py<3.11
-            import tomli as tomllib
-        parsed = tomllib.loads(content)
-        # The command is leerie's own for the manager, never the capture's
-        # (DESIGN §6½ *A capture names packages and managers, never
-        # commands*).
-        assert json.loads(parsed["language_installs"]) == [
-            {"manager": "pnpm", "command": "pnpm install --frozen-lockfile",
-             "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
-        ]
+        assert 'setup_packages = "ffmpeg"' in content
+        assert "language_installs" not in content and "pnpm" not in content
+        assert (run / leerie.CAPTURED_DEPS_APPLIED_FILE).exists()
 
     def test_no_op_on_warm_repo(self, leerie, tmp_path, monkeypatch):
         """When all captured packages are already in setup_packages, no write."""
@@ -661,7 +546,6 @@ class TestCaptureRepoDeps:
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -694,7 +578,7 @@ class TestCaptureRepoDeps:
         called = []
         async def _mock_claude_p(**_kwargs):
             called.append(True)
-            return {"setup_packages": ["postgresql"], "language_installs": [],
+            return {"setup_packages": ["postgresql"],
                     "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
@@ -723,7 +607,6 @@ class TestCaptureRepoDeps:
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -742,7 +625,6 @@ class TestCaptureRepoDeps:
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         exc_caught = None
@@ -768,7 +650,7 @@ class TestCaptureRepoDeps:
         called = []
         async def _mock_claude_p(**_kwargs):
             called.append(True)
-            return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
+            return {"setup_packages": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
             _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
@@ -793,7 +675,7 @@ class TestCaptureRepoDeps:
         called = []
         async def _mock_claude_p(**_kwargs):
             called.append(True)
-            return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
+            return {"setup_packages": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
             _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
@@ -834,7 +716,7 @@ class TestCaptureRepoDeps:
         called = []
         async def _mock_claude_p(**_kwargs):
             called.append(True)
-            return {"setup_packages": [], "language_installs": [], "dockerfile_notes": None}
+            return {"setup_packages": [], "dockerfile_notes": None}
 
         with patch.object(leerie, "claude_p", new=AsyncMock(side_effect=_mock_claude_p)):
             _capture_then_apply(leerie, repo, st, caps=None)
@@ -857,7 +739,6 @@ class TestCaptureRepoDeps:
 
         worker_result = {
             "setup_packages": ["git", "postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -871,66 +752,21 @@ class TestCaptureRepoDeps:
         # New package added.
         assert "postgresql" in content
 
-    def test_language_installs_never_clobber_existing_manager(
-            self, leerie, tmp_path, monkeypatch):
-        """Existing language_installs manager entries are never replaced."""
-        repo = tmp_path / "repo"
-        leerie_dir = repo / ".leerie"
-        leerie_dir.mkdir(parents=True)
-        existing = [{"manager": "pip", "command": "pip install -r requirements.txt",
-                     "copy_inputs": ["requirements.txt"]}]
-        cfg = leerie_dir / "config.toml"
-        # _write_config_toml_keys stores: language_installs = "<json>"
-        # _read_toml_key strips the outer quotes → returns raw JSON string.
-        inner_json = json.dumps(existing, separators=(",", ":"))
-        cfg.write_text(f'language_installs = "{inner_json}"\n')
-
-        st = _make_fake_state(tmp_path, ["pnpm install --frozen-lockfile"])
-        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
-
-        worker_result = {
-            "setup_packages": [],
-            "language_installs": [
-                {"manager": "pip", "command": "pip install -e .",
-                 "copy_inputs": ["setup.py"]},
-                {"manager": "pnpm", "command": "pnpm install --frozen-lockfile",
-                 "copy_inputs": ["package.json", "pnpm-lock.yaml"]},
-            ],
-            "dockerfile_notes": None,
-        }
-        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
-            _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
-                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS)
-
-        content = cfg.read_text()
-        # pnpm is new — should be added.
-        assert "pnpm" in content
-        # pip already existed — the original command must not be replaced.
-        assert "requirements.txt" in content
-
     def test_replace_true_wholesale_overwrites(
             self, leerie, tmp_path, monkeypatch):
-        """replace=True (the --recapture --force path) drops deps no longer
-        captured, for both setup_packages and language_installs."""
+        """replace=True (the --recapture --force path) drops packages no
+        longer captured."""
         repo = tmp_path / "repo"
         leerie_dir = repo / ".leerie"
         leerie_dir.mkdir(parents=True)
         cfg = leerie_dir / "config.toml"
-        stale_li = [{"manager": "cargo", "command": "cargo build",
-                     "copy_inputs": ["Cargo.toml"]}]
-        cfg.write_text(
-            'setup_packages = "postgresql stale-pkg"\n'
-            f'language_installs = "{json.dumps(stale_li, separators=(",", ":"))}"\n')
+        cfg.write_text('setup_packages = "postgresql stale-pkg"\n')
 
-        st = _make_fake_state(tmp_path, ["pnpm install --offline"])
+        st = _make_fake_state(tmp_path, ["apt-get install -y postgresql"])
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [
-                {"manager": "pnpm", "command": "pnpm install --offline",
-                 "copy_inputs": ["package.json"]},
-            ],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -941,9 +777,6 @@ class TestCaptureRepoDeps:
         content = cfg.read_text()
         assert "postgresql" in content
         assert "stale-pkg" not in content, "replace=True must drop stale packages"
-        managers = {e["manager"]
-                    for e in json.loads(leerie._read_toml_key(cfg, "language_installs"))}
-        assert managers == {"pnpm"}, "replace=True must drop stale managers (cargo)"
 
     def test_replace_true_empty_capture_leaves_existing(
             self, leerie, tmp_path, monkeypatch):
@@ -959,7 +792,7 @@ class TestCaptureRepoDeps:
         monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
 
         worker_result = {
-            "setup_packages": [], "language_installs": [], "dockerfile_notes": None,
+            "setup_packages": [], "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
             _capture_then_apply(leerie, repo, st, caps=_FAKE_CAPS,
@@ -1022,7 +855,6 @@ class TestDepCaptureSentinel:
 
         worker_result = {
             "setup_packages": ["git"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -1042,7 +874,6 @@ class TestDepCaptureSentinel:
 
         worker_result = {
             "setup_packages": ["curl"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
@@ -1065,7 +896,6 @@ class TestDepCaptureSentinel:
 
         worker_result = {
             "setup_packages": ["postgresql"],
-            "language_installs": [],
             "dockerfile_notes": None,
         }
         with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):

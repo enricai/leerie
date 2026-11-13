@@ -224,9 +224,9 @@ def test_a_failed_install_is_not_recorded(leerie, env, monkeypatch):
 
 
 def test_the_install_key_reads_the_inputs_by_commit(leerie, env):
-    """The key changes with an input, with the recipe's install entries and
-    with a named copy input, and not with any other file; it is read from
-    the run repository."""
+    """The key changes with an input and with the recipe's install
+    entries, and not with any other file; it is read from the run
+    repository."""
     st, staging, _caps, _count = env
     repo = st.run_dir / "repo"
     recipe = st.data["provision"]["recipe"]
@@ -236,9 +236,8 @@ def test_the_install_key_reads_the_inputs_by_commit(leerie, env):
     d = _commit(leerie, staging, {"notes.md": "n"})
     e = _commit(leerie, staging, {"pkg/b/package.json": "{}"})
 
-    def key(t, r=recipe, ci=()):
-        return leerie._install_key(repo, t, r, list(ci))
+    def key(t, r=recipe):
+        return leerie._install_key(repo, t, r)
     assert key(a) == key(b) != key(c) == key(d) != key(e)
     assert key(a) != key(a, [{"kind": "install", "command": ["other"]}])
     assert key(a) != key(a, [{**recipe[0], "env": {"X": "1"}}, recipe[1]])
-    assert key(a) != key(a, ci=["src/a.txt"])

@@ -1701,7 +1701,7 @@ TOML
         # host-side python3 seam.  Host-only — no nerdctl invoked.
         # With --force: re-run the worker over runs already captured (clears the
         #   dep_capture.done sentinel) AND wholesale-replace the persisted
-        #   setup_packages + language_installs from the fresh capture (drops deps
+        #   setup_packages from the fresh capture (drops packages
         #   no longer captured; an empty capture leaves the existing config).
         # Without --force: never-clobber union (only new packages/managers added).
         shift  # consume --recapture; next arg may be --force
@@ -7590,59 +7590,18 @@ _leerie_repo_id() {
 }
 
 # Shared gating check (IMPLEMENTATION.md §0.5 "Auto-generation triggers"):
-# true when a Dockerfile should be auto-generated because ANY of (1)
-# setup_packages is non-empty, (2) a known dependency lockfile is present in
-# the repo, or (3) language_installs is non-empty in .leerie/config.toml.
-# Used by both resolve_repo_image_tag (the early-return gate) and the main
-# generation body, so the two can never drift out of sync on what counts as
-# "this repo needs a bake."
+# true when a Dockerfile should be auto-generated, which is when
+# .leerie/config.toml declares setup_packages. The image holds the apt
+# packages and nothing a run installs: no dependency is baked (DESIGN §6½
+# *The repository image holds no dependency*), so no lockfile and no
+# manager triggers a build. Used by both resolve_repo_image_tag (the
+# early-return gate) and the main generation body, so the two can never
+# drift out of sync on what counts as "this repo needs an image".
 #
 # Args: $1 = repo dir, $2 = setup_packages value (already extracted by the
 # caller — avoids re-parsing config.toml twice per call site).
 _leerie_should_generate_dockerfile() {
-  local _repo="$1" _sp_val="$2"
-  if [ -n "$_sp_val" ]; then
-    return 0
-  fi
-  # Mirrors orchestrator/leerie.py's _lockfile_table_entries exactly — bare
-  # requirements.txt / bare pyproject.toml (no lockfile) is deliberately
-  # EXCLUDED here too: it's the ambiguous tail that goes to the LLM
-  # fallback, not the deterministic table, so it must not trigger a bake
-  # either (a bake based on a guess is worse than no bake).
-  for _lf in package-lock.json pnpm-lock.yaml yarn.lock \
-             uv.lock poetry.lock Pipfile.lock \
-             Gemfile.lock Cargo.lock composer.lock \
-             packages.lock.json; do
-    if [ -f "$_repo/$_lf" ]; then
-      unset _lf
-      return 0
-    fi
-  done
-  unset _lf
-  # Go needs BOTH go.mod and go.sum (mirrors _lockfile_table_entries).
-  if [ -f "$_repo/go.mod" ] && [ -f "$_repo/go.sum" ]; then
-    return 0
-  fi
-  _leerie_config_declares_language_installs "$_repo/.leerie/config.toml"
-}
-
-# _leerie_config_declares_language_installs <config.toml> — true when the
-# file's language_installs is non-empty. It is a JSON array string in
-# config.toml; "[]" (or quoted "[]") means empty/absent, anything else
-# non-blank means present.
-_leerie_config_declares_language_installs() {
-  local _li_cfg="$1" _li
-  [ -f "$_li_cfg" ] || return 1
-  _li="$( { grep -E '^[[:space:]]*language_installs[[:space:]]*=' \
-                "$_li_cfg" 2>/dev/null \
-            || true; } \
-          | sed -n 1p \
-          | sed -E 's/^[[:space:]]*language_installs[[:space:]]*=[[:space:]]*//;
-                    s/[[:space:]]*$//')"
-  case "$_li" in
-    ""|'""'|"''"|'[]'|'"[]"'|"'[]'") return 1 ;;
-  esac
-  return 0
+  [ -n "$2" ]
 }
 
 # _leerie_checkout_id — 12 hex characters of the sha256 of $USER_REPO, the
@@ -7682,10 +7641,6 @@ resolve_repo_image_tag() {
                     s/[[:space:]]*$//;
                     s/^"(.*)"$/\1/;
                     s/^'"'"'(.*)'"'"'$/\1/')"
-    # Bug fix: this early-return previously checked setup_packages ONLY, so a
-    # repo with a lockfile / language_installs but no setup_packages fell
-    # through to the base image with no bake at all (IMPLEMENTATION.md §0.5
-    # "Dockerfile-emitter gating"). Broaden via the shared helper.
     if ! _leerie_should_generate_dockerfile "$USER_REPO" "$sp"; then
       # No Dockerfile and nothing to bake — use base image.
       echo ""
@@ -8670,7 +8625,7 @@ _repo_image_prepare() {
 # empty, so neither pulls with the operator's registry credentials (DESIGN
 # §6 *A repository's build carries no operator credential*).
 build_repo_image() {
-  local repo_image_tag="$1" _soft="${2:-}" _layout _q _digest _ns _auth _rc=0
+  local repo_image_tag="$1" _layout _q _digest _ns _auth _rc=0
   [ -f "$_REPO_BUILD_DIR/repo/Dockerfile" ] \
     || _repo_build_fail "the repository image's Dockerfile was not prepared"
   leerie_buildkit_check || _repo_build_fail "$LEERIE_BUILDKIT_REFUSAL"
@@ -8686,9 +8641,8 @@ build_repo_image() {
   _q="${_layout//\"/\"\"}"
   # The build prints what the repository's Dockerfile steps print, so it
   # reaches the terminal through the relay (_build_job); the build's own
-  # status decides. With `soft` (leerie's generated file, which has a
-  # fallback) a failure of this build returns 1 to the caller. Each build
-  # is given a cache-mount namespace of its own (leerie_cache_mount_ns).
+  # status decides. Each build is given a cache-mount namespace of its own
+  # (leerie_cache_mount_ns).
   _ns="$(leerie_cache_mount_ns)" \
     || _repo_build_fail "could not draw a cache-mount namespace for the build"
   DOCKER_CONFIG="$_auth" DOCKER_AUTH_CONFIG='' _build_job nerdctl --namespace "$LEERIE_IMAGE_NS" build \
@@ -8704,10 +8658,7 @@ build_repo_image() {
   # The cache-mount records it left are dead: no build can name $_ns again.
   leerie_prune_cache_mounts "$_ns" \
     || remote_log "warning: could not remove the build's cache-mount records ($_ns); BuildKit's garbage collection keeps them"
-  if [ "$_rc" -ne 0 ]; then
-    [ "$_soft" = soft ] && return 1
-    _repo_build_fail "per-repo container image build failed"
-  fi
+  [ "$_rc" -eq 0 ] || _repo_build_fail "per-repo container image build failed"
   _digest="$(_repo_layout_digest "$_layout")" \
     || _repo_build_fail "the repository's build did not leave exactly one image"
   remote_log "repository stage built ($_digest); copying it to the worker root..."
@@ -8739,38 +8690,6 @@ REPO_IMAGE_TAG=""
 REPO_IMAGE_REF=""
 _leerie_config_toml="$USER_REPO/.leerie/config.toml"
 _leerie_dockerfile="$USER_REPO/.leerie/Dockerfile"
-
-# Resolve bake_language_deps preference.
-# Precedence: LEERIE_BAKE_LANGUAGE_DEPS env > leerie.toml > .leerie/config.toml > true.
-_BAKE_LANGUAGE_DEPS=true
-if [ -n "${LEERIE_BAKE_LANGUAGE_DEPS:-}" ]; then
-  case "${LEERIE_BAKE_LANGUAGE_DEPS}" in
-    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
-    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
-  esac
-elif [ -f "$USER_REPO/leerie.toml" ]; then
-  _bld_toml="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
-                      "$USER_REPO/leerie.toml" 2>/dev/null \
-                  | sed -n 1p \
-                  | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
-                            s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
-  case "${_bld_toml:-}" in
-    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
-    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
-  esac
-  unset _bld_toml
-elif [ -f "$_leerie_config_toml" ]; then
-  _bld_cfg="$( { grep -E '^[[:space:]]*bake_language_deps[[:space:]]*=' \
-                     "$_leerie_config_toml" 2>/dev/null \
-                 | sed -n 1p \
-                 | sed -E 's/^[[:space:]]*bake_language_deps[[:space:]]*=[[:space:]]*//;
-                           s/[[:space:]]*$//; s/^"//; s/"$//'; } || true)"
-  case "${_bld_cfg:-}" in
-    0|false|no) _BAKE_LANGUAGE_DEPS=false ;;
-    1|true|yes)  _BAKE_LANGUAGE_DEPS=true ;;
-  esac
-  unset _bld_cfg
-fi
 
 # Whether the checkout file $1 (a path relative to the checkout) is a
 # repository's content rather than the operator's (DESIGN §6 *A repository
@@ -8867,7 +8786,6 @@ LEERIE_GENERATED_SENTINEL="# leerie-generated: do not edit (regenerated from .le
 _REPO_DF_OWN=false
 _REPO_DF_GEN=""
 _leerie_do_gen=false
-_REPO_GEN_FALLBACK=""
 _sp="$( { grep -E '^[[:space:]]*setup_packages[[:space:]]*=' \
               "$_leerie_config_toml" 2>/dev/null \
           || true; } \
@@ -8883,8 +8801,8 @@ if [ -f "$_leerie_dockerfile" ]; then
   IFS= read -r -n 256 _df_first_line < "$_leerie_dockerfile" 2>/dev/null || true
   if [ "$_df_first_line" != "$LEERIE_GENERATED_SENTINEL" ]; then
     _REPO_DF_OWN=true
-    if [ -n "$_sp" ] || _leerie_config_declares_language_installs "$_leerie_config_toml"; then
-      remote_log "note: the repository's own .leerie/Dockerfile is built as written; .leerie/config.toml's setup_packages and language_installs are not read while it is there"
+    if [ -n "$_sp" ]; then
+      remote_log "note: the repository's own .leerie/Dockerfile is built as written; .leerie/config.toml's setup_packages is not read while it is there"
     fi
   elif _checkout_file_tracked ".leerie/Dockerfile"; then
     remote_log "error: .leerie/Dockerfile is committed, and its first line is leerie's mark for a file it generated ('$LEERIE_GENERATED_SENTINEL'). Leerie generates that file from .leerie/config.toml on every launch and never reads a copy of it: a committed copy keeps the image at the configuration it was generated from, and leerie cannot tell a stale copy from lines written in it since. Remove it from the repository (git rm .leerie/Dockerfile), and leerie builds what .leerie/config.toml asks for; or, if lines in it are yours, delete its first line, and it is the repository's own Dockerfile (DESIGN §6½ *A generated Dockerfile is leerie's output, never the repository's*)."
@@ -8898,14 +8816,15 @@ else
   _leerie_do_gen=true
 fi
 [ -f "$_leerie_config_toml" ] || _leerie_do_gen=false
+# The keys an earlier leerie read to bake dependencies into the image. None
+# is read now: the image holds no dependency, and each run installs its
+# own from the recipe it proves (DESIGN §6½ *The repository image holds no
+# dependency*). Said, not refused: the operator's file is left as it is.
+if [ -f "$_leerie_config_toml" ] \
+   && grep -qE '^[[:space:]]*(language_installs|bake_language_deps)[[:space:]]*=' "$_leerie_config_toml" 2>/dev/null; then
+  remote_log "note: .leerie/config.toml's language_installs and bake_language_deps are no longer read: leerie bakes no dependency into the repository image, and each run installs them from its own provision recipe (DESIGN §6½ *The repository image holds no dependency*); those lines can be removed"
+fi
 if [ "$_leerie_do_gen" = "true" ]; then
-  # Bug fix: this used to be `if [ -n "$_sp" ]; then` — the whole generation
-  # body (apt layer, language-dep layer, build-verify fallback) skipped
-  # entirely for a repo with a lockfile / language_installs but no
-  # setup_packages (IMPLEMENTATION.md §0.5 "Dockerfile-emitter gating").
-  # Broaden the outer gate via the shared helper; the apt-package loop below
-  # stays conditional on `$_sp` specifically so a repo with zero system
-  # packages gets a Dockerfile with no dangling/empty apt RUN.
   if _leerie_should_generate_dockerfile "$USER_REPO" "$_sp"; then
     remote_log "generating the repository image's Dockerfile from .leerie/config.toml (setup_packages=$(_terminal_safe "${_sp:-<none>}"))"
     # Leerie's own file, in the launch's build directory: nothing of it is
@@ -8948,576 +8867,13 @@ if [ "$_leerie_do_gen" = "true" ]; then
       printf '    && rm -rf /var/lib/apt/lists/*\n' >> "$_gen_df_tmp"
     fi
 
-    # Language-dep layer (gated on bake_language_deps, default true).
-    # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
-    # Dockerfile sha folds them into .dockerfile-hash (the single hash site
-    # below). Each copy_input is existence-checked (p.exists()) before being
-    # added to the COPY list — hallucinated paths are silently dropped while
-    # the RUN line is always emitted.
-    if [ "$_BAKE_LANGUAGE_DEPS" = "true" ]; then
-      # The heredoc is written to a temp file rather than piped inline via
-      # "$(python3 - ... <<'PY' ... )". bash 3.2 (macOS /bin/bash) mis-scans a
-      # quoted heredoc nested inside a "$(...)" command substitution once the
-      # body grows past a threshold and aborts with "unexpected EOF" — de-nesting
-      # the heredoc from the command substitution sidesteps that parser bug.
-      _dep_pyf="$(mktemp)"
-      cat >"$_dep_pyf" <<'PY'
-import fnmatch
-import json as _json
-import os
-import re
-import stat
-import subprocess
-import sys
-
-repo = sys.argv[1]
-config_toml = sys.argv[2] if len(sys.argv) > 2 else None
-# The inputs come from the committed tree at HEAD, the image's build context
-# (`_repo_build_prepare`): git's own listing and blobs, never a path in the
-# checkout, so a link the repository holds is read as what it is — a link,
-# which is no input — and every read is bounded (DESIGN §6 *Leerie never
-# reads through a link a repository holds*). A file's hash is its blob id.
-READ_LIMIT = 1 << 20
-_FILE_MODES = ("100644", "100755")
-
-
-def _git(*args):
-    return subprocess.run(["git", "-C", repo, *args], capture_output=True,
-                          check=False)
-
-
-_TREE = {}
-_r = _git("ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD")
-if _r.returncode == 0:
-    for _item in _r.stdout.split(b"\0"):
-        _meta, _tab, _path = _item.partition(b"\t")
-        _f = _meta.split()
-        if _tab and len(_f) == 4:
-            _TREE[os.fsdecode(_path)] = (_f[0].decode(), _f[2].decode(),
-                                         _f[3].decode())
-
-
-def is_file(rel):
-    e = _TREE.get(rel)
-    return e is not None and e[0] in _FILE_MODES
-
-
-def is_dir(rel):
-    pre = rel.rstrip("/") + "/"
-    return any(p.startswith(pre) for p in _TREE)
-
-
-def exists(rel):
-    return is_file(rel) or is_dir(rel)
-
-
-def read_text(rel):
-    """The committed file's text, or None (absent, a link, too large)."""
-    e = _TREE.get(rel)
-    if e is None or e[0] not in _FILE_MODES or not e[2].isdigit() \
-            or int(e[2]) > READ_LIMIT:
-        return None
-    r = _git("cat-file", "blob", e[1])
-    return (r.stdout[:READ_LIMIT].decode("utf-8", "replace")
-            if r.returncode == 0 else None)
-
-
-def glob(pattern):
-    """The committed regular files matching `pattern`, one component per
-    `/` as `glob.glob` matches."""
-    want = pattern.strip("/").split("/")
-    return sorted(p for p in _TREE if is_file(p)
-                  and len(p.split("/")) == len(want)
-                  and all(fnmatch.fnmatchcase(a, b)
-                          for a, b in zip(p.split("/"), want)))
-
-
-def read_config(path):
-    """The operator's `.leerie/config.toml`, read beneath the checkout
-    without following a link, bounded; "" when it cannot be."""
-    try:
-        fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            d = os.open(".leerie", os.O_RDONLY | os.O_DIRECTORY
-                        | os.O_NOFOLLOW, dir_fd=fd)
-        finally:
-            os.close(fd)
-        try:
-            f = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW,
-                        dir_fd=d)
-        finally:
-            os.close(d)
-        try:
-            if not stat.S_ISREG(os.fstat(f).st_mode):
-                return ""
-            return os.read(f, READ_LIMIT).decode("utf-8", "replace")
-        finally:
-            os.close(f)
-    except OSError:
-        return ""
-
-
-def _hash_copy_files(repo, copy_files):
-    copy_shas = {}
-    for rel in copy_files:
-        if is_file(rel):
-            copy_shas[rel] = _TREE[rel][1]
-        elif is_dir(rel):
-            pre = rel.rstrip("/") + "/"
-            for p in sorted(_TREE):
-                if p.startswith(pre) and is_file(p):
-                    copy_shas[p] = _TREE[p][1]
-    return copy_shas
-
-
-def _emit_layer(copy_files, run_cmd, copy_shas, workdir=None, env_lines=None,
-                 pre_run_lines=None):
-    """Emit the COPY-input-shas comment, an optional `WORKDIR` (out-of-`/work`
-    build scratch dir — never write the /work-mounted tree at build time, see
-    DESIGN §6½ and the darwin no-clobber invariant), optional `ENV` lines
-    (baked ecosystem env like VIRTUAL_ENV/BUNDLE_PATH/CARGO_TARGET_DIR/
-    GOCACHE — must be present in the image so the bake target survives into
-    every container run), the COPY lines, any pre-RUN lines (e.g. a discarded
-    dummy source file some ecosystems need to give their build tool a valid
-    target — see the Rust/Go branches below), and finally the RUN line.
-
-    copy_files/copy_shas stay REPO-RELATIVE regardless of workdir — hashing
-    covers the real dependency-input files, not the scratch dir the install
-    writes into, so the existing .dockerfile-hash cache-invalidation
-    mechanism (leerie:~4982) is unaffected by where the RUN line installs to.
-
-    NOTE: this WORKDIR is never reset back to /work afterward, so it leaks
-    into the final image's baked WORKDIR config. Confirmed harmless: the
-    launcher's `nerdctl run` always passes an explicit `-w /work`
-    (leerie:~7503), which overrides any image-baked WORKDIR at container
-    start; every worker subprocess additionally passes its own explicit
-    `cwd=worktree` (orchestrator/leerie.py's claude_p/run_proc calls) rather
-    than inheriting cwd from the container. Nothing in this codebase relies
-    on the image's own WORKDIR value.
-    """
-    sha_comment = "# copy-input-shas: " + " ".join(
-        f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
-    )
-    # Docker's `COPY src... ./` flattens each source into ./ by basename: a
-    # directory (patches/ → /work/*.patch, not /work/patches/) and a nested
-    # file (packages/a/package.json → /work/package.json, clobbering the root
-    # manifest) both land wrong. Only top-level files (no "/") are safe to
-    # batch into a single `COPY ... ./`. Everything else needs an explicit
-    # destination that preserves its path, or the baked install fails (ENOENT
-    # on a patch, or a workspace manifest overwriting the root one).
-    def _needs_own_copy(c):
-        return c.endswith("/") or "/" in c
-    top_level = [c for c in copy_files if not _needs_own_copy(c)]
-    own = [c for c in copy_files if _needs_own_copy(c)]
-    print(sha_comment)
-    if workdir:
-        # WORKDIR creates the dir if absent — no separate mkdir needed. This
-        # is what keeps the install OUT of the inherited /work WORKDIR: every
-        # COPY/RUN below runs relative to this scratch dir instead.
-        print(f"WORKDIR {workdir}")
-    for line in (env_lines or []):
-        print(f"ENV {line}")
-    if top_level:
-        print("COPY " + " ".join(top_level) + " ./")
-    for c in own:
-        # Directories keep their trailing slash on both sides; files map 1:1.
-        print(f"COPY {c} ./{c}")
-    for line in (pre_run_lines or []):
-        print(line)
-    print(f"RUN {run_cmd}")
-
-
-def _node_ancillary(repo, copy_files):
-    """Append the ancillary inputs a node install needs beyond the lockfile:
-    workspace roots (pnpm-workspace.yaml), registry config (.npmrc),
-    every workspace child's package.json, and patches/. Shared by
-    pnpm/yarn/npm — DESIGN §6½ requires the full input set, not just the
-    lockfile, or the baked `install` fails (ENOENT on a patch, missing
-    workspace manifest). Workspace globs come from pnpm-workspace.yaml
-    (pnpm) or package.json's "workspaces" field (yarn/npm)."""
-    for f in ("pnpm-workspace.yaml", ".npmrc"):
-        if is_file(f) and f not in copy_files:
-            copy_files.append(f)
-    globs = []
-    ws = read_text("pnpm-workspace.yaml")
-    if ws is not None:
-        globs += re.findall(r"[-]\s+['\"]?([^'\"#\n]+)['\"]?", ws)
-    pj = read_text("package.json")
-    if pj is not None:
-        try:
-            wsf = _json.loads(pj).get("workspaces", [])
-            # yarn classic/npm: a list; yarn "nohoist" form: {"packages": [...]}.
-            globs += wsf if isinstance(wsf, list) else wsf.get("packages", [])
-        except (ValueError, AttributeError):
-            pass
-    for g in globs:
-        g = (g if isinstance(g, str) else "").strip()
-        if not g:
-            continue
-        for rel in glob(os.path.join(g, "package.json")):
-            if rel not in copy_files:
-                copy_files.append(rel)
-    if is_dir("patches") and "patches/" not in copy_files:
-        copy_files.append("patches/")
-
-
-# Out-of-repo bake targets (DESIGN §6½, IMPLEMENTATION.md §0.5). Node/pnpm is
-# deliberately absent: node_modules cannot be fully baked (must live in the
-# repo tree for resolution), so the pnpm/yarn/npm install still targets the
-# inherited /work WORKDIR. The pnpm store is not baked either: the
-# orchestrator sets its stores in the state mount at runtime (DESIGN §6 *The
-# pnpm store shares the worktrees' mount*). Composer/.NET are also left targeting /work: no verified
-# out-of-repo bake exists for them yet (out of scope — Python/Ruby/Rust/Go
-# are the four ecosystems this feature covers per the plan).
-#
-# Rust and Go both need a discardable dummy source file at build time: neither
-# `cargo build`/`cargo fetch` nor `go build` will populate their respective
-# build-artifact caches (CARGO_TARGET_DIR / GOCACHE) against a manifest-only
-# COPY context with zero real source files — `cargo` refuses to parse a
-# manifest with no build target at all, and `go build ./...` against zero .go
-# files is a silent no-op that warms neither cache. This is a well-documented
-# Cargo/Go Docker-layer-caching workaround (no `cargo build
-# --dependencies-only` exists) — live-verified this session: a genuine cache
-# hit (`Fresh serde`/`packagefile ...` reused, zero network) from a REAL
-# worktree afterward, against the same baked CARGO_TARGET_DIR/GOCACHE, from a
-# different directory, fully offline.
-def _bake_params_for_manager(manager, run_cmd):
-    """Returns (workdir, env_lines, pre_run_lines, run_cmd) for a bakeable
-    manager, or None if this manager doesn't have a verified out-of-repo bake
-    (falls back to the original /work-targeting run_cmd unchanged)."""
-    m = (manager or "").lower()
-    if m in ("pip", "pip3"):
-        # Plain pip installing from requirements.txt: `pip install -r ...`
-        # already targets whatever interpreter runs it, so putting
-        # /opt/venv/bin first on PATH (baked ENV) is sufficient — no
-        # per-tool active-venv detection involved.
-        return (
-            "/opt/python-build",
-            ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:$PATH"],
-            ["RUN python3 -m venv /opt/venv"],
-            run_cmd,
-        )
-    if m in ("uv", "poetry", "pipenv"):
-        # These tools' own active-venv detection is inconsistent and
-        # live-verified to be unreliable via VIRTUAL_ENV/PATH alone: `uv
-        # sync` silently IGNORES VIRTUAL_ENV unless --active is passed
-        # (verified live this session — without it, uv creates its own
-        # .venv in the build scratch dir instead of /opt/venv); pipenv has
-        # long-standing open bugs about not respecting an already-active
-        # venv at all (pypa/pipenv#1021). Sidestep per-tool detection
-        # entirely: install the tool ITSELF into /opt/venv via pip first,
-        # so when /opt/venv/bin/<tool> runs, its own interpreter's
-        # sys.prefix IS /opt/venv — the same interpreter-path-derived
-        # resolution verified for `python3 -m pip` in the clone+delta
-        # mechanism (1b below), not env-var-based active-venv detection.
-        tool = m
-        extra_flag = " --active" if m == "uv" else ""
-        fixed_run_cmd = run_cmd + extra_flag
-        return (
-            "/opt/python-build",
-            ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:$PATH"],
-            [
-                "RUN python3 -m venv /opt/venv",
-                f"RUN /opt/venv/bin/python3 -m pip install {tool}",
-            ],
-            fixed_run_cmd,
-        )
-    if m in ("bundle", "gem"):
-        return (
-            "/opt/ruby-build",
-            ["BUNDLE_PATH=/opt/bundle", "BUNDLE_APP_CONFIG=/opt/bundle"],
-            [],
-            run_cmd,
-        )
-    if m == "cargo":
-        return (
-            "/opt/rust-build",
-            ["CARGO_TARGET_DIR=/opt/cargo-target"],
-            # Dummy target so `cargo fetch`/`cargo build` have something to
-            # resolve the dependency graph against — discarded, never COPY'd
-            # into /work.
-            ["RUN mkdir -p src && printf 'fn main() {}' > src/main.rs"],
-            # NO --release: cargo keys its build cache by profile
-            # (debug/ vs release/ under CARGO_TARGET_DIR) — a --release bake
-            # produces ZERO cache benefit for a normal `cargo build`/`cargo
-            # test` (both default to the debug profile, which is what
-            # implementer/conformer workers actually run). Verified live:
-            # baking with --release left a real worktree's plain `cargo
-            # build` fully recompiling every dependency from scratch
-            # ("Compiling serde", not "Fresh serde"); dropping --release
-            # fixed it (confirmed "Fresh serde_core"/"Fresh serde").
-            "cargo fetch && cargo build --offline && rm -rf src",
-        )
-    if m == "go":
-        return (
-            "/opt/go-build",
-            ["GOCACHE=/opt/go-cache"],
-            ["RUN printf 'package main\\nfunc main() {}\\n' > _leerie_dummy.go"],
-            "go mod download && go build ./... && rm -f _leerie_dummy.go",
-        )
-    return None
-
-
-# Node package managers whose frozen install reads patches/, workspace
-# manifests, and .npmrc — the persisted-path copy_inputs often omit these
-# (DESIGN §6½ requires the full input set), so we augment via _node_ancillary.
-_NODE_MANAGERS = ("pnpm", "yarn", "npm")
-
-
-def _is_node_context(repo, manager):
-    """True when the install is a node one — by explicit manager string or by
-    the presence of a node lockfile (persisted copy_inputs may not name it)."""
-    if (manager or "").lower() in _NODE_MANAGERS:
-        return True
-    return any(
-        is_file(lf)
-        for lf in ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
-    )
-
-
-# The one install command each manager's bake runs (DESIGN §6½ *A capture
-# names managers, never commands*): a persisted `language_installs` entry
-# chooses the manager and its inputs, never the command — its `command`
-# field is not read. Equal to the orchestrator's `BAKE_INSTALL_COMMANDS`
-# (tests/test_capture_validation.py).
-_INSTALL_COMMANDS = {
-    "pnpm": "pnpm install --frozen-lockfile",
-    "yarn": "yarn install --frozen-lockfile",
-    "npm": "npm ci",
-    "uv": "uv sync",
-    "poetry": "poetry install",
-    "pipenv": "pipenv install",
-    "pip": "pip install -r requirements.txt",
-    "pip3": "pip install -r requirements.txt",
-    "go": "go mod download",
-    "cargo": "cargo fetch",
-    "bundle": "bundle install",
-    "composer": "composer install --no-interaction",
-    "dotnet": "dotnet restore",
-}
-_SAFE_REL = re.compile(r"[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*/?")
-
-
-def _safe_rel(p):
-    return (isinstance(p, str) and _SAFE_REL.fullmatch(p) is not None
-            and ".." not in p.split("/"))
-
-
-persisted_installs = []
-if config_toml:
-    raw = read_config(config_toml)
-    # Extract the language_installs value from a flat TOML file.
-    # The value is a JSON string (possibly quoted with " or ').
-    for line in raw.splitlines():
-        m = re.match(
-            r"^\s*language_installs\s*=\s*(?:\"(.*)\"|'(.*)'|(.*))$",
-            line.strip(),
-        )
-        if m:
-            val = m.group(1) or m.group(2) or m.group(3) or ""
-            val = val.strip()
-            if val:
-                try:
-                    persisted_installs = _json.loads(val)
-                    if not isinstance(persisted_installs, list):
-                        persisted_installs = []
-                except (ValueError, TypeError):
-                    persisted_installs = []
-            break
-
-if persisted_installs:
-    emitted = False
-    for entry in persisted_installs:
-        if not isinstance(entry, dict):
-            continue
-        manager = entry.get("manager")
-        known = isinstance(manager, str) and manager in _INSTALL_COMMANDS
-        copy_inputs = entry.get("copy_inputs") or []
-        bad = [ci for ci in copy_inputs if not _safe_rel(ci)] \
-            if isinstance(copy_inputs, list) else [copy_inputs]
-        if not known or bad:
-            sys.exit(f"leerie: .leerie/config.toml's language_installs names "
-                     f"{'inputs ' + repr(bad) if known else 'manager ' + repr(manager)}"
-                     f", which leerie does not bake: the managers it bakes "
-                     f"are {', '.join(sorted(_INSTALL_COMMANDS))}, each with "
-                     f"its own command, and an input is a plain path in the "
-                     f"repository (DESIGN §6½ *A capture names managers, "
-                     f"never commands*). Fix or remove the entry.")
-        run_cmd = _INSTALL_COMMANDS[manager]
-        # Validate each copy_input; skip hallucinated paths but always emit RUN.
-        copy_files = [ci for ci in copy_inputs if exists(ci)]
-        # A persisted copy_inputs list often names only the lockfile+manifest.
-        # For node managers, augment with the ancillary inputs a frozen install
-        # requires (patches/, workspace children, .npmrc) — else the bake fails
-        # ENOENT on a patch and silently degrades to apt-only (DESIGN §6½).
-        if _is_node_context(repo, entry.get("manager")):
-            _node_ancillary(repo, copy_files)
-        # _filter_residual_deps (already shipped, untouched — see
-        # orchestrator/leerie.py) strips bakeable managers out of what gets
-        # persisted to config.toml, so this branch should rarely see one. But
-        # a stale config.toml from before this feature landed could still
-        # carry a bakeable manager's command — route it through the same
-        # /opt/* bake params rather than emit a raw /work-targeting RUN.
-        bake = _bake_params_for_manager(entry.get("manager"), run_cmd)
-        if bake:
-            workdir, env_lines, pre_run_lines, run_cmd = bake
-        else:
-            workdir = env_lines = pre_run_lines = None
-        if copy_files:
-            copy_shas = _hash_copy_files(repo, copy_files)
-            _emit_layer(copy_files, run_cmd, copy_shas, workdir=workdir,
-                        env_lines=env_lines, pre_run_lines=pre_run_lines)
-        else:
-            # No valid copy inputs: emit RUN without COPY (still honor
-            # workdir/env_lines/pre_run_lines for a bakeable manager).
-            if workdir:
-                print(f"WORKDIR {workdir}")
-            for line in (env_lines or []):
-                print(f"ENV {line}")
-            for line in (pre_run_lines or []):
-                print(line)
-            print(f"RUN {run_cmd}")
-        emitted = True
-    sys.exit(0 if emitted else 0)
-
-# Detect lockfile manager (mirrors _lockfile_table_entries precedence).
-has_pnpm  = is_file("pnpm-lock.yaml")
-has_yarn  = is_file("yarn.lock")
-has_npm   = is_file("package-lock.json")
-has_uv    = is_file("uv.lock")
-has_poetry = is_file("poetry.lock")
-has_pipenv = is_file("Pipfile.lock")
-has_go    = is_file("go.mod") and is_file("go.sum")
-has_cargo = is_file("Cargo.lock")
-has_bundle = is_file("Gemfile.lock")
-has_composer = is_file("composer.lock")
-has_dotnet = is_file("packages.lock.json")
-
-copy_files = []
-run_cmd = ""
-manager = None
-
-if has_pnpm:
-    copy_files.append("pnpm-lock.yaml")
-    if is_file("package.json"):
-        copy_files.append("package.json")
-    _node_ancillary(repo, copy_files)
-    run_cmd = "pnpm install --frozen-lockfile"
-    manager = "pnpm"
-elif has_yarn:
-    copy_files.append("yarn.lock")
-    if is_file("package.json"):
-        copy_files.append("package.json")
-    _node_ancillary(repo, copy_files)
-    run_cmd = "yarn install --frozen-lockfile"
-    manager = "yarn"
-elif has_npm:
-    copy_files.append("package-lock.json")
-    if is_file("package.json"):
-        copy_files.append("package.json")
-    _node_ancillary(repo, copy_files)
-    run_cmd = "npm ci"
-    manager = "npm"
-elif has_uv:
-    copy_files.append("uv.lock")
-    if is_file("pyproject.toml"):
-        copy_files.append("pyproject.toml")
-    run_cmd = "uv sync"
-    manager = "uv"
-elif has_poetry:
-    copy_files.append("poetry.lock")
-    if is_file("pyproject.toml"):
-        copy_files.append("pyproject.toml")
-    run_cmd = "poetry install"
-    manager = "poetry"
-elif has_pipenv:
-    copy_files.append("Pipfile.lock")
-    if is_file("Pipfile"):
-        copy_files.append("Pipfile")
-    run_cmd = "pipenv install"
-    manager = "pipenv"
-elif has_go:
-    copy_files += ["go.mod", "go.sum"]
-    run_cmd = "go mod download"
-    manager = "go"
-elif has_cargo:
-    copy_files.append("Cargo.lock")
-    if is_file("Cargo.toml"):
-        copy_files.append("Cargo.toml")
-    run_cmd = "cargo fetch"
-    manager = "cargo"
-elif has_bundle:
-    copy_files.append("Gemfile.lock")
-    if is_file("Gemfile"):
-        copy_files.append("Gemfile")
-    run_cmd = "bundle install"
-    manager = "bundle"
-elif has_composer:
-    copy_files.append("composer.lock")
-    if is_file("composer.json"):
-        copy_files.append("composer.json")
-    run_cmd = "composer install --no-interaction"
-    manager = "composer"
-elif has_dotnet:
-    copy_files.append("packages.lock.json")
-    run_cmd = "dotnet restore"
-    manager = "dotnet"
-
-if not run_cmd:
-    sys.exit(0)
-
-# Hash EVERY file that participates in the COPY list (lockfiles, manifests,
-# workspace children, patches/*, .npmrc) so any dependency-input change — not
-# only a lockfile bump — triggers a rebuild. A patch edit that leaves the
-# lockfile untouched must still invalidate the image (DESIGN §6½: "every
-# lockfile that participates in the COPY list"; patches participate).
-# NOTE: copy_files stays repo-relative here regardless of the bake's WORKDIR
-# below — hashing covers the real dependency-input files, not the scratch
-# dir the install writes into.
-copy_shas = _hash_copy_files(repo, copy_files)
-
-# Out-of-repo bake (DESIGN §6½): Python/Ruby/Rust/Go target /opt/* instead of
-# the inherited /work WORKDIR. Node/composer/dotnet are unchanged (no
-# verified bake target — Node's node_modules must live in the repo tree; see
-# _bake_params_for_manager's docstring).
-bake = _bake_params_for_manager(manager, run_cmd)
-if bake:
-    workdir, env_lines, pre_run_lines, run_cmd = bake
-else:
-    workdir = env_lines = pre_run_lines = None
-
-# Emit COPY + RUN lines.
-# Shas are embedded as a comment so the Dockerfile sha captures dep-input drift.
-_emit_layer(copy_files, run_cmd, copy_shas, workdir=workdir,
-            env_lines=env_lines, pre_run_lines=pre_run_lines)
-PY
-      # Guard the exit code so `set -e` never aborts before the temp file is
-      # cleaned up (mirrors the _launch_stderr/_early_probe_stderr sites), then
-      # re-raise a real interpreter crash — the original inline command-sub
-      # aborted the launcher on python failure, and that contract is preserved.
-      _lang_rc=0
-      _lang_layer="$(python3 -I "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml")" \
-        || _lang_rc=$?
-      rm -f "$_dep_pyf"
-      if [ "$_lang_rc" != "0" ]; then exit "$_lang_rc"; fi
-      if [ -n "$_lang_layer" ]; then
-        # The same file without the language-dep layer: what the launch
-        # builds when the layer does not (below, at the build decision).
-        _REPO_GEN_FALLBACK="$(cat "$_gen_df_tmp")"
-        printf '%s\n' "$_lang_layer" >> "$_gen_df_tmp"
-      else
-        remote_log "auto-generating: no lockfile detected; skipping language-dep layer"
-      fi
-      unset _lang_layer _lang_rc _dep_pyf
-    fi
-
     _REPO_DF_GEN="$(cat "$_gen_df_tmp")"
     [ -n "$_REPO_DF_GEN" ] || _repo_build_fail "could not read back the Dockerfile leerie generated"
     unset _gen_df_tmp _pkg
   fi
   unset _sp_packages _sp_list
 fi
-unset _sp _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL _BAKE_LANGUAGE_DEPS
+unset _sp _leerie_config_toml _leerie_do_gen LEERIE_GENERATED_SENTINEL
 
 # Only proceed when there is a Dockerfile to build: the repository's own, or
 # the one this launch generated.
@@ -9525,8 +8881,7 @@ if [ "$_REPO_DF_OWN" = "true" ] || [ -n "$_REPO_DF_GEN" ]; then
   REPO_IMAGE_TAG="$(resolve_repo_image_tag)"
   if [ -n "$REPO_IMAGE_TAG" ]; then
     # Hash file stores "<version>:<layout>:<base id>:<dockerfile sha256>:
-    # <context sha256> <image digest>", and a third field, `apt-only`, when
-    # the image is the generated file's fallback: any input changing triggers a
+    # <context sha256> <image digest>": any input changing triggers a
     # rebuild — the context is what the Dockerfile's instructions read, so a
     # COPY of a file that changed rebuilds and nothing else does — and an image
     # is reused only when it is the one this checkout built — the digest
@@ -9548,9 +8903,9 @@ if [ "$_REPO_DF_OWN" = "true" ] || [ -n "$_REPO_DF_GEN" ]; then
     # (_check_repo_image), so a rebuilt base rebuilds it.
     _base_id="$(nerdctl --namespace "$LEERIE_IMAGE_NS" image inspect -f '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)"
     _cur_hash="${LEERIE_VERSION}:${REPO_IMAGE_LAYOUT}:${_base_id}:${_cur_df_sha}:${_REPO_CTX_SHA}"
-    _stored_hash="" _stored_ref="" _stored_mark="" _cur_mark=""
+    _stored_hash="" _stored_ref=""
     if [ -f "$_hash_file" ]; then
-      read -r _stored_hash _stored_ref _stored_mark < "$_hash_file" || true
+      read -r _stored_hash _stored_ref _ < "$_hash_file" || true
     fi
     _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
 
@@ -9591,37 +8946,19 @@ if [ "$_REPO_DF_OWN" = "true" ] || [ -n "$_REPO_DF_GEN" ]; then
       ensure_frontend_in_worker_ns
       leerie_unlock "$_image_lock_holder"
       unset _image_lock_holder
-      if [ -z "${_REPO_GEN_FALLBACK:-}" ]; then
-        build_repo_image "$REPO_IMAGE_TAG"
-      elif ! build_repo_image "$REPO_IMAGE_TAG" soft; then
-        # Leerie's generated file is tested only by its own build (DESIGN
-        # §6½ *Language deps*): when its language-dep layer does not build,
-        # the same file without it is built, and recorded under the key
-        # computed above, the generated file's, so the next launch, which
-        # generates that file again, reuses the image instead of failing
-        # the layer again; the record marks it, and each reuse says so.
-        remote_log "warning: language-dep Dockerfile build failed; falling back to apt-only bake, reused until an input of its key changes (to retry the layer, remove $(_terminal_safe "$_hash_file"))"
-        _cur_mark=" apt-only"
-        _REPO_DF_GEN="$_REPO_GEN_FALLBACK"
-        _repo_image_prepare
-        build_repo_image "$REPO_IMAGE_TAG"
-      fi
+      build_repo_image "$REPO_IMAGE_TAG"
       _cur_ref="$(_repo_image_digest "$REPO_IMAGE_TAG")"
       [ -n "$_cur_ref" ] || _repo_build_fail "the repository image $REPO_IMAGE_TAG has no digest"
-      printf '%s %s%s\n' "$_cur_hash" "$_cur_ref" "${_cur_mark:-}" > "$_hash_file"
+      printf '%s %s\n' "$_cur_hash" "$_cur_ref" > "$_hash_file"
     else
       remote_log "per-repo image up-to-date ($(_terminal_safe "$REPO_IMAGE_TAG")); skipping build"
-      if [ "$_stored_mark" = "apt-only" ]; then
-        remote_log "warning: this image is the apt-only fallback: its language-dep layer failed to build, so no language dependency is installed in it; to retry the layer, remove $(_terminal_safe "$_hash_file")"
-      fi
     fi
     leerie_unlock "$_repo_lock_holder"
     REPO_IMAGE_REF="$_cur_ref"
-    unset _repo_lock_holder _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _stored_mark _cur_mark _cur_ref _need_build _base_id
+    unset _repo_lock_holder _hash_file _cur_df_sha _cur_hash _stored_hash _stored_ref _cur_ref _need_build _base_id
   fi
 fi
 _repo_build_done
-unset _REPO_GEN_FALLBACK
 unset _leerie_dockerfile
 
 # --- assemble auth/config mounts ----------------------------------------
@@ -10282,18 +9619,17 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/
 # necessary — git/gh/ssh run with the host's own auth state, where they
 # already work. The host preflight above verified gh auth + origin.
 
-# --- per-repo dependency caches (DESIGN §6½, IMPLEMENTATION §0.5) -------
-# Two host-side cache dirs survive across runs: mise-data, so mise doesn't
+# --- the host's toolchain cache (DESIGN §6½, IMPLEMENTATION §0.5) --------
+# One host-side cache dir survives across runs: mise-data, so mise doesn't
 # re-install Node 20.11.0 every time the user runs leerie against a repo
-# with .nvmrc: 20.11.0, and Bundler's. Package stores (pnpm, pip, Go,
-# Cargo, corepack) are not host caches: they live in the state mount
-# (DESIGN §6 *The pnpm store shares the worktrees' mount*). Created lazily
-# (mkdir -p) on every leerie invocation — cheap on existing dirs, free of
-# failure modes on first run. Concurrency-safety per cache is documented
-# in IMPLEMENTATION §0.5.
+# with .nvmrc: 20.11.0. A toolchain is not a store. Package stores (pnpm,
+# pip, Go, Cargo, Bundler, corepack) are not host caches: they live in the
+# state mount (DESIGN §6 *The stores a view installs from are leerie's*).
+# Created lazily (mkdir -p) on every leerie invocation — cheap on existing
+# dirs, free of failure modes on first run. Concurrency-safety is
+# documented in IMPLEMENTATION §0.5.
 #
 mkdir -p "$HOME/.cache/leerie/mise-data" \
-         "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR" \
          "$_leerie_host_dir"
 
@@ -10305,18 +9641,7 @@ CACHE_MOUNTS=(
   # installs from are leerie's*). Both are in the state mount, beside the
   # worktrees, so an install can hard-link from its run's store (DESIGN §6
   # *The pnpm store shares the worktrees' mount*).
-  -v "$HOME/.cache/leerie/bundle:/home/leerie/.cache/leerie/bundle"
-  -e "BUNDLE_CACHE_ALL=1"
 )
-# BUNDLE_PATH: the cache mount above. A repository image whose worker stage
-# baked gems to /opt/bundle sets BUNDLE_PATH there in that stage's
-# environment, which the shim lays over a confined command's — a value
-# beneath /opt/ wins over this one (scripts/landlock_exec.py
-# apply_worker_env; DESIGN §6 *The orchestrator's root is leerie's; a
-# repository's root is only a confined process's*). The orchestrator's own
-# environment is the base image's: it never takes a value the repository
-# chose.
-CACHE_MOUNTS+=(-e "BUNDLE_PATH=/home/leerie/.cache/leerie/bundle")
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
 # launcher invocations. Not user-tunable here.

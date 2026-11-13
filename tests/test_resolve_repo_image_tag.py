@@ -225,17 +225,22 @@ def test_no_dockerfile_no_setup_packages_repo_image_tag_empty(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# ($_sp gating-bug fix) a lockfile present (no setup_packages) must still
-# resolve a non-empty tag — regression coverage for the bug this session
-# fixed: the early-return previously checked setup_packages ONLY.
+# Only setup_packages ask for a generated image: a lockfile does not.
 # ---------------------------------------------------------------------------
 
-def test_lockfile_without_setup_packages_resolves_nonempty_tag(tmp_path: Path):
-    """A lockfile-only repo (no setup_packages, no Dockerfile) must resolve a
-    real tag, not fall back to the empty string / base image."""
+def test_lockfiles_without_setup_packages_resolve_no_tag(tmp_path: Path):
+    """No lockfile asks for a repository image (DESIGN §6½ *The repository
+    image holds no dependency*): a tree holding Gemfile.lock, Cargo.lock,
+    go.mod/go.sum, pnpm-lock.yaml and uv.lock, with no setup_packages and no
+    Dockerfile, resolves the empty tag — the base image runs. Falsified
+    against 0.65.0's launcher: it resolved `leerie-repo/…` for the
+    lockfiles."""
     user_repo = tmp_path / "myrepo"
-    user_repo.mkdir()
-    (user_repo / "uv.lock").write_text("")
+    (user_repo / ".leerie").mkdir(parents=True)
+    (user_repo / ".leerie" / "config.toml").write_text("test = \"true\"\n")
+    for name in ("Gemfile.lock", "Cargo.lock", "go.mod", "go.sum",
+                 "pnpm-lock.yaml", "uv.lock"):
+        (user_repo / name).write_text("")
     result = _run(
         'echo "tag=$(resolve_repo_image_tag)"',
         env={
@@ -245,13 +250,12 @@ def test_lockfile_without_setup_packages_resolves_nonempty_tag(tmp_path: Path):
         },
     )
     assert result.returncode == 0, result.stderr
-    tag = result.stdout.strip().removeprefix("tag=")
-    assert tag == f"leerie-repo/owner-myrepo-{_checkout_id(user_repo)}:1.2.3", tag
+    assert result.stdout.strip() == "tag=", result.stdout
 
 
 def test_bare_requirements_txt_without_setup_packages_returns_empty(tmp_path: Path):
-    """Negative control: bare requirements.txt (no lockfile) is deliberately
-    excluded — must still resolve empty, matching _lockfile_table_entries."""
+    """Negative control: bare requirements.txt without setup_packages
+    resolves empty."""
     user_repo = tmp_path / "myrepo"
     user_repo.mkdir()
     (user_repo / "requirements.txt").write_text("requests==2.31.0\n")

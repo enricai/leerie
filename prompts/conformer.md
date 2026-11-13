@@ -70,12 +70,7 @@ The orchestrator gives you, in your prompt:
   recipe is shown because a *targeted* command of your own (§4) may
   still need the deps present. The shared package-manager caches make
   re-running fast. If the block is absent, the orchestrator detected no
-  install command for this repo (or the run is docs-only). For Python repos where the implementer
-  changed dependencies, use whichever venv it left behind (its private
-  `.venv-private` clone, or the shared `/opt/venv` if unchanged) —
-  never install directly into `/opt/venv` yourself; see
-  `prompts/implementer.md`'s "Python dependency changes" section for
-  the mechanism and why (DESIGN §6½).
+  install command for this repo (or the run is docs-only).
 - Possibly a `BASELINE:` block recording the build/lint/test health of
   the **base tree** (before any subtask's change), measured by the
   orchestrator directly. This is authoritative — treat it as ground

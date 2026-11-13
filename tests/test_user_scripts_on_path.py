@@ -48,9 +48,18 @@ def test_the_moved_base_s_scripts_go_last_in_place_of_the_old(leerie):
     assert env["PATH"].count("/new/pyuser/bin") == 1
 
 
-def test_a_baked_base_and_a_pathless_env_are_left_alone(leerie):
+def test_a_base_beneath_opt_is_no_exception(leerie):
+    """A user base beneath `/opt/` gets its scripts on `PATH` like any
+    other: no value is the image's (DESIGN §6½ *The repository image holds
+    no dependency*)."""
     env = {"PATH": "/usr/bin", "PYTHONUSERBASE": "/opt/bake/pyuser"}
     leerie._with_user_scripts(env, None)
+    assert env["PATH"].split(":") == ["/usr/bin", "/opt/bake/pyuser/bin"]
+
+
+def test_an_unmoved_base_and_a_pathless_env_are_left_alone(leerie):
+    env = {"PATH": "/usr/bin", "PYTHONUSERBASE": "/old/pyuser"}
+    leerie._with_user_scripts(env, "/old/pyuser")
     assert env["PATH"] == "/usr/bin"
     env = {"PYTHONUSERBASE": "/new/pyuser"}
     leerie._with_user_scripts(env, None)

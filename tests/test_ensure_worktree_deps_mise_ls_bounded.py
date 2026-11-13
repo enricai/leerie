@@ -32,7 +32,7 @@ def _make_state(leerie, tmp_path):
 class _HangingProc:
     """Mimics an `asyncio.subprocess.Process` whose `communicate()` never
     returns on its own — only cancellation (as driven by `asyncio.wait_for`
-    inside `run_proc`) unblocks it."""
+    inside `_run_proc`) unblocks it."""
 
     returncode = None
     pid = 999999

@@ -271,26 +271,22 @@ def test_both_builds_of_a_repository_image_reuse_no_cache(tmp_path):
 
 def test_the_generated_files_builds_reuse_no_cache(tmp_path):
     """Leerie's generated file is built by `build_repo_image` alone (review
-    round 35, execution R35E-1), and so is its fallback: when the
-    language-dep layer does not build, all three builds are given
-    `--no-cache` and leerie's frontend, pulled before them. Falsified:
+    round 35, execution R35E-1): both its builds are given `--no-cache` and
+    leerie's frontend, pulled before them. Falsified:
     either dropped from `build_repo_image`'s first build (fails); the pull
     dropped from the build decision (fails)."""
     from tests.test_build_repo_image import (_generate_dockerfile,
                                              _write_config_toml)
     user_repo = tmp_path / "repo"
     (user_repo / ".leerie").mkdir(parents=True)
-    _write_config_toml(user_repo / ".leerie")
-    (user_repo / "uv.lock").write_text("")
-    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    _write_config_toml(user_repo / ".leerie", setup_packages="jq")
     state = tmp_path / "state"
     state.mkdir()
-    r = _generate_dockerfile(tmp_path, user_repo, state,
-                             {"NERDCTL_FAIL_LANG_LAYER": "1"})
+    r = _generate_dockerfile(tmp_path, user_repo, state, {})
     assert r.returncode == 0, r.stderr
     builds = [line for line in (tmp_path / "nerdctl.log").read_text()
               .splitlines() if _is_build(line)]
-    assert len(builds) == 3, builds
+    assert len(builds) == 2, builds
     assert all(_LEERIE_BUILD.match(b) for b in builds), builds
     assert all(_pinned(b) for b in builds), builds
     calls = (tmp_path / "nerdctl.log").read_text().splitlines()
@@ -439,7 +435,7 @@ def test_every_build_site_is_given_a_cache_mount_namespace_of_its_own():
 
 def test_every_build_draws_a_fresh_cache_mount_namespace(tmp_path):
     """Run, not read: the base build, both builds of a repository image, the
-    generated file's three (its fallback's included), and `build-push.sh`'s
+    generated file's two, and `build-push.sh`'s
     builds on either builder, each run twice. Every one is given exactly
     one `leerie-<32 hex>` namespace, and no two are given the same.
     Falsified: one value drawn once per launch and reused for every build
@@ -467,12 +463,9 @@ def test_every_build_draws_a_fresh_cache_mount_namespace(tmp_path):
     gen = tmp_path / "gen"
     user_repo = gen / "repo"
     (user_repo / ".leerie").mkdir(parents=True)
-    _write_config_toml(user_repo / ".leerie")
-    (user_repo / "uv.lock").write_text("")
-    (user_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    _write_config_toml(user_repo / ".leerie", setup_packages="jq")
     (gen / "state").mkdir()
-    r = _generate_dockerfile(gen, user_repo, gen / "state",
-                             {"NERDCTL_FAIL_LANG_LAYER": "1"})
+    r = _generate_dockerfile(gen, user_repo, gen / "state", {})
     assert r.returncode == 0, r.stderr
     seen += _namespaces((gen / "nerdctl.log").read_text())
     for mode in ("remote", "local"):
@@ -486,7 +479,7 @@ def test_every_build_draws_a_fresh_cache_mount_namespace(tmp_path):
             assert r.returncode == 0, r.stderr
             log = "flyctl.log" if mode == "remote" else "nerdctl.log"
             seen += _namespaces((d / log).read_text())
-    assert len(seen) == 1 + 2 + 3 + 4, seen
+    assert len(seen) == 1 + 2 + 2 + 4, seen
     assert all(re.fullmatch(r"leerie-[0-9a-f]{32}", x) for x in seen), seen
     assert len(set(seen)) == len(seen), seen
 

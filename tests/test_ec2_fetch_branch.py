@@ -415,7 +415,7 @@ def test_fetch_state_ec2_names_the_capture_and_streams_nothing_back(
     (instance_work / ".leerie" / "Dockerfile").write_text("FROM debian:13\n")
     (instance_work / ".leerie" / "runs" / run_id / "captured-deps.json").write_text(
         json.dumps([{"from_run": run_id, "setup_packages": ["curl"],
-                     "language_installs": [], "replace": False}]))
+                     "replace": False}]))
 
     exec_log = tmp_path / "exec_log.txt"
     _make_stub_aws(tmp_path / "aws", exec_log, instance_work)

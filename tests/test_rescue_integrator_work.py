@@ -174,7 +174,7 @@ def test_rescue_swallows_an_exception(leerie, conflicted_repo, monkeypatch):
     async def boom(*a, **kw):
         raise FileNotFoundError("git: command not found")
 
-    monkeypatch.setattr(leerie, "run_proc", boom)
+    monkeypatch.setattr(leerie, "_run_proc", boom)
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref is None, "a raising git must degrade to None, not propagate"
@@ -186,7 +186,7 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
     """The `finally` must hold on the exception path too — otherwise a crashed
     rescue leaves a stale index in .git/ for the next attempt to trip over."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     calls = []
 
     async def boom_after_seed(cmd, **kw):
@@ -195,7 +195,7 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
             return await real(cmd, **kw)
         raise FileNotFoundError("git vanished mid-rescue")
 
-    monkeypatch.setattr(leerie, "run_proc", boom_after_seed)
+    monkeypatch.setattr(leerie, "_run_proc", boom_after_seed)
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
     assert ref is None
@@ -204,7 +204,7 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
 
 
 def _make_nth_call_fail_stub(real, fail_at_call, rc=1):
-    """Return a run_proc stub whose Nth invocation (1-indexed) returns a
+    """Return a _run_proc stub whose Nth invocation (1-indexed) returns a
     nonzero-returncode CompletedProcess instead of raising — exercising
     the `if <step>.returncode != 0: return None` guards directly, distinct
     from `test_rescue_swallows_an_exception`'s raising-git case."""
@@ -222,9 +222,9 @@ def test_rescue_returns_none_when_add_fails(leerie, conflicted_repo, monkeypatch
     """`git add -A` failing (2nd call, after read-tree) must degrade to None
     via the returncode guard, not raise."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     stub, calls = _make_nth_call_fail_stub(real, fail_at_call=2)
-    monkeypatch.setattr(leerie, "run_proc", stub)
+    monkeypatch.setattr(leerie, "_run_proc", stub)
 
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
@@ -236,9 +236,9 @@ def test_rescue_returns_none_when_write_tree_fails(leerie, conflicted_repo,
                                                     monkeypatch):
     """`git write-tree` failing (3rd call) must degrade to None."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     stub, calls = _make_nth_call_fail_stub(real, fail_at_call=3)
-    monkeypatch.setattr(leerie, "run_proc", stub)
+    monkeypatch.setattr(leerie, "_run_proc", stub)
 
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
@@ -253,7 +253,7 @@ def test_rescue_returns_none_when_write_tree_prints_no_sha(leerie,
     case as a nonzero rc — the `or not tree.stdout.strip()` half of the
     guard, not just the `tree.returncode != 0` half."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     calls: list[list[str]] = []
 
     async def _stub(cmd, **kw):
@@ -261,7 +261,7 @@ def test_rescue_returns_none_when_write_tree_prints_no_sha(leerie,
         if len(calls) == 3:
             return subprocess.CompletedProcess(cmd, 0, stdout="  \n", stderr="")
         return await real(cmd, **kw)
-    monkeypatch.setattr(leerie, "run_proc", _stub)
+    monkeypatch.setattr(leerie, "_run_proc", _stub)
 
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
@@ -273,9 +273,9 @@ def test_rescue_returns_none_when_commit_tree_fails(leerie, conflicted_repo,
     """`git commit-tree` failing (5th call, after the head-tree comparison)
     must degrade to None."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     stub, calls = _make_nth_call_fail_stub(real, fail_at_call=5)
-    monkeypatch.setattr(leerie, "run_proc", stub)
+    monkeypatch.setattr(leerie, "_run_proc", stub)
 
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))
@@ -290,9 +290,9 @@ def test_rescue_returns_none_when_update_ref_fails(leerie, conflicted_repo,
     stray, unreferenced commit is harmless, but claiming a ref exists
     when it doesn't would be a lie to the operator."""
     (conflicted_repo / "f.txt").write_text("RESOLVED\n")
-    real = leerie.run_proc
+    real = leerie._run_proc
     stub, calls = _make_nth_call_fail_stub(real, fail_at_call=6)
-    monkeypatch.setattr(leerie, "run_proc", stub)
+    monkeypatch.setattr(leerie, "_run_proc", stub)
 
     ref = _run(leerie._rescue_integrator_work(
         conflicted_repo, "feat-006", "run1"))

@@ -494,7 +494,6 @@ _DEPCAP_ENVELOPE = {
     "result": "{}",
     "structured_output": {
         "setup_packages": [],
-        "language_installs": [],
         "dockerfile_notes": None,
     },
     "usage": {"input_tokens": 10, "output_tokens": 10},

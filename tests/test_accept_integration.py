@@ -399,7 +399,7 @@ def test_without_accept_resume_reinvokes_the_judge(
         return mock
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", fake_run_proc)
     judge_checkout_in_place(leerie, monkeypatch)
 
     async def _run():

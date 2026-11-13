@@ -9,9 +9,9 @@ during the 2026-08-01 audit:
                            "zero remaining callers" — and it was left in
                            place, with its unit tests the only callers.
   _repo_map_cache_key      described a cache key nothing computed.
-  _is_node_offline_relink  superseded by `_filter_residual_deps`, which
-                           tests the same condition inline and
-                           deliberately more broadly. A test pinned its
+  _is_node_offline_relink  superseded by `_filter_residual_deps` (itself
+                           removed 2026-11-12), which tested the same
+                           condition inline and more broadly. A test pinned its
                            *existence*, which only guaranteed it stayed
                            dead.
 

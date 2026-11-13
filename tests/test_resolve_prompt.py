@@ -39,6 +39,6 @@ def test_load_prompt_dep_capture(leerie):
     """dep_capture is a non-WORKER_TYPES worker; _load_prompt must find its file."""
     content = leerie._load_prompt("dep_capture")
     assert content and content.strip(), "dep_capture prompt must be non-empty"
-    # All three schema fields must be documented (per success criteria §3).
-    for field in ("setup_packages", "language_installs", "dockerfile_notes"):
+    # Both schema fields must be documented (per success criteria §3).
+    for field in ("setup_packages", "dockerfile_notes"):
         assert field in content, f"dep_capture prompt missing schema field: {field}"

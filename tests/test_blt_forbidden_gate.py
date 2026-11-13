@@ -75,7 +75,7 @@ def test_no_shell_launch_outside_the_gate():
 # went past it on every run (review r2 H1).
 _SUBPROCESS = {"run", "Popen", "check_output", "check_call", "call",
                "getoutput", "getstatusoutput"}
-_LAUNCH_FUNCS = {"run_proc", "_run_streaming", "_run_contained"}
+_LAUNCH_FUNCS = {"_run_proc", "_run_streaming", "_run_contained"}
 
 # A literal argv led by one of these runs a program leerie itself chose —
 # never a command read from the repository, a CI file, the plan or the
@@ -101,7 +101,7 @@ LEERIE_OWNED_HEADS = {
 # computed argv must go through `_blt_shell_argv` or be added here with a
 # reason a reviewer can check.
 EXEMPT = {
-    "run_proc": "the launch primitive; its callers are checked",
+    "_run_proc": "the launch primitive; its callers are checked",
     "_run_streaming": "the launch primitive; its callers are checked",
     "_run_contained": "the contained-launch primitive; callers are checked",
     "_invoke": "spawns the `claude -p` worker argv `claude_p` builds",
@@ -242,7 +242,7 @@ def test_the_guard_flags_an_argv_launch_of_a_repo_command():
         "    argv = _blt_shell_argv(cmd, forb)\n"
         "    await _run_contained(argv, cwd='.')\n"
         "async def fixed():\n"
-        "    await run_proc(['git', 'status'])\n")
+        "    await _run_proc(['git', 'status'])\n")
     bad = _repo_command_launches_outside_the_gate(ast.parse(src))
     assert sorted(b[1] for b in bad) == ["ci", "deps", "raw"]
 

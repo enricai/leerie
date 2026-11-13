@@ -92,12 +92,12 @@ def test_probe_goes_through_the_proxy(leerie, proxy):
 
 def test_the_proxy_credential_never_reaches_argv(leerie, proxy, monkeypatch):
     seen: list = []
-    real = leerie.run_proc
+    real = leerie._run_proc
 
     async def _spy(cmd, **kw):
         seen.append((list(cmd), kw.get("env")))
         return await real(cmd, **kw)
-    monkeypatch.setattr(leerie, "run_proc", _spy)
+    monkeypatch.setattr(leerie, "_run_proc", _spy)
     assert asyncio.run(leerie._network_reach(
         "reach.leerie-proxy.invalid", 443)) == "reachable"
     (argv, penv), = seen

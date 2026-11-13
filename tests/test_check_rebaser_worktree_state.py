@@ -314,7 +314,7 @@ def test_unresolvable_rebase_state_fails_closed(leerie, tmp_path,
                                                 monkeypatch, claim):
     repo = init_git_repo(tmp_path / "repo")
     pre_sha = _rev_parse(repo, "HEAD")
-    real_run_proc = leerie.run_proc
+    real_run_proc = leerie._run_proc
 
     async def failing_git_path(cmd, **kw):
         # Wherever the subcommand sits: leerie names the tree's repository
@@ -324,7 +324,7 @@ def test_unresolvable_rebase_state_fails_closed(leerie, tmp_path,
             return subprocess.CompletedProcess(cmd, 128, "", "fatal")
         return await real_run_proc(cmd, **kw)
 
-    monkeypatch.setattr(leerie, "run_proc", failing_git_path)
+    monkeypatch.setattr(leerie, "_run_proc", failing_git_path)
     result = asyncio.run(
         leerie.check_rebaser_worktree_state(repo, claim, pre_sha))
     assert result is not None and "could not verify" in result

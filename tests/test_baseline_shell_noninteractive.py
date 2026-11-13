@@ -9,7 +9,7 @@ image's `ENV PATH=...` (Dockerfile:288). A login shell sources
 so a mise-managed runner (pnpm, npx, ...) silently resolves to "not found"
 during the baseline capture even though it is genuinely on PATH for every
 other command path in the module, all of which already use `["bash", "-c"]`
-via `run_proc`/`_run_streaming` call sites elsewhere.
+via `_run_proc`/`_run_streaming` call sites elsewhere.
 """
 from __future__ import annotations
 

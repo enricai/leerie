@@ -518,78 +518,12 @@ def test_nerdctl_run_uses_repo_image_ref_when_set(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Language-dep bake (bake_language_deps, default true)
+# The repository image holds no dependency (DESIGN §6½): only the apt layer
 # ---------------------------------------------------------------------------
 
-def test_language_dep_layer_included_for_pnpm_repo(tmp_path):
-    """With pnpm-lock.yaml present and bake_language_deps=true, the auto-generated
-    Dockerfile includes COPY of lockfile+manifests and RUN pnpm install."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "libvips-dev"\n')
-    # Simulate a pnpm repo.
-    (user_repo / "package.json").write_text('{"name":"test"}')
-    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-            "LEERIE_BAKE_LANGUAGE_DEPS": "true",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    df_content = result.stdout
-    # Must have apt layer.
-    assert "apt-get install" in df_content
-    assert "libvips-dev" in df_content
-    # Must have COPY line including pnpm-lock.yaml.
-    assert "COPY" in df_content
-    assert "pnpm-lock.yaml" in df_content
-    # Must have RUN pnpm install.
-    assert "RUN pnpm install --frozen-lockfile" in df_content
-    # Must have copy-input-shas comment so Dockerfile sha captures dep drift.
-    assert "copy-input-shas:" in df_content
-    assert "pnpm-lock.yaml=" in df_content
-
-
-def test_language_dep_layer_includes_patches_for_pnpm(tmp_path):
-    """patches/ directory is included in COPY when present (pnpm patchedDependencies)."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    (user_repo / "package.json").write_text('{"name":"test"}')
-    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
-    patches_dir = user_repo / "patches"
-    patches_dir.mkdir()
-    (patches_dir / "foo.patch").write_text("--- a/foo\n+++ b/foo\n")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert "patches/" in result.stdout
-
-
-def test_language_dep_layer_disabled_by_env(tmp_path):
-    """LEERIE_BAKE_LANGUAGE_DEPS=false produces apt-only Dockerfile."""
+def test_setup_packages_generate_only_the_apt_layer(tmp_path):
+    """setup_packages generate the apt layer and nothing else: no COPY, no
+    `RUN` but the apt one, whatever lockfile the tree holds."""
     user_repo = tmp_path / "repo"
     leerie_dir = user_repo / ".leerie"
     leerie_dir.mkdir(parents=True)
@@ -607,125 +541,13 @@ def test_language_dep_layer_disabled_by_env(tmp_path):
             "NERDCTL_INSPECT_RC": "1",
             "NERDCTL_BUILD_RC": "0",
             "FAKE_GIT_REMOTE": "",
-            "LEERIE_BAKE_LANGUAGE_DEPS": "false",
         },
     )
     assert result.returncode == 0, result.stderr
     df_content = result.stdout
-    # apt layer present.
-    assert "apt-get install" in df_content
-    assert "curl" in df_content
-    # No language-dep layer.
+    assert "apt-get install" in df_content and "curl" in df_content
     assert "COPY" not in df_content
-    assert "pnpm install" not in df_content
-    assert "copy-input-shas" not in df_content
-
-
-def test_language_dep_disabled_via_zero(tmp_path):
-    """LEERIE_BAKE_LANGUAGE_DEPS=0 is accepted as false."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "libffi-dev"\n')
-    (user_repo / "pnpm-lock.yaml").write_text("lockfileVersion: '6.0'\n")
-    (user_repo / "package.json").write_text('{}')
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-            "LEERIE_BAKE_LANGUAGE_DEPS": "0",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert "COPY" not in result.stdout
-    assert "pnpm install" not in result.stdout
-
-
-def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
-    """A lockfile change causes the Dockerfile sha to differ (because the sha
-    comment line changes), which flips _need_build=true via the hash check."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    (user_repo / "package.json").write_text('{"name":"x"}')
-    lockfile = user_repo / "pnpm-lock.yaml"
-    lockfile.write_text("lockfileVersion: '6.0'\n")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    # First run: generate Dockerfile, record its sha.
-    result1 = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result1.returncode == 0, result1.stderr
-    df_content_v1 = result1.stdout
-    assert "copy-input-shas:" in df_content_v1
-
-    # Now simulate a lockfile change — the sha comment will differ in a new
-    # generation. No manual Dockerfile removal needed: the generated file
-    # carries the leerie-generated sentinel, so the launcher refreshes it
-    # in place (GAP 4 auto-refresh).
-    lockfile.write_text("lockfileVersion: '6.0'\n# changed\n")
-
-    result2 = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "0",  # image present
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result2.returncode == 0, result2.stderr
-    df_content_v2 = result2.stdout
-
-    # The copy-input-shas line must differ between v1 and v2 (different sha).
-    sha_line_v1 = next((l for l in df_content_v1.splitlines() if "copy-input-shas:" in l), "")
-    sha_line_v2 = next((l for l in df_content_v2.splitlines() if "copy-input-shas:" in l), "")
-    assert sha_line_v1 != sha_line_v2, "copy-input sha comment must differ when lockfile changes"
-
-
-def test_no_lockfile_no_language_dep_layer(tmp_path):
-    """Without any lockfile, only the apt layer is generated even with bake_language_deps=true."""
-    user_repo = tmp_path / "repo"
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    # No lockfile in user_repo.
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-            "LEERIE_BAKE_LANGUAGE_DEPS": "true",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    df_content = result.stdout
-    assert "apt-get install" in df_content
-    assert "COPY" not in df_content
+    assert df_content.count("RUN ") == 1, df_content
 
 
 def test_unrelated_file_change_no_rebuild(tmp_path):
@@ -771,130 +593,6 @@ def test_unrelated_file_change_no_rebuild(tmp_path):
     # No rebuild should have fired.
     assert "per-repo image up-to-date" in result.stderr
     assert "building per-repo container image" not in result.stderr
-
-
-def test_language_dep_sentinel_strings_in_launcher():
-    """Coupling assertion: the language-dep template sentinel strings exist
-    verbatim in the live launcher source so the test stays tied to reality."""
-    launcher_text = _launcher_text()
-    # The sha comment format string must be present in the Python embedded block.
-    assert "copy-input-shas:" in launcher_text
-    # The pnpm install command used in the RUN layer.
-    assert "pnpm install --frozen-lockfile" in launcher_text
-    # The COPY+RUN emission path.
-    assert "COPY " in launcher_text
-    # bake_language_deps resolution variable.
-    assert "_BAKE_LANGUAGE_DEPS" in launcher_text
-    # Shared node-ancillary helper (GAP 2) and generated-Dockerfile sentinel (GAP 4).
-    assert "_node_ancillary" in launcher_text
-    assert "# leerie-generated" in launcher_text
-
-
-# ---------------------------------------------------------------------------
-# GAP 2 — COPY set complete for yarn AND npm (not just pnpm): workspace
-# children (from package.json "workspaces"), .npmrc, and patches/.
-# ---------------------------------------------------------------------------
-
-def _make_workspace_repo(user_repo, lockfile_name, workspaces_field):
-    """Build a node workspace repo with a child package, .npmrc, and a patch."""
-    leerie_dir = user_repo / ".leerie"
-    leerie_dir.mkdir(parents=True)
-    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
-    import json
-    (user_repo / "package.json").write_text(
-        json.dumps({"name": "root", "workspaces": workspaces_field}))
-    (user_repo / lockfile_name).write_text("# lock\n")
-    (user_repo / ".npmrc").write_text("registry=https://example.com\n")
-    child = user_repo / "packages" / "child"
-    child.mkdir(parents=True)
-    (child / "package.json").write_text('{"name":"@x/child"}')
-    patches = user_repo / "patches"
-    patches.mkdir()
-    (patches / "foo.patch").write_text("--- a/f\n+++ b/f\n")
-
-
-def _assert_full_node_copy(df_content, lockfile_name):
-    assert lockfile_name in df_content
-    assert "packages/child/package.json" in df_content
-    assert ".npmrc" in df_content
-    assert "patches/" in df_content
-    # sha comment must include the patch + child manifest, not just the lockfile.
-    assert "copy-input-shas:" in df_content
-    assert "patches/foo.patch=" in df_content
-    assert "packages/child/package.json=" in df_content
-
-
-def test_language_dep_full_copy_for_yarn_workspace(tmp_path):
-    """GAP 2: a yarn workspace repo COPYs workspace children, .npmrc, patches/
-    (workspaces declared as a list in package.json)."""
-    user_repo = tmp_path / "repo"
-    _make_workspace_repo(user_repo, "yarn.lock", ["packages/*"])
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert "RUN yarn install --frozen-lockfile" in result.stdout
-    _assert_full_node_copy(result.stdout, "yarn.lock")
-
-
-def test_language_dep_full_copy_for_npm_workspace(tmp_path):
-    """GAP 2: an npm workspace repo COPYs workspace children, .npmrc, patches/
-    (workspaces declared as a {"packages": [...]} object)."""
-    user_repo = tmp_path / "repo"
-    _make_workspace_repo(user_repo, "package-lock.json", {"packages": ["packages/*"]})
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    result = _run_harness(
-        BUILT_DOCKERFILE,
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "NERDCTL_INSPECT_RC": "1",
-            "NERDCTL_BUILD_RC": "0",
-            "FAKE_GIT_REMOTE": "",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert "RUN npm ci" in result.stdout
-    _assert_full_node_copy(result.stdout, "package-lock.json")
-
-
-def test_patch_edit_changes_copy_input_sha(tmp_path):
-    """GAP 3: editing a file under patches/ WITHOUT touching the lockfile must
-    change the copy-input-shas line (so .dockerfile-hash flips → rebuild)."""
-    user_repo = tmp_path / "repo"
-    _make_workspace_repo(user_repo, "pnpm-lock.yaml", ["packages/*"])
-    (user_repo / "pnpm-workspace.yaml").write_text("packages:\n  - 'packages/*'\n")
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    env = {
-        "USER_REPO": str(user_repo),
-        "LEERIE_STATE_HOST_DIR": str(state_dir),
-        "NERDCTL_INSPECT_RC": "1",
-        "NERDCTL_BUILD_RC": "0",
-        "FAKE_GIT_REMOTE": "",
-    }
-    r1 = _run_harness(BUILT_DOCKERFILE, env=env)
-    assert r1.returncode == 0, r1.stderr
-    sha1 = next((l for l in r1.stdout.splitlines() if "copy-input-shas:" in l), "")
-
-    # Edit the patch only; lockfile untouched. Generated Dockerfile refreshes
-    # in place (sentinel), so no manual removal.
-    (user_repo / "patches" / "foo.patch").write_text("--- a/f\n+++ b/f\n@@ changed\n")
-    r2 = _run_harness(BUILT_DOCKERFILE,
-                      env={**env, "NERDCTL_INSPECT_RC": "0"})
-    assert r2.returncode == 0, r2.stderr
-    sha2 = next((l for l in r2.stdout.splitlines() if "copy-input-shas:" in l), "")
-    assert sha1 and sha2 and sha1 != sha2, "patch edit must change copy-input-shas"
 
 
 # ---------------------------------------------------------------------------
@@ -1062,7 +760,7 @@ def test_a_committed_dockerfile_whose_mark_was_removed_is_the_repositorys(
                      FIRST_BUILD_OUT=str(out))
     assert result.returncode == 0, result.stderr
     assert _built_bytes(tmp_path) == mine.encode()
-    assert "setup_packages and language_installs are not read" in \
+    assert "setup_packages is not read while it is there" in \
         result.stderr, result.stderr
     assert "generating the repository image's Dockerfile" not in result.stderr
 

@@ -2706,8 +2706,7 @@ directory is granted only when it lies beneath `<run-dir>/workers/`
 (`_worker_own_dirs`): one left at a shared default — `/tmp`, `~/.claude` —
 grants nothing. The caches are granted as the one directory its side
 shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
-`MISE_DATA_DIR`, `/opt/venv`, `/opt/bundle`, `/opt/cargo-target`,
-`/opt/go-cache` and the run's stores `<run-dir>/worktrees/.stores/stores/` are never
+`MISE_DATA_DIR` and the run's stores `<run-dir>/worktrees/.stores/stores/` are never
 granted, so no store leerie's own commands install from can be written by
 a worker. The grants are computed after `claude_p` has named
 the worker's own directories, and follow them.
@@ -3208,7 +3207,7 @@ choose the root itself.
 broker, `container-entry.sh`, the Landlock shim, a worker's CLI and the
 helpers it runs — runs in a root filesystem repository content shaped.
 Repository-derived filesystem content (a committed `.leerie/Dockerfile`,
-`setup_packages`, `language_installs`, the lockfile bake) is only ever the
+`setup_packages`) is only ever the
 root of a confined process: a worker's command, a repository command
 leerie runs, a held-out sandbox's runner. It becomes their root only after
 they are confined.
@@ -3357,15 +3356,14 @@ they are confined.
   program in a root a worker shaped gains anything, and Landlock's rules
   are on inodes, so a `chroot` widens no grant.
 - *The worker stage's environment reaches only confined commands.* A
-  committed Dockerfile's `ENV PATH=…`, a bake's `VIRTUAL_ENV` and
-  `BUNDLE_PATH`: the orchestrator's environment is the base image's and
+  committed Dockerfile's `ENV PATH=…` or `VIRTUAL_ENV`: the orchestrator's environment is the base image's and
   never takes them (a `PATH` the repository chose would decide which `git`
   the orchestrator runs). The shim and `worker-shell.py` lay the
   difference between the two recorded environments over a command's
   (`worker_env_changes`, `apply_worker_env`): a variable the orchestrator
-  did not set, or one beneath `/opt/` (what the worker stage built, as
-  `_BAKED_ROOT` already treats it), and the `PATH` entries the base's
-  `PATH` lacks, first. Leerie's, the CLI's and Anthropic's variables, the
+  did not set — a store variable it set is the run's, whatever the stage
+  says (§6½ *The repository image holds no dependency*) — and the `PATH`
+  entries the base's `PATH` lacks, first. Leerie's, the CLI's and Anthropic's variables, the
   proxy variables, `HOME` and `TMPDIR` are never taken. This replaces the
   launcher's search of the Dockerfile for `ENV BUNDLE_PATH`.
 - *The build sees the committed tree.* The build context is taken from
@@ -3949,21 +3947,21 @@ anyway. A checkout that switches between two branches whose copied files
 differ rebuilds from nothing on each switch. Each launch exports, dates
 and hashes the context, which for a whole-tree copy is the size of the
 tree. A launch that needs no rebuild runs no build at all, whatever wrote
-the Dockerfile. Leerie's generated file is tested only by its own build:
-when its language-dep layer does not build, the launch builds the same
-file without that layer (*Language deps*, §6½), and records the image
-under the key of the file it generated, so the next launch, which
-generates the same file, reuses it, and warns that it does. *Revised
-2026-11-03 (review round 35, execution R35E-1).* A separate probe build of the generated file ran on
-every launch, before the rebuild check; once every build was given
-`--no-cache`, it reinstalled every language dependency on each launch and
-threw the result away (32 s instead of 11 s for a one-package bake,
-measured; minutes for a real lockfile), and each launch needed apt and the
-package registry. On a rebuild it doubled the build.
+the Dockerfile. Leerie's generated file is tested only by its own build.
+*Revised 2026-11-03 (review round 35, execution R35E-1).* A separate
+probe build of the generated file ran on every launch, before the rebuild
+check; once every build was given `--no-cache`, it reinstalled every
+language dependency on each launch and threw the result away (32 s
+instead of 11 s for a one-package bake, measured; minutes for a real
+lockfile), and each launch needed apt and the package registry. On a
+rebuild it doubled the build. The generated file holds an apt layer and
+nothing else since 2026-11-12 (§6½ *The repository image holds no
+dependency*), so a failure of its build is the build's error, with no
+fallback.
 
 **Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
-tools in leerie's root: a path only the worker root has (`/opt/venv/…`)
-is found by a command, not by those tools. A worker stage whose last
+tools in leerie's root: a path only the worker root has (a Debian
+package's files) is found by a command, not by those tools. A worker stage whose last
 stage has no `/bin/sh` cannot record its environment, so its build fails.
 The pinned frontend image is a network pull (about 14 MB), as a
 `# syntax=` frontend was. The launcher pulls it into the containerd
@@ -4915,12 +4913,11 @@ admission gate), the worker and rate-limit timeouts, verbosity, `no_push`
 (it can only withhold a push), `pr_template`, `pr_base_branch`,
 `strict_conformer`, `stop_on_blocked`, `stop_on_repo_change` (each only
 tightens), `subtask_tests` (the final tree is measured whatever it says),
-`skip_repo_map` (context, not a check), the heal and judge tuning, the seed
-knobs and `bake_language_deps`. The operator's flag or environment overrides
+`skip_repo_map` (context, not a check), the heal and judge tuning and the seed
+knobs. The operator's flag or environment overrides
 each.
 
-**Residual.** `.leerie/Dockerfile`, `setup_packages`, `language_installs` and
-a dependency lockfile build the image the run's container starts from, and
+**Residual.** `.leerie/Dockerfile` and `setup_packages` build the image the run's container starts from, and
 that build is not confined: its steps run as root in the image, and the
 image holds the orchestrator itself. A repository's content therefore still
 shapes the orchestrator's own environment. This design does not close that.
@@ -8739,10 +8736,11 @@ every manager, and no manager is configured differently because of it:
   (`_tree_store_env`): the stores that hold one tree's environment or build
   (*Which stores an install may share*, below).
 
-A variable pointing beneath the image's bake root (`/opt/`, the
-*persistent out-of-repo dependency bake*) is left alone on every side:
-those are dependencies leerie built into the image, which the recipe no
-longer installs.
+No variable is left at a value the image chose: the image holds no
+dependency (§6½ *The repository image holds no dependency*). Until
+2026-11-12 one pointing beneath `/opt/`, where a bake put dependencies,
+was kept on every side, read-only, so a subtask that added a dependency
+could not install it.
 
 *Why the shared read-only store was replaced* (2026-11-04). Until 0.44.3
 leerie's commands shared one store per repository across runs,
@@ -8837,9 +8835,8 @@ unmeasured. *Wherever leerie points a confined process's
 `PYTHONUSERBASE`, that process's `PATH` carries its `bin`, last*
 (`_with_user_scripts`, in `_worker_cache_env`, `_tree_store_env` and
 every command `_run_streaming` starts), in place of the value it replaces,
-and after the image's tools, so a user-installed script never shadows a
-baked one. A value beneath the bake root is the image's and is left
-alone. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
+and after the image's tools, so a user-installed script never shadows one
+the image holds. Never on the orchestrator's own `PATH` (`_leerie_stores` sets the
 store variables there, not `PATH`): leerie's unconfined process never
 resolves a program from a store directory, which a confined command writes
 (review round 23 isolation, an observation f0ce3e56 opened).
@@ -11393,151 +11390,84 @@ the CI parity baseline, the browser suite unable to start).
    schema-validated, the commands inside it are restricted by an
    argv-allowlist, and any deviation from the schema rejects the
    worker. This is a *deliberate* exception to §12 — see below.
-5. **Persistent out-of-repo dependency bake.** Dependencies are
-   installed once at image-build time into persistent paths outside
-   `/work`, so a fresh worktree inherits the bake with zero (or
-   minimal, for Node) install cost. The bake targets:
+5. **The repository image holds no dependency.** *Revised 2026-11-12
+   (OPEN-ISSUES #23; the language-agnostic audit's cluster C1).*
 
-   - **Python:** `/opt/venv` — a virtual environment created via `pip`
-     or `uv` from the repo's `requirements.txt`, `pyproject.toml`, or
-     `Pipfile.lock`. Workers activate it via `ENV VIRTUAL_ENV=/opt/venv`
-     and `PATH`.
-   - **Ruby:** `/opt/bundle` — Bundler installs gems here via
-     `BUNDLE_PATH=/opt/bundle`. Workers inherit the env var and find
-     gems without a per-worktree `bundle install`.
-   - **Rust:** A pre-populated `CARGO_TARGET_DIR` (build artifacts)
-     plus a warmed `CARGO_HOME` (registry cache). A `cargo build` in a
-     worktree hits no network and reuses compiled dependencies.
-   - **Go:** A pre-populated `GOCACHE` (build cache) plus a warmed
-     `GOMODCACHE` (fetched modules). A `go build` in a worktree is
-     network-free and reuses the module cache.
-   - **Node/pnpm:** A warmed pnpm content-addressable store with
-     `frozenStore` set. `node_modules` cannot be fully baked — it must
-     live inside the repo tree to resolve — so the residual per-run
-     step is a fast, network-free, extract-free `pnpm install
-     --offline --frozen-lockfile` that relinks the baked store into
-     the worktree: not zero-cost, but no download or extraction, only
-     symlink creation.
+   *Root cause.* Until 0.65.0 the launcher baked a repository's
+   dependencies into its image from a hand-written manager-to-command
+   table (the generator's `_INSTALL_COMMANDS`, kept equal to the
+   orchestrator's `BAKE_INSTALL_COMMANDS`: thirteen managers), chosen by
+   which lockfile the tree holds, onto a base image whose only runtimes
+   are leerie's Node and one Python. Nothing installed the runtime a layer
+   needed, so every layer for a manager whose runtime the base lacks
+   failed — `bundle install`, `cargo fetch`, `go mod download`, `composer
+   install`, `dotnet restore` — and the launch built the apt-only
+   fallback with a warning, every time (a user's Rails repository, Ruby
+   3.3.9 from `.ruby-version`: ten runs on 0.39.0–0.55.1, the recipe
+   `bundle install` each time, no layer ever built). A layer that did
+   build was not read: a Node layer installs into the worker stage's
+   `/work`, and every run measures in views under the state mount. And
+   the orchestrator acted as if every bake had built:
+   `_format_provision_recipe_section` dropped every pip, uv, poetry,
+   pipenv, bundle, cargo and go install from the implementer's and the
+   conformer's prompts as "baked" (in those ten runs, 0 of 62 implementer
+   and 0 of 65 conformer prompts carried the recipe), and the implementer
+   prompt told every repository that its Python dependencies were in a
+   shared `/opt/venv`. A store variable a bake pointed beneath `/opt/`
+   (`_BAKED_ROOT`) was kept, read-only, on every side, so a subtask that
+   added a dependency could not install it. The defect is the shape, not
+   a missing row: a list of managers covers the managers someone listed
+   and fails without a word for the rest.
 
-   **Rust and Go require a discardable dummy source file at
-   build time.** Neither `cargo fetch`/`cargo build` nor `go
-   build` will populate their respective build-artifact caches
-   (`CARGO_TARGET_DIR` / `GOCACHE`) against a manifest-only build
-   context — `cargo` refuses to parse a manifest with no build
-   target at all, and `go build ./...` against zero `.go` files
-   is a silent no-op (only `go mod download`'s `GOMODCACHE` warms
-   without one). This is a well-documented Cargo/Go Docker-layer-
-   caching workaround (no `cargo build --dependencies-only`
-   exists): emit a throwaway `src/main.rs` (`fn main() {}`) or
-   `main.go` into the build scratch dir, run the fetch/build step
-   against it to force the dependency graph to compile, then
-   discard the dummy file — never `COPY` it into `/work`. Verified:
-   a real worktree's subsequent build against real source then
-   gets a genuine cache hit from the same baked cache, fully
-   offline, from a different directory.
+   *Invariant.* The repository image holds the Debian packages the
+   configuration names (`setup_packages`) and nothing a run installs.
+   Every dependency a run uses is installed by that run, into its own
+   stores (§6 *The stores a view installs from are leerie's*), from the
+   recipe it proved (steps 3–4; *Who runs that install* above) — which is
+   what every run already did, for every ecosystem: the orchestrator
+   installs the recipe in each tree it measures, and a worker in its own.
+   So there is no dependency layer, no manager table, no `/opt/` exception
+   to the stores, and the `PROVISION_RECIPE:` block carries every install
+   and build entry. A runtime is not a dependency: the version a
+   repository pins is the one mise discovers from the repository's own
+   files (step 2), installed into the host's `MISE_DATA_DIR`
+   (`~/.cache/leerie/mise-data`, §6 *One toolchain install at a time on a
+   host*), which keeps it across runs, launches and leerie upgrades.
 
-   **The Rust bake step must NOT use `cargo build --release`.**
-   Cargo keys its build cache by profile — `debug/` and
-   `release/` are separate subtrees under `CARGO_TARGET_DIR` —
-   so a `--release` bake produces **zero cache benefit** for a
-   plain `cargo build`/`cargo test`, both of which default to the
-   debug profile. Reproduced live: a `--release` bake left a
-   worktree's subsequent `cargo build` recompiling every dependency
-   from scratch. Go has no equivalent split, so this trap is
-   Rust-specific.
+   *What a run pays.* One dependency install per tree it measures, as
+   before. The bake saved it only for a Python repository whose
+   `/opt/venv` built, and there it put a venv made by the image's Debian
+   Python ahead of the version the repository pins; for Node it saved
+   nothing, and for Ruby, Rust, Go, PHP and .NET it never built.
 
-   **Immutability invariant:** The baked layer is shared and
-   read-only across up to `max_parallel` (default 5) concurrent
-   worktrees. A worktree that changes a dependency (edits
-   `package.json`, `requirements.txt`, `Gemfile`, `Cargo.toml`,
-   etc.) must materialize its own private, mutated layer rather
-   than writing to the shared bake — this prevents both staleness
-   (a worktree silently resolving deps it changed) and
-   cross-worktree corruption. Node, Rust, and Go are naturally
-   safe to bake: their package managers use content-addressed
-   stores or input-hash-keyed caches, so concurrent access is
-   read-only by design.
+   *Considered instead.* (a) Adding the missing runtimes to the base
+   image, so each layer could build: another hand list, and the layer
+   would still bake into `/opt/` stores a subtask cannot write. (b)
+   Baking the repository's pinned toolchains into the image, from the
+   run's own `mise ls --current --json`, as exec-form `mise install
+   --system <tool>@<version>` lines: measured on 0.65.0's image, a Ruby
+   or Zig installed that way resolves for a tree pinning it, but a Rust
+   toolchain does not resolve for the `leerie` user (rustup's homes are
+   the installing user's), and Go's version lives in `go.mod`, which mise
+   does not read; and `MISE_DATA_DIR` already keeps every toolchain a run
+   installs, while an image layer is rebuilt on every leerie upgrade. (c)
+   Caching dependency installs across runs, keyed by the recipe and its
+   inputs: that is a store shared across runs, which §6 *The stores a
+   view installs from are leerie's* rules out, so it is a change to that
+   invariant and is not made here.
 
-   **Python requires a clone-then-delta approach.** A `.pth`-file
-   overlay or a `--system-site-packages` venv does not correctly
-   handle dependency *removal* or a fresh venv's isolation from
-   another venv's packages. The mechanism is `cp -r /opt/venv` into
-   a private copy, then apply the dependency delta via `pip
-   install`/`pip uninstall`. No `pyvenv.cfg` editing or `bin/`
-   shebang relocation is needed — `pyvenv.cfg`'s `home =` line
-   points at the system Python install and is unaffected by moving
-   the clone. The one real trap is invoking the clone's `bin/pip`
-   directly: that script's shebang is hardcoded to the *original*
-   `/opt/venv`'s python binary, so `bin/pip install`/`uninstall`
-   silently operate on the shared `/opt/venv` instead of the clone,
-   corrupting the bake for every other concurrent worktree
-   (reproduced live). The fix is an invocation convention: always
-   run `<clone>/bin/python3 -m pip install|uninstall`, never
-   `<clone>/bin/pip` — `-m pip` runs pip as a module inside that
-   interpreter's own `sys.prefix`, sidestepping the shebang. This
-   materializes a full private environment only when a subtask
-   actually mutates dependencies — the common case consumes the
-   shared `/opt/venv` directly with zero clone cost. `uv sync`
-   silently ignores `VIRTUAL_ENV` unless `--active` is passed, and
-   `pipenv` has long-standing bugs about not respecting an
-   already-active venv at all — the bake sidesteps both by
-   installing the tool itself into `/opt/venv` via pip at build
-   time, so the tool's own `/opt/venv/bin/<tool>` resolves
-   `sys.prefix` correctly by construction.
+   An earlier `.leerie/config.toml`'s `language_installs` and
+   `bake_language_deps` are no longer read; the launch says so once and
+   leaves the file as it is.
 
-   **Cache invalidation is preserved.** The existing rebuild-decision
-   mechanism — SHA-256 of every dependency-input file (lockfiles,
-   manifests, workspace `package.json`s, `patches/`, `.npmrc`) folded
-   into the generated Dockerfile, driving a `.dockerfile-hash`
-   rebuild check — continues to work; only the install *target*
-   changes from `/work` to `/opt/*`. A dependency-input change
-   triggers a full image rebuild; an unrelated source-file change
-   does not. The cost — minutes per rebuild — is paid once across all
-   subsequent runs.
-
-   **config.toml's role narrows to residual-only.** The file no
-   longer represents "what gets installed per run" broadly — it
-   holds only the irreducible residual that cannot be baked: typically
-   empty for Python/Ruby/Rust/Go, and just the offline-relink note for
-   Node/pnpm. The `dep_capture` worker (*Auto-capture* below) always
-   runs at finalize time, even with a committed `.leerie/Dockerfile`,
-   and writes only residual dependencies workers executed but could
-   not bake — so `config.toml` grows only when new residuals appear,
-   never churning on every baked-dep change.
-
-   **Permissions under rootless containerd.** The baked `/opt/*`
-   directories must be **root-owned and world-readable** (`drwxr-xr-x
-   root:root`), not chowned to the `leerie` user. This is the
-   inverse of normal Docker intuition and is load-bearing under
-   rootless containerd. Rootless drops privilege via `unshare
-   --user --map-user=$(id -u leerie)`, a single-entry UID map
-   (outer UID 0 → inner `leerie`) that leaves outer `leerie`
-   *unmapped*. An image-layer directory explicitly chowned to
-   `leerie`'s non-zero UID appears as `nobody/65534` to the
-   privilege-dropped process — traversable via mode-755 "other"
-   bits but not writable. A root-owned directory, by contrast, is
-   writable because outer root maps to inner `leerie`. Rootful
-   (Colima/macOS, Fly/EC2) needs the opposite: `runuser -u
-   leerie` is a real UID switch with no remap, so
-   `container-entry.sh`'s rootful guard applies literal `leerie`
-   ownership at runtime for `/home/leerie` (user dirs), but
-   `/opt/*` (shared cross-worktree state) stays root-owned in the
-   image. See `CLAUDE.md` "Evaluate every ownership/permission
-   change" and `tests/test_tmp_cache_writable.py` /
-   `test_home_leerie_ownership.py` for the pinned form.
-
-   The detected recipe is still **persisted to state and injected
-   into the implementer and conformer prompts as a
-   `PROVISION_RECIPE:` advisory block**, but its role has narrowed:
-   informational for baked ecosystems (Python/Ruby/Rust/Go, shows
-   what was baked), and the residual offline-relink command for
-   Node. Each worker reads the recipe and decides whether its
-   subtask needs the residual step (a config-only or docs-only
-   subtask doesn't; a "run the tests" subtask does). The host's
-   checked-out source tree and tracked dep artifacts
-   (`node_modules/`, `.venv/`, `target/`, etc.) are never written to
-   by leerie's install path — `.leerie-setup.sh` (user-opt-in) is the
-   only path leerie ever modifies under the host repo (run state
+   The detected recipe is persisted to state and injected into the
+   implementer and conformer prompts as a `PROVISION_RECIPE:` advisory
+   block, whole. Each worker reads it and decides whether its subtask
+   needs it (a config-only or docs-only subtask doesn't; a "run the
+   tests" subtask does). The host's checked-out source tree and tracked
+   dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are never
+   written to by leerie's install path — `.leerie-setup.sh` (user-opt-in)
+   is the only path leerie ever modifies under the host repo (run state
    lives outside the repo at `<state-root>`).
 
 ### The §12 carve-out
@@ -11623,12 +11553,12 @@ is derived from the git remote URL, sanitized to tag chars, and
 `<checkout-id>` from the checkout's path), in leerie's containerd namespace
 `leerie` (§6 *No build consumes what another build left in BuildKit*), and
 uses it for all subsequent `nerdctl run` invocations. When the checkout
-holds no Dockerfile of the repository's own, the launcher generates one
-from `.leerie/config.toml` (`setup_packages`, `language_installs`) and the
-committed lockfiles, on every launch, and builds it through the same path.
+holds no Dockerfile of the repository's own and `.leerie/config.toml`
+declares `setup_packages`, the launcher generates one from them — an apt
+layer, and nothing a run installs (§6½ *The repository image holds no
+dependency*) — on every launch, and builds it through the same path.
 A Dockerfile the repository wrote always takes precedence: while one is
-there, `setup_packages`, `language_installs` and the lockfiles generate
-nothing, and the launch says so when the configuration declares either key.
+there, `setup_packages` generates nothing, and the launch says so.
 
 **A generated Dockerfile is leerie's output, never the repository's.**
 *Designed 2026-11-09 (OPEN-ISSUES #18).*
@@ -11640,8 +11570,8 @@ place only while git did not track it. A tracked one was left alone as the
 repository's ("a committed Dockerfile always takes precedence"), and this
 document told the operator to commit the file (*No auto-commit* below). So
 a committed generated file froze the repository image at the configuration
-it was generated from: every later edit of `setup_packages` and
-`language_installs` reached `.leerie/config.toml` and never the image, and
+it was generated from: every later edit of `setup_packages` (and, then,
+of the dependency keys) reached `.leerie/config.toml` and never the image, and
 nothing said so. Measured 2026-11-09 on four repositories, each with its
 generated file committed: navegando's configuration asks for `ffmpeg
 postgresql-client` and a pnpm layer, its committed file (2026-08-25) is
@@ -11699,12 +11629,7 @@ image. On Fly the per-repo tag is computed from the same generated bytes
 (`_set_fly_per_repo_image`); the machine's `/work/.leerie/` copy was never
 a build input. A configuration the frozen file hid is read again, and one
 that is not valid (a `setup_packages` word that is not a Debian package
-name) now stops the launch with that refusal; a language-dep layer the
-frozen file hid is built for the first time, and one that does not build
-takes the apt-only fallback of *Language deps* below, with its warning
-(measured on a clone of navegando, 2026-11-09: its pnpm layer's
-`postinstall` runs `prisma generate`, which finds no schema among the
-layer's inputs).
+name) now stops the launch with that refusal.
 
 The repository's Dockerfile builds only the *worker stage*: its result is
 copied whole to `/opt/leerie-worker-root` in an image whose own root is
@@ -11835,8 +11760,7 @@ let the worker degenerate into echoing prose as package names. Reasoning over
 manifest files (with commands as a hint) is what delivers the "across all
 languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
-*Prompts are advisory, code enforces*). Structured output (`setup_packages`
-and `language_installs`) is validated against a JSON schema and in code,
+*Prompts are advisory, code enforces*). Structured output (`setup_packages`) is validated against a JSON schema and in code,
 recorded in the run directory, and written to `.leerie/config.toml`
 deterministically when the operator applies it (*The operator applies a
 capture* below). The `dep_capture` worker defaults to
@@ -11851,45 +11775,11 @@ derived apt-install Dockerfile next run. Workers that previously failed every
 `apt-get install` attempt (unprivileged) find the package pre-installed; the
 install-intent loop stops.
 
-**Language deps → `language_installs` → richer Dockerfile bake (gated on
-`bake_language_deps`, default true).** `dep_capture`'s `language_installs`
-output (per-manager `{manager, command, copy_inputs}` entries) is written to
-`.leerie/config.toml`, keyed by manager, never-clobber. When enabled, the
-auto-generated `.leerie/Dockerfile` (and the repository image, when
-`build_repo_image` builds it) also includes a language-dep layer: `COPY` for
-the lockfile, manifest files, and any ancillary inputs the package manager
-requires, followed by `RUN <command>`, where the command is leerie's own
-for that manager (`pnpm install --frozen-lockfile`, `pip install -r
-requirements.txt`, etc.; *A capture names packages and managers, never
-commands* below). Workers that inherit this image find
-`node_modules`/site-packages already populated — per-worker install drops to
-near-zero.
-The generated file's own build is its only test: when it fails, the launch
-builds the file again without the language-dep layer (apt only;
-`bake_language_deps=false` for that launch) and records that image under
-the key of the file it generated. The next launch generates the same file
-and reuses the image, so a layer that cannot build costs one failed build,
-not one per launch; a change to any input the key holds tries the layer
-again, and so does removing `.dockerfile-hash` from the state root. The
-record marks such an image as the apt-only one, and every launch that
-reuses it says so, naming that file: the file each launch generates
-again holds the language-dep layer, so nothing else tells the operator that the image running lacks it, or that a failure that
-was only a registry outage is still being reused. *Revised 2026-11-03
-(review round 36, execution X3).* The warning said the apt-only bake was
-"for this run", and later launches reused the image without a word.
-Considered instead: never recording the apt-only image under the
-generated file's key, so every launch tries the layer again. That makes a
-transient failure heal itself, but it puts back what this paragraph rules
-out, a full failing build on every launch for a layer that cannot build;
-the record stays, and is no longer silent.
-
-**Rebuild tradeoff.** A dependency-input change triggers a full image rebuild
-(`build_repo_image` fires when the hash mismatches). To keep rebuilds narrow,
-`.dockerfile-hash` folds in the sha256 of every input in the `COPY` list
-(lockfiles, manifests, workspace `package.json`s, `patches/`, `.npmrc`); an
-unrelated source-file change does not invalidate the layer. The cost —
-minutes per rebuild — is paid once across all subsequent runs, a clear net
-win against per-worker install time accumulated across hundreds of workers.
+**Language deps are not captured.** Until 2026-11-12 the capture also
+named per-manager installs (`language_installs`) for a dependency layer in
+the generated image; the image holds no dependency now (§6½ *The
+repository image holds no dependency*), and each run installs its own from
+the recipe it proves.
 
 **Trigger seams.** All three funnel to one `dep_capture` worker — the trigger
 differs, the decision-maker does not:
@@ -11918,15 +11808,15 @@ differs, the decision-maker does not:
 
 **Union by default; replace only on `--recapture --force`.** Every automatic
 seam — finalize, cancel, backstop — writes as a never-clobber *union*, so
-capture can only add packages/managers, never remove one the operator
+capture can only add packages, never remove one the operator
 narrowed by hand. The one exception is operator-driven `leerie config
 --recapture --force`, which wholesale-*replaces* the persisted
-`setup_packages` + `language_installs` from the fresh capture (dropping deps
+`setup_packages` from the fresh capture (dropping packages
 no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
-**A capture names packages and managers, never commands.** The capture is
+**A capture names packages, never commands.** The capture is
 an LLM worker's answer over the commands a run's workers ran, and those
 workers are hostile by assumption, so nothing in it reaches a `RUN` line
 as text (review round 28, isolation E2: a `setup_packages` item `&&` was
@@ -11934,24 +11824,18 @@ word-split into the apt `RUN` line as shell, and an unknown manager's
 `command` was emitted verbatim as `RUN <command>`). Checked mechanically,
 three times, and refused rather than trimmed: in the schema (a
 `setup_packages` item matches the Debian package-name pattern
-`DEBIAN_PACKAGE_PATTERN`; a `manager` is a plain word; a `copy_inputs`
-path a plain relative one), in code before a capture is recorded or
-applied (`_capture_problems`: every item, every manager one of
-`BAKE_INSTALL_COMMANDS`, every input a relative path without `..`), and by
-the launcher before it writes a Dockerfile line (the same package pattern
-per word; the generator's own `_INSTALL_COMMANDS` table, which a test
-keeps equal to `BAKE_INSTALL_COMMANDS`). A recorded entry is
-`{manager, command, copy_inputs}` with the command taken from leerie's
-table; the generator reads only the manager and the inputs, never a
-`command` field, so a hand-edited or committed `language_installs` names
-which bake runs, not what it runs. A manager outside the table is dropped
-by `_filter_residual_deps`, which used to keep it verbatim.
+`DEBIAN_PACKAGE_PATTERN`), in code before a capture is recorded or
+applied (`_capture_problems`: every item), and by the launcher before it
+writes a Dockerfile line (the same package pattern per word). Until
+2026-11-12 a capture also named managers, each mapped to leerie's own
+install command for a dependency layer; there is no such layer now (§6½
+*The repository image holds no dependency*).
 
 **The operator applies a capture.** The container never writes the user's
 checkout (§6 *The explicit channel*; locally it is mounted read-only), so a
 capture inside the container is recorded, not written:
 `capture_repo_deps(..., record_in=<the run's directory>)` appends
-`{setup_packages, language_installs, replace, from_run}` to
+`{setup_packages, replace, from_run}` to
 `<run-dir>/captured-deps.json`. Only the operator's `leerie config
 --apply-capture <run-id>` writes it into `$USER_REPO/.leerie/config.toml`
 (`host_apply_captured_deps` → `apply_captured_deps`), with the same union
@@ -20308,7 +20192,7 @@ Three layers follow, each derived from that one list:
   `.leerie-setup.sh` is not a task command and is not gated.
   Code enforces the single gate: a test fails when a shell launch appears
   outside the helper, or when any process launch (`subprocess`,
-  `asyncio.create_subprocess_*`, `os.exec*`, `run_proc`, `_run_streaming`,
+  `asyncio.create_subprocess_*`, `os.exec*`, `_run_proc`, `_run_streaming`,
   `_run_contained`) runs an argv that is neither a literal led by a
   program leerie chose (`git`, `claude`, …) nor bound from the gate in
   the same function, outside a short reviewed list of launchers that run
@@ -21884,7 +21768,7 @@ recurs everywhere in the design:
 
 - The orchestrator does not trust the `dep_capture` worker to self-select
   what to write; it schema-validates the worker's structured output
-  (`setup_packages`, `language_installs`) before writing anything to
+  (`setup_packages`) before writing anything to
   `.leerie/config.toml`. The worker decides content — what the repo
   genuinely needs — but the code enforces the write path: union merge,
   never-clobber, and the committed-Dockerfile-authoritative rule are all

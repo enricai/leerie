@@ -234,9 +234,7 @@ def test_capture_in_the_container_records_and_never_writes_the_checkout(
     monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
 
     async def fake(**_kw):
-        return {"setup_packages": ["libpq-dev"], "language_installs": [
-            {"manager": "pnpm", "command": "pnpm install --offline",
-             "copy_inputs": ["package.json"]}], "dockerfile_notes": None}
+        return {"setup_packages": ["libpq-dev"], "dockerfile_notes": None}
     monkeypatch.setattr(leerie, "claude_p", fake)
     user.chmod(0o555)                       # as the read-only mount is
     try:
@@ -249,10 +247,6 @@ def test_capture_in_the_container_records_and_never_writes_the_checkout(
     assert not (user / ".leerie").exists()
     rec = json.loads((st.run_dir / "captured-deps.json").read_text())
     assert rec == [{"from_run": RUN_ID, "setup_packages": ["libpq-dev"],
-                    "language_installs": [
-                        {"manager": "pnpm",
-                         "command": "pnpm install --frozen-lockfile",
-                         "copy_inputs": ["package.json"]}],
                     "replace": False}]
     assert (st.run_dir / "dep_capture.done").is_file()
 
@@ -277,7 +271,7 @@ def test_apply_merges_against_the_users_current_config_once(leerie, tmp_path):
     user = _user_repo(tmp_path)
     run_dir = tmp_path / "state" / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
-    leerie._record_capture(run_dir, RUN_ID, ["libpq-dev", "curl"], [], False)
+    leerie._record_capture(run_dir, RUN_ID, ["libpq-dev", "curl"], False)
     # The user edits the key during the run; the apply merges with it.
     (user / ".leerie").mkdir()
     (user / ".leerie" / "config.toml").write_text(
@@ -315,7 +309,7 @@ def test_host_apply_writes_the_users_config(leerie, tmp_path):
     state = tmp_path / "state"
     run_dir = state / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
-    leerie._record_capture(run_dir, RUN_ID, ["libpq-dev"], [], False)
+    leerie._record_capture(run_dir, RUN_ID, ["libpq-dev"], False)
     r = subprocess.run(
         ["bash", "-c", '. "$1"; host_apply_captured_deps "$2"; echo rc=$?',
          "_", str(HOST_FINALIZE), str(run_dir)],
@@ -344,7 +338,7 @@ def test_the_launcher_exit_names_the_ran_runs_capture_and_applies_none(
     for rid, pkg in ((RUN_ID, "libpq-dev"), ("other-run", "zlib1g")):
         d = state / "runs" / rid
         d.mkdir(parents=True)
-        leerie._record_capture(d, rid, [pkg], [], False)
+        leerie._record_capture(d, rid, [pkg], False)
     rid_file = state / ".runid-test"
     rid_file.write_text(RUN_ID + "\n")
     exit_trap = [ln for ln in LAUNCHER.read_text().splitlines()

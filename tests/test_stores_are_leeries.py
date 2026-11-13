@@ -148,22 +148,22 @@ def test_an_edit_in_one_runs_view_never_reaches_another_runs(
 
 def test_every_store_variable_is_split(leerie, tmp_path):
     run_dir = tmp_path / "root" / "runs" / "r"
-    lenv: dict[str, str] = {"GOCACHE": "/opt/go-cache"}
+    # A value beneath /opt/, where a bake used to put dependencies, is moved
+    # like any other on both sides: the image holds no dependency (DESIGN §6½
+    # *The repository image holds no dependency*).
+    lenv: dict[str, str] = {"GOCACHE": "/opt/go-cache",
+                            "BUNDLE_PATH": "/opt/bundle"}
     leerie._leerie_stores(lenv, run_dir)
     wenv = leerie._worker_cache_env(lenv, run_dir)
     leerie_side = run_dir / "worktrees" / ".stores" / "stores"
     for var in leerie._STORE_VARS:
-        if var == "GOCACHE":                    # baked into the image
-            assert lenv[var] == wenv[var] == "/opt/go-cache"
-            continue
         assert Path(lenv[var]).is_relative_to(leerie_side), var
         assert Path(wenv[var]).is_relative_to(run_dir / "worktrees" / ".stores" / "cache"), var
     # One set per run, every worker's: the grant is that one directory.
     cache = run_dir / "worktrees" / ".stores" / "cache"
     assert Path(wenv["XDG_CACHE_HOME"]).is_relative_to(cache)
     for var in leerie._STORE_VARS:
-        if var != "GOCACHE":
-            assert Path(wenv[var]).is_relative_to(cache), var
+        assert Path(wenv[var]).is_relative_to(cache), var
     assert wenv["npm_config_store_dir"] == str(cache / "pnpm-store")
 
 

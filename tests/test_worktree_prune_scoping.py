@@ -258,7 +258,7 @@ def test_the_scan_leaves_the_replacement_alone(benign):
 # Only these actually EXECUTE. Scoping to them is what keeps a docstring or a
 # `log(...)` naming the forbidden construct from reading as a violation — the
 # trap this file has hit before.
-_EXEC = {"run", "run_proc", "system", "Popen", "check_output", "check_call",
+_EXEC = {"run", "_run_proc", "system", "Popen", "check_output", "check_call",
          "call", "getoutput", "getstatusoutput",
          # `chain/git_ops.py` routes 8 of its 9 git calls through a LOCAL
          # `_run(...)` wrapper, so the scan was vacuous for a file this
@@ -478,7 +478,7 @@ def test_the_derived_surface_is_not_empty():
 @pytest.mark.parametrize("evasion", [
     # the shape the four real call sites had
     '    subprocess.run(["git", "worktree", "prune"], check=False)',
-    '    await run_proc(["git", "worktree", "prune"])',
+    '    await _run_proc(["git", "worktree", "prune"])',
     # every spelling the substring version missed
     "    subprocess.run(['git', 'worktree', 'prune'])",
     '    subprocess.run("git worktree prune", shell=True)',
