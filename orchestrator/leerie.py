@@ -33866,22 +33866,33 @@ _MISE_REGISTRY_TIMEOUT = 30
 _mise_registry_cache: frozenset[str] | None = None
 
 
-def _mise_registry_names() -> frozenset[str]:
+async def _mise_registry_names(st: "State") -> frozenset[str]:
     """Every short name in mise's registry (`mise registry`'s first
-    column), read once per process. mise's own data, run from `/`, which
-    holds no configuration: not a command of the repository's. Empty when
-    mise cannot be run."""
+    column), read once per process. Confined like every `mise` leerie runs
+    (DESIGN §6 *Leerie's runs of the repository's commands are confined
+    too*), in the planning tree under a measurement's grant: the listing is
+    mise's own and needs no network. Empty when mise cannot be run."""
     global _mise_registry_cache
     if _mise_registry_cache is None:
+        tree = _judgment_cwd(st)
+        out = ""
         try:
-            r = subprocess.run(["mise", "registry"], cwd="/",
-                               capture_output=True, text=True, check=False,
-                               timeout=_MISE_REGISTRY_TIMEOUT)
+            grants = _measurement_grants(st, tree)
+            async with _exec_lock().shared():
+                with _shim_refusals("mise registry") as refusal_fd:
+                    r = await _run_proc(
+                        _confined_argv(grants, ["mise", "registry"],
+                                       refusal_fd=refusal_fd),
+                        cwd=tree,
+                        env=_grant_env(_repo_command_env(os.environ), grants),
+                        timeout=_MISE_REGISTRY_TIMEOUT,
+                        pass_fds=(refusal_fd,))
             out = r.stdout if r.returncode == 0 else ""
         except (OSError, subprocess.TimeoutExpired):
             out = ""
         _mise_registry_cache = frozenset(
-            line.split()[0] for line in out.splitlines() if line.split())
+            line.split()[0] for line in (out or "").splitlines()
+            if line.split())
     return _mise_registry_cache
 
 
@@ -33953,7 +33964,7 @@ async def _discover_tools(st: "State", caps: dict, models: dict[str, str],
     and never written. A worker that fails leaves the run on the
     repository's own pins, as before this step existed."""
     prov = st.data.setdefault("provision", {})
-    registry = _mise_registry_names()
+    registry = await _mise_registry_names(st)
     if not registry:
         log("  tool discovery skipped: mise's registry could not be read")
         prov["tools"] = []
