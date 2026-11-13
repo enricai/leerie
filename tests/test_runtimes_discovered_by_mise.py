@@ -136,7 +136,7 @@ def test_mise_install_runs_in_a_tree_holding_no_known_pin_file(
         return _Done()
 
     monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
-    monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+    monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
     asyncio.run(leerie._run_mise_install(repo, st.run_dir / "logs", st, None))
     assert ["mise", "install"] in ran
     assert st.data["provision"]["mise_versions"]["zig"][0]["version"] \
