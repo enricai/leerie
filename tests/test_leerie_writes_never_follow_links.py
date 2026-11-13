@@ -446,7 +446,7 @@ _LEERIE_ONLY = {
     "_capture_call", "_write_memory_sample", "_invoke", "claude_p",
     "_append_system_prompt_file_supported", "_write_system_prompt_file",
     "_ci_run", "_tsc_lists_paths", "_run_setup_hook", "_run_mise_install",
-    "phase_provision", "_synth_mise_go_override", "_ensure_run_repo",
+    "phase_provision", "_ensure_run_repo",
     "_take_run_settings", "_take_host_settings", "_make_clone_git_dir",
     "_claude_config_template", "_worker_dirs", "_record_run_id_for_launcher",
     "_record_capture", "apply_captured_deps", "capture_repo_deps",

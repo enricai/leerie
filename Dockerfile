@@ -219,9 +219,10 @@ RUN chmod +x /usr/lib/chromium/chrome_crashpad_handler
 # runtime version selection (DESIGN §6½). Reads mise.toml / .tool-versions
 # natively, and every idiomatic version file of every tool it ships via
 # /etc/mise/config.toml (scripts/mise-system-config.sh, below; those files
-# are opt-in per tool in current mise, silently ignored otherwise). go.mod's
-# `go 1.X` line is NOT parsed by mise; leerie synthesizes a .go-version
-# override at provision time.
+# are opt-in per tool in current mise, silently ignored otherwise). A
+# version a repository states where mise does not look (go.mod's `go` line)
+# reaches mise through the run's tools file (DESIGN §6½ *The tools a
+# repository needs are read from it*).
 #
 # The mise.run script reads $MISE_VERSION; pin for reproducibility.
 ARG MISE_VERSION=v2026.5.4

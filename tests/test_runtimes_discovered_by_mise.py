@@ -127,20 +127,29 @@ def test_mise_install_runs_in_a_tree_holding_no_known_pin_file(
         return (0, "ok")
 
     class _Done:
+        # Text, as `_run_proc` returns (`text=True` semantics).
         returncode = 0
-        stdout = (b'{"zig": [{"version": "0.13.0", "requested_version": '
-                  b'"0.13.0", "installed": true}]}')
-        stderr = b""
+        stdout = ('{"zig": [{"version": "0.13.0", "requested_version": '
+                  '"0.13.0", "installed": true}]}')
+        stderr = ""
+
+    class _BinPaths:
+        returncode = 0
+        stdout = "/md/installs/zig/0.13.0\n"
+        stderr = ""
 
     async def _fake_run_proc(argv, **kwargs):
-        return _Done()
+        return _BinPaths() if "bin-paths" in argv else _Done()
 
     monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
     monkeypatch.setattr(leerie, "_run_proc", _fake_run_proc)
-    asyncio.run(leerie._run_mise_install(repo, st.run_dir / "logs", st, None))
+    asyncio.run(leerie._run_mise_install(repo, st.run_dir / "logs", st))
     assert ["mise", "install"] in ran
     assert st.data["provision"]["mise_versions"]["zig"][0]["version"] \
         == "0.13.0"
+    # The directories the run's programs resolve in (`mise bin-paths`), for
+    # the recipe's program check.
+    assert st.data["provision"]["bin_paths"] == ["/md/installs/zig/0.13.0"]
 
 
 def _users_env() -> dict[str, str]:
@@ -194,18 +203,20 @@ def test_the_real_image_reads_every_tools_own_version_file(tmp_path):
 @pytest.mark.skipif(not os.environ.get("LEERIE_TEST_CONTAINER_IMAGE")
                     or shutil.which("nerdctl") is None,
                     reason="set LEERIE_TEST_CONTAINER_IMAGE to a leerie image")
-def test_mise_trusts_the_runs_trees_and_leeries_override(leerie, tmp_path):
-    """A tree beneath the run directory pinning in `mise.toml`, and leerie's
-    synthesized override there, are read by mise with the environment the
-    run gives every process; without it mise refuses both and exits 1."""
+def test_mise_trusts_the_runs_trees_and_reads_its_tools_file(leerie,
+                                                            tmp_path):
+    """A tree beneath the run directory pinning in `mise.toml`, and the
+    run's tools file there, are read by mise with the environment the run
+    gives every process; without the trust mise refuses the tree's file
+    and exits 1."""
     image = os.environ["LEERIE_TEST_CONTAINER_IMAGE"]
     run = tmp_path / "run"
     tree = run / "worktrees" / "t"
     tree.mkdir(parents=True)
     (tree / "mise.toml").write_text('[tools]\nzig = "0.13.0"\n')
-    (run / leerie.MISE_OVERRIDES_NAME).write_text('[tools]\ngo = "1.23.4"\n')
+    (run / leerie.MISE_TOOLS_NAME).write_text('[tools]\ngo = "1.23.4"\n')
     for p in (tmp_path, run, run / "worktrees", tree, tree / "mise.toml",
-              run / leerie.MISE_OVERRIDES_NAME):
+              run / leerie.MISE_TOOLS_NAME):
         p.chmod(p.stat().st_mode | 0o055)
     env: dict[str, str] = {}
     leerie._trust_run_mise_configs(env, Path("/run-dir"))
@@ -216,13 +227,14 @@ def test_mise_trusts_the_runs_trees_and_leeries_override(leerie, tmp_path):
              "-v", f"{run}:/run-dir:ro", image, "-c",
              "cd /run-dir/worktrees/t && exec runuser -u leerie -- env "
              "HOME=/home/leerie " + " ".join(extra) +
-             f" MISE_OVERRIDE_CONFIG_FILENAMES=/run-dir/"
-             f"{leerie.MISE_OVERRIDES_NAME} mise ls --current --offline"],
+             f" MISE_GLOBAL_CONFIG_FILE=/run-dir/"
+             f"{leerie.MISE_TOOLS_NAME} mise ls --current --offline"],
             capture_output=True, text=True, timeout=300, env=_users_env())
 
     trusted = _ls([f"{k}={v}" for k, v in env.items()])
     assert trusted.returncode == 0, trusted.stdout + trusted.stderr
     assert "go" in trusted.stdout.split(), trusted.stdout
+    assert "zig" in trusted.stdout.split(), trusted.stdout
     untrusted = _ls([])
     assert untrusted.returncode != 0
     assert "not trusted" in untrusted.stderr

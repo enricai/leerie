@@ -69,17 +69,12 @@ def test_provision_command_is_argv_list(leerie):
     assert cmd_schema["minItems"] == 1
 
 
-def test_provision_argv0_allowlist_intersects_documented_managers(leerie):
-    """The argv[0] allowlist enforced by _validate_provision_recipe is
-    the §12 carve-out's mechanical containment. Pin it against the
-    documented set from IMPLEMENTATION §6½ — any drift here must be a
-    deliberate update to both the validator and the docs."""
-    documented = {
-        "pnpm", "npm", "yarn", "pip", "pip3", "uv", "poetry", "pipenv",
-        "go", "cargo", "bundle", "gem", "mvn", "gradle", "gradlew", "make",
-        "composer", "dotnet",
-    }
-    assert leerie._PROVISION_ARGV0_ALLOW == documented
+def test_provision_has_no_program_list(leerie):
+    """The recipe's programs are the repository's (DESIGN §6½ *The §12
+    carve-out*): no allowlist survives, in the code or in the prompt."""
+    assert not hasattr(leerie, "_PROVISION_ARGV0_ALLOW")
+    prompt = leerie._load_prompt("provision")
+    assert "allowlist**" not in prompt and "must be in this" not in prompt
 
 
 def test_provision_in_worker_types(leerie):

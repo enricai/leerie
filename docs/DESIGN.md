@@ -2699,7 +2699,7 @@ worker gets the first block, then its kind's.
 | its tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
 | outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
-| the run's mise overrides | `<run-dir>/mise-overrides.toml`, which `MISE_OVERRIDE_CONFIG_FILENAMES` names to every process of a Go repository's run (§6½ step 3): without it a worker's `mise` cannot load its configuration | read | `_synth_mise_go_override` |
+| the run's tools file | `<run-dir>/mise-tools.toml`, which `MISE_GLOBAL_CONFIG_FILE` names to every process of the run (§6½ *The tools a repository needs are read from it*): without it a worker's `mise` cannot load its configuration | read | `_discover_tools` |
 
 `<wid>` is the worker's id, its first call's log sid; a re-ask or resume
 reuses the same worker's directories. A temp or config variable's
@@ -4327,7 +4327,7 @@ confinement failure stops the run; it is never a result*).
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
 | the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/`; its `home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
-| the run's mise configuration | `<run-dir>/mise-overrides.toml`, `<run-dir>/mise-tools.toml` (§6½ *The tools a repository needs are read from it*) | read |
+| the run's tools file | `<run-dir>/mise-tools.toml` (§6½ *The tools a repository needs are read from it*) | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR` and the toolchain home layer `/leerie-toolchains/home`, which is its `HOME`; no store variable in its environment; `mise-state/` emptied first | write |
@@ -11632,11 +11632,9 @@ the CI parity baseline, the browser suite unable to start).
    refused the same way (measured on 0.65.0's image and a real launch,
    lane LG). Trusting the run's trees is no new authority: what mise runs
    from them runs in confined processes, as the repository's own install
-   and tests do. What mise cannot read stays outside this
-   rule and is named as such: Go's version in `go.mod`, which mise does
-   not parse (step 3's synthesized override, still Go's own code; a typed
-   pin the provision worker reads from the repository is the general
-   form, not made here).
+   and tests do. What mise does not read — Go's version in `go.mod`, which
+   mise 2026.5.4 does not parse — is read from the repository with every
+   other tool's (*The tools a repository needs are read from it*, below).
 
    **The tools a repository needs are read from it.** *Designed
    2026-11-13 (OPEN-ISSUES #23, lane LG2).* *Root cause.* mise installs
@@ -11647,8 +11645,7 @@ the CI parity baseline, the browser suite unable to start).
    Poetry repository is the same, and so is every runtime the image does
    not carry when the repository states its version only where mise does
    not look — a Gemfile's `ruby` line, `build.zig.zon`'s minimum, `mix.exs`'s
-   `elixir`, `go.mod`'s `go` line (which leerie read with Go's own code,
-   step 3). Knowing which tools a repository's steps run is reading the
+   `elixir`, `go.mod`'s `go` line. Knowing which tools a repository's steps run is reading the
    repository, and no list of files or managers covers the ones no one
    listed. *Invariant.* Before mise installs, a judgment worker
    (`tool_discovery`, read-only, in the planning tree) reads how the
@@ -11671,6 +11668,17 @@ the CI parity baseline, the browser suite unable to start).
    installs is installed by mise into the toolchain cache, under the
    toolchain kind's grant. Benched before it shipped (lane LG2, eight
    fixtures, an ecosystem leerie's code never names among them).
+
+   Go's own code is gone with it. Leerie used to synthesize
+   `<run-dir>/mise-overrides.toml` from `go.mod`'s `go` line when nothing
+   else pinned Go, and since `MISE_OVERRIDE_CONFIG_FILENAMES` *replaces*
+   mise's discovery, it also copied every idiomatic version file's pin into
+   that override, through its own parsers of `.nvmrc`, `.python-version`,
+   `.ruby-version` and `.tool-versions` — a list of files that a
+   repository pinning anything else lost. The tools file is read
+   *beneath* discovery rather than instead of it, so nothing has to be
+   copied, and `go.mod`'s version comes from the worker like every other
+   tool's (6/6 `go 1.22.3` in the bench).
 
    **A repository's pinned runtime is the one its commands run.**
    *Designed 2026-11-04 (barnacle's `.nvmrc`, found proving the corepack
@@ -11732,9 +11740,9 @@ the CI parity baseline, the browser suite unable to start).
    polyglot Makefile-driven setup), the orchestrator invokes a
    `claude -p` worker whose only job is reading the repo's README and
    configuration files and emitting a JSON recipe. The recipe is
-   schema-validated, the commands inside it are restricted by an
-   argv-allowlist, and any deviation from the schema rejects the
-   worker. This is a *deliberate* exception to §12 — see below.
+   schema-validated, each command's program must be one the run can run
+   (*The §12 carve-out* below), and any deviation from the schema
+   rejects the worker. This is a *deliberate* exception to §12 — see below.
 5. **The repository image holds no dependency.** *Revised 2026-11-12
    (OPEN-ISSUES #23; the language-agnostic audit's cluster C1).*
 
@@ -11829,14 +11837,35 @@ contain it:
    with conventional lockfiles never reach the worker. The model sees
    the genuinely ambiguous tail, where human judgment would be doing
    the work anyway.
-2. **The recipe is mechanically bounded.** Every command's `argv[0]`
-   must come from a fixed allowlist of package managers; shell
-   metacharacters and directory traversal are rejected. The worker
-   cannot emit `sudo`, pipe into `sh`, or reach outside the repo —
-   this is what makes the prompt-injection safe, since the validator
-   ensures the rendered `PROVISION_RECIPE:` block carries only argv
-   sequences from a known-safe vocabulary. The §12 guarantee lives in
-   the validator, not in any worker prompt.
+2. **The recipe is mechanically bounded.** Every command is an argv
+   list whose `argv[0]` is a program: a bare name the run's toolchain
+   provides — on a directory `mise bin-paths` lists for the provisioning
+   checkout, or on the image's own `PATH` (mise's shims aside) — or a
+   relative path, with no `..`, to a file the repository holds (a
+   wrapper it commits, `./gradlew`). Shell metacharacters, `sudo` and
+   directory traversal are rejected. The worker cannot pipe into `sh`,
+   use `sudo`, or reach outside the repo, and a program the run cannot
+   run is sent back to it as feedback rather than reaching a later step.
+
+   *Revised 2026-11-13 (OPEN-ISSUES #23, lane LG2).* This used to be a
+   fixed allowlist of package managers (eighteen in code, sixteen in the
+   prompt). That list held back no
+   authority confinement does not already hold back: what a recipe runs
+   is the repository's own code (`make` runs the repository's
+   Makefile, every package manager runs install scripts), and it runs
+   confined like every repository command (§6 *Leerie's runs of the
+   repository's commands are confined too*). What the list did do was
+   keep the worker from naming a repository's real tool. On a Zig
+   repository it emitted `make --version` (lane LG's launch). In the
+   bench, on Zig and Elixir fixtures, it answered `kind: none` 6/6 each
+   because neither `zig` nor `mix` was in the list. Without the list,
+   the same worker named `zig` 6/6 and `mix` 5/6 (`none` in the sixth),
+   and kept Maven, bare-pyproject and docs controls equal to before
+   (bench PREREG frozen before 60 samples, every bar met). The table's
+   recipes are code's and need no such check; the worker's are checked
+   against the toolchain the run actually has.
+   The §12 guarantee lives in the validator and that check, not in any
+   worker prompt.
 3. **It is the only documented exception.** Any future feature that
    wants to render LLM-generated content into a downstream worker
    prompt needs its own §-level justification, not a pointer to this
