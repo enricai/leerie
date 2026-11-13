@@ -52,10 +52,11 @@ def _extract_bedrock_block() -> str:
     """Pull the full Bedrock activation region (bearer-token block +
     SSO/profile block) verbatim from the launcher, from the
     `_BEDROCK_BEARER_ACTIVE` assignment through the SSO block's closing
-    `fi`, just before the "Mount each staged file/dir" comment."""
+    `fi`, just before the "staged home reaches the container as a copy"
+    comment."""
     src = LAUNCHER.read_text()
     start = src.index("_BEDROCK_BEARER_ACTIVE=false")
-    end = src.index("# -- Mount each staged file/dir at its default in-container path. --")
+    end = src.index("# -- The staged home reaches the container as a copy, never a mount. --")
     block = src[start:end]
     assert "AWS_BEARER_TOKEN_BEDROCK=$AWS_BEARER_TOKEN_BEDROCK" in block
     assert "detect_bedrock_mode" in block
@@ -162,8 +163,12 @@ def _env_pairs(tokens: list[str]) -> dict[str, str]:
     return pairs
 
 
-def _has_aws_mount(tokens: list[str]) -> bool:
-    return any(t.endswith(":/home/leerie/.aws:ro") for t in tokens)
+def _has_aws_mount(tokens: list[str], tmp_path: Path) -> bool:
+    """`~/.aws` staged for the container: copied into `$STAGE/.aws`, which
+    the entry copies into the home (DESIGN §6 *Every confined process has
+    its own home*), and never a mount of its own."""
+    assert not any(":/home/leerie/.aws" in t for t in tokens), tokens
+    return (tmp_path / "stage" / ".aws").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +328,7 @@ def test_bearer_token_skips_aws_preflight_and_mount(tmp_path: Path) -> None:
         tmp_path=tmp_path,
     )
     assert rc == 0, tokens
-    assert not _has_aws_mount(tokens)
+    assert not _has_aws_mount(tokens, tmp_path)
     assert bearer_active is True
     assert sso_active is False
 
@@ -338,7 +343,7 @@ def test_bearer_token_skips_preflight_even_with_aws_present_but_failing(tmp_path
         tmp_path=tmp_path,
     )
     assert rc == 0, tokens
-    assert not _has_aws_mount(tokens)
+    assert not _has_aws_mount(tokens, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +362,7 @@ def test_bearer_token_wins_over_settings_json_sso(tmp_path: Path) -> None:
     assert rc == 0, tokens
     assert bearer_active is True
     assert sso_active is False
-    assert not _has_aws_mount(tokens)
+    assert not _has_aws_mount(tokens, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +390,7 @@ def test_settings_json_sso_still_works_without_bearer_token(tmp_path: Path) -> N
     assert rc == 0, tokens
     assert bearer_active is False
     assert sso_active is True
-    assert _has_aws_mount(tokens)
+    assert _has_aws_mount(tokens, tmp_path)
     pairs = _env_pairs(tokens)
     assert pairs["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
@@ -462,7 +467,7 @@ def test_sso_mode_preflight_failure_propagates_exit(tmp_path: Path) -> None:
         tmp_path=tmp_path,
     )
     assert rc == 1
-    assert not _has_aws_mount(tokens)
+    assert not _has_aws_mount(tokens, tmp_path)
 
 
 # ---------------------------------------------------------------------------

@@ -1010,19 +1010,19 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$(pwd -P)` (user repo) | `/work` | ro | The repo leerie operates on, read only: leerie fetches from it into the run's own repository, and nothing in the container writes it (DESIGN §6 *The run's own repository*, *The explicit channel*). Every worktree, and all run state, lives under `/leerie-state` (see below); the run branch comes back by the host-side bring-back. |
 | `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | *Local mode only.* Leerie run state (state.json, runs/, logs/, worktrees/). Mounted at a top-level container path distinct from `/work` so the repo checkout stays pristine — no `.leerie/` dir accumulates inside the project. The orchestrator reads the container path from `LEERIE_STATE_DIR=/leerie-state` (passed as `-e` in the same `nerdctl run` invocation). `LEERIE_STATE_HOST_DIR` is resolved on the host by the launcher before launch; see §2 "Host-side per-repo state directory". |
 | `$STAGE/leerie-code` (`$_code_dir`: the launch's snapshot of `orchestrator/`, `scripts/`, `prompts/`, `.claude-plugin/`, `_snapshot_leerie_code`) | `/opt/leerie-image` | ro | *Local mode only.* The leerie code this launch runs, one snapshot of the install taken when the launch starts (before any image step), never the install directory itself, so an upgrade or edit of the install never reaches a running run (DESIGN §6 *A launch runs only the leerie code it started with*). Read-only because the container has no business mutating it. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect on the next launch without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
-| `$STAGE` (per-run host scratch — same tree seed-auth.sh/ec2-seed-auth.sh tar-pipe to Fly/EC2) | `/opt/leerie-claude-json-src` | **ro** | The per-container copy of `~/.claude.json` (with `projects[]` stripped) lives at `$STAGE/.claude.json`; `$STAGE` is bind-mounted read-only at this staging path — `.claude.json` is never bind-mounted directly onto `/home/leerie/.claude.json`. A shared mount there is a documented `claude-code` corruption race (anthropics/claude-code #28847, #29217, #29395, #40226) and the CLI's atomic rename() write returns `EBUSY` on a bind-mounted single file, forcing a non-atomic truncate fallback with a demonstrated corruption window under concurrent workers. `scripts/container-entry.sh` instead copies it to `/home/leerie/.claude.json` as a real file at container start (root-owned under rootless, `chown`ed to `leerie:` under rootful) — mirroring the tar-copy pattern the remote runtimes use. |
-| `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky/prior-session/history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + siblings, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/`/`marketplaces/` are rebuilt on the remote for the fly runtime (`scripts/remote/seed-auth.sh` step 4). |
-| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | Resolves which Claude OAuth credential to use, in order: `$CLAUDE_CODE_OAUTH_TOKEN` first when set (synthesized into `{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — `scopes` is mandatory, the CLI rejects a scope-less blob); then Keychain (`security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json`. A container can't refresh a copied token, so the long-lived token wins over file-based sources (DESIGN §6 *Credential strategy*). Keychain/on-disk branches are shape-checked via `_claude_creds_has_oauth_token` (non-empty `claudeAiOauth.accessToken`), guarding an upstream CLI bug (steipete/CodexBar#1844) where Keychain can hold only `{"mcpOAuth": {...}}` with no usable token even while the host CLI works — `claude /login` does not repair this. A failing source is treated as empty and resolution falls through; rejection reason goes to a PID-scoped temp file (`$_CLAUDE_CREDS_REJECT_REASON_FILE`, since the caller reads the helper via `$(...)` subshell). All branches write the same JSON shape at mode 600. When `$CLAUDE_CODE_OAUTH_TOKEN` is set the launcher also forwards it as a container env var unconditionally, since that path survives past the file blob's `expiresAt`. Same helper populates `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` for the `chain` arm. **On failure**, with no Bedrock auth mechanism active, the STAGE-assembly block `die()`s immediately rather than running a container doomed to fail the smoke test; the message names the mcpOAuth bug and recommends `claude setup-token` or standard `/login` guidance. Exempted when either Bedrock auth mode is active. |
-| `$STAGE/.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc` (per-run host scratch) | `/home/leerie/.<same>` | rw | Per-container copies of each present host `~/.git*` sibling and `~/.netrc`. Worker can `git config --local` / mutate freely without affecting host state. |
-| `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` | rw | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
-| `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` | rw | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
-| `$STAGE/.gnupg` (per-run host scratch) | `/home/leerie/.gnupg` | rw | Per-container copy of `~/.gnupg/` with agent socket files (`S.gpg-agent*`, `S.scdaemon`, `S.keyboxd`) excluded and `use-keyboxd` stripped from `common.conf` (the container cannot reach the host keyboxd daemon; stripping the directive makes gpg fall back to file-based `pubring.kbx` lookup — on keyboxd-only hosts signing keys become unfindable, which is acceptable since commit signing is best-effort). Keyrings + `trustdb.gpg` ride along so workers can `git commit -S` if signing is configured. Permissions set to `0700`. |
-| `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` truthy (`1`/`true`/`yes`/`on`, matching the CLI's `isEnvTruthy`) in any of the three settings files the CLI merges (`~/.claude/settings.json`, `<USER_REPO>/.claude/settings.json`, `<USER_REPO>/.claude/settings.local.json`) — and only when `AWS_BEARER_TOKEN_BEDROCK` (below) is **not** set. The CLI's AWS SDK reads `~/.aws/config` and `~/.aws/sso/cache/*.json` (SSO tokens, ~12h TTL) directly via file I/O — no `aws` binary needed in-container. `~/.aws/cli/cache` is excluded. Mounted read-only since workers never write credentials. `aws sso login` needs an interactive TTY/browser, so `bedrock_preflight()` catches an expired SSO token on the host first and prints the recovery hint. On Fly.io, `$STAGE/.aws/` rides the tar pipe to `seed_auth` automatically. Belt-and-suspenders: the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, `AWS_REGION` as explicit env vars so workers activate Bedrock via `process.env` regardless of `settings.json` handling. The same local block also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set — see the bearer-token row. |
+| `$STAGE` (per-run host scratch — same tree seed-auth.sh/ec2-seed-auth.sh tar-pipe to Fly/EC2) | `/opt/leerie-home-src` | **ro** | The staged home: `.claude/`, `.claude.json` (with `projects[]` stripped), the credentials, the git files, `.config/git`, `.netrc`, `.ssh`, `.gnupg`, `.aws` (each described in the rows below). `scripts/container-entry.sh` copies every dot-entry of it into `/home/leerie` (`cp -a`, before the privilege drop; `leerie-code` is not a dot-entry and is not copied), as real files of the container's own filesystem — root-owned under rootless, the whole home `chown -R leerie:` under rootful. **Nothing is mounted beneath `/home/leerie`** (DESIGN §6 *Every confined process has its own home*): each confined process gets an overlay of the home, and an overlay's lower layer cannot hold a mount; no write in the container reaches `$STAGE` or the host. A copied `.claude.json` also keeps the CLI's atomic rename() working, which a bind-mounted single file breaks (`EBUSY`, then a non-atomic truncate under concurrent workers; anthropics/claude-code #28847, #29217, #29395, #40226). |
+| `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` (copied, via `/opt/leerie-home-src`) | copy | Per-container copy of `~/.claude/` with bulky/prior-session/history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + siblings, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/`/`marketplaces/` are rebuilt on the remote for the fly runtime (`scripts/remote/seed-auth.sh` step 4). |
+| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` (copied, via `/opt/leerie-home-src`) | copy | Resolves which Claude OAuth credential to use, in order: `$CLAUDE_CODE_OAUTH_TOKEN` first when set (synthesized into `{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — `scopes` is mandatory, the CLI rejects a scope-less blob); then Keychain (`security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json`. A container can't refresh a copied token, so the long-lived token wins over file-based sources (DESIGN §6 *Credential strategy*). Keychain/on-disk branches are shape-checked via `_claude_creds_has_oauth_token` (non-empty `claudeAiOauth.accessToken`), guarding an upstream CLI bug (steipete/CodexBar#1844) where Keychain can hold only `{"mcpOAuth": {...}}` with no usable token even while the host CLI works — `claude /login` does not repair this. A failing source is treated as empty and resolution falls through; rejection reason goes to a PID-scoped temp file (`$_CLAUDE_CREDS_REJECT_REASON_FILE`, since the caller reads the helper via `$(...)` subshell). All branches write the same JSON shape at mode 600. When `$CLAUDE_CODE_OAUTH_TOKEN` is set the launcher also forwards it as a container env var unconditionally, since that path survives past the file blob's `expiresAt`. Same helper populates `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` for the `chain` arm. **On failure**, with no Bedrock auth mechanism active, the STAGE-assembly block `die()`s immediately rather than running a container doomed to fail the smoke test; the message names the mcpOAuth bug and recommends `claude setup-token` or standard `/login` guidance. Exempted when either Bedrock auth mode is active. |
+| `$STAGE/.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc` (per-run host scratch) | `/home/leerie/.<same>` (copied, via `/opt/leerie-home-src`) | copy | Per-container copies of each present host `~/.git*` sibling and `~/.netrc`. Worker can `git config --local` / mutate freely without affecting host state. |
+| `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` (copied, via `/opt/leerie-home-src`) | copy | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
+| `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` (copied, via `/opt/leerie-home-src`) | copy | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
+| `$STAGE/.gnupg` (per-run host scratch) | `/home/leerie/.gnupg` (copied, via `/opt/leerie-home-src`) | copy | Per-container copy of `~/.gnupg/` with agent socket files (`S.gpg-agent*`, `S.scdaemon`, `S.keyboxd`) excluded and `use-keyboxd` stripped from `common.conf` (the container cannot reach the host keyboxd daemon; stripping the directive makes gpg fall back to file-based `pubring.kbx` lookup — on keyboxd-only hosts signing keys become unfindable, which is acceptable since commit signing is best-effort). Keyrings + `trustdb.gpg` ride along so workers can `git commit -S` if signing is configured. Permissions set to `0700`. |
+| `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` (copied, via `/opt/leerie-home-src`) | copy | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` truthy (`1`/`true`/`yes`/`on`, matching the CLI's `isEnvTruthy`) in any of the three settings files the CLI merges (`~/.claude/settings.json`, `<USER_REPO>/.claude/settings.json`, `<USER_REPO>/.claude/settings.local.json`) — and only when `AWS_BEARER_TOKEN_BEDROCK` (below) is **not** set. The CLI's AWS SDK reads `~/.aws/config` and `~/.aws/sso/cache/*.json` (SSO tokens, ~12h TTL) directly via file I/O — no `aws` binary needed in-container. `~/.aws/cli/cache` is excluded. Mounted read-only since workers never write credentials. `aws sso login` needs an interactive TTY/browser, so `bedrock_preflight()` catches an expired SSO token on the host first and prints the recovery hint. On Fly.io, `$STAGE/.aws/` rides the tar pipe to `seed_auth` automatically. Belt-and-suspenders: the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, `AWS_REGION` as explicit env vars so workers activate Bedrock via `process.env` regardless of `settings.json` handling. The same local block also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set — see the bearer-token row. |
 | `AWS_BEARER_TOKEN_BEDROCK` (host env var, **Bedrock bearer-token mode**) | forwarded as `-e`/`child_env` only — **no bind mount** | n/a | Static-bearer-token analogue of `CLAUDE_CODE_OAUTH_TOKEN`; takes precedence over the SSO/profile row when both are present (matches the CLI's own resolution order — verified live, v2.1.220). No `aws` CLI, no SSO session, no `~/.aws` staging — `bedrock_preflight()` is skipped. The launcher forwards the token verbatim, `CLAUDE_CODE_USE_BEDROCK` (defaulting to `1` — confirmed the token alone is a no-op without it), and `AWS_REGION` when set. The same block forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set: leerie always invokes `claude -p --model <tier>`, never a raw model ID, and on Bedrock the CLI's alias table can lag the Anthropic-API one by a generation (e.g. `sonnet` resolving to Sonnet 4.5 instead of Sonnet 5) — these are the CLI's documented env vars for repointing an alias. On Fly, every substituted value (bearer token, region, use-bedrock flag, plus `_BEDROCK_PROFILE`/`_BEDROCK_REGION`/host-TZ) is JSON-encoded host-side first, since an opaque bearer token can contain a `"` or `\` that would break out of a raw `"${VAR}"` substitution. |
 
 The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`, `$SSH_AUTH_SOCK`) that earlier leerie versions bind-mounted **no longer exist** — finalize moved to the host (DESIGN §6 *Finalization*), so `git push`/`gh pr create` run with the host's own auth state.
 
-| `~/.cache/leerie/mise-data` | `/home/leerie/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). Its `shims` subdir is on the image's `ENV PATH` (see §0.5 "Image build") so a worker's own ad-hoc Bash commands can reach a repo-pinned runtime (e.g. Ruby via `.ruby-version`) without an explicit `mise exec --`. |
+| `~/.cache/leerie/toolchains` (`mise/`, `home/`) | `/leerie-toolchains` | rw | The host's toolchain cache, outside the home. `mise/` is mise's `MISE_DATA_DIR` (`ENV MISE_DATA_DIR=/leerie-toolchains/mise`: per-repo runtime installs, plugins, cache); the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). Its `shims` subdir is on the image's `ENV PATH` (see §0.5 "Image build"). `home/` is the toolchain home layer (`ENV LEERIE_TOOLCHAIN_HOME=/leerie-toolchains/home`): the toolchain kind's `HOME`, and the top lower layer of every other confined process's home (DESIGN §6 *Every confined process has its own home*). A new host directory: the older `~/.cache/leerie/mise-data`, which older images mount at `/home/leerie/.local/share/mise`, is never this one, since an install records absolute paths; the first run after the upgrade installs its toolchains again. Removing `mise-data` is the operator's, once no image that mounts it is kept (not yet a `leerie prune` step). |
 | (state mount) `$LEERIE_STATE_HOST_DIR/runs/<run-id>/worktrees/.stores/stores/<name>`, `$LEERIE_STATE_HOST_DIR/runs/<run-id>/worktrees/.stores/cache/` | `/leerie-state/runs/<run-id>/worktrees/.stores/stores/<name>`, `/leerie-state/runs/<run-id>/worktrees/.stores/cache/` | rw | Package stores and caches, **inside the state mount** next to the worktrees, so an install can hard-link from its run's store (a hard link cannot cross mounts; DESIGN §6 *The pnpm store shares the worktrees' mount*). No mount and no `-e` of their own: the orchestrator sets them (`_leerie_stores`, `_worker_cache_env`; DESIGN §6 *The stores a view installs from are leerie's*), the same on Fly (state root `/work/.leerie`). Every one is its run's: no store is shared across runs or repositories, and the run's process removes `<run-dir>/worktrees/.stores/stores/` at its exit. The former `<state-root>/.stores/leerie/` (shared across runs, read-only to installs, through 0.44.3) is no longer written; an existing one can be deleted. The former `~/.cache/leerie/{pip,go-mod,cargo,corepack}` mounts, their `PIP_CACHE_DIR`/`GOMODCACHE`/`CARGO_HOME`/`COREPACK_HOME` `-e`s, the `npm_config_store_dir=/leerie-state/.pnpm-store` `-e` and Fly's `child_env["npm_config_store_dir"]` are gone: every worker of every earlier run wrote them. `COREPACK_HOME` is set explicitly on both sides, so corepack never falls back to `XDG_CACHE_HOME=/tmp/.cache` (the rootless mkdir failure the old mount fixed). |
 | `~/.leerie/.host` (or `$LEERIE_HOST_DIR`, §2½) | `/leerie-host` | rw | Host-wide directory shared by every run on the host, whatever the repo; the launcher creates it with the cache dirs and passes `-e LEERIE_HOST_DIR=/leerie-host` after the `LEERIE_*` forward, so a host variable of that name cannot repoint it. Holds `build-slots/slot-<i>`, the lock files of the host build semaphore (DESIGN §6 *A host-wide build semaphore*; `_build_class_slot`), and `mise-install.lock`, the host's one toolchain-install lock (DESIGN §6 *One toolchain install at a time on a host*; `_mise_install_lock`). Ownership: rootless sees the host user's directory as its own (outer UID 0 → inner leerie); rootful's entry guard `chown`s the directory (not `-R`) to leerie; slot files are opened read-only, so one another identity created still locks. No such mount on Fly/EC2: `_host_shared_dir` falls back to `<state-root>/.host`, host-wide there. Pinned by `tests/test_host_dir_ownership.py`. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
@@ -4713,9 +4713,30 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   and the real `main()` driven down each dispatch path (fresh, `resume
   <id>`, `--phase judge`, `--phase heal`) calls it before its first
   confined spawn, which carries `--isolate`.
-- `WorkerGrants(rw, ro, env=(), egress=False, link="")` (NamedTuple of
+- `WorkerGrants(rw, ro, env=(), egress=False, link="", home="",
+  home_layers=(), drop=())` (NamedTuple of
   absolute paths; the `shared_tmp` field is deleted — every confined
-  process has its own `/tmp`). `link`: `str(<run-dir>/worktrees)`
+  process has its own `/tmp`). `home`, `home_layers`: the home the shim
+  gives the process its own copy of, and the layers beneath its upper,
+  first on top (DESIGN §6 *Every confined process has its own home*):
+  `_confined_home(env=None) -> str` is the realpath of `env["HOME"]` (else
+  `os.environ`'s, else `Path.home()`), or `""` when it holds `SHARED_TMP`
+  or lies beneath it; `_toolchain_home() -> str` is the realpath of
+  `$LEERIE_TOOLCHAIN_HOME` (`TOOLCHAIN_HOME_ENV`; the image sets
+  `/leerie-toolchains/home`), or `""` when unset or relative.
+  `_worker_grants` and `_measurement_grants` set `home=_confined_home(…)`
+  and `home_layers=(_toolchain_home(),)` when both are non-empty; the
+  toolchain kind sets `home_layers=()`, `env["HOME"]=_toolchain_home()`
+  and `drop` = every `_STORE_VARS` key plus `pnpm_config_<k>` for each
+  `_PNPM_SETTINGS` key. `_grant_env(base, grants) -> dict` is `{**base,
+  **dict(grants.env)}` less every `grants.drop` key: the environment of
+  every confined command (`_run_streaming`, `_run_mise_install`'s version
+  read, `_ts_script_run`). `HOME_UPPER_BYTES = 1 << 30`. `_home_argv(grants)
+  -> list[str]`: `[]` when `grants.home` is empty, else `["--home", home,
+  "--home-bytes", str(HOME_UPPER_BYTES)]` plus `["--home-layer", L]` per
+  layer; `_confined_argv` appends it after the sandbox options, and after
+  the isolation ones when `_isolated()` (never when neither: the home stays
+  read). `link`: `str(<run-dir>/worktrees)`
   (`TREES_DIRNAME`) from `_worker_grants` and `_measurement_grants`, the
   directory whose grants the shim binds as one mount (DESIGN §6 *The write
   grants on one mount are one mount*). Every store a tree installs from is
@@ -4984,8 +5005,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   stores `<run>/worktrees/.stores/stores/` (`RUN_STORES_DIRNAME`, made 0700), the tree's
   private temp directory `_private_tmp(<measure-dir>)`; setup-hook kind
   adds `MISE_DATA_DIR` (default `~/.local/share/mise`) and `~/.local/bin`
-  (both made first), toolchain kind `MISE_DATA_DIR` — a toolchain path
-  beneath the state root is never granted. `ro`:
+  (both made first), toolchain kind `MISE_DATA_DIR` and the toolchain home
+  layer `_toolchain_home()` (`$LEERIE_TOOLCHAIN_HOME`, `TOOLCHAIN_HOME_ENV`,
+  realpath; none when unset) — a toolchain path beneath the state root is
+  never granted. `ro`:
   `_reads_outside(state_root, tmp=False)` (no grant names `/tmp`: an
   isolated command's own is the shim's), leerie's install `ROOT`, `os.environ["HOME"]` (realpath;
   left out when it holds `SHARED_TMP`),
@@ -4998,11 +5021,9 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   is `<run>/worktrees/`, `<run>/worktrees/.stores/tree-stores/<tree>/`
   (`TREE_STORES_DIRNAME`, made; what `_tree_store_env` names). `env`: `TMPDIR`/`TMP`/`TEMP` and
   `XDG_CACHE_HOME` → the private temp directory (remade on every call),
-  `XDG_RUNTIME_DIR` → `<private-tmp>/run`, `GNUPGHOME` → a new
-  `tempfile.mkdtemp(prefix="gnupg-", dir=<private-tmp>)` (0700) on every
-  call and every kind (DESIGN §6 *A confined command's scratch is short and
-  private*, a gpg home of its own: mise imports Node's release keys there; `~/.gnupg` is never
-  granted; pinned by `tests/test_confined_gnupg_home.py`), `XDG_STATE_HOME` →
+  `XDG_RUNTIME_DIR` → `<private-tmp>/run` (no `GNUPGHOME`: the private
+  home's `~/.gnupg` is the command's own, DESIGN §6 *Every confined process
+  has its own home*), `XDG_STATE_HOME` →
   `<measure-dir>/state`, `MISE_STATE_DIR` → `<measure-dir>/mise-state`
   (emptied first for the toolchain kind), and, for the kinds that write
   `MISE_DATA_DIR` (toolchain, setup hook), `MISE_CACHE_DIR` →
@@ -5511,6 +5532,35 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   directories leading to a grant walked. Every other grant is bound onto
   itself apart. Returns `(grants, roots)`: the grants, and `[link_root]`
   when it was bound. `isolate(..., link_root=)` passes it through.
+- `private_home(home, layers, size, grants) -> None` (`--home DIR
+  --home-bytes N [--home-layer DIR]...`, with `--isolate` or `--sandbox`;
+  DESIGN §6 *Every confined process has its own home*) — called by
+  `isolate(..., home=, home_layers=, home_bytes=)` right after
+  `pivot_to_owned_root`, before the grants are bound or overlaid; `home` is
+  then in `roots` (its own mount kept writable, what is beneath it judged
+  apart). Refuses (`IsolationError`) a `home` that is not a directory, a
+  layer or home path holding `,`, `:` or a backslash, and a mount beneath
+  `home` (`/proc/self/mountinfo`). Mounts a `tmpfs` (`size=N,mode=0700`,
+  `nosuid,nodev`) on `_HOME_UPPER` (`/tmp/.leerie-home`), makes `u/` (the
+  home's mode) and `w/` in it, binds `home` recursively at `_HOME_REAL`
+  (`/tmp/.leerie-home-real`), mounts `overlay` on `home` with
+  `lowerdir=<each existing layer not beneath home>:<home>`,
+  `upperdir=_HOME_UPPER/u`, `workdir=_HOME_UPPER/w`, `userxattr`; binds
+  every `rw`/`ro` grant strictly beneath `home` from `_HOME_REAL/<rel>`
+  over the overlay (`MS_BIND | MS_REC`; a missing source or a link
+  skipped); then detaches `_HOME_REAL` and `_HOME_UPPER` (`MNT_DETACH`)
+  and removes both directories. `main()` and `run_sandbox` add `home` to
+  the Landlock write grants (`_watch_home`) and set `_HOME_WATCH =
+  HomeWatch(home, N)`: `_wait_signal(watched)` (every wait in `run`,
+  `run_as_init` and `run_sandbox`) samples it and waits with
+  `sigtimedwait(…, HOME_SAMPLE_SEC = 0.2)`; a sample with `f_bavail *
+  f_frsize < HOME_FULL_MARGIN` (1 MiB) marks it full; `_home_full()`
+  samples once more after the command and its descendants have ended and,
+  when full, the shim exits through `_refused(HomeWatch.finding())` ("the
+  command filled its home <home> (<N> MiB, its private overlay's
+  limit)…"), so the caller raises `ConfinementRefused`. The AppArmor
+  profile allows `mount fstype=overlay overlay -> /home/*/` and `mount
+  fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /tmp/.leerie-home/`.
   `overlay_grants(rw, view) -> list[str]` (`--sandbox`) — `view` first,
   then each other `rw` directory outside `/tmp` and `/dev`: an overlay on
   it, `lowerdir=<it>,upperdir=/tmp/.leerie-overlay/<n>/u,
@@ -5711,7 +5761,8 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `--forward <its port>=<_egress_server().forward(its port)>`; with
   `worker_root` True and `_worker_root()` a path, `--worker-root <path>`
   (after the sandbox options, or after the isolation ones when isolated;
-  plus `--cli` when `cli`); then `--rw`/`--ro` from `grants` and `-- cmd`.
+  plus `--cli` when `cli`); `_home_argv(grants)` (sandboxed or isolated);
+  then `--rw`/`--ro` from `grants` and `-- cmd`.
   `_invoke` passes `cli=True` (it starts a worker's CLI), and so does
   `scripts/worker-guard.py`'s `guard_confine`; `_require_heldout_sandbox`'s
   probe passes `worker_root=False` (it checks the shim's own machinery, in
@@ -5791,7 +5842,16 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `ipc_ns` (`/proc/self/ns/ipc`), `interfaces` (`socket.if_nameindex()`),
   `tmp_private` and `shm_private` (the markers absent), `erofs`
   (`os.utime(ro.txt)` → True on EROFS, else the errno name), `add_key`
-  (True on EPERM), `placed` (the placed file read in the view). A non-zero
+  (True on EPERM), `placed` (the placed file read in the view), and, when
+  `_confined_home()` is non-empty (the grant then names it and the
+  toolchain layer, and the probe gets a fifth argument
+  `.leerie-probe-<nonce>`), `home_written` (that file written in `$HOME`:
+  True, else the error); a `home_written` other than True, or the file
+  found in the real home afterwards (then removed), is a failed property
+  ("its home is not writable", "a write to its home reached the real
+  home"). The `_SANDBOX_FIXES` entry for `home .* is mounted beneath it` or
+  `overlay /home…: EINVAL` comes before the generic overlay one and names a
+  mount beneath the home. A non-zero
   exit or no report → `die()` with the shim's stderr and
   `_sandbox_fix(stderr) -> str`, the first of `_SANDBOX_FIXES` (regexes
   over the shim's own step and errno names, most specific first) that
@@ -12159,8 +12219,9 @@ branch, after the `_write_run_json(...)` block and before
 
 ### Caches
 
-One host cache is mounted into the container, `rw`: mise-data, the host's
-toolchains (§0.5 "Bind-mount table"). Package stores and caches (pnpm, pip,
+One host cache is mounted into the container, `rw`: `~/.cache/leerie/toolchains`
+at `/leerie-toolchains`, the host's toolchains and the toolchain home layer
+(§0.5 "Bind-mount table"). Package stores and caches (pnpm, pip,
 Go, Cargo, Bundler, corepack) are not mounted from the host: they live in the state
 mount, each run's own at `<run-dir>/worktrees/.stores/stores/` and its workers'
 at `<run-dir>/worktrees/.stores/cache/` (the held-out side's at

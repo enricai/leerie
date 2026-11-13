@@ -247,13 +247,18 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # bison, etc.) inside the container. Becomes the mise default in 2026.8.0.
 #
 # DATA_DIR is where mise installs per-repo runtime versions; the
-# launcher bind-mounts this from ~/.cache/leerie/mise-data so installs
-# survive across runs. SYSTEM_DATA_DIR is where the LTS fallback
+# launcher bind-mounts ~/.cache/leerie/toolchains at /leerie-toolchains so
+# installs survive across runs. It is outside the home: nothing is mounted
+# beneath the home, which each confined process gets an overlay copy of
+# (DESIGN §6 *Every confined process has its own home*). LEERIE_TOOLCHAIN_HOME
+# is the toolchain home layer beside it: the toolchain install's HOME, and
+# a lower layer of every other confined process's home. SYSTEM_DATA_DIR is where the LTS fallback
 # lives (baked below). The resolver checks DATA_DIR first then falls
 # through to SYSTEM_DATA_DIR (mise.jdx.dev/mise-cookbook/docker.html).
 ENV MISE_NODE_COREPACK=false
 ENV MISE_RUBY_COMPILE=false
-ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
+ENV MISE_DATA_DIR=/leerie-toolchains/mise
+ENV LEERIE_TOOLCHAIN_HOME=/leerie-toolchains/home
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 # Rootless containerd (Linux + nerdctl without setuid) runs the orchestrator
 # inside `unshare --user --map-user=leerie_uid`, which maps outer UID 0 →
@@ -334,7 +339,7 @@ RUN set -eux; \
 #      shadow a baked-in binary. Pinned by tests/test_dockerfile_path.py.
 # There is no system shims directory: `mise install --system` makes none
 # (measured, leerie 0.44.1: /usr/local/share/mise/shims does not exist).
-ENV PATH=/opt/leerie-vendor/bin:/home/leerie/.local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
+ENV PATH=/opt/leerie-vendor/bin:/leerie-toolchains/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
 
 # Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245) for
 # --json-schema. The install is pinned ≥ 2.1.219: that release fixed `claude
@@ -388,7 +393,15 @@ RUN set -eu; \
 # via --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g).
 ARG HOST_UID=501
 ARG HOST_GID=20
-RUN if ! getent group "${HOST_GID}" >/dev/null 2>&1; then \
+# The home is made first, root-owned and 0755, so `useradd -m` neither
+# re-owns it nor copies the skeleton into it: rootless maps outer root onto
+# the inner leerie, so a root-owned home is the one leerie can write, and a
+# home owned by leerie's literal uid is nobody's there (CLAUDE.md's ownership
+# trap); the rootful entry chowns it whole. It used to exist already
+# because `MISE_DATA_DIR` lay beneath it; it no longer does (DESIGN §6 *Every
+# confined process has its own home*).
+RUN mkdir -p /home/leerie && chmod 0755 /home/leerie; \
+    if ! getent group "${HOST_GID}" >/dev/null 2>&1; then \
       groupadd -g "${HOST_GID}" leerie; \
     fi; \
     useradd -u "${HOST_UID}" -g "${HOST_GID}" -m -s /bin/bash leerie
@@ -421,7 +434,7 @@ RUN mkdir -p /inspect && chown leerie:"${HOST_GID}" /inspect
 # with no chown. container-entry.sh's rootful branch chowns these to
 # leerie at runtime instead, since the rootful `runuser -u leerie` drop
 # is a real uid switch with no remap to rely on.
-RUN mkdir -p /home/leerie/.local/share/mise \
+RUN mkdir -p /leerie-toolchains/mise /leerie-toolchains/home \
              /home/leerie/.local/state/mise \
              /home/leerie/.cache/leerie/pnpm-store \
              /home/leerie/.cache/leerie/pip \

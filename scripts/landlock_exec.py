@@ -5,11 +5,14 @@ command's processes end with it*).
 
 Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                          [--link-root DIR]
-                         [--worker-root DIR [--cli]]] [--refusal-fd N]
+                         [--worker-root DIR [--cli]]
+                         [--home DIR --home-bytes N [--home-layer DIR]...]]
+                         [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
                         [--replace SRC=REL]... [--remove REL]...
                         [--report PATH --report-fd N] [--worker-root DIR]
+                        [--home DIR --home-bytes N [--home-layer DIR]...]
                         [--refusal-fd N] [--taken-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
 
@@ -18,6 +21,15 @@ mount rooted at DIR, everything else beneath it read-only, so a hard link
 between two of them works (`bind_grants`). DIR holds only trees and the
 stores they install from (DESIGN §6 *The write grants on one mount are one
 mount*); every other grant is its own mount.
+
+`--home DIR --home-bytes N [--home-layer DIR]...` (with either): the
+process's own home (DESIGN §6 *Every confined process has its own home*):
+an overlay on DIR whose lower layers are each `--home-layer` (first on top)
+and DIR itself, and whose upper is a `tmpfs` of N bytes in the process's
+own mount namespace, so the kernel frees it on every exit. A grant beneath
+DIR is bound from the real directory over it. DIR is then written like a
+grant. The shim samples the home while the command runs; a home that fills
+is a refusal (`--refusal-fd`), never the command's result.
 
 `--refusal-fd N`: every refusal (each exit 126 the shim makes itself, never
 CMD's) also writes its reason to descriptor N, which the shim makes
@@ -527,8 +539,8 @@ def run(cmd: list[str], relay: int | None = None,
         except ChildProcessError:
             break
         if status is None:
-            info = signal.sigwaitinfo(watched)
-            if info.si_signo in _STOP_SIGNALS:
+            info = _wait_signal(watched)
+            if info is not None and info.si_signo in _STOP_SIGNALS:
                 stopped = info.si_signo
     if relay is not None:
         try:
@@ -538,6 +550,9 @@ def run(cmd: list[str], relay: int | None = None,
             pass
     end_descendants(STOP_GRACE_SEC if stopped is not None
                     else END_GRACE_SEC)
+    full = _home_full()
+    if full is not None:
+        return _refused(full)
     if stopped is not None:
         return _die_of(stopped)
     if status is None:
@@ -721,6 +736,16 @@ DEV_LINKS = (("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"),
 CONSOLE = "/dev/console"
 _OLDROOT = "/.oldroot"
 _OVERLAY_DIR = "/tmp/.leerie-overlay"
+# Where the home's upper `tmpfs` and the real home are mounted while the
+# home's overlay is made (`private_home`); both are detached before the
+# command starts, so nothing reaches either but through `$HOME`.
+_HOME_UPPER = "/tmp/.leerie-home"
+_HOME_REAL = "/tmp/.leerie-home-real"
+# A home with less than this free is full (`HomeWatch`): a write that does
+# not fit fails with ENOSPC once the `tmpfs` has no page left.
+HOME_FULL_MARGIN = 1 << 20
+# How often the shim samples its home's use while the command runs.
+HOME_SAMPLE_SEC = 0.2
 # The most of a runner's report PID 1 copies out (a larger one is cut short
 # and reads as unreadable, which a caller treats as "could not measure").
 REPORT_MAX_BYTES = 64 << 20
@@ -1022,6 +1047,129 @@ def overlay_grants(rw: list[str], view: str) -> list[str]:
             f"lowerdir={p},upperdir={base}/u,workdir={base}/w,userxattr"))
         kept.append(p)
     return kept
+
+
+def private_home(home: str, layers: list[str], size: int,
+                 grants: list[str]) -> None:
+    """Mount the process's own home on `home` (DESIGN §6 *Every confined
+    process has its own home*): an overlay whose lower layers are `layers`
+    (each that exists, the first on top) and then `home` itself, and whose
+    upper and work directories are on a `tmpfs` of `size` bytes mounted in
+    this mount namespace, so the kernel frees it with the namespace on any
+    exit. Every grant in `grants` that lies beneath `home` is bound from the
+    real directory over the overlay, so it names what it names. The upper
+    `tmpfs` and the real home are then detached: the process reaches
+    neither but through `home`. Fails (`IsolationError`) rather than mount
+    a home over a mount beneath it, which the kernel refuses (`EINVAL`)."""
+    home = os.path.normpath(home)
+    if not os.path.isdir(home) or os.path.islink(home):
+        raise IsolationError(f"home {home}: not a directory")
+    lowers = [os.path.normpath(p) for p in layers
+              if os.path.isdir(p) and not _beneath(p, home)] + [home]
+    if any(c in p for p in lowers for c in ",:\\"):
+        raise IsolationError(f"home {home}: a path overlayfs cannot name")
+    for mp, _opts in _mountinfo():
+        if mp != home and _beneath(mp, home):
+            raise IsolationError(
+                f"home {home}: {mp} is mounted beneath it, and an overlay's "
+                "lower layer cannot hold a mount")
+    try:
+        os.mkdir(_HOME_UPPER, 0o700)
+        os.mkdir(_HOME_REAL, 0o700)
+    except OSError as e:
+        raise IsolationError(f"make {_HOME_UPPER}: {e}", e.errno or 0) \
+            from None
+    _must(f"tmpfs {_HOME_UPPER}", _mount(
+        "tmpfs", _HOME_UPPER, "tmpfs", MS_NOSUID | MS_NODEV,
+        f"size={size},mode=0700"))
+    try:
+        mode = stat.S_IMODE(os.stat(home).st_mode)
+        os.mkdir(f"{_HOME_UPPER}/u", mode)
+        os.chmod(f"{_HOME_UPPER}/u", mode)
+        os.mkdir(f"{_HOME_UPPER}/w", 0o700)
+    except OSError as e:
+        raise IsolationError(f"make the home's upper: {e}", e.errno or 0) \
+            from None
+    _must(f"bind {home}", _mount(home, _HOME_REAL, None, MS_BIND | MS_REC))
+    _must(f"overlay {home}", _mount(
+        "overlay", home, "overlay", 0,
+        f"lowerdir={':'.join(lowers)},upperdir={_HOME_UPPER}/u,"
+        f"workdir={_HOME_UPPER}/w,userxattr"))
+    for g in sorted({os.path.normpath(g) for g in grants}):
+        if g == home or not _beneath(g, home):
+            continue
+        src = _HOME_REAL + g[len(home):]
+        if not os.path.lexists(src) or os.path.islink(src):
+            continue
+        _must(f"bind {g} over the home",
+              _mount(src, g, None, MS_BIND | MS_REC))
+    libc = _libc()
+    for d in (_HOME_REAL, _HOME_UPPER):
+        _must(f"detach {d}", libc.umount2(os.fsencode(d), MNT_DETACH))
+        with contextlib.suppress(OSError):
+            os.rmdir(d)
+
+
+class HomeWatch:
+    """The use of the process's own home, sampled while its command runs
+    (DESIGN §6 *Every confined process has its own home*): `full` once a
+    sample found less than `HOME_FULL_MARGIN` free. The overlay's `statfs`
+    is its upper's."""
+
+    def __init__(self, home: str, size: int) -> None:
+        self.home = home
+        self.size = size
+        self.full = False
+
+    def sample(self) -> None:
+        try:
+            v = os.statvfs(self.home)
+        except OSError:
+            return
+        if v.f_bavail * v.f_frsize < HOME_FULL_MARGIN:
+            self.full = True
+
+    def finding(self) -> str:
+        return (f"leerie: the command filled its home {self.home} "
+                f"({self.size >> 20} MiB, its private overlay's limit): "
+                "whatever it then failed is the environment's, not a "
+                "verdict on the code (DESIGN §6 *Every confined process has "
+                "its own home*)")
+
+
+# The home being watched for the command this shim runs, or None.
+_HOME_WATCH: HomeWatch | None = None
+
+
+def _wait_signal(watched: set) -> "signal.struct_siginfo | None":
+    """`sigwaitinfo`, waking every `HOME_SAMPLE_SEC` to sample the home
+    when one is watched; None on such a wake."""
+    if _HOME_WATCH is None:
+        return signal.sigwaitinfo(watched)
+    _HOME_WATCH.sample()
+    return signal.sigtimedwait(watched, HOME_SAMPLE_SEC)
+
+
+def _home_full() -> str | None:
+    """The finding when the watched home filled, else None: it goes to the
+    refusal descriptor, so the caller never reads the command's result as
+    one (DESIGN §6 *A confinement failure stops the run; it is never a
+    result*)."""
+    if _HOME_WATCH is None:
+        return None
+    _HOME_WATCH.sample()
+    return _HOME_WATCH.finding() if _HOME_WATCH.full else None
+
+
+def _watch_home(home: str | None, size: int | None) -> list[str]:
+    """Watch `home`, the process's own (`HomeWatch`), when there is one;
+    returns it as a write grant (the overlay is the process's), or
+    nothing."""
+    global _HOME_WATCH
+    if home is None:
+        return []
+    _HOME_WATCH = HomeWatch(home, size or 0)
+    return [home]
 
 
 def _unescape_mountinfo(field: str) -> str:
@@ -1418,7 +1566,9 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             over_pairs: list[tuple[str, str]] = (),
             remove_paths: list[str] = (),
             sockets: list[str] = (),
-            worker_root: str | None = None) -> tuple[int, list[str]]:
+            worker_root: str | None = None,
+            home: str | None = None, home_layers: list[str] = (),
+            home_bytes: int = 0) -> tuple[int, list[str]]:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
     with `view`); returns how many mounts were made read-only and the read
     grants the worker view needs (`build_worker_view`; none without
@@ -1435,12 +1585,18 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
     carry_rw = [p for p in rw if _beneath(p, TMP) and p != TMP]
     kept = pivot_to_owned_root(carry_ro, carry_rw, sandbox=sandbox)
     roots: list[str] = []
+    if home is not None:
+        # Before the grants are bound: one beneath the home is bound from
+        # the real directory over it, then bound or overlaid as any grant.
+        private_home(home, list(home_layers), home_bytes, rw + ro)
+        roots.append(os.path.normpath(home))
     if sandbox:
         assert view is not None
         kept += overlay_grants(rw, view)
     else:
-        bound, roots = bind_grants(rw, link_root)
+        bound, linked = bind_grants(rw, link_root)
         kept += bound
+        roots += linked
     view_ro: list[str] = []
     private = PRIVATE
     if worker_root is not None:
@@ -1697,8 +1853,8 @@ def run_as_init(cmd: list[str], report: str | None, report_fd: int | None,
         except ChildProcessError:
             break
         if status is None:
-            info = signal.sigwaitinfo(watched)
-            if info.si_signo in _STOP_SIGNALS:
+            info = _wait_signal(watched)
+            if info is not None and info.si_signo in _STOP_SIGNALS:
                 stopped = info.si_signo
     _end_namespace(STOP_GRACE_SEC if stopped is not None else END_GRACE_SEC)
     _copy_report(report, report_fd)
@@ -1773,7 +1929,8 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                 place_pairs: list[tuple[str, str]], report: str | None,
                 report_fd: int | None, worker_root: str | None = None, *,
                 over_pairs: list[tuple[str, str]] = (),
-                remove_paths: list[str] = ()) -> int:
+                remove_paths: list[str] = (), home: str | None = None,
+                home_layers: list[str] = (), home_bytes: int = 0) -> int:
     """`--sandbox`: build it, fork PID 1 of the new PID namespace, forward
     a stop signal to it, and exit as `cmd` did."""
     enter = None
@@ -1782,7 +1939,9 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                               place_pairs=place_pairs,
                               over_pairs=over_pairs,
                               remove_paths=remove_paths,
-                              worker_root=worker_root)
+                              worker_root=worker_root, home=home,
+                              home_layers=home_layers,
+                              home_bytes=home_bytes)
         if worker_root is not None:
             ro = ro + view_ro
             enter = ("view", WORKER_VIEW, worker_env_changes(worker_root))
@@ -1793,6 +1952,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
     why = _undumpable()
     if why is not None:
         return _isolation_failed(OSError(why))
+    _watch_home(home, home_bytes)
     if report_fd is not None:
         os.set_inheritable(report_fd, False)
     status_r, status_w = os.pipe()
@@ -1811,7 +1971,8 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                           | ({report_fd} if report_fd is not None else set())
                           | ({_REFUSAL_FD} if _REFUSAL_FD is not None
                              else set()))
-        rc = _confine_or_126(rw + [view] + list(PRIVATE), ro)
+        rc = _confine_or_126(rw + [view] + list(PRIVATE)
+                             + ([home] if home is not None else []), ro)
         if rc is not None:
             os.write(status_w, f"E{rc}".encode())
             os._exit(0)
@@ -1824,14 +1985,17 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
             break
         if pid == init:
             break
-        info = signal.sigwaitinfo(watched)
-        if info.si_signo in _STOP_SIGNALS:
+        info = _wait_signal(watched)
+        if info is not None and info.si_signo in _STOP_SIGNALS:
             try:
                 os.kill(init, signal.SIGTERM)
             except OSError:
                 pass
     with os.fdopen(status_r, "rb") as f:
         word = f.read().decode(errors="replace")
+    full = _home_full()
+    if full is not None:
+        return _refused(full)
     if word.startswith("S") and word[1:].isdigit():
         return _die_of(int(word[1:]))
     if word.startswith("E") and word[1:].isdigit():
@@ -1905,6 +2069,7 @@ def _parse(argv: list[str]) -> dict | str:
                "report_fd": None, "egress": None, "forward": [],
                "worker_root": None, "cli": False, "refusal_fd": None,
                "taken_fd": None, "link_root": None,
+               "home": None, "home_layer": [], "home_bytes": None,
                "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
@@ -1918,7 +2083,8 @@ def _parse(argv: list[str]) -> dict | str:
                      "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd",
-                     "--link-root") \
+                     "--link-root", "--home", "--home-layer",
+                     "--home-bytes") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
@@ -1947,6 +2113,17 @@ def _parse(argv: list[str]) -> dict | str:
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --link-root {v!r}"
             o["link_root"] = os.path.normpath(v)
+        elif k in ("--home", "--home-layer"):
+            if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
+                return f"landlock_exec.py: bad {k} {v!r}"
+            if k == "--home":
+                o["home"] = os.path.normpath(v)
+            else:
+                o["home_layer"].append(os.path.normpath(v))
+        elif k == "--home-bytes":
+            if not v.isdigit() or int(v) <= 0:
+                return f"landlock_exec.py: bad --home-bytes {v!r}"
+            o["home_bytes"] = int(v)
         elif k == "--worker-root":
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --worker-root {v!r}"
@@ -1980,6 +2157,12 @@ def _parse(argv: list[str]) -> dict | str:
         return "landlock_exec.py: --report and --report-fd go together"
     if o["worker_root"] and not (o["isolate"] or o["sandbox"]):
         return "landlock_exec.py: --worker-root needs --isolate or --sandbox"
+    if o["home"] and not (o["isolate"] or o["sandbox"]):
+        return "landlock_exec.py: --home needs --isolate or --sandbox"
+    if (o["home"] is None) != (o["home_bytes"] is None) \
+            or (o["home_layer"] and o["home"] is None):
+        return ("landlock_exec.py: --home and --home-bytes go together, and "
+                "--home-layer needs them")
     if o["link_root"] and not o["isolate"]:
         return "landlock_exec.py: --link-root needs --isolate"
     if o["cli"] and not (o["worker_root"] and o["isolate"]):
@@ -2012,10 +2195,12 @@ def main(argv: list[str]) -> int:
             "terminal*)")
     rw, ro, cmd = o["rw"], o["ro"], o["cmd"]
     wr = o["worker_root"]
+    home = {"home": o["home"], "home_layers": o["home_layer"],
+            "home_bytes": o["home_bytes"] or 0}
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
                            o["report_fd"], wr, over_pairs=o["replace"],
-                           remove_paths=o["remove"])
+                           remove_paths=o["remove"], **home)
     relays: list[tuple[socket.socket, str]] = []
     enter = None
     if o["isolate"]:
@@ -2024,7 +2209,7 @@ def main(argv: list[str]) -> int:
         try:
             _n, view_ro = isolate(rw, ro, sockets=[t for _p, t in targets],
                                   worker_root=wr,
-                                  link_root=o["link_root"])
+                                  link_root=o["link_root"], **home)
             if wr is not None:
                 ro = ro + view_ro
                 enter = (("cli", WORKER_VIEW, wr) if o["cli"] else
@@ -2048,7 +2233,7 @@ def main(argv: list[str]) -> int:
             return _isolation_failed(OSError(why))
         if o["egress"]:
             os.environ.update(proxy_env(relays[-1][0].getsockname()[1]))
-        rw = rw + list(PRIVATE)
+        rw = rw + list(PRIVATE) + _watch_home(o["home"], o["home_bytes"])
     rc = _confine_or_126(rw, ro)
     if rc is not None:
         return rc

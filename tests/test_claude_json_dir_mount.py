@@ -60,16 +60,14 @@ def test_claude_json_still_written_at_the_stage_root():
 
 def test_stage_mounted_as_a_readonly_directory_for_the_local_container():
     text = _launcher_text()
-    assert (
-        'AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-claude-json-src:ro")' in text
-    )
+    assert 'AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-home-src:ro")' in text
 
 
-def test_claude_dir_mount_untouched():
-    """The unrelated `.claude/` directory mount (never part of this
-    defect) must be unchanged."""
+def test_claude_dir_is_copied_not_mounted():
+    """`.claude/` reaches the container as a copy too (DESIGN §6 *Every
+    confined process has its own home*): no mount of it remains."""
     text = _launcher_text()
-    assert 'AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/leerie/.claude")' in text
+    assert '"$STAGE/.claude:/home/leerie/.claude"' not in text
 
 
 # ---------------------------------------------------------------------------
@@ -79,18 +77,15 @@ def test_claude_dir_mount_untouched():
 
 def _entry_sh_claude_json_copy_block() -> str:
     text = _entry_sh_text()
-    marker = "if [ -f /opt/leerie-claude-json-src/.claude.json ]; then"
+    marker = "if [ -d /opt/leerie-home-src ]; then"
     start = text.index(marker)
     end = text.index("\nfi", start)
     return text[start:end]
 
 
-def test_container_entry_copies_claude_json_into_place():
+def test_container_entry_copies_the_staged_home_into_place():
     block = _entry_sh_claude_json_copy_block()
-    assert (
-        "cp /opt/leerie-claude-json-src/.claude.json /home/leerie/.claude.json"
-        in block
-    )
+    assert 'cp -a "$_e" /home/leerie/' in block
 
 
 def test_container_entry_copy_step_does_not_itself_chown():
@@ -102,14 +97,14 @@ def test_container_entry_copy_step_does_not_itself_chown():
     assert "ROOTLESS" not in block
 
 
-def test_container_entry_chowns_claude_json_in_the_shared_rootful_guard():
+def test_container_entry_chowns_the_home_in_the_shared_rootful_guard():
     block = _entry_sh_rootful_block()
-    assert "chown leerie: /home/leerie/.claude.json" in block
+    assert "chown -R leerie: /home/leerie " in block
 
 
 def test_container_entry_claude_json_copy_precedes_privilege_drop():
     text = _entry_sh_text()
-    copy_idx = text.index("cp /opt/leerie-claude-json-src/.claude.json")
+    copy_idx = text.index('cp -a "$_e" /home/leerie/')
     unshare_idx = text.index("unshare --user --map-user=")
     orchestrator_idx = text.rindex(
         "python3 /opt/leerie-image/orchestrator/leerie.py"
@@ -120,8 +115,8 @@ def test_container_entry_claude_json_copy_precedes_privilege_drop():
 
 def test_container_entry_claude_json_copy_precedes_the_rootful_chown():
     text = _entry_sh_text()
-    copy_idx = text.index("cp /opt/leerie-claude-json-src/.claude.json")
-    chown_idx = text.index("chown leerie: /home/leerie/.claude.json")
+    copy_idx = text.index('cp -a "$_e" /home/leerie/')
+    chown_idx = text.index("chown -R leerie: /home/leerie ")
     assert copy_idx < chown_idx
 
 
@@ -146,9 +141,10 @@ def _run_copy_and_ownership(
     rootful_block = _entry_sh_rootful_block() + "\nfi\n"
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        src_dir = tmp_path / "opt" / "leerie-claude-json-src"
+        src_dir = tmp_path / "opt" / "leerie-home-src"
         src_dir.mkdir(parents=True)
         (src_dir / ".claude.json").write_text('{"ok": true}')
+        (src_dir / "leerie-code").mkdir()
         dest_dir = tmp_path / "home" / "leerie"
         dest_dir.mkdir(parents=True)
         bin_dir = tmp_path / "bin"
@@ -167,15 +163,11 @@ def _run_copy_and_ownership(
 
         def _rewrite(text: str) -> str:
             return text.replace(
-                "/opt/leerie-claude-json-src/.claude.json",
-                str(src_dir / ".claude.json"),
+                "/opt/leerie-home-src", str(src_dir),
             ).replace(
-                "/home/leerie/.claude.json", str(dest_dir / ".claude.json")
+                "/home/leerie/", str(dest_dir) + "/"
             ).replace(
                 "/home/leerie ", str(dest_dir) + " "
-            ).replace(
-                "/home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg",
-                f"{dest_dir}/.local {dest_dir}/.cache {dest_dir}/.gnupg",
             ).replace(
                 "/work ", str(tmp_path / "work") + " "
             ).replace(
@@ -196,7 +188,12 @@ def _run_copy_and_ownership(
         dest_file = dest_dir / ".claude.json"
         dest_exists = dest_file.exists()
         dest_content = dest_file.read_text() if dest_exists else None
-        chown_invoked = chown_log.exists() and str(dest_file) in chown_log.read_text()
+        # The home is chowned whole (`chown -R leerie: <home>`).
+        chown_invoked = chown_log.exists() and any(
+            line.split()[-1] == str(dest_dir)
+            for line in chown_log.read_text().splitlines()
+            if line.startswith("-R "))
+        assert not (dest_dir / "leerie-code").exists()
         return dest_exists, dest_content, chown_invoked
 
 
@@ -235,10 +232,9 @@ def test_copy_is_a_noop_when_source_mount_absent():
         script = (
             "#!/bin/sh\nset -e\nROOTLESS=false\n"
             + block.replace(
-                "/opt/leerie-claude-json-src/.claude.json",
-                str(tmp_path / "nonexistent" / ".claude.json"),
+                "/opt/leerie-home-src", str(tmp_path / "nonexistent"),
             ).replace(
-                "/home/leerie/.claude.json", str(dest_dir / ".claude.json")
+                "/home/leerie/", str(dest_dir) + "/"
             )
         )
         subprocess.run(["sh", "-c", script], check=True, cwd=tmp_path, timeout=10)

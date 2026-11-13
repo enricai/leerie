@@ -25,12 +25,12 @@ LAUNCHER = REPO_ROOT / "leerie"
 ENTRY_SH = REPO_ROOT / "scripts" / "container-entry.sh"
 
 _OLD_SINGLE_FILE_MOUNT = '-v "$STAGE/.claude.json:/home/leerie/.claude.json"'
-_NEW_DIR_MOUNT = '-v "$STAGE:/opt/leerie-claude-json-src:ro"'
+_NEW_DIR_MOUNT = '-v "$STAGE:/opt/leerie-home-src:ro"'
 
 
 def _entry_sh_copy_block() -> str:
     text = ENTRY_SH.read_text()
-    marker = "if [ -f /opt/leerie-claude-json-src/.claude.json ]; then"
+    marker = "if [ -d /opt/leerie-home-src ]; then"
     start = text.index(marker)
     end = text.index("\nfi", start) + len("\nfi")
     return text[start:end]
@@ -46,32 +46,35 @@ def test_launcher_bind_mounts_stage_dir_for_claude_json_src():
     assert _NEW_DIR_MOUNT in text
 
 
-def test_launcher_still_mounts_claude_dir_directly():
+def test_launcher_mounts_nothing_beneath_the_home():
+    """Nothing is mounted beneath /home/leerie (DESIGN §6 *Every confined
+    process has its own home*): the staged home is copied in, `.claude`
+    with the rest."""
     text = LAUNCHER.read_text()
-    assert '-v "$STAGE/.claude:/home/leerie/.claude"' in text
+    assert ':/home/leerie/' not in text
+    assert ':/home/leerie"' not in text
 
 
-def test_container_entry_copies_claude_json_into_place():
+def test_container_entry_copies_the_staged_home_into_place():
     block = _entry_sh_copy_block()
-    assert "cp /opt/leerie-claude-json-src/.claude.json /home/leerie/.claude.json" in block
+    assert 'cp -a "$_e" /home/leerie/' in block
 
 
 def test_container_entry_copy_step_is_unconditional_across_privilege_models():
     """The copy runs before the rootless/rootful branch point, so it applies
     under both unshare --map-user (rootless) and runuser (rootful)."""
     text = ENTRY_SH.read_text()
-    copy_idx = text.index("cp /opt/leerie-claude-json-src/.claude.json")
+    copy_idx = text.index('cp -a "$_e" /home/leerie/')
     rootful_idx = text.index('if [ "$ROOTLESS" != "true" ] && getent passwd leerie')
     assert copy_idx < rootful_idx
 
 
-def test_container_entry_chowns_claude_json_in_rootful_guard():
+def test_container_entry_chowns_the_home_in_rootful_guard():
     """Rootful's runuser -u leerie is a real uid switch (no remap), so the
-    freshly-copied root-owned file needs an explicit chown there -- same
-    reasoning as the other /home/leerie ownership fixes in that guard."""
+    freshly-copied root-owned files need an explicit chown there: the whole
+    home, which each confined process's overlay copies up from."""
     block = _entry_sh_rootful_block()
-    assert "if [ -f /home/leerie/.claude.json ]; then" in block
-    assert "chown leerie: /home/leerie/.claude.json" in block
+    assert "chown -R leerie: /home/leerie " in block
 
 
 def test_falsify_reverting_to_single_file_mount_fails_the_guard():

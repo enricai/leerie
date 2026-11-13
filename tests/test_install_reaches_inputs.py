@@ -65,10 +65,7 @@ def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
         m = leerie._measurement_grants(st, tree, leerie.MEASURE_KIND)
         i = leerie._measurement_grants(st, tree, leerie.INSTALL_KIND)
         assert (m.egress, i.egress) == (False, True)
-        # Each grant's gpg home is a new one (DESIGN §6 *A confined
-        # command's scratch is short and private*); the rest is the same.
         me, ie = dict(m.env), dict(i.env)
-        assert me.pop("GNUPGHOME") != ie.pop("GNUPGHOME")
         assert (i.rw, i.ro, ie) == (m.rw, m.ro, me)
         stores = str(run["run_dir"] / "worktrees" / ".stores" / "stores")
         assert stores in i.rw and stores not in i.ro

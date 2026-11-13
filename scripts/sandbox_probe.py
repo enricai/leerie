@@ -4,7 +4,7 @@
 world that dies with it (I3)*). Writes `report.json` in its working directory
 (the overlaid view) with each property the orchestrator checks.
 
-Usage: sandbox_probe.py RO_FILE PLACED_REL TMP_MARK SHM_MARK
+Usage: sandbox_probe.py RO_FILE PLACED_REL TMP_MARK SHM_MARK [HOME_MARK]
 
 Stdlib only; it never decides anything, it reports what it observed."""
 from __future__ import annotations
@@ -43,8 +43,21 @@ def _erofs(path: str) -> bool | str:
     return "changed"
 
 
+def _home_written(mark: str) -> bool | str:
+    """Write `mark` in the process's own home (DESIGN §6 *Every confined
+    process has its own home*): True when it could."""
+    try:
+        with open(os.path.join(os.environ["HOME"], mark), "w",
+                  encoding="utf-8") as f:
+            f.write("home\n")
+    except (OSError, KeyError) as e:
+        return type(e).__name__ + ": " + str(e)
+    return True
+
+
 def main(argv: list[str]) -> int:
-    ro_file, rel, tmp_mark, shm_mark = argv
+    ro_file, rel, tmp_mark, shm_mark = argv[:4]
+    home_mark = argv[4] if len(argv) > 4 else None
     try:
         with open(rel, encoding="utf-8") as f:
             placed = f.read() == "held-out\n"
@@ -59,6 +72,8 @@ def main(argv: list[str]) -> int:
         "add_key": _add_key(),
         "placed": placed,
     }
+    if home_mark is not None:
+        report["home_written"] = _home_written(home_mark)
     with open("report.json", "w", encoding="utf-8") as f:
         json.dump(report, f)
     return 0

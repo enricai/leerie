@@ -88,8 +88,8 @@ grep -m1 "^RUN echo 'CHROMIUM_FLAGS=" "$DOCKERFILE" | sed "s/^RUN echo '//; s/' 
   > /etc/chromium.d/leerie-container-flags
 
 # --- leerie user ---
-# Before mise: its data dir (MISE_DATA_DIR) is under /home/leerie, and a home
-# that already exists makes `useradd -m` skip the skeleton files.
+# Before anything writes beneath /home/leerie: a home that already exists
+# makes `useradd -m` skip the skeleton files.
 if ! getent group "$LEERIE_GID" >/dev/null 2>&1; then
   groupadd -g "$LEERIE_GID" leerie
 fi
@@ -135,8 +135,11 @@ git config --system --add safe.directory '*'
 mkdir -p /inspect
 chown "leerie:$LEERIE_GID" /inspect
 
-mkdir -p /home/leerie/.local/share/mise \
-         /home/leerie/.local/state/mise \
+# The toolchain cache, outside the home (DESIGN §6 *Every confined process
+# has its own home*): MISE_DATA_DIR and the toolchain home layer.
+mkdir -p /leerie-toolchains/mise /leerie-toolchains/home
+chown -R leerie: /leerie-toolchains
+mkdir -p /home/leerie/.local/state/mise \
          /home/leerie/.cache/leerie/pnpm-store \
          /home/leerie/.cache/leerie/pip \
          /home/leerie/.cache/leerie/go-mod \

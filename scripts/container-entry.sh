@@ -156,25 +156,31 @@ BROKER="/opt/leerie-image/scripts/cgroup-broker.py"
 
 cd /work
 
-# -- .claude.json: copy from the staged directory mount into place. --
-# Local nerdctl mounts the whole per-run host scratch dir ($STAGE) at
-# /opt/leerie-claude-json-src, read-only, rather than bind-mounting
-# .claude.json itself onto /home/leerie/.claude.json (see
-# the leerie launcher's AUTH_MOUNTS comment for the corruption this
-# avoids: rename() onto a bind-mounted single file returns EBUSY, forcing
-# the CLI to truncate-in-place, which is not atomic under concurrent
-# workers). We copy it into place here, as a real file inside the
-# container's own filesystem, so the CLI's normal atomic rename() works.
-# This mirrors what seed-auth.sh/ec2-seed-auth.sh already do for the
-# remote runtimes (tar-copy, never a live bind mount of this file).
+# -- The home: copy the staged host files into place. --
+# The launcher mounts the whole per-run host scratch dir ($STAGE: the CLI's
+# configuration and credentials, `.claude.json`, the git files, `.ssh`,
+# `.gnupg`, `.aws`) read-only at /opt/leerie-home-src, and nothing beneath
+# /home/leerie. They are copied here, as real files of the container's own
+# filesystem, before privilege is dropped: the host's files reach the
+# container as copies, and no write inside reaches the host (DESIGN §6
+# *Every confined process has its own home*). Nothing may be mounted beneath
+# the home: each confined process gets an overlay of it, and an overlay's
+# lower layer cannot hold a mount. A copied `.claude.json` also keeps the
+# CLI's atomic rename() working, which a bind-mounted single file breaks
+# (EBUSY, then a non-atomic truncate under concurrent workers, N19).
+# Only the dot-entries: $STAGE also holds the launcher's snapshot of
+# leerie's own code (`leerie-code`), which is not the home's.
 #
-# Absent on the Fly/EC2 paths (they seed .claude.json directly, no such
-# mount exists there), so this is a no-op there. Left root-owned for now
-# under rootless (correct there — see the rootful guard below, which
-# chowns it to leerie only in the rootful case, same reasoning as the
-# other /home/leerie ownership fixes it already contains).
-if [ -f /opt/leerie-claude-json-src/.claude.json ]; then
-  cp /opt/leerie-claude-json-src/.claude.json /home/leerie/.claude.json
+# Absent on the Fly/EC2 paths (they tar-copy $STAGE into the home
+# directly, never a live mount), so this is a no-op there. Root-owned
+# under rootless (correct there: outer root is inner leerie); the rootful
+# guard below chowns the home to leerie.
+if [ -d /opt/leerie-home-src ]; then
+  for _e in /opt/leerie-home-src/.[!.]* /opt/leerie-home-src/..?*; do
+    [ -e "$_e" ] || [ -L "$_e" ] || continue
+    cp -a "$_e" /home/leerie/
+  done
+  unset _e
 fi
 
 # /work ownership fix. On the Fly path, when FLY_VM_DISK_GB is set in
@@ -212,13 +218,17 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   # root-owned (rootless needs that; see the Dockerfile comment there).
   # The rootful `runuser -u leerie` drop is a real uid switch, so it
   # needs literal leerie ownership — applied here instead.
-  chown leerie: /home/leerie 2>/dev/null || true
-  chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg 2>/dev/null || true
-  # .claude.json (copied into place above, root-owned since it's a fresh
-  # file inside the container's own filesystem) needs the same rootful
-  # chown-to-leerie treatment as everything else in this guard.
-  if [ -f /home/leerie/.claude.json ]; then
-    chown leerie: /home/leerie/.claude.json 2>/dev/null || true
+  # The whole home, the staged copies above included: each confined
+  # process's home is an overlay of it, and copying a file up needs to own
+  # it (DESIGN §6 *Every confined process has its own home*).
+  chown -R leerie: /home/leerie 2>/dev/null || true
+  # The toolchain directories where they are the image's own (Fly, EC2):
+  # never where the launcher mounted the host's cache there, which is the
+  # host user's and keeps its owner.
+  if ! awk '$2 == "/leerie-toolchains" { found = 1 } END { exit found ? 0 : 1 }' \
+      /proc/self/mounts 2>/dev/null; then
+    chown leerie: /leerie-toolchains /leerie-toolchains/mise \
+      /leerie-toolchains/home 2>/dev/null || true
   fi
   # The Dockerfile's `mise install --system` creates /tmp/.cache/mise/
   # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an

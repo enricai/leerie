@@ -2693,7 +2693,8 @@ worker gets the first block, then its kind's.
 | own temp dir | what `TMPDIR`, `TMP` and `TEMP` name: `/tmp/l/<id>/`, `<id>` derived from `<run-dir>/workers/<wid>/` (*A confined command's scratch is short and private*) | write | `_worker_dirs` |
 | own CLI config | what `CLAUDE_CONFIG_DIR` names: `<run-dir>/workers/<wid>/config/` (sessions live there, so `--resume` finds them) | write | `_worker_dirs` |
 | the CLI configuration template | `<run-dir>/claude-config/`, whose directories each worker's configuration links | read | `_claude_config_template` |
-| leerie's own code, the CLI, the worker's home | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check), the `claude` its `PATH` finds, and `$HOME` (the git identity, a package manager's config) unless it holds `/tmp`: each named, so that one under `/tmp` on a host is still read | read | — |
+| leerie's own code, the CLI | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check) and the `claude` its `PATH` finds: each named, so that one under `/tmp` on a host is still read | read | — |
+| its own home | `$HOME`, an overlay of the toolchain home layer and the pristine home with a private upper, made by the shim when isolated (*Every confined process has its own home*); not isolated (a test, a host harness), `$HOME` read, unless it holds `/tmp` | write | the shim |
 | its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/worktrees/.stores/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/worktrees/.stores/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
 | its tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
 | outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
@@ -2825,10 +2826,8 @@ and is a change of its own that needs its own bench on fresh cases (§8).
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/` or
 anything else in the run directory, not `repo-settings/`, not staging or a
 view (unless it is the worker's own tree), not a sibling's worktree, not
-`/work`, `$HOME` for writing, the container's `/tmp`. A tool that writes
-beneath `$HOME` by a fixed path is redirected by environment to the
-worker's own directories, or fails — then that is a finding, not a grant
-to widen.
+`/work`, the container's `/tmp`. The home a worker writes is its own
+copy (§6 *Every confined process has its own home*), never the run's.
 
 **Outside the container.** The host-side workers — the rebaser
 (`host-finalize.sh` → `run_rebaser`), the host recapture
@@ -3317,8 +3316,9 @@ they are confined.
   an image — a server bound to `localhost`, a `pg_isready -h localhost`, a
   test URL (review round 29, execution H1). They are the run's name
   service, as `/dev` and `/proc` are its kernel's. `/home` is the run's
-  own — its HOME, with leerie's caches and the CLI's credentials mounted
-  in it — never the repository's: what a repository's Dockerfile installs
+  own — its HOME, the pristine home copied in at the entry with nothing
+  mounted in it, overlaid per process (*Every confined process has its own
+  home*) — never the repository's: what a repository's Dockerfile installs
   beneath `/home/leerie` (a `curl | sh` installer, a user-site `pip
   install`) would be missing from every confined command, so a run whose
   worker root holds anything there the container's `/home/leerie` lacks
@@ -4320,16 +4320,17 @@ confinement failure stops the run; it is never a result*).
 | devices | as a worker's | write |
 | the measured tree | the checkout the command runs in (a committed view, an evaluation tree, a helper checkout, a worker tree an install runs in) | write |
 | its measurement directory | `<run-dir>/measure/<tree>-<id>/`: `mise-state/` (`MISE_STATE_DIR`), `state/` (`XDG_STATE_HOME`), `reports/` (the runner report of every run that is not held-out; a held-out run's report path is there inside its sandbox only), `coverage/` (the coverage detector's output) | write |
-| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) and a new `gnupg-<random>/` per grant (`GNUPGHOME`) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
+| its private temp directory | `/tmp/l/<id>/`, what `TMPDIR`, `TMP`, `TEMP` and `XDG_CACHE_HOME` name, and its `run/` (`XDG_RUNTIME_DIR`, which holds sockets) (*A confined command's scratch is short and private*), carried into its own `/tmp` | write |
 | `/tmp`, `/dev/shm` | the command's own, made by the shim, every kind, every tree (*Every confined process has its own `/tmp`, `/dev/shm` and IPC*) | read and write |
-| leerie's install, the home | `ROOT` (the AST scripts), `HOME` (unless it holds `/tmp`), named as a worker's are | read |
+| leerie's install | `ROOT` (the AST scripts), named as a worker's is | read |
+| its own home | `$HOME`, as a worker's (*Every confined process has its own home*) | write |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
 | the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
 | the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, cargo, bundler, NuGet, Go's build cache, pipenv, pnpm's metadata cache, pip's user base, the .NET CLI home, bundler's home), for a tree under `<run-dir>/worktrees/` | write |
 | the run's mise overrides | `<run-dir>/mise-overrides.toml` | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
-| *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR`; `mise-state/` emptied first | write |
+| *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR` and the toolchain home layer `/leerie-toolchains/home`, which is its `HOME`; no store variable in its environment; `mise-state/` emptied first | write |
 | *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
 
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
@@ -5066,6 +5067,10 @@ install would trust. The directory goes with the temp directory. A worker
 is not given one: a worker installs no toolchain (a toolchain under
 `MISE_DATA_DIR` is outside its write boundary), and its `~/.gnupg`
 stays the home a signed commit reads.
+*Superseded 2026-11-13* by *Every confined process has its own home*: a
+confined command's `~/.gnupg` is its own private copy, so no `GNUPGHOME` is
+set; the toolchain install's is the toolchain home layer's, kept with the
+toolchains it verified.
 
 **Each Node version's corepack shims go in its own `bin`.** *Designed
 2026-11-04 (barnacle's Node floor, the step after the gpg home).* With a
@@ -5106,7 +5111,9 @@ Node's corepack. So the shims stay, made where they belong.
 **One toolchain install at a time on a host, against mise's own
 completeness record.** *Designed 2026-11-04 (three barnacle runs at
 03:11).* Three runs on one host began provisioning together. Every run
-shares one `MISE_DATA_DIR` (the bind-mounted `~/.cache/leerie/mise-data`).
+shares one `MISE_DATA_DIR` (the bind-mounted `~/.cache/leerie/mise-data`;
+since 2026-11-13 `~/.cache/leerie/toolchains/mise`, *Every confined process
+has its own home*).
 Two died installing node 22.19.0 at the corepack step above. The third
 printed "mise all tools are installed" and went on with "resolved
 versions: node 22.19.0": it had taken another run's install, still in
@@ -5408,6 +5415,215 @@ build a sandbox was no longer stopped (review round 21, execution H1). The
 invariant restored: an invocation spawns no confined process before its
 entry has proved the runtime confines and isolates it; a test enumerates
 `main()`'s dispatch paths against it.
+
+### Every confined process has its own home
+
+*Designed 2026-11-13 (the user's decision: "HOME copies all the way down";
+lane HC). It replaces "`$HOME` is never granted for writing; a tool that
+writes beneath it by a fixed path is redirected by environment or fails"
+(I5), and *A confined command has a gpg home of its own* (2026-11-04).*
+
+**Root cause.** Every confined process read the run's one home,
+`/home/leerie`, and none could write it, because whatever one of them wrote
+there every later one would read: a worker's, a measurement's, a held-out
+evaluation's. So each tool that writes beneath `~` by a fixed path failed
+until leerie named a variable that moved it: pip's user base, the .NET CLI's
+home, bundler's home, gpg's home, each added after a run died (review round
+19 exec H2; barnacle's Node 22.19.0, 2026-11-04). That is a list of tools,
+and it fails without a word for the next one: Rust died at provision on
+every version since confinement, because rustup keeps its toolchains in
+`~/.rustup` (OPEN-ISSUES #23, lanes LG and LG2). The defect is not a
+missing row. The home was shared, so it had to be read-only, so every tool
+had to be moved out of it one at a time. And the home itself was not a copy:
+the launcher bind-mounted the host's staged credentials and configuration
+into it (`.claude` writable, `.ssh`, `.gnupg`, the git files), and the host's
+toolchain cache (`~/.cache/leerie/mise-data`) at `~/.local/share/mise`, so a
+write beneath one of those mounts reached the host's staging directory or
+every later run.
+
+**Invariant: every confined process — every worker, every repository
+command leerie runs, every held-out evaluation — has a home of its own: a
+copy of one pristine home, writable, private to its process tree, gone when
+that tree ends. Nothing one of them writes beneath `~` is seen by another.
+Only the toolchain install writes a layer others read.**
+
+1. *The pristine home is a copy, and nothing is mounted beneath it.* The
+   launcher stages the host's credentials and configuration in `$STAGE` as
+   before and mounts `$STAGE` read-only at `/opt/leerie-home-src`; the
+   container's entry copies it into `/home/leerie` (`cp -a`, the container's
+   own filesystem) before it drops privilege, so the host's files reach the
+   container as copies and no write inside reaches the host. The host's
+   toolchain cache moves out of the home: `~/.cache/leerie/toolchains/` is
+   mounted at `/leerie-toolchains`, holding `mise/` (`MISE_DATA_DIR`) and
+   `home/`, the toolchain home layer (3). It is a new host directory: the
+   older images that live runs still use keep `~/.cache/leerie/mise-data` at
+   its old container path, and an install records absolute paths, so the
+   two never share one. The first run after the upgrade therefore installs
+   its toolchains again, once, into the new directory. The old
+   `~/.cache/leerie/mise-data` is removed by `leerie prune --apply` once no
+   `leerie` image older than this change is held on the host (no live run
+   can then mount it); until that step ships (a follow-up of its own) it
+   is the operator's to remove. On Fly and EC2 `/leerie-toolchains` is a directory
+   of the machine. Nothing is mounted beneath the home on any runtime; the
+   orchestrator writes nothing beneath it after the entry, so the home the
+   first worker copies is the home the last one copies.
+2. *Each confined process's home is an overlay the shim makes.* In the
+   mount namespace it already builds (`--isolate`, `--sandbox`; *Every
+   confined process has its own `/tmp`*), after the pivot and before the
+   grants are bound, the shim mounts an overlay on `$HOME`: lower layers the
+   toolchain home layer, then the pristine home; upper and work directories
+   on a `tmpfs` of its own, mounted in that namespace (`--home`,
+   `--home-layer`). Every tool sees one ordinary `$HOME`, through `$HOME`
+   and through the password database alike: reads fall through to the
+   layers, writes land in the upper. A grant that lies beneath the home (a
+   setup hook's `~/.local/bin`; a host's state root) is bound from the real
+   directory over the overlay, so a grant keeps meaning what it names. The
+   home is then granted for writing to every confined process; the overlay
+   is what makes that safe.
+3. *Only the toolchain install writes a layer others read.* The toolchain
+   kind (`mise install`, `mise ls`) runs with `HOME` at the toolchain home
+   layer itself, `/leerie-toolchains/home`, granted for writing with
+   `MISE_DATA_DIR`, and with none of the run's store variables in its
+   environment: a toolchain is the host's, a store is one run's, and a
+   toolchain installed into one run's store would leave
+   `MISE_DATA_DIR/installs/<tool>/<version>`, which every run shares, a link
+   into that run (lane LG2, measured on 0.65.0's image). Whatever an
+   installer keeps beneath `~` (rustup's `~/.rustup` and `~/.cargo/bin`,
+   gpg's keyring of a runtime's release keys) is kept with the toolchains,
+   across runs and launches, and every later process reads it at its
+   ordinary path through its overlay's lower layer. No tool is named: what
+   the install writes beneath its home is the layer. The layer is as
+   trusted as `MISE_DATA_DIR` already is — every run executes the
+   toolchains there — so a key or a file a repository's toolchain install
+   could plant in it is no capability that install did not already have.
+4. *What stays redirected, and why.* A store variable moves a tool's writes
+   out of the home for a reason the private home does not remove: it must
+   outlive the command. The run's stores (`_STORE_VARS`) are shared by every
+   command of the run so one install feeds the next; a tree's own stores
+   (`_TREE_STORE_VARS`: pip's user base, bundler's path and home, the .NET
+   CLI home, uv, cargo, Go's build cache, NuGet, pipenv, pnpm's metadata
+   cache) carry an install's result to the build and test that follow it in
+   that tree, which a private home, gone when the install ends, would not;
+   the tree's private temp directory (`TMPDIR`, `XDG_CACHE_HOME`) and its
+   measurement directory (`XDG_STATE_HOME`, `MISE_STATE_DIR`) the same.
+   Each stays. What existed only because the home was read-only goes:
+   `GNUPGHOME` at a new directory per grant (the private home's `~/.gnupg`
+   is that, a copy of the operator's staged keyring in which nothing a
+   command imports outlives it). The rule for a new variable: one that only
+   makes a tool's write beneath `~` succeed is never added; one is added
+   only when the write must outlive the command or be shared.
+5. *The target: a tree home layer, and no per-tool variable.* The tree
+   store variables are still a list of tools — pip's, bundler's, the .NET
+   CLI's, cargo's — kept only because a private home ends with its command.
+   The shape that ends the list is the toolchain layer one level down: each
+   tree gets a tree home layer, written only by that tree's install step,
+   and stacked between the toolchain layer and the pristine home in every
+   later build and test command in that tree; discarded with the tree's
+   stores when the view moves (*A view moves to the next tip when the
+   install's inputs are unchanged*). Whatever an install keeps beneath `~`
+   then reaches the commands after it, for every tool, and the per-tree
+   variables go. It ships after this, and after the Rust change; a variable
+   that must stay then is named with its own reason.
+
+**Invariant: no upper outlives its process tree, on any exit path.** The
+upper is a `tmpfs` mounted inside the confined process's own mount
+namespace, and nothing else holds that namespace: the kernel frees it when
+the namespace's last process exits — a normal exit, an error, a timeout's
+kill, `SIGKILL` of the shim, the orchestrator's crash (its children die
+with the container's PID 1) or the container's kill — with no removal
+leerie runs and nothing for a sweep to find. Nothing is kept for debugging
+and no later process reuses one: a re-ask or a resume starts from the
+pristine home again, as it starts with an empty `/tmp`. Tested on the real
+path: leftover mounts and bytes counted after each exit path.
+
+**Invariant: an upper is bounded, and running out is a finding that names
+the process.** The upper's `tmpfs` is mounted with a size
+(`HOME_UPPER_BYTES`, 1 GiB), so one process cannot take the host's
+memory; its pages are charged to the writer's memory cgroup like any other
+`tmpfs` page, and only pages written are used, so the size times the run's
+concurrent workers (`max_parallel`, 5) is a ceiling, not a cost. Nothing
+large belongs in a home: packages and downloads go to the stores (4),
+toolchains to the toolchain layer (3). The shim samples its home's free
+space while the command runs (every `HOME_SAMPLE_SEC`, 0.2 s, and once at
+the end); a home found with less than `HOME_FULL_MARGIN` (1 MiB) free is
+full. A full home is a finding, never a result: the shim writes it to its
+refusal descriptor, naming the home and its size, so the spawn raises
+`ConfinementRefused` naming the worker (`worker <sid>`) or the command (its
+label), the run stops with it in the run's log, and nothing the command
+then failed is read as a verdict on the code — a test that failed from
+`ENOSPC` is never recorded as a failing test (*A confinement failure stops
+the run; it is never a result*). `resume` redoes the step.
+
+*A layer that changes under a mounted overlay.* overlayfs leaves a change to
+a lower layer while an overlay is mounted undefined, though never a crash
+or a deadlock (the kernel's overlayfs documentation, *Changes to underlying
+filesystems*). Two writes do that here, both by design: the toolchain
+install writes the toolchain layer while another run's processes may hold
+it as a lower, and a setup hook writes `~/.local/bin` (bound from the real
+home) while the pristine home is a lower of processes already running.
+Both happen at provisioning, before the run's workers start; what a process
+mounted earlier may miss is a file the change added, which every process
+mounted after it sees. No leerie step reads a toolchain through a process
+mounted before that toolchain's install.
+
+**Why the shim, not `bwrap`.** `bwrap` makes the same overlay
+(`--overlay-src`, `--tmp-overlay`, since 0.9.0) with the same kernel
+features: a user namespace, then an overlay with `userxattr`. It adds
+nothing the shim lacks, is not in the image, and cannot run inside the shim:
+the shim's seccomp filter refuses every namespace and mount call to the
+confined process, by design. The shim already builds the namespace, pivots
+and binds `bwrap`'s way; the home is one more mount in it.
+
+*Measured (2026-11-13, kernel 7.0, nerdctl 2.3.5, containerd 2.2.2).* In
+the container as the leerie user, in a user namespace mapping the caller
+onto itself:
+
+| what | rootless | rootful |
+|---|---|---|
+| overlay on `/home/leerie`, lower the home, upper a `tmpfs` (`userxattr`) | yes, 0.3–0.4 ms | yes, 0.3–0.5 ms (the entry's `chown -R` of the home, as today) |
+| the same with a host directory as a second lower | yes | yes |
+| a host directory as upper (the toolchain install's shape, not used: 3) | yes | yes |
+| lower a directory with a mount beneath it (`~/.local/share/mise`, the auth mounts; `/etc`) | `EINVAL` | — |
+| under the `leerie-container` profile before this change | `EACCES` | — |
+
+What it costs, measured on real launches (rootless, image `leerie:hc-home`,
+host load average about 45): making the home (`private_home`) took 6–10 ms
+per confined process; end to end, from the shim's start to its exit, 60
+paired spawns of `/bin/true` with and without a home differed by a median
+of 92 ms, the rest being the namespace's teardown of the overlay and its
+`tmpfs` at exit. Space: the shim's sampled peak of every confined process's
+home over four real runs (Rust, Node, pip and a repository whose test
+writes `~/.calcrc`; workers and commands alike, 216 shim reports in the launch
+logs) was 0 bytes, 4 KiB at most: what a run writes goes to its stores,
+toolchains and trees, as (4) and (3) intend. 128 MiB written to a home,
+then each exit path, left 0 bytes of the container's shared memory.
+
+A directory with a mount beneath it cannot be an overlay's lower, nor be
+bound without its submounts, in a user namespace: the kernel will not show
+what a locked mount covers. That is why nothing may be mounted beneath the
+home (1), and why the shim refuses (exit 126) rather than mount a home
+over one. The `leerie-container` AppArmor profile allows an overlay only
+by target; it now allows one on `/home/*/`. Rootful needs the home owned
+by the leerie user, which the entry's rootful guard already does; a
+root-owned directory in it is `EACCES` to copy up, as it would be to write
+(CLAUDE.md's ownership trap). The image therefore makes `/home/leerie`
+root-owned and 0755 before `useradd`: it used to exist already because
+`MISE_DATA_DIR` lay beneath it, and without that `useradd -m` made it 0700
+and owned by leerie's literal uid, which rootless does not map, so the
+orchestrator could not read its own `~/.gitconfig` (measured: every launch
+died "git user.email is not configured"). A real run measured on rootful
+too: the launcher's own `nerdctl run`, replayed under rootful containerd,
+passed its entry probe and finished the `~/.calcrc` repository done. Not
+measured: Colima, Fly and EC2. Each
+needs only what a held-out sandbox already needs (an overlay with
+`userxattr` in a user namespace, *A held-out evaluation runs alone*), and
+the entry's probe fails closed naming the fix.
+
+*Claude's credentials.* Unchanged by this: each worker's CLI configuration
+is already its own copy (`_worker_dirs`, from the run's template), and
+`CLAUDE_CONFIG_DIR` names it, outside the home. A container cannot refresh
+a subscription token (*Credential strategy*), so there is no refreshed token
+for a later worker to need; the long-lived token is the answer, as before.
 
 ### A confined process has its own network; the outside is reached only through leerie's proxy
 
@@ -8307,8 +8523,9 @@ while the user is logged in.
 A leerie container cannot participate in that renewal. Keychain and
 `~/.claude/.credentials.json` never traverse the Lima VM boundary directly
 — the launcher copies whatever credential it resolves into a fresh
-`mktemp -d` staging directory and bind-mounts it read-through into the
-container, so the container holds a **snapshot**, not a live view. It
+`mktemp -d` staging directory, mounts it read-only, and the container's
+entry copies it into the home, so the container holds a **copy**, not a
+live view (§6 *Every confined process has its own home*). It
 cannot refresh a token whose refresh state lives in the host's Keychain,
 and Anthropic's refresh flow **rotates the refresh token on every use** —
 a container-side refresh, even if it succeeded, would silently invalidate
@@ -8814,7 +9031,10 @@ environment. The class also holds where a user-level install lands when
 the system location is not writable — pip's user base (`PYTHONUSERBASE`),
 the .NET CLI's home (`DOTNET_CLI_HOME`) and bundler's home
 (`BUNDLE_USER_HOME`) — because each otherwise falls back to `$HOME`, which
-no measurement grant writes. Review round 19 exec H2 found every pip
+no measurement grant wrote. Since 2026-11-13 every confined process writes
+a home of its own (*Every confined process has its own home*), but that home
+ends with the command; these stay because an install's result must reach
+the build and test after it in the tree. Review round 19 exec H2 found every pip
 recipe failing in every view that way. Measured as the leerie user with
 `$HOME` read-only: `pip install` answered "Defaulting to user
 installation" and failed, and succeeded with `PYTHONUSERBASE` set, the
@@ -11473,7 +11693,7 @@ the CI parity baseline, the browser suite unable to start).
    and build entry. A runtime is not a dependency: the version a
    repository pins is the one mise discovers from the repository's own
    files (step 2), installed into the host's `MISE_DATA_DIR`
-   (`~/.cache/leerie/mise-data`, §6 *One toolchain install at a time on a
+   (`~/.cache/leerie/toolchains/mise`, §6 *One toolchain install at a time on a
    host*), which keeps it across runs, launches and leerie upgrades.
 
    *What a run pays.* One dependency install per tree it measures, as
