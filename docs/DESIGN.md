@@ -3304,8 +3304,13 @@ they are confined.
   view (`build_worker_view`, at `/.leerie-worker-view`): each top-level
   entry of the worker root but the container's own (`/dev`, `/proc`,
   `/sys`, `/run`, `/tmp`, `/home`, `/work`, `/inspect`, `/leerie-state`,
-  `/leerie-host`), those from the container — so the grants, the private
-  `/tmp` and the state root are the same mounts — and an `/opt` holding the
+  `/leerie-host`, `/leerie-toolchains`), those from the container — so the
+  grants, the private `/tmp`, the state root and the host's toolchains are
+  the same mounts; leerie's base image holds an empty `/leerie-toolchains`,
+  so a worker root taken from it would hide every toolchain the host
+  installed and leave the toolchain install's grant on a directory the
+  install never sees (0.69.0 and 0.70.0: `mise install` failed with
+  "Read-only file system" on every repository with an image) — and an `/opt` holding the
   worker root's entries with leerie's own `/opt/leerie-*` over them (the
   scripts the AST measurements run, the bundled `typescript`). The view's
   `/etc` likewise holds the worker root's entries, but `/etc/hosts`,

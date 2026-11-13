@@ -5582,7 +5582,9 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   holding each entry of the worker root's `/etc`, but each name in
   `CONTAINER_ETC_FILES` (`hosts`, `hostname`, `resolv.conf`) from the
   container's `/etc` when it has it; a name in `CONTAINER_ENTRIES` (`dev`, `proc`, `sys`, `run`, `tmp`,
-  `home`, `work`, `inspect`, `leerie-state`, `leerie-host`) or absent from
+  `home`, `work`, `inspect`, `leerie-state`, `leerie-host`,
+  `leerie-toolchains`; every top-level target the launcher mounts is one,
+  pinned by `tests/test_worker_root_view.py`) or absent from
   the worker root → the container's (when it has it); else the worker
   root's. Each entry by `_bind_entry(src, dst)`: a link copied as a link,
   a directory `rbind`-mounted, anything else bound as a file. Lists and
