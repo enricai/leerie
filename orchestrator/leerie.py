@@ -3127,7 +3127,7 @@ PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
 # one of INTENT_ANSWERS, from the user or a settled, trusted resolver
 # verdict.
 INTENT_ANSWERS = ("yes", "no")
-INTENT_SOURCES = ("plan", "set_aside", "contradiction")
+INTENT_SOURCES = ("plan", "set_aside", "contradiction", "base_form")
 INTENT_EVIDENCE_SOURCES = ("code", "history", "task", "report", "web")
 # The evidence sources code checks verbatim; `web` is not checked.
 INTENT_CHECKED_SOURCES = ("code", "history", "task", "report")
@@ -8067,6 +8067,10 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
     behaviour = state.get("existing_behaviour")
     moved = (behaviour.get("moved_literal") or {}) if isinstance(
         behaviour, dict) else {}
+    unkept = (behaviour.get("cause_unkept") or {}) if isinstance(
+        behaviour, dict) else {}
+    waiting = (behaviour.get("cause_open") or {}) if isinstance(
+        behaviour, dict) else {}
     failed: dict[str, list[str]] = {}
     for r in ((behaviour.get("changed") or []) if isinstance(behaviour, dict)
               else []):
@@ -8084,6 +8088,15 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
             continue
         entries: list[str] = []
         for r in required.get(rec["file"], []):
+            if r.get("cause"):
+                # DESIGN §8 *A broken base-form case whose cause is a change
+                # the run made is a question first*.
+                entries.append(
+                    "- existing test changed because the task changes what it "
+                    f"pins ({', '.join(str(c) for c in r['cause'])}; "
+                    + ", ".join(_pr_code(str(q)) for q in r.get("qids") or [])
+                    + f"): {_pr_code(str(r.get('id') or ''))}")
+                continue
             entries.append(
                 f"- existing test changed because required item "
                 f"{r.get('item_index')} contradicts it: "
@@ -8094,7 +8107,19 @@ def _pr_tracked_test_lines(state: dict) -> list[str]:
             if not i.strip():
                 continue
             ev = moved.get(i) if isinstance(moved, dict) else None
-            if ev:
+            why = unkept.get(i) if isinstance(unkept, dict) else None
+            asked = waiting.get(i) if isinstance(waiting, dict) else None
+            if why:
+                entries.append(
+                    "- the task changes what this existing test pins, but "
+                    f"{why}: {_pr_code(i)}")
+            elif asked:
+                entries.append(
+                    "- fails in its base form; whether the task changes what "
+                    "it pins is an open question ("
+                    + ", ".join(_pr_code(str(q)) for q in asked)
+                    + f"): {_pr_code(i)}")
+            elif ev:
                 # DESIGN §8 *A case pinning a moved literal gets no round*.
                 entries.append(
                     "- existing test pins text the run moved to the message "
@@ -43553,6 +43578,12 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # says it was not measured.
         reasons.append(_base_form_reason(
             [r for r in behaviour["changed"] if isinstance(r, dict)]))
+    if isinstance(behaviour, dict) and behaviour.get("literal_restored"):
+        # Text the task asked to move into the message files, back in the
+        # production code it left (DESIGN §8 *A broken base-form case whose
+        # cause is a change the run made is a question first*).
+        reasons.append(_literal_restored_reason(
+            [r for r in behaviour["literal_restored"] if isinstance(r, dict)]))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
@@ -61530,7 +61561,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 ex = await _ratchet_exec(st, caps, staging, pre, before,
                                          after, label=label,
                                          log_path=repair_log,
-                                         base_form=True)
+                                         base_form=True, models=models,
+                                         efforts=efforts)
             return await _delivery_ratchet(st, caps, models, efforts,
                                            staging, pre, post,
                                            exec_result=ex, label=label)
@@ -68560,7 +68592,9 @@ async def _near_rejection(st: "State", caps: dict, staging: Path,
 async def _ratchet_exec(st: "State", caps: dict, staging: Path,
                         pre_sha: str, before: dict | None,
                         after: dict | None, *, label: str,
-                        log_path: Path, base_form: bool = False) -> dict:
+                        log_path: Path, base_form: bool = False,
+                        models: dict | None = None,
+                        efforts: dict | None = None) -> dict:
     """The ratchet's execution route: the failing-test-ID diff of one repair
     — IDs failing after it and not before — confirmed by B* against
     `pre_sha` (`_redrive_new_failures`), on staging's commit (staging
@@ -68580,7 +68614,11 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
     (`_base_form_regressions`, narrowed to what the round reaches), and the
     cases that fail there only after it are `base_form_changed` — measured
     whether or not the ID diff could be (DESIGN §8 *What an existing test
-    pins on the base holds on the tree that ships*)."""
+    pins on the base holds on the tree that ships*). A case whose causes the
+    task asked for, and whose form in the commit still asserts the new
+    behaviour, is not the round's change (`_apply_base_form_rulings`; a
+    cause's question is asked here when `models` is given, never stopped
+    on)."""
     bf: dict | None = None
     if base_form and pre_sha:
         try:
@@ -68592,6 +68630,19 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
             log(f"  {label}: base-form check raised {bf['error']} — no "
                 "verdict from it; the tree that ships is checked again "
                 "before the outcome")
+        if bf.get("changed") and not bf.get("error"):
+            # A classification that raises leaves every case the round's
+            # change: nothing is excused without its check.
+            try:
+                await _base_form_classify(st, caps, staging, bf)
+                if models is not None:
+                    await _base_form_questions(st, caps, bf, models,
+                                               efforts or {})
+                _apply_base_form_rulings(st, bf)
+            except Exception as e:
+                log(f"  {label}: base-form cause classification raised "
+                    f"{type(e).__name__}: {e} — every failing case stays "
+                    "the round's change")
     if before is None or after is None:
         out = {"new": [], "pre_existing": [], "no_verdict": [],
                "resource_affected": [], "unmeasured": True,
@@ -69587,11 +69638,16 @@ async def _redrive_base_form_notes(st: "State", staging: Path
     tree = await _view_tree_sha(st, staging) or ""
     if not tree or rec.get("tree_sha") != tree:
         return []
-    moved = rec.get("moved_literal") or {}
+    # A case whose cause's question is open, or decided yes with the run's
+    # form of it failing its check, gets no round: its base form passes only
+    # if the run's change is undone (DESIGN §8 *A broken base-form case
+    # whose cause is a change the run made is a question first*).
+    held = set(rec.get("cause_open") or {}) | set(rec.get("cause_unkept")
+                                                  or {})
     by_file: dict[str, list[dict]] = {}
     for r in rec["changed"]:
         if (isinstance(r, dict) and str(r.get("file") or "")
-                and str(r.get("id")) not in moved):
+                and str(r.get("id")) not in held):
             by_file.setdefault(str(r["file"]), []).append(r)
     return [{"kind": "base_form_case", "key": f"base-form:{f}", "file": f,
              "base": str(rec.get("base") or ""),
@@ -69876,20 +69932,22 @@ def _moved_literal_evidence(repo: str | Path, base: str, head: str,
             still = holds(head, f)
             if not still:
                 out.append({"literal": text, "kind": lit.get("kind"),
-                            "file": f, "message_file": hit[0],
-                            "key": hit[1]})
+                            "ci": bool(ci), "file": f,
+                            "message_file": hit[0], "key": hit[1]})
                 break
     return out
 
 
 async def _base_form_moved_literals(st: "State", caps: dict, staging: Path,
-                                    rec: dict) -> dict[str, list[dict]]:
+                                    rec: dict, facts_out: dict | None = None
+                                    ) -> dict[str, list[dict]]:
     """Per case of `rec["changed"]` (a JS/TS test), the literals of its base
     form that the run moved into the message files
     (`_moved_literal_evidence`), read from the case's AST in the base form
     (`_probe_case_facts_placed`, a held-out sandbox over staging's committed
-    view). A case whose facts cannot be read is not classified. Never
-    raises."""
+    view). A case whose facts cannot be read is not classified. Each case's
+    base-form facts are also put in `facts_out` (by case id), which the
+    run-form check reads (`_base_form_causes`). Never raises."""
     base, head = str(rec.get("base") or ""), str(rec.get("after") or "")
     rows = [r for r in rec.get("changed") or [] if isinstance(r, dict)
             and str(r.get("file") or "").endswith(_JS_SRC_EXT)]
@@ -69928,6 +69986,8 @@ async def _base_form_moved_literals(st: "State", caps: dict, staging: Path,
             lits = facts.get("literals") if isinstance(facts, dict) else None
             if not isinstance(lits, list):
                 continue
+            if facts_out is not None:
+                facts_out[str(r["id"])] = facts
             ev = await asyncio.to_thread(_moved_literal_evidence, repo, base,
                                          head, lits, globs)
             if ev:
@@ -69936,6 +69996,412 @@ async def _base_form_moved_literals(st: "State", caps: dict, staging: Path,
         log(f"  moved-literal classification raised {type(e).__name__}: "
             f"{e} — the cases it did not reach are not classified")
     return out
+
+
+# --- A broken base-form case whose cause is a change the run made is a
+# question first (DESIGN §8). A cause is a fact code reads — a literal's
+# presence in production code and message files, a runner's fixed message,
+# the import graph — never a reading of the task or the test; the question is
+# the run's change, asked once per cause of the intent resolver (DESIGN §11,
+# source (d)); the answer is applied per case by a mechanical check of the
+# run's own form of the case.
+# vitest's fixed message for a module mock that lacks an export the code
+# under test reads: runner output, a mechanical string (DESIGN §12).
+_MOCK_MISSING_EXPORT_RE = re.compile(
+    r'No "([\w$]+)" export is defined on the "([^"]+)" mock')
+# The run's form of a test file is read beside its own path, as the base
+# form's is (`_BASE_FORM_FACTS_PREFIX`).
+_BASE_FORM_RUN_FORM_PREFIX = ".leerie-run-form."
+# Examples a cause's question shows (literals, files, cases, lines).
+_BASE_FORM_QUESTION_SHOWN = 8
+_BASE_FORM_QID_PREFIX = "intent-base-form-"
+
+
+def _js_named_imports(code: str, module: str) -> set[str]:
+    """The names `code` (comments blanked) imports by name from `module`:
+    `import { a, b as c } from "module"`, `import type { … }`, a default
+    import beside the braces."""
+    out: set[str] = set()
+    for m in re.finditer(
+            r"""\bimport\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*"""
+            r"""from\s*["']""" + re.escape(module) + r"""["']""", code):
+        for part in m.group(1).split(","):
+            name = re.sub(r"^\s*type\s+", "", part).split(" as ")[0].strip()
+            if name:
+                out.add(name)
+    return out
+
+
+def _mock_missing_export_evidence(repo: str | Path, base: str, head: str,
+                                  rel: str, base_src: str | None,
+                                  message: str) -> dict | None:
+    """The `mock_missing_export` cause of one failing base-form case: its
+    failure is the runner's message that the mock of module `M` has no
+    export `X` (`_MOCK_MISSING_EXPORT_RE`), and a production module the base
+    test reaches in the import graph at `head` (`_contradiction_code_files`)
+    imports `X` from `M` there and did not at `base` (or is new).
+    `{kind, module, export, files[], lines[]}`, or None."""
+    m = _MOCK_MISSING_EXPORT_RE.search(message or "")
+    if not m or base_src is None:
+        return None
+    name, module = m.group(1), m.group(2)
+    g = _js_source_graph(repo, head)
+    src = g.get("src") or {}
+    files: list[str] = []
+    lines: list[str] = []
+    for f in _contradiction_code_files(g, [(rel, base_src)]):
+        text = src.get(f)
+        if text is None or name not in _js_named_imports(
+                _tt_mask(text, False)[0], module):
+            continue
+        before = _git_blob_text(repo, base, f)
+        if before is not None and name in _js_named_imports(
+                _tt_mask(before, False)[0], module):
+            continue
+        files.append(f)
+        lines += [ln.strip()[:200] for ln in text.splitlines()
+                  if f"{name}(" in ln][:2]
+    if not files:
+        return None
+    return {"kind": "mock_missing_export", "module": module, "export": name,
+            "files": sorted(files), "lines": lines[:_BASE_FORM_QUESTION_SHOWN]}
+
+
+def _base_form_cause_key(c: dict) -> str:
+    """The question a cause belongs to: every moved literal of a run is one
+    question; each (module, export) of a missing mock export is one."""
+    if c.get("kind") == "moved_literal":
+        return "moved-literal"
+    return "mock-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{c.get('module')}-"
+                            f"{c.get('export')}").strip("-")[:80]
+
+
+def _message_file_values(repo: str | Path, rev: str
+                         ) -> list[tuple[str, str, str]]:
+    """(file, dotted key, value) of every message file (`_MESSAGE_FILE_RE`)
+    at `rev` that parses."""
+    out: list[tuple[str, str, str]] = []
+    for f in _redrive_git(repo, "ls-tree", "-r", "-z", "--name-only",
+                          rev).split("\0"):
+        if not f or not _MESSAGE_FILE_RE.search(f):
+            continue
+        try:
+            doc = json.loads(_redrive_git(repo, "show", f"{rev}:{f}"))
+        except ValueError:
+            continue
+        out += [(f, k, v) for k, v in _message_values(doc)]
+    return out
+
+
+def _moved_literal_forms(c: dict, values: list[tuple[str, str, str]]
+                         ) -> set[str]:
+    """What asserting a moved literal reads as once it lives in the message
+    files: the literal; every key whose value is it (a regex literal: whose
+    value contains it, case-insensitively), whole and its last dotted
+    segment; and every message file's value under those keys."""
+    text = str(c.get("literal") or "")
+    if c.get("literal_kind") == "regex":
+        keys = {k for _f, k, v in values if text.lower() in v.lower()}
+    else:
+        keys = {k for _f, k, v in values if v == text}
+    return ({text} | keys | {k.rsplit(".", 1)[-1] for k in keys}
+            | {v for _f, k, v in values if k in keys})
+
+
+def _moved_literal_kept(lits: list[dict], c: dict,
+                        values: list[tuple[str, str, str]]) -> bool:
+    """Whether a case's literals (`test-case-facts.cjs`) still assert a
+    moved literal in one of its forms (`_moved_literal_forms`): a string
+    equal to one, or a plain regex literal matching one."""
+    forms = _moved_literal_forms(c, values)
+    for lit in lits:
+        t = str(lit.get("text") or "")
+        if lit.get("kind") != "regex":
+            if t in forms:
+                return True
+        elif _PLAIN_REGEX_TEXT_RE.fullmatch(t):
+            rx = re.compile(re.escape(t), re.I if "i" in str(
+                lit.get("flags") or "") else 0)
+            if any(rx.search(f) for f in forms):
+                return True
+    return False
+
+
+def _base_form_run_form_check(base_facts: object, head_facts: object,
+                              causes: list[dict],
+                              values: list[tuple[str, str, str]]) -> str:
+    """Whether the run's own form of a case whose causes the task asked for
+    still asserts the new behaviour: "" when it does, else why not. The
+    case is still there (by title), makes at least as many assertions as its
+    base form, and for each moved literal still holds the literal or a
+    message form of it (`_moved_literal_kept`)."""
+    if not isinstance(base_facts, dict) or base_facts.get("error"):
+        return "its base form's facts could not be read"
+    if (not isinstance(head_facts, dict) or head_facts.get("error")
+            or not head_facts.get("title")):
+        return "the run's form of the test no longer has this case"
+    nb = len(base_facts.get("asserts") or [])
+    nh = len(head_facts.get("asserts") or [])
+    if nh < nb:
+        return (f"the run's form of it makes {nh} assertion(s) where the "
+                f"base form made {nb}")
+    lits = [x for x in head_facts.get("literals") or [] if isinstance(x, dict)]
+    for c in causes:
+        if c.get("kind") == "moved_literal" and not _moved_literal_kept(
+                lits, c, values):
+            return ("the run's form of it no longer asserts the moved text "
+                    f"`{c.get('literal')}` or a message key holding it")
+    return ""
+
+
+async def _base_form_classify(st: "State", caps: dict, staging: Path,
+                              rec: dict) -> None:
+    """The causes of `rec["changed"]` (DESIGN §8 *A broken base-form case
+    whose cause is a change the run made is a question first*):
+    `moved_literal` (`_base_form_moved_literals`, also stored as
+    `rec["moved_literal"]`) and `mock_missing_export`
+    (`_mock_missing_export_evidence`), as `rec["causes"]` {case id:
+    [cause]}; and for each caused case the check of the run's own form of it
+    (`_base_form_run_form_check`, its facts read at the commit `rec`
+    measured), as `rec["run_form"]` {case id: "" or why not}. Never raises:
+    a case it did not reach has no cause, or no check."""
+    facts: dict = {}
+    rec["moved_literal"] = await _base_form_moved_literals(
+        st, caps, staging, rec, facts)
+    base, head = str(rec.get("base") or ""), str(rec.get("after") or "")
+    causes: dict[str, list[dict]] = {
+        cid: [{**e, "kind": "moved_literal", "literal_kind": e.get("kind")}
+              for e in ev]
+        for cid, ev in rec["moved_literal"].items()}
+    rec["causes"], rec["run_form"] = causes, {}
+    if not base or not head:
+        return
+    repo = _run_repo(st)
+    rows = [r for r in rec.get("changed") or [] if isinstance(r, dict)
+            and str(r.get("file") or "").endswith(_JS_SRC_EXT)]
+    try:
+        for r in rows:
+            if not _MOCK_MISSING_EXPORT_RE.search(str(r.get("message") or "")):
+                continue
+            rel = str(r["file"])
+            ev = await asyncio.to_thread(
+                _mock_missing_export_evidence, repo, base, head, rel,
+                await asyncio.to_thread(_git_blob_text, repo, base, rel),
+                str(r.get("message") or ""))
+            if ev:
+                causes.setdefault(str(r["id"]), []).append(ev)
+        if not causes:
+            return
+        values = await asyncio.to_thread(_message_file_values, repo, head)
+        tree = await _measured_tree(
+            st, str(staging), caps, label="base-form-run-form",
+            log_path=st.run_dir / "logs" / "existing-behaviour.log")
+        srcs: dict[str, str | None] = {}
+        for r in rows:
+            cid, rel = str(r["id"]), str(r["file"])
+            if cid not in causes:
+                continue
+            if rel not in srcs:
+                blob = await asyncio.to_thread(_git_blob_text, repo, head, rel)
+                srcs[rel] = None
+                if blob is not None:
+                    path = (Path(st.run_dir) / "base-form-facts" / head[:12]
+                            / rel)
+                    _write_beneath(Path(st.run_dir), path, blob.encode())
+                    srcs[rel] = str(path)
+            head_facts: object = None
+            if srcs[rel] is not None:
+                beside = posixpath.join(posixpath.dirname(rel),
+                                        _BASE_FORM_RUN_FORM_PREFIX
+                                        + posixpath.basename(rel))
+                head_facts = await _probe_case_facts_placed(
+                    st, tree, srcs[rel], beside, cid.split(" :: ", 1)[-1])
+            if cid not in facts:
+                facts[cid] = await _base_form_case_facts(st, tree, repo, base,
+                                                         rel, cid)
+            rec["run_form"][cid] = _base_form_run_form_check(
+                facts.get(cid), head_facts, causes[cid], values)
+    except Exception as e:
+        log(f"  base-form cause classification raised {type(e).__name__}: "
+            f"{e} — the cases it did not reach have no check")
+
+
+async def _base_form_case_facts(st: "State", tree: str, repo: str | Path,
+                                base: str, rel: str, cid: str) -> object:
+    """A case's base-form facts, read beside its own path."""
+    blob = await asyncio.to_thread(_git_blob_text, repo, base, rel)
+    if blob is None:
+        return None
+    path = Path(st.run_dir) / "base-form-facts" / base[:12] / rel
+    _write_beneath(Path(st.run_dir), path, blob.encode())
+    beside = posixpath.join(posixpath.dirname(rel), _BASE_FORM_FACTS_PREFIX
+                            + posixpath.basename(rel))
+    return await _probe_case_facts_placed(st, tree, str(path), beside,
+                                          cid.split(" :: ", 1)[-1])
+
+
+def _base_form_cause_question(key: str, rows: list[tuple[str, dict]]) -> str:
+    """The intent question of one cause, built from its facts: whether the
+    task asks for the change the run made — never whether a test may
+    change."""
+    cases = sorted({cid for cid, _c in rows})
+    shown_cases = ", ".join(f"`{c}`" for c in cases[:3])
+    first = rows[0][1]
+    if first.get("kind") == "moved_literal":
+        lits: dict[str, dict] = {}
+        for _cid, c in rows:
+            lits.setdefault(str(c.get("literal")), c)
+        files = sorted({str(c.get("file")) for c in lits.values()})
+        lines = [f"- \"{t}\" from `{c.get('file')}`, now a value in "
+                 f"`{c.get('message_file')}` (key `{c.get('key')}`)"
+                 for t, c in list(lits.items())[:_BASE_FORM_QUESTION_SHOWN]]
+        return ("The run moved user-facing text out of the repository's "
+                f"production code into its message files: {len(lits)} "
+                f"text(s) from {len(files)} production file(s), for "
+                "example:\n" + "\n".join(lines) + "\n"
+                f"{len(cases)} existing test case(s) assert that text as the "
+                f"base wrote it (for example {shown_cases}) and fail on the "
+                "run's tree; they can pass only if the production code holds "
+                "that text again. Does the task ask for this text to move out "
+                "of the production code into the message files?")
+    files = sorted({f for _cid, c in rows for f in c.get("files") or []})
+    lines = []
+    for _cid, c in rows:
+        lines += [ln for ln in c.get("lines") or [] if ln not in lines]
+    mod, name = first.get("module"), first.get("export")
+    return (f"The run changed production code so it now imports `{name}` "
+            f"from `{mod}`, which it did not at the run's base: "
+            f"{len(files)} production file(s), for example "
+            + ", ".join(f"`{f}`" for f in files[:_BASE_FORM_QUESTION_SHOWN])
+            + (" — in lines such as:\n" + "\n".join(
+                f"    {ln}" for ln in lines[:_BASE_FORM_QUESTION_SHOWN])
+               if lines else "") + "\n"
+            f"{len(cases)} existing test case(s) mock `{mod}` without "
+            f"`{name}` and fail on the run's tree (for example "
+            f"{shown_cases}); they can pass only if that production code "
+            f"stops using `{name}`. Does the task ask for the change that "
+            f"makes this production code use `{name}` from `{mod}`?")
+
+
+async def _base_form_questions(st: "State", caps: dict, rec: dict,
+                               models: dict, efforts: dict) -> None:
+    """One intent question per cause of `rec["causes"]`
+    (`_base_form_cause_key`), registered once per run (a later record's
+    moved literals join its context, which the restored-literal guard
+    reads) and settled by the resolver when it can be. Never stops: an open
+    question is asked before finalize (`_stop_for_intent_questions`)."""
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    for cid, cs in sorted((rec.get("causes") or {}).items()):
+        for c in cs:
+            groups.setdefault(_base_form_cause_key(c), []).append((cid, c))
+    for key, rows in sorted(groups.items()):
+        qid = _BASE_FORM_QID_PREFIX + key
+        lits = sorted({(str(c.get("literal")), str(c.get("literal_kind")),
+                        str(c.get("file")), bool(c.get("ci")))
+                       for _cid, c in rows if c.get("kind") == "moved_literal"})
+        q = (st.data.get("intent_questions") or {}).get(qid)
+        if q is None:
+            _register_intent_question(
+                st, qid, "base_form", _base_form_cause_question(key, rows),
+                {"cause": key, "cases": len({cid for cid, _c in rows}),
+                 "literals": [list(x) for x in lits]})
+        else:
+            ctx = q.setdefault("context", {})
+            known = {tuple(x) for x in ctx.get("literals") or []}
+            ctx["literals"] = [list(x) for x in sorted(known | set(lits))]
+            st.save()
+        try:
+            await _settle_intent_question(st, qid, caps, models, efforts)
+        except Exception as e:
+            log(f"  intent: {qid} raised {type(e).__name__}: {e} — the "
+                "question stays open")
+
+
+def _apply_base_form_rulings(st: "State", rec: dict) -> bool:
+    """Move each case of `rec["changed"]` whose every cause's question is
+    decided yes and whose run form passes its check (`rec["run_form"]`) to
+    `rec["task_required"]`, with its causes and questions. A case with a
+    question decided no stays (a regression); one with a question still
+    open stays, listed in `rec["cause_open"]`; one whose run form fails
+    its check stays, listed in `rec["cause_unkept"]` with why. Deterministic
+    from state; whether any moved."""
+    causes = rec.get("causes") or {}
+    rows = rec.get("changed")
+    if not isinstance(causes, dict) or not causes or not isinstance(rows,
+                                                                    list):
+        return False
+    checks = rec.get("run_form") or {}
+    keep: list = []
+    moved = list(rec.get("task_required") or [])
+    waiting: dict[str, list[str]] = {}
+    unkept: dict[str, str] = {}
+    for r in rows:
+        cid = str(r.get("id")) if isinstance(r, dict) else ""
+        cs = causes.get(cid)
+        if not cs:
+            keep.append(r)
+            continue
+        qids = sorted({_BASE_FORM_QID_PREFIX + _base_form_cause_key(c)
+                       for c in cs})
+        ds = {q: _intent_decision(st, q) for q in qids}
+        if "no" in ds.values():
+            keep.append(r)
+            continue
+        if any(d is None for d in ds.values()):
+            waiting[cid] = [q for q, d in ds.items() if d is None]
+            keep.append(r)
+            continue
+        why = checks.get(cid, "the run's form of it could not be read")
+        if why:
+            unkept[cid] = str(why)
+            keep.append(r)
+            continue
+        moved.append({**r, "cause": sorted({str(c.get("kind")) for c in cs}),
+                      "qids": qids})
+    rec["cause_open"], rec["cause_unkept"] = waiting, unkept
+    if len(keep) == len(rows):
+        return False
+    rec["changed"], rec["task_required"] = keep, moved
+    return True
+
+
+def _base_form_literals_restored(st: "State", rec: dict) -> list[dict]:
+    """Every literal of a `moved_literal` question decided yes that a
+    production file holds again at the commit `rec` measured, where the run
+    had removed it (DESIGN §8: the guard against putting the text back to
+    keep an old test green). `[{literal, file, qid}]`."""
+    head = str(rec.get("after") or "")
+    if not head:
+        return []
+    repo = _run_repo(st)
+    out: list[dict] = []
+    for qid, q in sorted((st.data.get("intent_questions") or {}).items()):
+        if (not isinstance(q, dict) or q.get("source") != "base_form"
+                or _intent_decision(st, qid) != "yes"):
+            continue
+        for lit in (q.get("context") or {}).get("literals") or []:
+            if not isinstance(lit, list) or len(lit) < 3:
+                continue
+            text, kind, f = str(lit[0]), str(lit[1]), str(lit[2])
+            ci = kind == "regex" and len(lit) > 3 and bool(lit[3])
+            if not _redrive_exists_at(repo, head, f):
+                continue
+            code, _mask = _tt_mask(_redrive_git(repo, "show", f"{head}:{f}"),
+                                   False)
+            if re.search(re.escape(text), code, re.I if ci else 0):
+                out.append({"literal": text, "file": f, "qid": qid})
+    return out
+
+
+def _literal_restored_reason(rows: list[dict]) -> str:
+    """The outcome's words for moved text put back in production."""
+    shown = "; ".join(f"`{r.get('literal')}` in {r.get('file')}"
+                      for r in rows[:_BASE_FORM_SHOWN])
+    more = len(rows) - min(len(rows), _BASE_FORM_SHOWN)
+    return (f"{len(rows)} text(s) the task asked to move into the message "
+            "files are back in the production code they left "
+            "(literal_restored): " + shown
+            + (f" (+{more} more)" if more > 0 else ""))
 
 
 def _git_blob_text(repo: str | Path, rev: str, rel: str) -> str | None:
@@ -70061,7 +70527,8 @@ def _redrive_defects_unkept(rec: dict) -> None:
 
 
 async def _check_existing_behaviour(leerie_dir: Path, st: "State",
-                                    caps: dict) -> None:
+                                    caps: dict, models: dict,
+                                    efforts: dict) -> None:
     """Phase 5's last measurement before the outcome (DESIGN §8 *What an
     existing test pins on the base holds on the tree that ships*): every
     test-case file the base had and the tree that ships modified or deleted,
@@ -70069,7 +70536,12 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
     the base (`_base_form_regressions`), recorded as `existing_behaviour`
     with the tree it measured. Reused on the tree it already describes. The
     decider reads it; a check that raised is recorded as unmeasured, never
-    as a pass."""
+    as a pass. A failing case whose cause is a change the run made is a
+    question first (`_base_form_classify`, `_base_form_questions`,
+    `_apply_base_form_rulings`; DESIGN §8 *A broken base-form case whose
+    cause is a change the run made is a question first*), and moved text a
+    question allowed is checked to stay out of production
+    (`_base_form_literals_restored`)."""
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
         return
@@ -70080,8 +70552,11 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
     prior = st.data.get("existing_behaviour")
     if (isinstance(prior, dict) and tree_sha
             and prior.get("tree_sha") == tree_sha and not prior.get("error")):
-        if _existing_behaviour_task_required(st, prior):
-            st.save()
+        # Reused: an answer given since (a resume with answers) applies now.
+        _apply_base_form_rulings(st, prior)
+        _existing_behaviour_task_required(st, prior)
+        prior["literal_restored"] = _base_form_literals_restored(st, prior)
+        st.save()
         return
     try:
         rec = await _base_form_regressions(
@@ -70094,12 +70569,24 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
             "recorded as unmeasured")
     rec["tree_sha"] = tree_sha
     if rec.get("changed") and not rec.get("error"):
-        # A case pinning text the run moved into the message files gets no
-        # round: its only passing form is that text back in production
-        # (DESIGN §8 *A case pinning a moved literal gets no round*).
-        rec["moved_literal"] = await _base_form_moved_literals(
-            st, caps, staging, rec)
+        # A case whose cause is a change the run made — text moved into the
+        # message files, an export its code now reads that the base test's
+        # mock lacks — is asked once per cause whether the task asks for that
+        # change (DESIGN §8 *A broken base-form case whose cause is a change
+        # the run made is a question first*).
+        try:
+            await _base_form_classify(st, caps, staging, rec)
+            await _base_form_questions(st, caps, rec, models, efforts)
+        except Exception as e:
+            # A cause found stays: its question is open, so its cases get
+            # no round that could undo the run's change.
+            log(f"phase 5: base-form cause classification raised "
+                f"{type(e).__name__}: {e} — every failing case stays a "
+                "change")
+    _apply_base_form_rulings(st, rec)
     _existing_behaviour_task_required(st, rec)
+    if not rec.get("error"):
+        rec["literal_restored"] = _base_form_literals_restored(st, rec)
     st.data["existing_behaviour"] = rec
     st.save()
     _set_base_form_gap(st, rec)
@@ -72313,7 +72800,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             st, caps, staging, pre_sha, ids_before, ids_after,
                             label=f"redrive-r{rnd}g{gi}",
                             log_path=st.run_dir / "logs" / _REDRIVE_LOG,
-                            base_form=True)
+                            base_form=True, models=models, efforts=efforts)
                     # A shown probe never forces a change that breaks what an
                     # existing test pins (rule 4): a commit that made a probe
                     # pass and broke such a case contests the probe — measured,
@@ -81252,7 +81739,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # the re-drive starts from: each file failing there is a note it drives
     # once (DESIGN §8 *A fix that keeps both, else a conflict the task
     # decides*).
-    await _check_existing_behaviour(leerie_dir, st, caps)
+    await _check_existing_behaviour(leerie_dir, st, caps, models, efforts)
     # Hand confirmed-unmet work back to the subtasks that own it (DESIGN §8
     # *Delivery re-drive*): failing sets, unmet items, red merge checks,
     # existing tests failing in their base form.
@@ -81274,7 +81761,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # What an existing test pinned on the base holds on the tree that ships
     # (DESIGN §8): its base form is run there. The decider reads the record;
     # one that could not be taken is unmeasured, never a pass.
-    await _check_existing_behaviour(leerie_dir, st, caps)
+    await _check_existing_behaviour(leerie_dir, st, caps, models, efforts)
     # No intent question is left open when the PR is written (DESIGN §11).
     _stop_for_intent_questions(st)
     # The review the PR shows is of the tree that ships (DESIGN §9): made

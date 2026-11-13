@@ -227,7 +227,7 @@ def test_a_changed_case_makes_the_run_unconverged_and_names_it(
     w = World(leerie, tmp_path)
     w.commit({"lib.py": LIB.replace("return 5", "return 2"),
               "tests/test_gone.py": None})
-    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps))
+    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     rec = w.st.data["existing_behaviour"]
     assert rec["tree_sha"] == leerie._shipping_tree(w.st)
     assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
@@ -243,7 +243,7 @@ def test_an_unchanged_behaviour_leaves_the_run_done(leerie, tmp_path):
     w = World(leerie, tmp_path)
     w.commit({"tests/test_append.py": APPEND
               + "\ndef test_b():\n    assert True\n"})
-    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps))
+    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     assert w.st.data["existing_behaviour"]["files"] == [
         "tests/test_append.py"]
     reasons = leerie._unmeasured_on_shipping_tree(w.st)
@@ -261,7 +261,7 @@ def test_a_check_that_could_not_run_is_unmeasured_never_a_pass(
     (w.staging / "tests" / "test_gone.py").symlink_to("test_append.py")
     _git(w.staging, "add", "-A")
     _git(w.staging, "commit", "-qm", "a link where the test was")
-    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps))
+    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     rec = w.st.data["existing_behaviour"]
     assert rec["unmeasured"] == ["tests/test_gone.py"]
     assert rec["unmeasured_reason"] == ("the base form's path is a link or "
@@ -276,7 +276,7 @@ def test_a_check_that_could_not_run_is_unmeasured_never_a_pass(
 def test_a_record_of_another_tree_is_not_the_shipping_trees(leerie, tmp_path):
     w = World(leerie, tmp_path)
     w.commit({"tests/test_append.py": APPEND + "\n"})
-    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps))
+    asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     w.commit({"calc.py": FIXED})
     assert any("another tree" in r
                for r in leerie._unmeasured_on_shipping_tree(w.st))
