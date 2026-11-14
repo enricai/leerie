@@ -2200,6 +2200,11 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # tier; same TIMEOUT_DEFAULT_PER_WORKER absence rationale as
     # no_work_judge (no measured duration corpus yet).
     "delivery_judge": "medium",
+    # Lists the members of every set a judged item quantifies over, before
+    # the delivery judge's pack is judged (DESIGN §8 *An item is judged on
+    # its declared parts, and a set it quantifies over is listed before it
+    # is judged*). Judgment tier; no duration corpus yet.
+    "delivery_enumerator": "medium",
     # Pre-planning defect-shape site enumeration on defect-fix tasks
     # (DESIGN §5 *Defect-scope audit*). Judgment tier; same
     # TIMEOUT_DEFAULT_PER_WORKER absence rationale as its siblings.
@@ -2394,6 +2399,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
+                "delivery_enumerator",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
                 "set_auditor", "surrogate_fixer", "ci_checks",
                 "scope_judge", "pr_reviewer", "contract_extractor",
@@ -2427,8 +2433,8 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
-    "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
-    "scope_judge", "pr_reviewer", "contract_extractor",
+    "delivery_judge", "delivery_enumerator", "defect_scope_auditor",
+    "set_auditor", "ci_checks", "scope_judge", "pr_reviewer", "contract_extractor",
     "verifiability_classifier", "delivery_ratchet",
     "forbidden_command_extractor", "observability_judge",
     "contradiction_judge",
@@ -4867,6 +4873,70 @@ SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "delivery_enumerator": {
+        # Lists, before a delivery-judge pack is judged, the members of
+        # every set one of its items' checklist entries quantifies over
+        # ("every place that …", "all …"), with the searches that found
+        # them (DESIGN §8 *An item is judged on its declared parts, and a
+        # set it quantifies over is listed before it is judged*). Whether
+        # an entry quantifies at all is this worker's typed answer, never
+        # a reading of the item's words in code. Code re-runs every search
+        # on HEAD and adds each file it hits that no member names
+        # (`_delivery_enumeration`).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["sets"],
+        "properties": {
+            "sets": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "checklist_index", "set",
+                                 "members", "searches"],
+                    "properties": {
+                        "item_index": {"type": "integer"},
+                        # The checklist entry that quantifies over the set.
+                        "checklist_index": {"type": "integer"},
+                        # One sentence: what the set is.
+                        "set": {"type": "string"},
+                        "members": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["path", "line", "place"],
+                                "properties": {
+                                    # Repo-relative file of HEAD.
+                                    "path": {"type": "string"},
+                                    # 1-based, 0 when the member is the
+                                    # whole file.
+                                    "line": {"type": "integer"},
+                                    # A few words naming the member.
+                                    "place": {"type": "string"},
+                                },
+                            },
+                        },
+                        # Extended regexes code re-runs as `git grep -E`
+                        # on HEAD, each over a git pathspec ("" = the
+                        # whole tree).
+                        "searches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["regex", "pathspec"],
+                                "properties": {
+                                    "regex": {"type": "string"},
+                                    "pathspec": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
     "delivery_judge": {
         # Verifies the INTEGRATED staging tree against the run's
         # required_items just before finalize (DESIGN §8 *The delivery
@@ -4916,6 +4986,12 @@ SCHEMAS: dict[str, dict] = {
                                       "test_outcome"]},
                     "status": {"type": "string",
                                "enum": ["met", "unmet", "not_inspected"]},
+                    # The entry of the item's numbered `checklist` this
+                    # part answers (DESIGN §8 *An item is judged on its
+                    # declared parts*); -1 for a part the judge adds. Code
+                    # requires every entry answered — alignment by integer,
+                    # never by the requirement's prose.
+                    "checklist_index": {"type": "integer"},
                     "cites": {"type": "array",
                               "items": {"$ref": "#/$defs/cite"}},
                 },
@@ -54225,18 +54301,33 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     return "drift" if q in _scope_norm(text) else "absent"
 
 
+def _checklist_unanswered(v: dict, entries: int) -> list[int]:
+    """The entries of a verdict's item checklist (`entries` long) that no
+    part of `v` answers by `checklist_index` (DESIGN §8 *An item is judged
+    on its declared parts*). Typed integers only."""
+    answered = {p.get("checklist_index") for p in v.get("parts") or []
+                if isinstance(p, dict)
+                and isinstance(p.get("checklist_index"), int)
+                and not isinstance(p.get("checklist_index"), bool)}
+    return [j for j in range(entries) if j not in answered]
+
+
 def _delivery_verdict_check(v: dict, tree: str | Path, record: str,
-                            cache: dict | None = None
-                            ) -> tuple[str, str]:
+                            cache: dict | None = None,
+                            entries: int = 0) -> tuple[str, str]:
     """`met` only for a verdict claiming met whose every part is `met` and
-    carries at least one verified citation; a met claim failing that is
-    `unverified` (with the reason) — rejected, so a fabricated quote cannot
-    buy a met. A verdict not claiming met is `unmet`."""
+    carries at least one verified citation, and — when its item has a
+    checklist of `entries` — whose parts answer every entry; a met claim
+    failing that is `unverified` (with the reason) — rejected, so a
+    fabricated quote cannot buy a met, nor a part the judge chose to leave
+    out. A verdict not claiming met is `unmet`."""
     if v.get("met") is not True:
         return "unmet", ""
     parts = [p for p in (v.get("parts") or []) if isinstance(p, dict)]
     if not parts:
         return "unverified", "no_parts"
+    if entries and _checklist_unanswered(v, entries):
+        return "unverified", "checklist_unanswered"
     if any(p.get("status") != "met" for p in parts):
         return "unverified", "part_not_met"
     for p in parts:
@@ -54291,10 +54382,15 @@ def _relative_cites(v: dict, cwd: str | Path) -> dict:
 
 
 def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
-                            cache: dict | None = None) -> dict:
+                            cache: dict | None = None,
+                            checklists: dict[int, list] | None = None
+                            ) -> dict:
     """A judge sample with every rejected met turned into an unmet vote
     (`met: false`, `rejected: <reason>`), the shape
-    `_delivery_unmet_majority` tallies unchanged."""
+    `_delivery_unmet_majority` tallies unchanged. `checklists` maps an
+    item index to the checklist its verdict must answer
+    (`_delivery_checklist`); a rejection for an unanswered entry is not an
+    unmet vote either — `_delivery_uninspected` re-asks it."""
     out = []
     for v in sample.get("verdicts") or []:
         if not isinstance(v, dict):
@@ -54303,18 +54399,25 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
         if v.get("settled_by") == "test_id_diff":
             out.append(v)
             continue
-        status, why = _delivery_verdict_check(v, tree, record, cache)
+        status, why = _delivery_verdict_check(
+            v, tree, record, cache,
+            len((checklists or {}).get(v.get("item_index")) or ()))
         if status == "unverified":
             v = {**v, "met": False, "rejected": why}
         out.append(v)
     return {**sample, "verdicts": out}
 
 
-def _delivery_uninspected(sample: dict, indices: Iterable[int]) -> list[int]:
+def _delivery_uninspected(sample: dict, indices: Iterable[int],
+                          checklists: dict[int, list] | None = None
+                          ) -> list[int]:
     """The `indices` a screened judge sample did not inspect (DESIGN §8
     *Every item is judged before its vote counts*): no verdict for the
     index, or its last verdict has a part typed `not_inspected` and none
-    typed `unmet`. Typed fields only, never the evidence prose."""
+    typed `unmet`, or — for an item with a checklist in `checklists` — a
+    checklist entry no part answers and no part typed `unmet` (DESIGN §8
+    *An item is judged on its declared parts*). Typed fields only, never
+    the evidence prose."""
     last: dict[int, dict] = {}
     for v in sample.get("verdicts") or []:
         idx = v.get("item_index") if isinstance(v, dict) else None
@@ -54330,7 +54433,11 @@ def _delivery_uninspected(sample: dict, indices: Iterable[int]) -> list[int]:
             continue
         status = {p.get("status") for p in v.get("parts") or []
                   if isinstance(p, dict)}
-        if "not_inspected" in status and "unmet" not in status:
+        if "unmet" in status:
+            continue
+        entries = len((checklists or {}).get(i) or ())
+        if ("not_inspected" in status
+                or (entries and _checklist_unanswered(v, entries))):
             out.append(i)
     return out
 
@@ -54913,6 +55020,141 @@ def _delivery_norm_item(item: object) -> dict:
     return {**item, "item": text}
 
 
+def _delivery_checklist(item: dict, members: list[dict] | None = None
+                        ) -> list[dict]:
+    """The numbered entries a verdict on `item` must answer (DESIGN §8 *An
+    item is judged on its declared parts, and a set it quantifies over is
+    listed before it is judged*): the item's declared `parts` less its
+    `test_outcome_parts` (the failing-test-ID diff settles those), or the
+    item text when it declares none, then each member `members` lists
+    (`_delivery_enumeration`). An item whose every declared part is a test
+    outcome has no checklist. Each entry is `{checklist_index, part}`, a
+    member's with `member_of` (the entry its set belongs to) and `path`,
+    `line`."""
+    declared = [p for p in item.get("parts") or []
+                if isinstance(p, str) and p.strip()]
+    outcome = set(_test_outcome_parts(item))
+    own = [p for p in declared if p not in outcome]
+    if declared and not own:
+        return []
+    out = [{"checklist_index": j, "part": p}
+           for j, p in enumerate(own or [str(item.get("item") or "")])]
+    for m in members or []:
+        out.append({"checklist_index": len(out),
+                    "part": (f"{m['path']}"
+                             + (f":{m['line']}" if m.get("line") else "")
+                             + f" — {m.get('place') or ''}").strip(" —"),
+                    "member_of": m["member_of"], "path": m["path"],
+                    "line": m.get("line") or 0})
+    return out
+
+
+def _delivery_item_entry(item: dict, i: int,
+                         checklist: list[dict] | None = None) -> dict:
+    """One REQUIRED ITEMS entry of a delivery-judge prompt: the item, its
+    anchor, its global `item_index`, the test-outcome parts code settles,
+    a sweep item's `instances`, and its numbered `checklist` when it has
+    one (DESIGN §8 *An item is judged on its declared parts*)."""
+    return {"item": item["item"],
+            "source_ref": (item.get("span") or item.get("source_ref") or ""),
+            "item_index": i,
+            **({"test_outcome_parts": _test_outcome_parts(item)}
+               if _test_outcome_parts(item) else {}),
+            # A sweep's derived item names its instances (DESIGN §8 *A
+            # sweep's instances are items*).
+            **({"instances": item.get("parts") or []}
+               if item.get("sweep_of") else {}),
+            **({"checklist": [{k: e[k] for k in
+                               ("checklist_index", "part", "member_of")
+                               if k in e} for e in checklist]}
+               if checklist else {})}
+
+
+def _delivery_enumerator_prompt(task: str, entries: list[dict]) -> str:
+    """The `delivery_enumerator`'s input: the task and the pack's REQUIRED
+    ITEMS entries, each with its declared checklist."""
+    return ("TASK:\n" + task + "\n\nREQUIRED ITEMS (your cwd is a clean "
+            "checkout of the commit this run is about to ship):\n"
+            + json.dumps(entries, indent=2)
+            + "\n\nReturn one `sets` entry per checklist entry that "
+            "quantifies over a set, per your schema; none for an entry that "
+            "does not.")
+
+
+def _delivery_enumeration(raw: dict, tree: str | Path,
+                          checklists: dict[int, list[dict]],
+                          cwd: str | Path | None = None
+                          ) -> dict[int, list[dict]]:
+    """The members of each set the `delivery_enumerator` returned (`raw`),
+    per item index (DESIGN §8 *… a set it quantifies over is listed before
+    it is judged*): each listed member whose `path` is a file of `tree`'s
+    HEAD, then, for each of the set's searches, every file `git grep -E`
+    finds on HEAD that no member names (its first matching line, `place`
+    naming the search). A set is kept only when its item is in
+    `checklists` and its `checklist_index` is one of the item's declared
+    entries; a search git rejects adds nothing. A member's path is made
+    relative to `cwd` (the checkout the worker read, default `tree`).
+    Members are `{member_of, path, line, place}`."""
+    ls = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r",
+                         "--name-only", "-z", "HEAD"],
+                        capture_output=True, check=False)
+    files = (set(ls.stdout.decode("utf-8", "replace").split("\0")) - {""}
+             if ls.returncode == 0 else set())
+    out: dict[int, list[dict]] = {}
+    for s in raw.get("sets") or []:
+        if not isinstance(s, dict):
+            continue
+        i, j = s.get("item_index"), s.get("checklist_index")
+        declared = checklists.get(i) if isinstance(i, int) else None
+        if (not declared or not isinstance(j, int) or isinstance(j, bool)
+                or not 0 <= j < len(declared)):
+            continue
+        got = out.setdefault(i, [])
+        seen = {(m["member_of"], m["path"], m["line"]) for m in got}
+        named = {m["path"] for m in got if m["member_of"] == j}
+        for m in s.get("members") or []:
+            if not isinstance(m, dict):
+                continue
+            path = _delivery_cite_rel(str(m.get("path") or ""),
+                                      cwd if cwd is not None else tree)
+            line = m.get("line")
+            line = (line if isinstance(line, int)
+                    and not isinstance(line, bool) and line > 0 else 0)
+            if path not in files or (j, path, line) in seen:
+                continue
+            seen.add((j, path, line))
+            named.add(path)
+            got.append({"member_of": j, "path": path, "line": line,
+                        "place": str(m.get("place") or "")[:200]})
+        for q in s.get("searches") or []:
+            regex = str((q or {}).get("regex") or "").strip()
+            if not regex:
+                continue
+            spec = str((q or {}).get("pathspec") or "").strip()
+            r = subprocess.run(
+                ["git", *_tree_git_args(tree), "grep", "-n", "-z", "-I",
+                 "-E", "-e", regex, "HEAD", "--", *([spec] if spec else [])],
+                capture_output=True, check=False)
+            if r.returncode != 0:
+                continue
+            first: dict[str, int] = {}
+            for row in r.stdout.decode("utf-8", "replace").split("\n"):
+                # `-z`: `HEAD:<path>\0<line>\0<text>`, whatever the path holds.
+                cells = row.split("\0")
+                if len(cells) < 3 or not cells[0].startswith("HEAD:"):
+                    continue
+                f = cells[0][len("HEAD:"):]
+                if f in files and f not in first and cells[1].isdigit():
+                    first[f] = int(cells[1])
+            for f, line in sorted(first.items()):
+                if f in named:
+                    continue
+                named.add(f)
+                got.append({"member_of": j, "path": f, "line": line,
+                            "place": f"matches the search /{regex[:80]}/"})
+    return {i: ms for i, ms in out.items() if ms}
+
+
 async def _delivery_judge_unmet(
         task: str, items: list[dict], staging: Path, st: "State",
         caps: dict, models: dict[str, str],
@@ -55060,19 +55302,14 @@ async def _delivery_judge_unmet(
         if test_outcome:
             routing["test_outcome"] = test_outcome
 
+    # Each item's numbered checklist (DESIGN §8 *An item is judged on its
+    # declared parts*): its declared parts here, the members of the sets
+    # its pack's `delivery_enumerator` lists added in `_judge_pack`.
+    checklists: dict[int, list[dict]] = {
+        i: _delivery_checklist(normalized[i]) for i in judge_idx}
+
     def _pack_prompt(pack: list[int], with_contract: bool) -> str:
-        entries = [{"item": normalized[i]["item"],
-                    "source_ref": (normalized[i].get("span")
-                                   or normalized[i].get("source_ref") or ""),
-                    "item_index": i,
-                    **({"test_outcome_parts":
-                        _test_outcome_parts(normalized[i])}
-                       if _test_outcome_parts(normalized[i]) else {}),
-                    # A sweep's derived item names its instances (DESIGN §8
-                    # *A sweep's instances are items*); other items' entries
-                    # are unchanged.
-                    **({"instances": normalized[i].get("parts") or []}
-                       if normalized[i].get("sweep_of") else {})}
+        entries = [_delivery_item_entry(normalized[i], i, checklists.get(i))
                    for i in pack]
         slice_note = (
             f"\n(These are {len(pack)} of the task's {n_items} required "
@@ -55161,8 +55398,48 @@ async def _delivery_judge_unmet(
 
     majority_held = set(full_vote or ())
 
+    async def _enumerate(p: int, pack: list[int]) -> None:
+        # The sets the pack's checklist entries quantify over, listed once
+        # per pack before its first sample (DESIGN §8 *… a set it
+        # quantifies over is listed before it is judged*). A failed call
+        # lists nothing: the pack is judged on its declared parts.
+        declared = {i: checklists[i] for i in pack if checklists.get(i)}
+        if not declared:
+            return
+        st.bump_workers(caps)
+        try:
+            raw = await claude_p(
+                user_prompt=_delivery_enumerator_prompt(task, [
+                    _delivery_item_entry(normalized[i], i, declared[i])
+                    for i in declared]),
+                system_prompt=_load_prompt("delivery_enumerator"),
+                schema_key="delivery_enumerator", cwd=str(judge_cwd[0]),
+                allowed_tools=TREE_READER_TOOLS,
+                max_turns=min(30 + 6 * len(declared), 90),
+                autonomous=False, caps=caps, st=st,
+                model=models.get("delivery_enumerator", MODEL_DEFAULT),
+                effort=efforts.get("delivery_enumerator"),
+                sid=(f"delivery_enumerator-{phase_label}"
+                     + (f"-p{p}" if len(packs) > 1 else "")))
+        except (WorkerError, subprocess.TimeoutExpired) as e:
+            log(f"  delivery_enumerator ({phase_label}) failed "
+                f"({_brief_worker_exc(e)}) — the pack is judged on its "
+                "declared parts")
+            return
+        members = _delivery_enumeration(raw, staging, declared,
+                                        cwd=judge_cwd[0])
+        for i, ms in members.items():
+            checklists[i] = _delivery_checklist(normalized[i], ms)
+        if members:
+            log(f"  delivery_enumerator ({phase_label}): "
+                + "; ".join(f"item {i}: {len(ms)} member(s)"
+                            for i, ms in sorted(members.items())))
+
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
+        await _enumerate(p, pack)
+        members = sum(1 for i in pack for e in checklists.get(i) or ()
+                      if "member_of" in e)
         user_prompt = _pack_prompt(pack, with_contract)
         # The verifier's workload scales with the item count, so a fixed
         # cap converts a thorough judge into a crashed one: with
@@ -55175,7 +55452,7 @@ async def _delivery_judge_unmet(
         # for: shape + per-site disposition is measured at roughly two
         # items' worth of verification (DESIGN §8).
         judge_max_turns = min(
-            30 + 6 * len(pack) + (12 if with_contract else 0)
+            30 + 6 * len(pack) + members + (12 if with_contract else 0)
             + (2 * len(untyped) if with_contract else 0), 90)
         sid_base = (f"delivery_judge-{phase_label}"
                     + (f"-p{p}" if len(packs) > 1 else ""))
@@ -55186,7 +55463,7 @@ async def _delivery_judge_unmet(
                              f"{sid_base}-s{k}")
             # Every item is judged before its vote counts (DESIGN §8): what
             # the sample handed back unread goes back once, alone.
-            missing = _delivery_uninspected(smp, pack)
+            missing = _delivery_uninspected(smp, pack, checklists)
             if not missing:
                 return smp
             still: list[int] = []
@@ -55195,7 +55472,9 @@ async def _delivery_judge_unmet(
                 try:
                     again = await _ask(
                         _pack_prompt(chunk, False),
-                        min(30 + 6 * len(chunk), 90), set(chunk),
+                        min(30 + 6 * len(chunk) + sum(
+                            1 for i in chunk for e in checklists.get(i) or ()
+                            if "member_of" in e), 90), set(chunk),
                         f"{sid_base}-s{k}-r{c}")
                 except (WorkerError, subprocess.TimeoutExpired) as e:
                     log(f"  delivery_judge ({phase_label}) follow-up for "
@@ -55204,7 +55483,7 @@ async def _delivery_judge_unmet(
                     still += chunk
                     continue
                 smp = _delivery_merge_reask(smp, again, set(chunk))
-                still += _delivery_uninspected(smp, chunk)
+                still += _delivery_uninspected(smp, chunk, checklists)
             log(f"  delivery_judge ({phase_label}) sample {k} left "
                 f"{len(missing)} of {len(pack)} item(s) uninspected; "
                 f"re-asked — {len(missing) - len(still)} judged"
@@ -55249,7 +55528,7 @@ async def _delivery_judge_unmet(
             # 12 L3; leerie never re-runs it, round 14).
             return _mark_worker_only(
                 _delivery_screen_sample(smp, staging, exec_digest,
-                                        cite_cache),
+                                        cite_cache, checklists),
                 smp, staging, exec_digest, cite_cache)
 
         async with limit:

@@ -200,6 +200,7 @@ def _judge_parts(met: bool) -> list[dict]:
     """One part citing the committed line — `met` or `unmet`."""
     return [{"requirement": "the delivered feature exists",
              "kind": "static", "status": "met" if met else "unmet",
+             "checklist_index": 0,
              "cites": [{"path": DELIVERY_CITED_FILE, "line_start": 1,
                         "line_end": 1, "quote": DELIVERY_CITED_LINE}]}]
 

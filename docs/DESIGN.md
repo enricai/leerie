@@ -13344,6 +13344,68 @@ was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
 unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
 on average and 15–32× on large tasks.
 
+**An item is judged on its declared parts, and a set it quantifies over
+is listed before it is judged.** *Status: prototype, not merged
+(lane S4).* The judge used to write an item's parts itself, and code
+could only check that each part it wrote was cited. Measured on the 13
+false `met` verdicts the ground-truth lanes confirmed by execution (lane
+W6, 2026-11-14): the classifier's own `parts` reached the judge in no
+version (0 of 26 prompts read), and in 11 of the 13 a declared part or
+clause was never answered — narrowed ("preserves method and body on
+301/302/307/308", the declared 303 dropped), collapsed (three clauses
+into one), or left out. In 7 of the 13 the item quantified over a set
+("every place in `src/` that sends …", "every part of the site", "all
+site strings") and the judge searched one file or one directory and
+voted `met`; 7 of the 10 decided verdicts carrying that pattern were
+wrong. Two more voted `met` on a part they wrote down as not decidable
+on the tree ("justification belongs in the PR (not verifiable on
+tree)"). So the payload, not the judge, says what must be answered:
+
+- **Each item carries a numbered checklist.** Its entries are the
+  item's declared `parts` (less those `test_outcome_parts` names, which
+  the failing-test-ID diff settles), or the item text alone when it
+  declares none, then the members of every set one of them quantifies
+  over. Every part of a verdict names the `checklist_index` it answers
+  (`-1` for an extra part the judge adds). Alignment is by that
+  integer, never by matching the prose.
+- **A set is listed first, by a worker that searches.** Before a pack's
+  first judge sample, one `delivery_enumerator` (read-only,
+  TREE_READER_TOOLS, the same checkout) reads the pack's items and, for
+  each checklist entry that quantifies over a set, returns the set's
+  members it found — a place each, `path` and `line` — and the
+  searches it ran (`regex`, `pathspec`). Whether an entry quantifies at
+  all is the worker's typed answer (§12 *Language-to-JSON*). Code
+  re-runs every search with `git grep` on `HEAD`, and every file a
+  search hits that no member names becomes a member too: the list is at
+  least as complete as the worker's own searches, whatever it chose to
+  write down. A member whose `path` is not a file of `HEAD` is dropped.
+  An entry an item's `instances` already list (a sweep's) is not listed
+  again. A failed enumerator call lists nothing: the pass runs on the
+  declared parts alone.
+- **`met` needs every entry answered, with its own evidence.** A `met`
+  verdict counts only when every checklist entry has a part answering
+  it, every such part is `met`, and every part carries a citation that
+  verifies on `HEAD` (*Delivery detection*). A member is met when it is
+  handled, or when the part cites why the set's requirement does not
+  reach it (a log line no user sees, say); a member a part answers
+  `unmet` makes the vote unmet as any unmet part does. An entry no part
+  answers, or one answered `not_inspected` — the status for a part this
+  tree cannot decide, such as a PR's wording or how the run was
+  carried out — leaves the item uninspected in that sample, never met
+  and never an unmet vote, and it rides the re-ask and the `unknown`
+  rule of *Every item is judged before its vote counts*.
+- **The turn budget counts the checklist.** A pack's budget adds one
+  turn per set member to the per-item allowance, under the same
+  ceiling.
+
+The risk is new false unmets: a declared part no tree can decide, and a
+list wider than the requirement. Lane W6 measured the second on
+navegando-nv 399f7c8b, where a code-built instance list that included
+log-only strings drew 6 false unmet votes from 9 once a record entry
+primed the judge. So an entry the tree cannot decide is `unknown`, not
+unmet, and a member outside the requirement is met on a cite that shows
+why.
+
 **A sweep's instances are items.** Some requirements hold at every place
 a pattern occurs: "no user-facing text is hard-coded outside the message
 files", "every call to the old helper is replaced". Judged as one item, such
