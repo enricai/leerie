@@ -151,14 +151,19 @@ def test_a_hook_never_runs_after_a_committing_worker_started(leerie,
     assert not st.data.get("provision", {}).get("sh_hook_ran")
 
 
-def test_the_hook_writes_where_a_hook_installs_and_not_the_run(
+def test_the_hook_writes_no_host_directory_and_not_the_run(
         leerie, tmp_path, monkeypatch):
-    """Confined with the setup-hook grant: its checkout, `MISE_DATA_DIR`
-    and `~/.local/bin` (what DESIGN §6½ says a hook may install into), and
-    not the run's state."""
+    """Confined with the setup-hook grant: its checkout, and `MISE_DATA_DIR`
+    and its home only through overlays whose uppers are its run layer
+    (DESIGN §6 *The setup hook writes the run layer, never the host's
+    toolchains*), and not the run's state. Unisolated (no namespace for the
+    overlays) the grant names neither directory, so the host's toolchains
+    and the real home stay as they were: the hook's grant fails closed."""
     home, mise = tmp_path / "home", tmp_path / "mise-data"
+    (home / ".local" / "bin").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MISE_DATA_DIR", str(mise))
+    monkeypatch.delenv(leerie.ISOLATE_ENV, raising=False)
     st = _make_state(leerie, tmp_path)
     hook = _repo(tmp_path) / ".leerie-setup.sh"
     hook.write_text(
@@ -166,14 +171,49 @@ def test_the_hook_writes_where_a_hook_installs_and_not_the_run(
         'echo tool > "$HOME/.local/bin/tool"\n'
         'mkdir -p "$MISE_DATA_DIR/installs" && '
         'echo rt > "$MISE_DATA_DIR/installs/rt"\n'
+        'echo "cache=$MISE_CACHE_DIR" > cache-dir\n'
         f'if echo x >> {st.path}; then echo yes; else echo no; fi'
         ' > state-write\n')
     os.chmod(hook, 0o755)
     asyncio.run(leerie._run_setup_hook(_repo(tmp_path), st.run_dir / "logs",
                                        st))
-    assert (home / ".local" / "bin" / "tool").read_text() == "tool\n"
-    assert (mise / "installs" / "rt").read_text() == "rt\n"
+    assert not (home / ".local" / "bin" / "tool").exists()
+    assert list(mise.iterdir()) == []
+    assert (_repo(tmp_path) / "cache-dir").read_text() == \
+        f"cache={mise.resolve() / 'cache'}\n"
     assert (_repo(tmp_path) / "state-write").read_text() == "no\n"
     assert st.data["provision"]["sh_hook_ran"] is True
+    # Published whole once it exited 0, and only then.
+    assert (st.run_dir / leerie.RUN_LAYER_NAME / "mise").is_dir()
+    assert not (st.run_dir / leerie.RUN_LAYER_NEW_NAME).exists()
     # Leerie's own saves only: the hook's append never landed.
     assert json.loads(st.path.read_text())["provision"]["sh_hook_ran"]
+
+
+def test_a_failed_hook_publishes_no_layer_and_a_rerun_starts_empty(
+        leerie, tmp_path, monkeypatch):
+    """A hook that fails leaves no run layer any process reads, and the
+    next attempt starts from none: a layer left by an attempt that never
+    saved `sh_hook_ran` (here one published by a run killed between the
+    rename and the save) is removed before the hook runs (DESIGN §6 *The
+    setup hook writes the run layer*, 4)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "mise-data"))
+    st = _make_state(leerie, tmp_path)
+    hook = _repo(tmp_path) / ".leerie-setup.sh"
+    hook.write_text("#!/usr/bin/env bash\nexit 3\n")
+    os.chmod(hook, 0o755)
+    stale = st.run_dir / leerie.RUN_LAYER_NAME / "mise" / "installs"
+    stale.mkdir(parents=True)
+    (stale / "planted").write_text("x")
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._run_setup_hook(_repo(tmp_path),
+                                           st.run_dir / "logs", st))
+    assert not (st.run_dir / leerie.RUN_LAYER_NAME).exists()
+    assert not st.data.get("provision", {}).get("sh_hook_ran")
+    hook.write_text("#!/usr/bin/env bash\nexit 0\n")
+    asyncio.run(leerie._run_setup_hook(_repo(tmp_path), st.run_dir / "logs",
+                                       st))
+    layer = st.run_dir / leerie.RUN_LAYER_NAME
+    assert layer.is_dir() and not (layer / "mise" / "installs").exists()
+    assert not (st.run_dir / leerie.RUN_LAYER_NEW_NAME).exists()
