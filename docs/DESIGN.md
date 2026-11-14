@@ -11660,6 +11660,8 @@ the CI parity baseline, the browser suite unable to start).
    is asked about again and is never written — and each version to mise's
    syntax (an exact version, a prefix, `latest`, `lts`; never a range).
    The names go into the run's tools file (`<run-dir>/mise-tools.toml`),
+   each at the exact version mise resolves the stated one to (*A tool the
+   run names is installed at an exact version*, below),
    which mise reads as its global configuration (`MISE_GLOBAL_CONFIG_FILE`,
    on the orchestrator's environment, so every confined command and every
    worker reads it too): *beneath* every pin of the repository's own, so a
@@ -11673,6 +11675,44 @@ the CI parity baseline, the browser suite unable to start).
    installs is installed by mise into the toolchain cache, under the
    toolchain kind's grant. Benched before it shipped (lane LG2, eight
    fixtures, an ecosystem leerie's code never names among them).
+
+   **A tool the run names is installed at an exact version.** *Designed
+   2026-11-14 (lane LG2's Poetry finding, root-caused by lane W7).* *Root
+   cause.* mise runs a request that is not an exact version from its
+   alias directory: `python = "latest"`, `"3"` or `"3.15"` put
+   `installs/python/<request>/bin`, a symlink to `3.15.2`, on `PATH`
+   (`mise x` and the shims alike), and whatever records the path of the
+   interpreter it ran under records the alias. Poetry's own environment,
+   built during `mise install` by that Python, held `home =
+   …/python/latest/bin`; Poetry compares its interpreter's base with the
+   resolved one (`…/3.15.2`), concluded it was already inside a virtual
+   environment, created none, and installed the project into the shared
+   toolchain's `site-packages` — read-only to every confined process, so
+   the install failed and the run ended unconverged (lane LG2; lane W7's
+   real launch, `python@latest`). Changing only that `home` to
+   `…/3.15.2/bin` made Poetry create its environment, rootless and rootful
+   (lane W7). The request was leerie's: the `tool_discovery` worker reports
+   the version the repository states, which is a prefix or `latest` far
+   more often than an exact version, and the tools file wrote it as
+   stated. *Invariant.* What leerie asks mise to install is an exact
+   version: each version the worker gives is resolved by mise itself
+   (`mise latest <tool>@<version>`, confined under the toolchain kind's
+   grant, which reaches the network) and written as the version it
+   resolves to, so mise runs it from the version's own directory (measured
+   on 0.70.2's image: `latest`, `3` and `3.15` each give the alias on
+   `PATH` and in a new environment's `home`; `3.15.2` gives `…/3.15.2`, and
+   Poetry installed beside it creates its own environment). The stated
+   version still decides, through mise's own resolution of it, and the
+   tools file records the version it decided. A version
+   mise resolves to nothing stops the run at provision, naming the tool,
+   as `mise install` would have stopped it. The rule is not Poetry's: it
+   is every tool the tools file names, in every language. It does not
+   reach a repository's own pin — a `.python-version` of `3.15` still runs
+   from mise's alias, and a Poetry that `mise install` builds beside it
+   gets the same `home` (measured) — because the version a repository
+   pins is the repository's to state (*A repository's pinned runtime is
+   the one its commands run*); nor a tool's environment the shared
+   toolchain cache already holds, which mise does not rebuild.
 
    Go's own code is gone with it. Leerie used to synthesize
    `<run-dir>/mise-overrides.toml` from `go.mod`'s `go` line when nothing
