@@ -75,6 +75,14 @@ def test_a_routed_item_is_rejudged_only_on_a_changed_tree(
               claims={"s1": [{"item_index": 0, "kind": "deliverable"}]})
     start = _git(w.staging, "rev-parse", "HEAD")
     assert w.st.data["delivery_gate"]["final_sha"] == start
+    # Detection's row for the item: the re-check records its read there
+    # (`redrive_recheck`), and the end of the re-drive reads per item which
+    # commit each was last read on (DESIGN §8 *Every item verdict keyed to
+    # the tree that ships was read on it*).
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": 0, "item": "a does X", "verdict": "unmet",
+         "by": ["judge"]}]
+    w.st.save()
     w.install(monkeypatch)
     w.edits = ([lambda w: w.write("export const a = 1; // done\n")]
                if changes else [None, None])
@@ -94,8 +102,9 @@ def test_a_routed_item_is_rejudged_only_on_a_changed_tree(
     assert len(w.calls) == (1 if changes else 2)
     left = w.st.data["delivery_gate"]["unmet_final"]
     if changes:
-        # Re-judged on the new tree, by the whole vote.
-        assert judged and all(list(k["full_vote"]) == [0] for k in judged)
+        # Re-judged on the new tree, once, by the whole vote: the end of
+        # the re-drive does not read it again on the commit it was read on.
+        assert len(judged) == 1 and list(judged[0]["full_vote"]) == [0]
         assert left == []
     else:
         assert judged == []

@@ -11609,8 +11609,14 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   (`_acceptance_residual_of`) are rewritten, or kept when nothing measured;
   `_run_ci_parity_final` runs; `_redrive_refresh_test_id_diff(leerie_dir,
   st, caps, staging)` calls `_refresh_test_id_diff` (below, *The final
-  diff describes the tree that ships*) with `label="redrive-final"`; every
-  item still open at the start is re-checked unless that HEAD was already
+  diff describes the tree that ships*) with `label="redrive-final"`;
+  `_redrive_items_unread(st, <the items open at the start and every
+  unmet_final item>, final, det_sha)` lists, in index order, those whose
+  `delivery_gate.items` row's `redrive_recheck.sha` — `det_sha`, the
+  `delivery_gate.final_sha` the pass started from, when the row has none —
+  is not `final` (per item, never `items_rechecked_sha`, which a round's
+  re-check moves after reading only its routed items: DESIGN §8 *Every
+  item verdict keyed to the tree that ships was read on it*); those are
   re-checked, and `delivery_gate.unmet_final` / `items[]` are rewritten
   (`_redrive_apply_item_verdicts(st, verdicts, sha, tree_sha)`, which
   settles each re-checked row on its stored `test_outcome_part` and then,
