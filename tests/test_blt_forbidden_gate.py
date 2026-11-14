@@ -124,6 +124,9 @@ EXEMPT = {
     "_mise_registry_names": "`mise registry`, a literal argv naming "
                             "mise's own listing, confined through "
                             "`_confined_argv`",
+    "_mise_latest": "`mise latest <tool>@<version>`, a literal argv "
+                    "naming mise's own resolution of a version, confined "
+                    "through `_confined_argv` as the toolchain kind",
     "_enable_corepack_shims": "a Node version's own `corepack enable "
                               "--install-directory <its bin>`, the step "
                               "mise's implicit enable was, confined as "

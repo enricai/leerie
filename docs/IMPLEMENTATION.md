@@ -12211,10 +12211,20 @@ branch, after the `_write_run_json(...)` block and before
    leerie runs: `_run_proc(_confined_argv(_measurement_grants(st, tree),
    …))` in the planning tree (`_judgment_cwd(st)`), under the execution
    lock shared; empty when mise cannot run, and then discovery is skipped
-   with a log line. `_mise_tools_toml(tools,
-   registry)` writes one `"<tool>" = "<version>"` line under `[tools]` per
-   registry name, first occurrence wins, to `<run_dir>/mise-tools.toml`
-   (`MISE_TOOLS_NAME`, via `_write_beneath`); `_use_run_tools_file(env,
+   with a log line. `_tools_file_entries(tools, registry)` keeps one
+   `{tool: version}` per registry name, first occurrence wins;
+   `await _resolve_tool_versions(st, entries)` replaces each version with
+   the exact one mise resolves it to (DESIGN §6½ *A tool the run names is
+   installed at an exact version*): `await _mise_latest(st, tool, version)`
+   runs `mise latest <tool>@<version>` (`_MISE_LATEST_TIMEOUT`, 60 s)
+   through `_run_proc(_confined_argv(_measurement_grants(st, tree,
+   TOOLCHAIN_KIND), …))` in the planning tree, under the execution lock
+   shared, and gives its stripped stdout, or `""` when mise exits nonzero,
+   prints nothing (mise 2026.5.4 exits 0 with no output for a version it
+   cannot resolve) or cannot run; an empty answer `die()`s naming the tool,
+   the stated version and mise's stderr. `_mise_tools_toml(entries)` writes
+   one `"<tool>" = "<exact version>"` line under `[tools]` per entry to
+   `<run_dir>/mise-tools.toml` (`MISE_TOOLS_NAME`, via `_write_beneath`); `_use_run_tools_file(env,
    path)` sets `MISE_GLOBAL_CONFIG_FILE` on `os.environ`, so `mise install`
    (step 4), every confined command and every worker read it beneath the
    repository's own pins. Recorded at `st.data["provision"]["tools"]` (the

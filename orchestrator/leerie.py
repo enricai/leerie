@@ -34191,8 +34191,9 @@ def _check_tool_discovery_output(result: dict,
     return issues
 
 
-def _mise_tools_toml(tools: list[dict], registry: frozenset[str]) -> str:
-    """The run's tools file: one `[tools]` entry per registry name the
+def _tools_file_entries(tools: list[dict],
+                        registry: frozenset[str]) -> dict[str, str]:
+    """The tools file's entries: one `{tool: version}` per registry name the
     worker gave, first occurrence wins. Name and version match the schema's
     patterns, so neither needs escaping beyond TOML's quotes."""
     seen: dict[str, str] = {}
@@ -34206,10 +34207,68 @@ def _mise_tools_toml(tools: list[dict], registry: frozenset[str]) -> str:
                 and name in registry and name not in seen
                 and name_re.match(name) and ver_re.match(ver)):
             seen[name] = ver
-    body = "".join(f'"{n}" = "{v}"\n' for n, v in seen.items())
+    return seen
+
+
+_MISE_LATEST_TIMEOUT = 60
+
+
+async def _mise_latest(st: "State", tool: str, version: str
+                       ) -> tuple[str, str]:
+    """`mise latest <tool>@<version>`: the exact version mise resolves the
+    request to, and mise's stderr. Confined under the toolchain kind's
+    grant, which reaches the network (mise lists the backend's versions),
+    in the planning tree. The version is `""` when mise exits nonzero,
+    prints nothing — mise 2026.5.4 exits 0 with no output for a version it
+    cannot resolve (measured) — or cannot be run."""
+    tree = _judgment_cwd(st)
+    try:
+        grants = _measurement_grants(st, tree, TOOLCHAIN_KIND)
+        async with _exec_lock().shared():
+            with _shim_refusals(f"mise latest {tool}@{version}"
+                                ) as refusal_fd:
+                r = await _run_proc(
+                    _confined_argv(grants,
+                                   ["mise", "latest", f"{tool}@{version}"],
+                                   refusal_fd=refusal_fd),
+                    cwd=tree,
+                    env=_grant_env(_repo_command_env(os.environ), grants),
+                    timeout=_MISE_LATEST_TIMEOUT,
+                    pass_fds=(refusal_fd,))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "", str(e)
+    out = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return out, (r.stderr or "").strip()
+
+
+async def _resolve_tool_versions(st: "State", entries: dict[str, str]
+                                 ) -> dict[str, str]:
+    """Each entry at the exact version mise resolves its stated version to
+    (DESIGN §6½ *A tool the run names is installed at an exact version*):
+    mise runs a request that is not exact from its alias directory
+    (`installs/python/latest`), and a tool that records its interpreter's
+    path records the alias — Poetry's own environment then reads as one it
+    is already inside, and it installs the project into the toolchain. A
+    version mise resolves to nothing stops the run here, as `mise install`
+    would have."""
+    exact: dict[str, str] = {}
+    for tool, version in entries.items():
+        got, err = await _mise_latest(st, tool, version)
+        if not got:
+            die(f"mise resolved no version of {tool}@{version} (the version "
+                "the tool_discovery worker read from the repository)"
+                + (f":\n{err[-2000:]}" if err else ""))
+        exact[tool] = got
+    return exact
+
+
+def _mise_tools_toml(entries: Mapping[str, str]) -> str:
+    """The run's tools file: one `[tools]` line per entry."""
+    body = "".join(f'"{n}" = "{v}"\n' for n, v in entries.items())
     return ("# The tools this repository's steps run, as leerie's "
-            "tool_discovery worker\n# read them (DESIGN §6½). Beneath "
-            "every pin of the repository's own.\n[tools]\n" + body)
+            "tool_discovery worker\n# read them (DESIGN §6½), each at the "
+            "exact version mise resolved.\n# Beneath every pin of the "
+            "repository's own.\n[tools]\n" + body)
 
 
 def _use_run_tools_file(env: MutableMapping[str, str],
@@ -34427,15 +34486,17 @@ async def _discover_tools(st: "State", caps: dict, models: dict[str, str],
         st.save()
         return
     tools = list((result or {}).get("tools") or [])
-    text = _mise_tools_toml(tools, registry)
+    stated = _tools_file_entries(tools, registry)
+    exact = await _resolve_tool_versions(st, stated)
+    text = _mise_tools_toml(exact)
     path = st.run_dir / MISE_TOOLS_NAME
     _write_beneath(st.run_dir, path, text.encode())
     prov["tools"] = tools
     prov["tools_file"] = str(path)
     st.save()
     _use_run_tools_file(os.environ, path)
-    named = [f"{t.get('tool')}@{t.get('version')}" for t in tools
-             if isinstance(t, dict) and t.get("tool") in registry]
+    named = [f"{n}@{v}" + (f" ({exact[n]})" if exact[n] != v else "")
+             for n, v in stated.items()]
     log(f"  tools the repository needs: {', '.join(named) or '(none)'}")
 
 

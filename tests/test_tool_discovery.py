@@ -73,15 +73,31 @@ def test_check_names_every_tool_the_registry_does_not_hold(leerie):
 
 
 def test_tools_file_holds_registry_names_first_wins(leerie):
-    text = leerie._mise_tools_toml(
+    entries = leerie._tools_file_entries(
         [{"tool": "go", "version": "1.22.3", "evidence": "go.mod:3"},
          {"tool": "go", "version": "1.21", "evidence": "dup"},
          {"tool": "pyhton", "version": "3", "evidence": "typo"},
          {"tool": "uv", "version": "latest", "evidence": "uv.lock"},
          {"tool": "zig", "version": ">=0.13", "evidence": "a range"}],
         REGISTRY)
-    assert _tools_toml(text) == {"tools": {"go": "1.22.3",
-                                             "uv": "latest"}}
+    assert entries == {"go": "1.22.3", "uv": "latest"}
+    assert _tools_toml(leerie._mise_tools_toml(
+        {"go": "1.22.3", "uv": "0.9.1"})) == {
+            "tools": {"go": "1.22.3", "uv": "0.9.1"}}
+
+
+# What mise resolves each stated version to, as `mise latest` prints it.
+# Every stated version differs from its resolution except the exact one, so
+# a tools file holding the stated versions cannot pass for the resolved.
+_RESOLVED = {"python@3": "3.15.2", "uv@latest": "0.9.1",
+             "poetry@latest": "2.1.4", "go@1.22.3": "1.22.3"}
+
+
+def _fake_latest(asked: list[str]):
+    async def _latest(st, tool, version):
+        asked.append(f"{tool}@{version}")
+        return _RESOLVED.get(f"{tool}@{version}", ""), "no such version"
+    return _latest
 
 
 @pytest.mark.parametrize("version,ok", [
@@ -113,16 +129,98 @@ def test_discovery_asks_again_and_writes_only_known_tools(
         return answers[len(prompts) - 1]
 
     monkeypatch.setattr(leerie, "claude_p", _fake)
+    asked: list[str] = []
+    monkeypatch.setattr(leerie, "_mise_latest", _fake_latest(asked))
     caps = dict(leerie.DEFAULT_CAPS)
     asyncio.run(leerie._discover_tools(st, caps, {}, {}))
     assert len(prompts) == 2 and "pyhton" in prompts[1]
     path = st.run_dir / leerie.MISE_TOOLS_NAME
+    assert asked == ["python@3", "uv@latest"]
     assert _tools_toml(path.read_text()) == {
-        "tools": {"python": "3", "uv": "latest"}}
+        "tools": {"python": "3.15.2", "uv": "0.9.1"}}
     assert os.environ["MISE_GLOBAL_CONFIG_FILE"] == str(path)
     prov = st.data["provision"]
     assert prov["tools_file"] == str(path)
     assert [t["tool"] for t in prov["tools"]] == ["python", "uv"]
+
+
+def test_the_tools_file_holds_the_exact_version_mise_resolves(
+        leerie, tmp_path, monkeypatch, no_global_config):
+    """DESIGN §6½ *A tool the run names is installed at an exact version*:
+    mise runs a request that is not exact (`latest`, `3`) from its alias
+    directory, and Poetry's own environment built there reads as one it is
+    already inside. The file names the version mise resolved, never the
+    request; an exact one is resolved too and stays as it was."""
+    st = _make_state(leerie, tmp_path)
+    monkeypatch.setattr(leerie, "_mise_registry_names", _registry)
+
+    async def _fake(**kw):
+        return {"tools": [
+            {"tool": "python", "version": "3", "evidence": "pyproject"},
+            {"tool": "poetry", "version": "latest", "evidence": "poetry.lock"},
+            {"tool": "go", "version": "1.22.3", "evidence": "go.mod"}]}
+
+    monkeypatch.setattr(leerie, "claude_p", _fake)
+    asked: list[str] = []
+    monkeypatch.setattr(leerie, "_mise_latest", _fake_latest(asked))
+    asyncio.run(leerie._discover_tools(st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    text = (st.run_dir / leerie.MISE_TOOLS_NAME).read_text()
+    assert _tools_toml(text) == {"tools": {
+        "python": "3.15.2", "poetry": "2.1.4", "go": "1.22.3"}}
+    assert asked == ["python@3", "poetry@latest", "go@1.22.3"]
+    # The worker's answer is recorded as it stated it.
+    assert [t["version"] for t in st.data["provision"]["tools"]] == [
+        "3", "latest", "1.22.3"]
+
+
+def test_a_version_mise_resolves_to_nothing_stops_the_run(
+        leerie, tmp_path, monkeypatch, no_global_config, capsys):
+    st = _make_state(leerie, tmp_path)
+    monkeypatch.setattr(leerie, "_mise_registry_names", _registry)
+
+    async def _fake(**kw):
+        return {"tools": [
+            {"tool": "python", "version": "3", "evidence": "a"},
+            {"tool": "zig", "version": "9.99", "evidence": "b"}]}
+
+    monkeypatch.setattr(leerie, "claude_p", _fake)
+    monkeypatch.setattr(leerie, "_mise_latest", _fake_latest([]))
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(leerie._discover_tools(
+            st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "zig@9.99" in err and "no such version" in err, err
+    assert not (st.run_dir / leerie.MISE_TOOLS_NAME).exists()
+    assert "MISE_GLOBAL_CONFIG_FILE" not in os.environ
+
+
+@_landlock_mark
+def test_mise_latest_runs_confined_and_reads_what_mise_prints(
+        leerie, run, tmp_path, monkeypatch):
+    """The real `_mise_latest` through the real shim, with a `mise` that
+    answers as mise 2026.5.4 does: the version for a request it resolves,
+    and nothing, exit 0, for one it cannot."""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    mise = bindir / "mise"
+    mise.write_text('#!/bin/sh\n'
+                    'case "$1 $2" in\n'
+                    '  "latest python@3") echo 3.15.2 ;;\n'
+                    '  "latest zig@9.99") ;;\n'
+                    '  *) echo "unexpected: $*" >&2; exit 2 ;;\n'
+                    'esac\n')
+    mise.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "mise-data"))
+    (tmp_path / "mise-data").mkdir()
+    st = _St(run["user"], run["run_dir"])
+    st.data["planning_worktree"] = str(
+        run["wts"][f"{run['run_dir'].name}-view-staging"])
+    assert asyncio.run(leerie._mise_latest(st, "python", "3"))[0] == "3.15.2"
+    assert asyncio.run(leerie._mise_latest(st, "zig", "9.99"))[0] == ""
+    got, err = asyncio.run(leerie._mise_latest(st, "go", "1"))
+    assert got == "" and "unexpected: latest go@1" in err, err
 
 
 def test_a_failed_worker_leaves_the_repositorys_own_pins(
