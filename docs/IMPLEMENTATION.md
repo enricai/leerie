@@ -10312,9 +10312,11 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   pack's entries carry `test_outcome_parts` (`_test_outcome_parts(item)`)
   when non-empty. `_delivery_screen_sample` first applies
   `_drop_test_outcome_parts(v)`: parts typed `kind: "test_outcome"` are
-  removed; when any was and the judge said `met: false`, `met` becomes
-  True if every remaining part is `met` (then citation-checked as usual)
-  or none remains (`settled_by: "test_id_diff"`, no citation check).
+  removed; when any was, whatever the judge's `met`, `met` becomes True if
+  every remaining part is `met` (then citation-checked as usual) or none
+  remains (`settled_by: "test_id_diff"`, no citation check, never
+  `no_parts`); otherwise the judge's `met` stands (a `met: true` over an
+  unmet part is rejected `part_not_met` downstream).
   `_run_delivery_detection`'s row for a `_test_id_diff_item` is
   `{verdict: met | unmet | unknown, by: ["test_id_diff"], new[]}`, never
   in `unmet_final` and never falsified; an `unknown` row also carries
