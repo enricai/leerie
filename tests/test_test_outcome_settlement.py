@@ -140,6 +140,37 @@ class TestDropParts:
              "parts": [_part("test_outcome", "unmet", cited=False)]})
         assert only["met"] is True and only["settled_by"] == "test_id_diff"
 
+    def test_met_only_on_the_test_outcome_is_settled_not_no_parts(
+            self, leerie, tmp_path):
+        # Barnacle 59d17631 item 4: the judge said met and its only part
+        # was the test outcome. The same rule as `met: false` above.
+        v = {"item_index": 0, "met": True, "evidence": "e",
+             "parts": [_part("test_outcome", "met", cited=False)]}
+        out = leerie._drop_test_outcome_parts(v)
+        assert out["met"] is True and out["settled_by"] == "test_id_diff"
+        assert out["parts"] == []
+        screened = leerie._delivery_screen_sample(
+            {"verdicts": [v]}, _delivery_tree(tmp_path / "tree"), "")
+        assert "rejected" not in screened["verdicts"][0]
+        assert leerie._delivery_unmet_majority([screened] * 3, 2) == []
+
+    def test_unmet_path_is_unchanged(self, leerie):
+        # `met: false` outcomes, pinned: an unmet judge-owned part keeps the
+        # item unmet; a met claim over an unmet part is left for the
+        # citation check to reject.
+        unmet = leerie._drop_test_outcome_parts(
+            {"item_index": 0, "met": False, "evidence": "e",
+             "parts": [_part("test_outcome", "met", cited=False),
+                       _part("static", "unmet")]})
+        assert unmet["met"] is False and "settled_by" not in unmet
+        claim = leerie._drop_test_outcome_parts(
+            {"item_index": 0, "met": True, "evidence": "e",
+             "parts": [_part("test_outcome", "met", cited=False),
+                       _part("static", "unmet")]})
+        assert claim["met"] is True and "settled_by" not in claim
+        assert leerie._delivery_verdict_check(claim, "/nonexistent", "") == (
+            "unverified", "part_not_met")
+
     def test_screened_sample_votes_met(self, leerie, tmp_path):
         tree = _delivery_tree(tmp_path / "tree")
         smp = {"verdicts": [

@@ -2369,6 +2369,118 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     assert "reason" not in row
 
 
+def _test_outcome_only_judge(leerie, monkeypatch, met: bool):
+    """Stub claude_p: every judge answers with one part, typed
+    `test_outcome`, uncited, carrying `met` (barnacle 59d17631 item 4: three
+    of three judges said met with only "existing tests do not newly fail",
+    citing the orchestrator's diff)."""
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kw):
+        calls.append(kw)
+        if kw["schema_key"] == "delivery_judge":
+            asked = sorted({int(x) for x in re.findall(
+                r'"item_index": (\d+)', kw["user_prompt"])})
+            return {"verdicts": [{
+                "item_index": i, "met": met,
+                "evidence": "The orchestrator's failing-test diff shows no "
+                            "newly failing tests.",
+                "parts": [{"requirement": "existing tests do not newly fail",
+                           "kind": "test_outcome",
+                           "status": "met" if met else "unmet",
+                           "cites": []}]} for i in asked]}
+        if kw["schema_key"] == "observability_judge":
+            return {"items": []}
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    return calls
+
+
+@pytest.mark.parametrize("met", [True, False])
+def test_a_verdict_on_only_the_test_outcome_reads_the_diff_either_way(
+        leerie, tmp_path, monkeypatch, met):
+    """DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*:
+    a judge's `test_outcome` parts are dropped and the item is met or unmet
+    on its other parts, whatever the judge's `met` said. With no other part,
+    `met: false` was settled by the diff but `met: true` became a verdict
+    with no parts, rejected `no_parts` and counted as an unmet vote
+    (barnacle 59d17631 item 4: the item went unmet on three met votes).
+    Through `_run_delivery_detection`, both polarities give the row the
+    diff's verdict: met, unmet or unknown, and never a re-drive note."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          judged=False, k=0)
+    part = "existing tests do not newly fail"
+    item = {"item": "Characterization tests pin today's redirect handling, "
+                    "and existing tests do not newly fail",
+            "span": "S9",
+            "parts": ["characterization tests pin today's redirect handling",
+                      part],
+            "part_checks": [{"part": part, "check": "test_id_diff",
+                             "verifiability": "execution"}]}
+    st.data["required_items"] = [item]
+    st.data.pop("acceptance")
+    calls = _test_outcome_only_judge(leerie, monkeypatch, met)
+    tree = asyncio.run(leerie._worktree_tree_sha(
+        str(st.run_dir / "worktrees" / "staging")))
+    cand = "tests/a.test.ts > newly broken"
+
+    def detect(diff: dict) -> dict:
+        st.data["test_id_diff"] = {**diff, "tree_sha": tree}
+        st.data.pop("delivery_gate", None)
+        st.save()
+        asyncio.run(leerie._run_delivery_detection(
+            st.run_dir, st, caps, MODELS, EFFORTS))
+        return st.data["delivery_gate"]
+
+    gate = detect({"candidates": [], "new": []})
+    assert {c["schema_key"] for c in calls} - {"observability_judge"} == {
+        "delivery_judge"}
+    assert gate["items"][0]["verdict"] == "met"
+    assert gate["unmet_final"] == []
+    gate = detect({"candidates": [cand], "new": [cand]})
+    row = gate["items"][0]
+    assert row["verdict"] == "unmet" and row["by"] == ["test_id_diff"]
+    assert gate["unmet_final"] == []
+    gate = detect({"candidates": [cand], "new": [], "no_verdict": [cand],
+                   "base_unavailable": True})
+    row = gate["items"][0]
+    assert row["verdict"] == "unknown" and row["by"] == ["test_id_diff"]
+    assert gate["unmet_final"] == []
+
+
+def test_an_unmet_judge_owned_part_still_makes_the_item_unmet(
+        leerie, tmp_path, monkeypatch):
+    """The `met: false` path is unchanged: dropping the `test_outcome` part
+    leaves a judge-owned part the judge held unmet, so all three samples
+    vote unmet and the item is unmet by the judge, not the diff."""
+    tree = _delivery_tree(tmp_path / "tree")
+    st = leerie.State(tmp_path / ".leerie", "s2")
+    st.data = {"task": "t", "worker_count": 0,
+               "test_id_diff": {"candidates": [], "new": []}}
+    st.save()
+    items = [{"item": "Login times out, with no regressions", "span": "S1",
+              "parts": ["login times out", "no regressions"],
+              "part_checks": [{"part": "no regressions",
+                               "check": "test_id_diff",
+                               "verifiability": "execution"}]}]
+    cite = {"path": DELIVERY_CITED_FILE, "line_start": 1, "line_end": 1,
+            "quote": DELIVERY_CITED_LINE}
+
+    async def fake_claude_p(**kw):
+        return {"verdicts": [{
+            "item_index": 0, "met": False, "evidence": "no timeout",
+            "parts": [{"requirement": "no regressions",
+                       "kind": "test_outcome", "status": "met",
+                       "cites": []},
+                      {"requirement": "login times out", "kind": "static",
+                       "status": "unmet", "cites": [cite]}]}]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    unmet, _n, _c = asyncio.run(leerie._delivery_judge_unmet(
+        "task", items, tree, st, dict(leerie.DEFAULT_CAPS), MODELS,
+        EFFORTS, phase_label="final", routing={}))
+    assert [u["item_index"] for u in unmet] == [0]
+
+
 class TestAJudgeCrashIsNeverMet:
     """Review round 13 claims M1: a crashed final judge set `unmet = []`,
     and every item the falsifier did not confirm became a `met` row with no

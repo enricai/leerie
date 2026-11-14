@@ -13314,8 +13314,14 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   mixed item the judge types such a part `kind: test_outcome` (the
   payload names the classifier's `part_checks` for it), and code drops
   that part from the verdict before it is checked or voted: the item is
-  met or unmet on its other parts. Its row still carries the diff's verdict
-  for that part. When the other parts are met and the diff did not say
+  met or unmet on its other parts, whatever the judge's own `met` said, in
+  either direction. A verdict whose every part is typed `test_outcome` has
+  no other part: the judge owns nothing in it, so its vote is met and the
+  row is the diff's. Read only for an unmet `met`, a met claim with nothing
+  left became a verdict with no parts, rejected as uncited and counted as an
+  unmet vote (barnacle 59d17631 item 4: all three judges said met on "no
+  regressions" alone, citing the diff, and code made the item unmet). Its
+  row still carries the diff's verdict for that part. When the other parts are met and the diff did not say
   met, the row reads the diff's verdict — `unknown`, its reason
   `met except: <part>, unknown — <why>`, or `unmet` when B\* confirmed
   new failures — never `met` over a part B\* did not settle (review round

@@ -54819,9 +54819,11 @@ def _settle_test_outcome_part(row: dict) -> dict:
 def _drop_test_outcome_parts(v: dict) -> dict:
     """A judge verdict without its parts typed `test_outcome` — the failing-
     test-ID diff settles those, not the judge (DESIGN §8). When any was
-    dropped and the judge said unmet, the verdict is met if every remaining
-    part is met (still citation-checked downstream), or if none remains
-    (`settled_by: test_id_diff`)."""
+    dropped, the verdict is the judge's over the parts it owns, whatever its
+    `met` said: met if every remaining part is met (still citation-checked
+    downstream), or if none remains (`settled_by: test_id_diff`) — a met
+    claim with no judge-owned part left has nothing to check, so it is not
+    `no_parts` (barnacle 59d17631 item 4)."""
     parts = v.get("parts")
     if not isinstance(parts, list):
         return v
@@ -54831,12 +54833,10 @@ def _drop_test_outcome_parts(v: dict) -> dict:
         return v
     out = {**v, "parts": rest,
            "test_outcome_parts_dropped": len(parts) - len(rest)}
-    if v.get("met") is False:
-        if not rest:
-            out.update(met=True, settled_by="test_id_diff")
-        elif all(isinstance(p, dict) and p.get("status") == "met"
-                 for p in rest):
-            out["met"] = True
+    if not rest:
+        out.update(met=True, settled_by="test_id_diff")
+    elif all(isinstance(p, dict) and p.get("status") == "met" for p in rest):
+        out["met"] = True
     return out
 
 
