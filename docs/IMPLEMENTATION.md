@@ -566,7 +566,8 @@ Base layers (top-down):
   unpinned fallback (and the only `node` before any `mise reshim` in a fresh
   `MISE_DATA_DIR`). No `/usr/local/share/mise/shims` entry: `mise install
   --system` makes no such directory. A tool a setup hook puts in
-  `/home/leerie/.local/bin` comes last, so it can never shadow a baked-in
+  `/home/leerie/.local/bin` (its run layer's, DESIGN §6 *The setup hook
+  writes the run layer*) comes last, so it can never shadow a baked-in
   binary. Pinned by
   `tests/test_dockerfile_path.py` and `tests/test_pinned_runtime_runs.py`
   (whose real-container test, opt-in through
@@ -4718,7 +4719,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   <id>`, `--phase judge`, `--phase heal`) calls it before its first
   confined spawn, which carries `--isolate`.
 - `WorkerGrants(rw, ro, env=(), egress=False, link="", home="",
-  home_layers=(), drop=(), home_upper="")` (NamedTuple of
+  home_layers=(), drop=(), home_upper="", layers=(), layer_uppers=())`
+  (NamedTuple of
   absolute paths; the `shared_tmp` field is deleted — every confined
   process has its own `/tmp`). `home`, `home_layers`: the home the shim
   gives the process its own copy of, and the layers beneath its upper,
@@ -4738,7 +4740,39 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   the layer; every other kind puts the layer first in `home_layers` when
   it is a directory. `_worker_grants` does the same for a worker whose
   `_installed_tree_stores(cwd)` is not None (DESIGN §6 *Every confined
-  process has its own home*, 4). `_grant_env(base, grants) -> dict` is `{**base,
+  process has its own home*, 4). The run layer (DESIGN §6 *The setup hook
+  writes the run layer, never the host's toolchains*): `RUN_LAYER_NAME =
+  "run-layer"`, `RUN_LAYER_NEW_NAME = "run-layer.new"`, `RUN_LAYER_HOME =
+  "home"`, `RUN_LAYER_MISE = "mise"`; `_mise_data_dir() -> Path` is
+  `$MISE_DATA_DIR` (else `~/.local/share/mise`), realpath;
+  `_run_layer_reads(run_dir, own_home) -> tuple[tuple[str, ...],
+  tuple[tuple[str, str], ...]]` is `((<run-dir>/run-layer/home,),
+  ((_mise_data_dir(), <run-dir>/run-layer/mise),))`, each part only when it
+  is a directory (the home part only with a non-empty `own_home`), and both
+  empty unless `<run-dir>/run-layer` is a directory. Every grant
+  `_worker_grants` and `_measurement_grants` build but the toolchain and
+  setup-hook kinds' puts the home part in `home_layers` after any tree home
+  layer and before the toolchain home layer, and sets `layers` to the
+  `MISE_DATA_DIR` part: a read-only overlay, the run layer's `mise` above
+  the host's directory. The setup-hook kind sets `home_upper` to
+  `<run-dir>/run-layer.new/home` (with a home) and
+  `layer_uppers=((_mise_data_dir(), <run-dir>/run-layer.new/mise),)` (when
+  `MISE_DATA_DIR` is not beneath the state root; it is made first), each
+  upper made 0700 with its `_home_work` by `_mkdir_private`, and names
+  neither `MISE_DATA_DIR` nor `~/.local/bin` in `rw`: the shim adds each
+  overlay it makes writable. `_layer_argv(grants) -> list[str]` is
+  `["--layer", f"{d}={l}"]` per `layers` entry and `["--layer-upper",
+  f"{d}={u}"]` per `layer_uppers` entry; `_confined_argv` appends it after
+  `_home_argv` in both the sandbox and the isolated branch (never when
+  neither). `_run_view(run_dir, path) -> Path`: the path a confined
+  process of the run sees at `path` when it lies beneath `_confined_home()`
+  or `_mise_data_dir()` and the run layer exists — its run-layer
+  counterpart when that layer's component walk finds an entry at it, or
+  meets a non-directory, a link or a directory whose `user.overlay.opaque`
+  is `y` on the way (overlayfs's lookup without `redirect_dir`), else
+  `path`. `_run_which(name, run_dir, path) -> str | None`: the first
+  `_run_view` of `<dir>/<name>` over `path`'s entries that is an executable
+  regular file, as `shutil.which`. `_grant_env(base, grants) -> dict` is `{**base,
   **dict(grants.env)}` less every `grants.drop` key: the environment of
   every confined command (`_run_streaming`, `_run_mise_install`'s version
   read, `_ts_script_run`). `HOME_UPPER_BYTES = 1 << 30`. `_home_argv(grants)
@@ -5008,14 +5042,15 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   values `_measurement_grants` accepts (`ValueError` otherwise). `die()`s when `st` has no `run_dir`, or
   when the tree holds or lies beneath one of `_MEASURE_PRIVATE`
   (`state.json`, `acceptance`, `logs`, `workers`, `tree-stores`, `stores`, `tmp`,
+  `run-layer`, `run-layer.new`,
   `repo-settings`, `tree-repos`, `repo`, `measure` under the run
   directory). A tree beneath
   `<run>/worktrees/` is taken at its git toplevel. `rw`:
   `_WORKER_DEVICES`, the tree, `_measure_dir(st, tree)`, the run's
   stores `<run>/worktrees/.stores/stores/` (`RUN_STORES_DIRNAME`, made 0700), the tree's
   private temp directory `_private_tmp(<measure-dir>)`; setup-hook kind
-  adds `MISE_DATA_DIR` (default `~/.local/share/mise`) and `~/.local/bin`
-  (both made first), toolchain kind `MISE_DATA_DIR` and the toolchain home
+  adds nothing (its writes are its run layer's overlays, `layer_uppers` and
+  `home_upper` above), toolchain kind `MISE_DATA_DIR` and the toolchain home
   layer `_toolchain_home()` (`$LEERIE_TOOLCHAIN_HOME`, `TOOLCHAIN_HOME_ENV`,
   realpath; none when unset) — a toolchain path beneath the state root is
   never granted. `ro`:
@@ -5040,7 +5075,7 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `<MISE_DATA_DIR>/<MISE_CACHE_NAME>` (`"cache"`; inside the granted data
   directory, shared with every run: mise's install lock and `incomplete`
   markers live there — DESIGN §6 *One toolchain install at a time on a
-  host*); no store variable (leerie's environment and
+  host*; the setup hook's is its overlay, so its own go to its run layer); no store variable (leerie's environment and
   `_tree_store_env` set them). No grant names `/tmp` (the shim gives the
   command its own, DESIGN §6 *Every confined process has its own `/tmp`,
   `/dev/shm` and IPC*); the worker-tree distinction (`_is_worker_tree`,
@@ -5553,7 +5588,22 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   only; `upper=` here) no `tmpfs` is made: `upperdir=DIR`,
   `workdir=DIR.work` (both must be directories and nameable, else
   `IsolationError`), and only `_HOME_REAL` is detached; such a home is not
-  watched (`_watch_home(..., watch=False)`). `main()` and `run_sandbox` add `home` to
+  watched (`_watch_home(..., watch=False)`).
+- `layer_mounts(layers, uppers) -> list[str]` (`--layer DIR=LAYER`, with
+  `--isolate` or `--sandbox`; `--layer-upper DIR=UPPER`, with `--isolate`
+  only; DESIGN §6 *The setup hook writes the run layer, never the host's
+  toolchains*) — called by `isolate(..., layers=, layer_uppers=)` right
+  after `private_home`, before the grants are bound. Refuses
+  (`IsolationError`) a `DIR` that is not a directory, a path holding `,`,
+  `:` or a backslash, and a mount beneath `DIR`. For each `--layer` whose
+  `LAYER` is a directory: `overlay` on `DIR` with
+  `lowerdir=<LAYER>:<DIR>`, `userxattr`, and no upper (read-only). For
+  each `--layer-upper`: `overlay` on `DIR` with `lowerdir=<DIR>,
+  upperdir=<UPPER>,workdir=<UPPER>.work,userxattr` (`UPPER` and its
+  `.work` must be directories). Returns the `--layer-upper` targets, which
+  `isolate` keeps writable (its `roots`) and `main()` adds to the Landlock
+  write grants. The AppArmor profile allows `mount fstype=overlay overlay
+  -> /leerie-toolchains/mise/`. `main()` and `run_sandbox` add `home` to
   the Landlock write grants (`_watch_home`) and set `_HOME_WATCH =
   HomeWatch(home, N)`: `_wait_signal(watched)` (every wait in `run`,
   `run_as_init` and `run_sandbox`) samples it and waits with
@@ -12106,7 +12156,7 @@ on violation):
 - `working_dir` is either `"."` or a relative path with no `..` segments
   and no leading `/`.
 
-`_recipe_program_issues(recipe, repo_root, bin_paths, path) -> list[str]`
+`_recipe_program_issues(recipe, repo_root, bin_paths, path, run_dir=None) -> list[str]`
 is the provision worker's check, run with `check_provision_output` in its
 `_run_checked_loop` (the table's recipe is code's and is not checked): one
 `UNKNOWN_PROGRAM` issue per non-`none` entry whose bare program has no
@@ -12119,7 +12169,9 @@ regular file beneath `repo_root/<working_dir>` (`_regular_file_beneath`).
 `mise bin-paths` confined under the same toolchain grant in the
 provisioning checkout, bounded by `MISE_LS_TIMEOUT`, one directory per
 line; a timeout or nonzero exit is logged and leaves it unrecorded, so a
-bare program then resolves on `PATH` alone. Pinned by
+bare program then resolves on `PATH` alone. With `run_dir` (both callers
+pass the run's), each directory is read through the run layer
+(`_run_view`), so a program the setup hook installed counts. Pinned by
 `tests/test_provision_recipe_validation.py`.
 
 ### Phase implementation (`phase_provision`)
@@ -12175,15 +12227,19 @@ branch, after the `_write_run_json(...)` block and before
    `st.data["provision"]["sh_hook_ran"]`. Nonzero exit → `die()`.
    **Runs as the non-root `leerie` container user; no sudo.** The hook
    can install user-space tooling (`mise install <lang>@<version>`,
-   anything writing to `~/.local/bin`) and pre-populate fixtures, but
+   anything writing beneath its home, `pip install --user` among them) and
+   pre-populate fixtures, but
    cannot `apt-get install` or write to system directories. Repos
    that need root-level system packages maintain a fork of the leerie
    Dockerfile and override `IMAGE_TAG`; out of scope for the hook.
-   Its pip user base is its own home's (DESIGN §6 *Every confined process
-   has its own home*), and `_measurement_grants` sets its `XDG_CACHE_HOME`
-   to the checkout's own, and no worker reads either, so a
-   tool for the workers goes beneath `~/.local/bin` (`pip install --target`
-   and a launcher script, DESIGN §6½ step 1). It installs no git hooks.
+   It writes the run layer (DESIGN §6 *The setup hook writes the run
+   layer, never the host's toolchains*): before it runs,
+   `<run-dir>/run-layer.new` and `<run-dir>/run-layer` are removed
+   (`_rmtree_owned`) and the former made again by its grant; after it exits
+   0, `run-layer.new` is renamed `run-layer` (`os.replace`) and then
+   `sh_hook_ran` is saved. `_measurement_grants` sets its `XDG_CACHE_HOME`
+   to the checkout's own, which no worker reads. It installs no git
+   hooks.
 4. **Mise install.** `_run_mise_install(repo_root, log_dir, st)`:
    runs `mise install` in that checkout. (The go override that step 3
    once synthesized from `go.mod` — `_synth_mise_go_override`, its
@@ -12278,7 +12334,7 @@ branch, after the `_write_run_json(...)` block and before
 |---|---|
 | `_gather_provision_fixtures(repo_root) -> dict` | Assembles the LLM-worker input set under a 24KB total ceiling. README extracted by `_extract_readme_sections()`; root manifests (`package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`, `Makefile`, `pom.xml`, `build.gradle*`) included if present; workspace child manifests capped at 3 (1KB each) for monorepos; up to 2 `.github/workflows/*.yml` files matching `(?i)ci\|test\|build\|release` (skip `codeql\|stale\|dependabot`); optional `CONTRIBUTING.md` / `docs/DEVELOPMENT.md` capped at 4KB. |
 | `_extract_readme_sections(text) -> str` | **Size-bounding only** — returns the leading slice of the README, ≤ `_README_EXTRACT_BUDGET` (12KB), cut back to the last section boundary so the worker never receives a header with its body sheared off (never discarding more than 25% of the budget chasing one; a headerless document still gets its first three-quarters of the budget, i.e. ~9KB at the current 12KB setting). Under budget the README is returned verbatim. **It does not decide which sections are install-relevant** — that is a judgment about prose and belongs to the `provision` worker, which is told so in `prompts/provision.md`; no keyword filter is applied. `_gather_provision_fixtures` additionally reports `readme_bytes_unseen` / `readme_sections_unseen`, and `_format_provision_user_prompt` renders them as an explicit `[TRUNCATED: …]` note under an `UNFILTERED` header — a slice the worker cannot tell is a slice reads as the whole README. Reporting the size of the gap is mechanical; guessing at its contents would be back to classifying prose. |
-| `_run_setup_hook(repo_root, log_dir, st)` | Execs `<repo>/.leerie-setup.sh` if present with a 10-min timeout via `_run_streaming` (live output to terminal + persistent log at `<log_dir>/setup-hook.log`); sets `st.data["provision"]["sh_hook_ran"] = True` on success. |
+| `_run_setup_hook(repo_root, log_dir, st)` | Execs `<repo>/.leerie-setup.sh` if present with a 10-min timeout via `_run_streaming` (live output to terminal + persistent log at `<log_dir>/setup-hook.log`) under the setup-hook grant, whose writes land in `<run-dir>/run-layer.new`; on success renames it `<run-dir>/run-layer` and sets `st.data["provision"]["sh_hook_ran"] = True`. |
 | `_run_mise_install(repo_root, log_dir, st)` | Runs `mise install` + `mise ls --current --json` at `repo_root`. The install streams via `_run_streaming` so the user sees per-tool progress on a first-run Python/Ruby/Rust install. |
 | `_format_provision_recipe_section(recipe, *, audience) -> str \| None` | Renders the persisted recipe as a `PROVISION_RECIPE:` block for injection into implementer or conformer prompts. Audience-specific framing ("decide whether your subtask needs them" vs "ensure deps before BUILD/LINT/TEST"). Returns None when the recipe is empty or all-`none`. |
 | `phase_provision(repo_root, st, models)` | Orchestrates all of the above. Detects + persists the recipe; does NOT execute it (workers run installs in their worktrees per DESIGN §6½). |

@@ -20145,17 +20145,18 @@ _DEPCAP_SEGMENT_RE = re.compile(r"[\n;]|&&|\|\||[|&]")
 
 
 def _recipe_program_issues(recipe: list, repo_root: Path,
-                           bin_paths: list[str], path: str) -> list[str]:
+                           bin_paths: list[str], path: str,
+                           run_dir: Path | None = None) -> list[str]:
     """One `UNKNOWN_PROGRAM` issue for each recipe command whose program the
     run cannot run (DESIGN §6½ *The §12 carve-out*): a bare name with no
     executable of that name on a directory `mise bin-paths` listed for the
     provisioning checkout (`bin_paths`) or on `path` (mise's shims aside: a
     shim exists for every tool any run installed, active here or not); a
     path with no regular file beneath the repository at its working
-    directory."""
-    shims = os.path.realpath(
-        Path(os.environ.get("MISE_DATA_DIR")
-             or Path.home() / ".local" / "share" / "mise") / "shims")
+    directory. With `run_dir`, each directory is read as the run's confined
+    processes see it, through the run layer (`_run_view`), so a program the
+    setup hook installed counts."""
+    shims = str(_mise_data_dir() / "shims")
     dirs = [d for d in [*bin_paths, *path.split(os.pathsep)]
             if d and os.path.realpath(d) != shims]
     issues: list[str] = []
@@ -20174,8 +20175,7 @@ def _recipe_program_issues(recipe: list, repo_root: Path,
                     f"UNKNOWN_PROGRAM: recipe[{i}] runs {prog!r}, which is "
                     f"not a file the repository holds at {wd!r}")
             continue
-        if not any(os.access(os.path.join(d, prog), os.X_OK)
-                   and os.path.isfile(os.path.join(d, prog)) for d in dirs):
+        if _run_which(prog, run_dir, os.pathsep.join(dirs)) is None:
             issues.append(
                 f"UNKNOWN_PROGRAM: recipe[{i}] runs {prog!r}, which this "
                 "run's toolchain does not provide — name the program the "
@@ -25748,6 +25748,12 @@ class WorkerGrants(NamedTuple):
     # laid over it (`_grant_env`): the store variables, for the toolchain
     # kind.
     drop: tuple[str, ...] = ()
+    # The run layer (DESIGN §6 *The setup hook writes the run layer, never
+    # the host's toolchains*): `(DIR, LAYER)` pairs the shim overlays
+    # read-only, LAYER above DIR (`layers`), and `(DIR, UPPER)` pairs it
+    # overlays with an upper on disk, writable (`layer_uppers`, the hook's).
+    layers: tuple[tuple[str, str], ...] = ()
+    layer_uppers: tuple[tuple[str, str], ...] = ()
 
 
 # DESIGN §6 *Every confined process has its own home*: the size of the
@@ -25778,6 +25784,92 @@ def _toolchain_home() -> str:
     """The toolchain home layer (`TOOLCHAIN_HOME_ENV`), resolved, or ""."""
     v = os.environ.get(TOOLCHAIN_HOME_ENV, "")
     return os.path.realpath(v) if os.path.isabs(v) else ""
+
+
+# DESIGN §6 *The setup hook writes the run layer, never the host's
+# toolchains*: what the hook writes beneath its home and `MISE_DATA_DIR`,
+# kept in the run directory, read by every later confined process of the run.
+# The hook writes `RUN_LAYER_NEW_NAME`; it is renamed `RUN_LAYER_NAME` only
+# once the hook has exited 0, and only that name is ever read.
+RUN_LAYER_NAME = "run-layer"
+RUN_LAYER_NEW_NAME = "run-layer.new"
+RUN_LAYER_HOME = "home"
+RUN_LAYER_MISE = "mise"
+
+
+def _mise_data_dir() -> Path:
+    """`MISE_DATA_DIR` (mise's default when unset), resolved."""
+    return Path(os.path.realpath(os.environ.get("MISE_DATA_DIR")
+                                 or Path.home() / ".local" / "share"
+                                 / "mise"))
+
+
+def _run_layer_reads(run_dir: str | Path, own_home: str
+                     ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """What a confined process of the run reads of the run layer: its home
+    part as a home layer (with a home of its own), and its `MISE_DATA_DIR`
+    part as a read-only overlay on that directory. Empty until the hook's
+    layer is published."""
+    layer = Path(run_dir) / RUN_LAYER_NAME
+    if not layer.is_dir():
+        return (), ()
+    home = layer / RUN_LAYER_HOME
+    mise = layer / RUN_LAYER_MISE
+    return ((str(home),) if own_home and home.is_dir() else (),
+            ((str(_mise_data_dir()), str(mise)),) if mise.is_dir() else ())
+
+
+_OVERLAY_OPAQUE_XATTR = "user.overlay.opaque"
+
+
+def _run_view(run_dir: str | Path, path: str | Path) -> Path:
+    """`path` as a confined process of the run sees it (DESIGN §6 *The setup
+    hook writes the run layer*, 6): beneath the home or `MISE_DATA_DIR`, the
+    run layer's entry where the layer decides it, overlayfs's lookup for the
+    overlays the shim makes (no `redirect_dir`): the layer's path when its
+    walk finds an entry there, or on the way a non-directory, a link or an
+    opaque directory, which hide what is beneath them; else `path`."""
+    p = Path(os.path.abspath(path))
+    layer = Path(run_dir) / RUN_LAYER_NAME
+    if not layer.is_dir():
+        return p
+    for base, part in ((_confined_home(), RUN_LAYER_HOME),
+                       (str(_mise_data_dir()), RUN_LAYER_MISE)):
+        if not base or not p.is_relative_to(base):
+            continue
+        cur = layer / part
+        rel = p.relative_to(base).parts
+        for i, name in enumerate(rel):
+            cur = cur / name
+            if not os.path.lexists(cur):
+                return p
+            if i == len(rel) - 1:
+                return cur
+            if cur.is_symlink() or not cur.is_dir():
+                return cur.joinpath(*rel[i + 1:])
+            with contextlib.suppress(OSError):
+                if os.getxattr(cur, _OVERLAY_OPAQUE_XATTR,
+                               follow_symlinks=False) == b"y":
+                    return cur.joinpath(*rel[i + 1:])
+        return cur
+    return p
+
+
+def _run_which(name: str, run_dir: str | Path | None,
+               path: str) -> str | None:
+    """`shutil.which(name, path=path)` as a confined process of the run
+    finds it: each directory read through the run layer (`_run_view`);
+    with no run, as it is."""
+    if os.path.dirname(name):
+        return shutil.which(name)
+    for d in path.split(os.pathsep):
+        if not d:
+            continue
+        f = (Path(d) / name if run_dir is None
+             else _run_view(run_dir, Path(d) / name))
+        if f.is_file() and os.access(f, os.X_OK):
+            return str(Path(d) / name)
+    return None
 
 
 def _grant_env(base: Mapping[str, str],
@@ -26321,6 +26413,10 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     own_home = _confined_home(env)
     layer = _toolchain_home()
     layers = (layer,) if own_home and layer else ()
+    # What the run's setup hook wrote, beneath the home and `MISE_DATA_DIR`
+    # (DESIGN §6 *The setup hook writes the run layer*, 2).
+    run_home, run_mise = _run_layer_reads(run_dir, own_home)
+    layers = (*run_home, *layers)
     # A tree leerie installed for: the worker reads what that install kept
     # beneath `~` (DESIGN §6 *Every confined process has its own home*, 4).
     tree_home = _tree_home_layer(cwd_r) if tree_stores is not None else None
@@ -26331,7 +26427,7 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
         egress=True, link=str(run_dir / TREES_DIRNAME), home=own_home,
-        home_layers=layers)
+        home_layers=layers, layers=run_mise)
 
 
 # DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
@@ -26433,6 +26529,17 @@ def _home_argv(grants: WorkerGrants) -> list[str]:
     return argv
 
 
+def _layer_argv(grants: WorkerGrants) -> list[str]:
+    """The shim's options for the run layer's overlays (DESIGN §6 *The setup
+    hook writes the run layer, never the host's toolchains*)."""
+    argv: list[str] = []
+    for d, layer in grants.layers:
+        argv += ["--layer", f"{d}={layer}"]
+    for d, upper in grants.layer_uppers:
+        argv += ["--layer-upper", f"{d}={upper}"]
+    return argv
+
+
 def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                    refusal_fd: int | None = None,
                    sandbox: HeldOutSandbox | None = None,
@@ -26481,7 +26588,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                      str(report_fd)]
         if wr is not None:
             argv += ["--worker-root", wr]
-        argv += _home_argv(grants)
+        argv += _home_argv(grants) + _layer_argv(grants)
     elif _isolated():
         argv.append("--isolate")
         if grants.egress:
@@ -26496,7 +26603,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
             argv += ["--worker-root", wr] + (["--cli"] if cli else [])
         if grants.link:
             argv += ["--link-root", grants.link]
-        argv += _home_argv(grants)
+        argv += _home_argv(grants) + _layer_argv(grants)
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -26581,7 +26688,8 @@ _PRIVATE_TMPS: dict[str, int] = {}
 _MEASURE_PRIVATE = ("state.json", "acceptance", "logs", WORKERS_DIR,
                     f"{TREES_DIRNAME}/{STORES_HOME_NAME}", "tmp",
                     RUN_REPO_SETTINGS_NAME, TREE_REPOS_DIRNAME,
-                    RUN_REPO_NAME, MEASURE_DIRNAME)
+                    RUN_REPO_NAME, MEASURE_DIRNAME, RUN_LAYER_NAME,
+                    RUN_LAYER_NEW_NAME)
 
 
 def _use_run_tmp(st: "State") -> Path:
@@ -27253,7 +27361,11 @@ def _measurement_grants(st: "State", tree: str | Path,
     share*); read its git metadata (`_measured_git_reads`), the run's mise
     overrides and everything outside the state root.
     `INSTALL_KIND` is `MEASURE_KIND` with egress.
-    `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and `~/.local/bin`,
+    `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and its home, each
+    through an overlay whose upper is the run layer being made
+    (`RUN_LAYER_NEW_NAME`; DESIGN §6 *The setup hook writes the run layer,
+    never the host's toolchains*), and every kind but it and the toolchain
+    kind reads the published run layer beneath both;
     `TOOLCHAIN_KIND` `MISE_DATA_DIR` with its trust records
     (`MISE_STATE_DIR`) emptied first. `env` points the command's temp
     and `XDG_CACHE_HOME` at the tree's private temp directory
@@ -27303,9 +27415,10 @@ def _measurement_grants(st: "State", tree: str | Path,
         ro.append(home)
     mise_cache: Path | None = None
     layer = _toolchain_home()
+    layer_uppers: tuple[tuple[str, str], ...] = ()
+    new_layer = run_dir / RUN_LAYER_NEW_NAME
     if kind in (SETUP_HOOK_KIND, TOOLCHAIN_KIND):
-        tools = [Path(os.environ.get("MISE_DATA_DIR")
-                      or Path.home() / ".local" / "share" / "mise")]
+        tools = [_mise_data_dir()]
         if kind == TOOLCHAIN_KIND and layer:
             # The toolchain install's home is the toolchain home layer
             # itself: what it keeps beneath `~` is kept with the toolchains
@@ -27314,16 +27427,23 @@ def _measurement_grants(st: "State", tree: str | Path,
         # mise's install lock and its `incomplete` markers live in its
         # cache: there, they are shared as widely as the installs they
         # guard (DESIGN §6 *One toolchain install at a time on a host*).
+        # The hook's is its overlay, so its own go to its run layer.
         mise_cache = tools[0] / MISE_CACHE_NAME
-        if kind == SETUP_HOOK_KIND:
-            tools.append(Path.home() / ".local" / "bin")
         for d in tools:
-            d = d.resolve()
             if d.is_relative_to(state_root):
                 continue
             with contextlib.suppress(OSError):
                 d.mkdir(parents=True, exist_ok=True)
-            rw.append(str(d))
+            if kind == TOOLCHAIN_KIND:
+                rw.append(str(d))
+            else:
+                # The hook writes the host's toolchains never: its writes
+                # there land in the run layer it makes, an overlay the
+                # shim mounts and grants (`--layer-upper`).
+                upper = new_layer / RUN_LAYER_MISE
+                _mkdir_private(upper, run_dir)
+                _mkdir_private(_home_work(upper), run_dir)
+                layer_uppers = ((str(d), str(upper)),)
     mise_state = own / "mise-state"
     if kind == TOOLCHAIN_KIND:
         # mise keeps its trust records here: emptied, it trusts no
@@ -27350,6 +27470,18 @@ def _measurement_grants(st: "State", tree: str | Path,
     layers: tuple[str, ...] = (layer,) if own_home and layer else ()
     drop: tuple[str, ...] = ()
     upper = ""
+    run_home, run_mise = ((), ()) if kind in (
+        SETUP_HOOK_KIND, TOOLCHAIN_KIND) else _run_layer_reads(run_dir,
+                                                               own_home)
+    layers = (*run_home, *layers)
+    if kind == SETUP_HOOK_KIND and own_home:
+        # What the hook writes beneath `~` is its run's (DESIGN §6 *The
+        # setup hook writes the run layer*): its home's upper is the run
+        # layer being made, kept after it.
+        hook_home = new_layer / RUN_LAYER_HOME
+        _mkdir_private(hook_home, run_dir)
+        _mkdir_private(_home_work(hook_home), run_dir)
+        upper = str(hook_home)
     if own_home and tree_home is not None and kind != TOOLCHAIN_KIND:
         # The tree home layer (DESIGN §6 *Every confined process has its own
         # home*, 4): the install keeps what it writes beneath `~` there;
@@ -27378,7 +27510,8 @@ def _measurement_grants(st: "State", tree: str | Path,
                             + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND,
         link=str(run_dir.resolve() / TREES_DIRNAME), home=own_home,
-        home_layers=layers, drop=drop, home_upper=upper)
+        home_layers=layers, drop=drop, home_upper=upper, layers=run_mise,
+        layer_uppers=layer_uppers)
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
@@ -33910,9 +34043,13 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
     - `mise install <lang>@<version>` to add a language runtime mise
       supports beyond the image-baked LTS bake (Ruby, Java, Rust, etc.).
     - Install user-space CLI tools into `~/.local/bin`, where the workers
-      find them. A Python tool goes in with `pip install --target` and a
-      launcher script: `pip install --user` installs into a user base no
-      worker reads (DESIGN §6½ step 1).
+      find them, and anything else beneath its home (`pip install --user`).
+
+    Its writes beneath `~` and `MISE_DATA_DIR` land in the run layer,
+    never the host's toolchains (DESIGN §6 *The setup hook writes the run
+    layer, never the host's toolchains*): `RUN_LAYER_NEW_NAME`, made empty
+    first, renamed `RUN_LAYER_NAME` only after the hook exits 0, which is
+    when every later confined process of the run starts reading it.
     - Pre-populate fixtures the workers need (sample data, config).
     - Set per-run environment variables via `~/.bashrc` (note: the
       orchestrator does not source bashrc by default; the hook would
@@ -33964,6 +34101,15 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "setup-hook.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+    # A layer left by an attempt that never saved `sh_hook_ran` (killed,
+    # failed, or killed between the rename and the save) is no hook's
+    # finished work: the hook starts from none.
+    run_dir = _run_dir_of(st)
+    for name in (RUN_LAYER_NEW_NAME, RUN_LAYER_NAME):
+        if os.path.lexists(run_dir / name) \
+                and not _rmtree_owned(run_dir / name):
+            die(f"leerie could not remove {run_dir / name}, left by an "
+                "earlier attempt at .leerie-setup.sh: remove it and resume")
     try:
         rc, tail = await _run_streaming(
             ["bash", str(hook)],
@@ -33979,6 +34125,10 @@ async def _run_setup_hook(repo_root: Path, log_dir: Path,
             f"(see {log_path})\n{exc.output or ''}")
     if rc != 0:
         die(f".leerie-setup.sh exited {rc}\n(see {log_path})\n{tail}")
+    # Published whole, after the hook: no process reads a layer still
+    # being written (DESIGN §6 *The setup hook writes the run layer*, 4).
+    if (run_dir / RUN_LAYER_NEW_NAME).is_dir():
+        os.replace(run_dir / RUN_LAYER_NEW_NAME, run_dir / RUN_LAYER_NAME)
     prov["sh_hook_ran"] = True
     st.save()
 
@@ -34075,7 +34225,7 @@ _BLT_SHELL_OPERATORS = ("&&", "||", "|", ";", ">", "<", "`", "$(")
 
 
 def _blt_command_issues(found: dict, repo_root: Path, bin_paths: list[str],
-                        path: str) -> list[str]:
+                        path: str, run_dir: Path | None = None) -> list[str]:
     """Issues with a `blt_discovery` answer: a command with a shell operator
     or a `cd` (leerie runs one command from the root), one that does not
     split as words, or one whose program the run cannot run
@@ -34102,7 +34252,7 @@ def _blt_command_issues(found: dict, repo_root: Path, bin_paths: list[str],
             continue
         for issue in _recipe_program_issues(
                 [{"kind": "build", "command": words, "working_dir": "."}],
-                repo_root, bin_paths, path):
+                repo_root, bin_paths, path, run_dir):
             issues.append(issue.replace("recipe[0]", f"the {ax} command"))
     return issues
 
@@ -34150,7 +34300,8 @@ async def _discover_blt(st: "State", caps: dict, models: dict[str, str],
         result, warnings = await _run_checked_loop(
             invoke=_invoke,
             check=lambda r: _blt_command_issues(
-                r, repo_root, bin_paths, os.environ.get("PATH", "")),
+                r, repo_root, bin_paths, os.environ.get("PATH", ""),
+                _run_dir_of(st)),
             name="blt_discovery",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_fb,
@@ -34162,13 +34313,15 @@ async def _discover_blt(st: "State", caps: dict, models: dict[str, str],
     found = {ax: (((result or {}).get(ax) or {}).get("command") or "").strip()
              for ax in ("build", "lint", "test")}
     if result is not None and _blt_command_issues(
-            result, repo_root, bin_paths, os.environ.get("PATH", "")):
+            result, repo_root, bin_paths, os.environ.get("PATH", ""),
+            _run_dir_of(st)):
         # Still unrunnable after the re-asks: an axis leerie cannot run is
         # not one it measures.
         bad = {ax for ax in found
                if _blt_command_issues({ax: {"command": found[ax]}},
                                       repo_root, bin_paths,
-                                      os.environ.get("PATH", ""))}
+                                      os.environ.get("PATH", ""),
+                                      _run_dir_of(st))}
         for ax in sorted(bad):
             log(f"  blt_discovery: {ax} command {found[ax]!r} cannot run "
                 "here; the axis is left empty")
@@ -36602,7 +36755,8 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
             check=lambda r: (check_provision_output(r, repo_root)
                              + _recipe_program_issues(
                                  r.get("recipe") or [], repo_root, bin_paths,
-                                 os.environ.get("PATH", ""))),
+                                 os.environ.get("PATH", ""),
+                                 _run_dir_of(st))),
             name="provision",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_prov_fb,
@@ -75971,7 +76125,9 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
             return _end("refuted", f"claimed missing file {key}, but it "
                         "exists")
     if kind == "binary":
-        found = shutil.which(key) or _binary_install_source(key, worktree, st)
+        found = (_run_which(key, getattr(st, "run_dir", None),
+                            os.environ.get("PATH", os.defpath))
+                 or _binary_install_source(key, worktree, st))
         if found:
             return _end("refuted", f"claimed missing binary {key}, but it is "
                         f"available or installable here: {found}")

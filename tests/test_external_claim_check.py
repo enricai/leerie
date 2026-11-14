@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -127,16 +128,42 @@ def test_file(ext):
     assert "claimed missing file config/acme-billing.pem" in out["why"]
 
 
-def test_binary(ext, monkeypatch):
-    c = ext["leerie"]
+def _exe(p):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("#!/bin/sh\n")
+    p.chmod(0o755)
+
+
+def test_binary(ext, monkeypatch, tmp_path):
     claim = {"kind": "binary", "name": "acmectl-leerie-t"}
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
     assert _check(ext, claim)["verdict"] == "verified"
-    monkeypatch.setattr(c.shutil, "which",
-                        lambda n: "/usr/bin/" + n if n == "acmectl-leerie-t"
-                        else None)
+    _exe(bin_ / "acmectl-leerie-t")
     out = _check(ext, claim)
     assert out["verdict"] == "refuted"
-    assert "/usr/bin/acmectl-leerie-t" in out["why"]
+    assert f"{bin_}/acmectl-leerie-t" in out["why"]
+
+
+def test_a_binary_the_setup_hook_installed_is_refuted(ext, monkeypatch,
+                                                     tmp_path):
+    """What the run's setup hook installed is the run's (DESIGN §6 *The setup
+    hook writes the run layer*, 6): a binary only its run layer holds, at a
+    directory on `PATH`, is there for the worker. (`/tmp` named elsewhere:
+    `_confined_home` answers "" for a home beneath it, as CI's is.)"""
+    monkeypatch.setattr(ext["leerie"], "SHARED_TMP",
+                        tmp_path / "no-shared-tmp")
+    claim = {"kind": "binary", "name": "acmectl-leerie-t"}
+    local_bin = ext["home"].resolve() / ".local" / "bin"
+    monkeypatch.setenv("PATH", f"{local_bin}:{os.environ['PATH']}")
+    assert _check(ext, claim)["verdict"] == "verified"
+    layer = Path(ext["st"].run_dir) / "run-layer"
+    (layer / "mise").mkdir(parents=True)
+    _exe(layer / "home" / ".local" / "bin" / "acmectl-leerie-t")
+    out = _check(ext, claim)
+    assert out["verdict"] == "refuted"
+    assert f"{local_bin}/acmectl-leerie-t" in out["why"]
 
 
 @pytest.mark.parametrize("plant, source", [

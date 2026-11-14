@@ -4334,7 +4334,8 @@ confinement failure stops the run; it is never a result*).
 | the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/`; its `home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
 | the run's tools file | `<run-dir>/mise-tools.toml` (§6½ *The tools a repository needs are read from it*) | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
-| *setup-hook kind* | also `MISE_DATA_DIR` and `~/.local/bin` | write |
+| the run layer | `<run-dir>/run-layer/` once the setup hook has published it: `home/` a lower layer of the home, `mise/` a read-only layer over `MISE_DATA_DIR`, every kind but the toolchain and setup-hook kinds (*The setup hook writes the run layer, never the host's toolchains*) | read |
+| *setup-hook kind* | also `MISE_DATA_DIR` and its home, each an overlay whose upper is `<run-dir>/run-layer.new/` (`mise/`, `home/`); no host directory | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR` and the toolchain home layer `/leerie-toolchains/home`, which is its `HOME`; no store variable in its environment; `mise-state/` emptied first | write |
 | *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
 
@@ -4447,8 +4448,10 @@ planning commit (§6½ step 1), before any worker that commits exists: it is
 the repository's own code as the user committed it, not a worker's. It is
 confined with the setup-hook kind, whose extra writes are exactly what §6½
 says a hook may do — install a language runtime with `mise`
-(`MISE_DATA_DIR`) and a user-space tool into `~/.local/bin` — and nothing
-of the state root but its checkout and its measurement directory. The
+(`MISE_DATA_DIR`) and a user-space tool beneath its home — and nothing
+of the state root but its checkout and its measurement directory. Both
+writes land in the run layer, never a host directory (*The setup hook
+writes the run layer, never the host's toolchains*). The
 premise is checked, not assumed: `claude_p` records the first committing
 worker's start (`committing_worker_started`), and a hook that has not run
 yet when that is set stops the run instead of running.
@@ -5149,7 +5152,8 @@ install, and leerie's own steps on an installed version are serialised
 with the install.** Two parts.
 
 1. mise's cache travels with its data: every kind that writes
-   `MISE_DATA_DIR` (the toolchain install, the setup hook) gets
+   `MISE_DATA_DIR` (the toolchain install, the setup hook — the hook's is
+   its overlay, *The setup hook writes the run layer*) gets
    `MISE_CACHE_DIR=$MISE_DATA_DIR/cache`. mise's own lock and completeness
    check then hold across every run that shares the data. A crashed
    install's marker outlives its container, so the next install redoes it
@@ -5450,7 +5454,9 @@ every later run.
 command leerie runs, every held-out evaluation — has a home of its own: a
 copy of one pristine home, writable, private to its process tree, gone when
 that tree ends. Nothing one of them writes beneath `~` is seen by another.
-Only the toolchain install writes a layer others read.**
+Only a layer's one writer writes a layer others read: the toolchain
+install the toolchain home layer, the setup hook its run's layer, a tree's
+install its tree's.**
 
 1. *The pristine home is a copy, and nothing is mounted beneath it.* The
    launcher stages the host's credentials and configuration in `$STAGE` as
@@ -5481,7 +5487,7 @@ Only the toolchain install writes a layer others read.**
    `--home-layer`). Every tool sees one ordinary `$HOME`, through `$HOME`
    and through the password database alike: reads fall through to the
    layers, writes land in the upper. A grant that lies beneath the home (a
-   setup hook's `~/.local/bin`; a host's state root) is bound from the real
+   host's state root) is bound from the real
    directory over the overlay, so a grant keeps meaning what it names. The
    home is then granted for writing to every confined process; the overlay
    is what makes that safe.
@@ -5598,13 +5604,13 @@ the run; it is never a result*). `resume` redoes the step.
 *A layer that changes under a mounted overlay.* overlayfs leaves a change to
 a lower layer while an overlay is mounted undefined, though never a crash
 or a deadlock (the kernel's overlayfs documentation, *Changes to underlying
-filesystems*). Two writes do that here, both by design: the toolchain
-install writes the toolchain layer while another run's processes may hold
-it as a lower, and a setup hook writes `~/.local/bin` (bound from the real
-home) while the pristine home is a lower of processes already running.
-Both happen at provisioning, before the run's workers start; what a process
-mounted earlier may miss is a file the change added, which every process
-mounted after it sees. No leerie step reads a toolchain through a process
+filesystems*). One write does that here, by design: the toolchain
+install writes the toolchain layer and `MISE_DATA_DIR` while another run's
+processes may hold them as lowers (a setup hook's among them). It happens
+at provisioning; what a process mounted earlier may miss is a file the
+change added, which every process mounted after it sees. The run layer is
+never written while mounted as a lower: it is published only after its
+hook exits (*The setup hook writes the run layer*, 4). No leerie step reads a toolchain through a process
 mounted before that toolchain's install.
 
 **Why the shim, not `bwrap`.** `bwrap` makes the same overlay
@@ -5665,6 +5671,121 @@ is already its own copy (`_worker_dirs`, from the run's template), and
 `CLAUDE_CONFIG_DIR` names it, outside the home. A container cannot refresh
 a subscription token (*Credential strategy*), so there is no refreshed token
 for a later worker to need; the long-lived token is the answer, as before.
+
+### The setup hook writes the run layer, never the host's toolchains
+
+*Designed 2026-11-14 (the user's decision; lane HC3, from lane HC2's
+measurements, `CF/W7`).*
+
+**Root cause.** The setup-hook kind was granted `MISE_DATA_DIR` for writing
+because a hook may install a runtime with `mise` (§6½ step 1), and
+`MISE_DATA_DIR` is `/leerie-toolchains/mise`, the host's
+`~/.cache/leerie/toolchains/mise`: one directory every run of every
+repository on the host executes from. So a repository's committed hook
+wrote the host. Measured on both runtimes, through real launches: a
+fixture hook wrote a file into `mise/`, `mise/installs/` and `mise/shims/`
+(on every confined process's `PATH`, ahead of `/usr/bin`), and each was
+still there, owned by the host user, after the run ended and after the same
+run's own `mise install`. A hook is the user's code, but it is *one
+repository's* code; what it installs is that repository's business, and the
+grant made it every later run's. Its other write, `~/.local/bin`, was the
+container's real home bound over the hook's own: not the host's, but
+mutated the pristine home every later process copies (§6 *Every confined
+process has its own home*, 1), and, being the container's filesystem, was
+gone on `resume`, whose fresh container skips the hook because it already
+ran (`provision.sh_hook_ran`), so a run resumed with a tool the hook
+installed missing.
+
+**Invariant: what the setup hook writes is its run's alone. The hook never
+writes a host directory; every later confined process of the same run, and
+no other run's, reads what it wrote at the path it wrote it.**
+
+1. *The run layer.* `<run-dir>/run-layer/` (`RUN_LAYER_NAME`) holds two
+   uppers on disk: `home/`, over the home, and `mise/`, over
+   `MISE_DATA_DIR`, each with its overlay work directory beside it. The
+   hook's home is an overlay whose upper is `home/` (the shape a tree's
+   install already has, `--home-upper`), and the shim mounts a second
+   overlay on `MISE_DATA_DIR` whose lower is the host's directory and whose
+   upper is `mise/` (`--layer-upper`). Writes land in the run layer; reads
+   fall through to the host's toolchains and the pristine home. The hook's
+   grant names `MISE_DATA_DIR` and its home for writing, both overlays it
+   alone holds; it names no host directory and no `~/.local/bin`. A hook's
+   `mise install` reuses a toolchain the host already has, and installs
+   what it lacks into the run layer.
+2. *Every later confined process of the run reads it.* Every worker and
+   every repository command leerie runs in the run, but the toolchain
+   install, has `run-layer/home` as a lower layer of its own home (beneath
+   a tree home layer, above the toolchain home layer) and a read-only
+   overlay on `MISE_DATA_DIR` whose top layer is `run-layer/mise`
+   (`--layer`): a tool the hook put in `~/.local/bin`, a package `pip
+   install --user` put in the user base, a runtime `mise install` put in
+   `installs/`, each at the path the hook wrote it. Nothing but the hook
+   writes the layer: a reader's `MISE_DATA_DIR` has no upper, and its home's
+   upper is its own.
+3. *The toolchain install reads none of it.* A toolchain is the host's
+   (§6 *Every confined process has its own home*, 3): `mise install` and
+   `mise ls` see the host's `MISE_DATA_DIR` alone and write it, so nothing
+   a hook installed reaches the host through them either. A runtime both
+   the hook and the repository's pins name is then in both; the run's
+   processes read the run layer's copy above the host's.
+4. *It is published whole.* The hook writes `run-layer.new/`, made empty
+   before it starts; only after the hook exits 0 is it renamed
+   `run-layer/` and `provision.sh_hook_ran` saved. A reader uses the layer
+   only when `run-layer/` exists, so no process ever mounts a layer the hook
+   is still writing (overlayfs leaves a change to a mounted layer
+   undefined), and a hook killed partway leaves nothing a reader takes:
+   `resume` runs it again into a fresh `run-layer.new/`.
+5. *It lives as long as the run.* It is in the run directory, not the
+   container: a `resume`, in a new container, reads the layer the hook
+   wrote in the first. It goes when the run directory goes (`leerie
+   prune`), and no other run reads it.
+6. *Leerie's own reads see the run as its processes do.* The orchestrator
+   is not in the processes' mount namespaces. Where it asks whether the run
+   can run a program (`_recipe_program_issues`, an external claim of a
+   missing binary), a directory beneath the home or `MISE_DATA_DIR` is read
+   through the run layer (`_run_view`): the layer's entry where it has one
+   (a whiteout, a character device, hides the path), the layer's alone
+   beneath an opaque directory or a non-directory, else the directory
+   itself — overlayfs's own lookup, for the overlays the shim makes (no
+   `redirect_dir`, no `metacopy`).
+
+The variables a hook's environment had stay: `MISE_CACHE_DIR` is still
+`$MISE_DATA_DIR/cache`, now the hook's overlay, so mise's lock and its
+`incomplete` markers for what the hook installs are in the run layer with
+the installs they guard (*One toolchain install at a time on a host*); an
+install in progress in another run is in the host's lower with its marker,
+which the hook's mise reads and does not trust.
+
+What this deletes: the setup-hook kind's write grant on the host's
+`MISE_DATA_DIR` and on the container's `~/.local/bin`, the bind of
+`~/.local/bin` from the real home over the hook's own, and the advice that
+a Python tool goes in with `pip install --target` and a launcher script
+because `pip install --user` reached no worker (§6½ step 1).
+
+*Measured (2026-11-14, kernel 7.0, nerdctl 2.3.5, containerd 2.2.2, image
+`leerie:0.70.2` with this change's code; lane HC2's hook fixture, extended
+and given a repository image by `setup_packages`, so every confined process
+ran in the worker view).* The fixture's hook tried to write a marker into
+`MISE_DATA_DIR`, its `installs/` and `shims/`, `~/.local/bin`, `~`, the
+toolchain home layer, `/usr/local/bin` and `/etc`; installed an executable
+`~/.local/bin/hc3-tool`; and ran `mise install shfmt@3.10.0`. Its test suite
+runs `hc3-tool`.
+
+| | rootless | rootful (the launcher's argv replayed) |
+|---|---|---|
+| hook writes `MISE_DATA_DIR`, `installs/`, `shims/`, `~/.local/bin`, `~` | each lands in `<run-dir>/run-layer/` | the same |
+| `mise install shfmt` in the hook | `installs/shfmt`, its shim and download in the run layer | the same |
+| marker or `shfmt` in the host's `~/.cache/leerie/toolchains` after the run | none | none |
+| toolchain home layer, `/usr/local/bin`, `/etc` | denied | denied |
+| the measured base and final suites, which run `hc3-tool` | 2 and 3 passed; outcome done | 2 and 3 passed; outcome done |
+| a run killed after its hook, then `resume` in a new container | the hook not run again; base 2 and final 3 passed; outcome done | — |
+
+Before this change, on lane HC2's fixture (`CF/W7`, 0.70.2), each of
+the first row's writes reached the host's toolchains on both runtimes. Not
+measured: Colima, Fly and EC2; each needs only the overlay with `userxattr`
+in a user namespace that the home already needs, on `/leerie-toolchains/mise`
+(Colima: the same AppArmor rule; Fly and EC2: no AppArmor, and
+`/leerie-toolchains` is a directory of the machine).
 
 ### A confined process has its own network; the outside is reached only through leerie's proxy
 
@@ -11546,21 +11667,18 @@ the CI parity baseline, the browser suite unable to start).
    explicit channel*). Step 2's `mise install` and `mise ls` run in the same
    checkout. Both are confined (§6 *Leerie's runs of the repository's
    commands are confined too*): the hook may write its checkout, its own
-   temp and cache, `MISE_DATA_DIR` and `~/.local/bin`; `mise` its
-   checkout, its own temp and cache and `MISE_DATA_DIR`, trusting no
-   configuration. The hook runs once, before any worker that commits: one
+   temp and cache, `MISE_DATA_DIR` and its home, both overlays whose writes
+   land in the run layer (§6 *The setup hook writes the run layer, never the
+   host's toolchains*); `mise` its checkout, its own temp and cache and
+   `MISE_DATA_DIR`, trusting no configuration. The hook runs once, before any worker that commits: one
    that would run after one has started stops the run instead.
 
    A tool the workers run goes in `~/.local/bin`: the hook writes it, and
-   every worker reads it and has it on `PATH`. The rest of the hook's
-   environment belongs to its checkout:
-   - *pip's user base.* `pip install --user` installs into the hook's own
-     home, which ends with it (§6 *Every confined process has its own
-     home*); no worker reads it. A Python tool goes in with
-     `pip install --target ~/.local/bin/.<tool> <tool>` and a launcher
-     script at `~/.local/bin/<tool>` that sets `PYTHONPATH` to that
-     directory and runs `python3 -m <module>`. The image has no
-     `ensurepip`, so `python3 -m venv` makes no environment with pip.
+   every worker reads it and has it on `PATH`. Whatever else the hook
+   writes beneath its home is read the same way, at its ordinary path:
+   `pip install --user` puts a package in the user base every later
+   process of the run imports from. The rest of the hook's environment
+   belongs to its checkout:
    - *Its cache.* `XDG_CACHE_HOME` is the checkout's private temp directory,
      and a worker's is its side's cache (`_worker_cache_env`). The worker
      that first runs a tool builds whatever that tool caches, such as the
@@ -11582,8 +11700,10 @@ the CI parity baseline, the browser suite unable to start).
    Measured on the image's Python 3.13 with pre-commit 4.7.0: a commit in a
    worktree of a bare repository, with its own user base and cache and a
    read-only hooks directory reached through `core.hooksPath`, ran
-   pre-commit installed this way, and failed with a `pip install --user`
-   install in another user base.
+   pre-commit installed with `pip install --target` and a launcher, and
+   failed with a `pip install --user` install in another user base — the
+   case the run layer removes: the hook's user base is every later
+   process's.
 
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for the

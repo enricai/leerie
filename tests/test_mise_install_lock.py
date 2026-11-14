@@ -131,9 +131,14 @@ def test_the_kinds_that_write_mise_data_share_its_cache(
         return
     cache = Path(env["MISE_CACHE_DIR"])
     assert cache == data.resolve() / "cache"
-    # Shared with every run, unlike the command's own temp and cache.
+    # With its data, unlike the command's own temp and cache: the toolchain
+    # install's is the host's, shared with every run; the setup hook's is
+    # its overlay over that, whose writes are its run layer's (DESIGN §6
+    # *The setup hook writes the run layer, never the host's toolchains*).
     assert not cache.is_relative_to(env["TMPDIR"])
-    assert any(cache.is_relative_to(p) for p in g.rw), g.rw
+    written = (g.rw if kind == "TOOLCHAIN_KIND"
+               else tuple(d for d, _u in g.layer_uppers))
+    assert any(cache.is_relative_to(p) for p in written), g
 
 
 # ------------------------------------------------------ the real container

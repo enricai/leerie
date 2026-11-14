@@ -1128,6 +1128,46 @@ def private_home(home: str, layers: list[str], size: int,
             os.rmdir(d)
 
 
+def layer_mounts(layers: list[tuple[str, str]],
+                 uppers: list[tuple[str, str]]) -> list[str]:
+    """The run layer's overlays (DESIGN §6 *The setup hook writes the run
+    layer, never the host's toolchains*): on each `DIR` of `layers` whose
+    `LAYER` exists, a read-only overlay with `LAYER` above `DIR`; on each
+    `DIR` of `uppers`, an overlay over `DIR` whose upper is `UPPER` on disk
+    (its work directory `<UPPER>.work`), kept after the process. Mounted in
+    this mount namespace, after the home and before the grants are bound.
+    Returns the writable ones' targets, which the caller keeps writable.
+    Fails (`IsolationError`) rather than mount over a mount beneath `DIR`,
+    which the kernel refuses (`EINVAL`)."""
+    infos = _mountinfo()
+    writable: list[str] = []
+    for d, top, upper in ([(d, t, False) for d, t in layers]
+                          + [(d, u, True) for d, u in uppers]):
+        d, top = os.path.normpath(d), os.path.normpath(top)
+        if any(c in p for p in (d, top) for c in ",:\\"):
+            raise IsolationError(f"layer {d}: a path overlayfs cannot name")
+        if not os.path.isdir(d) or os.path.islink(d):
+            raise IsolationError(f"layer {d}: not a directory")
+        for mp, _opts in infos:
+            if mp != d and _beneath(mp, d):
+                raise IsolationError(
+                    f"layer {d}: {mp} is mounted beneath it, and an "
+                    "overlay's lower layer cannot hold a mount")
+        if not upper:
+            if not os.path.isdir(top):
+                continue
+            opts = f"lowerdir={top}:{d},userxattr"
+        else:
+            if not os.path.isdir(top) or not os.path.isdir(top + ".work"):
+                raise IsolationError(f"layer upper {top}: not a directory "
+                                     "with its .work")
+            opts = (f"lowerdir={d},upperdir={top},workdir={top}.work,"
+                    "userxattr")
+            writable.append(d)
+        _must(f"overlay {d}", _mount("overlay", d, "overlay", 0, opts))
+    return writable
+
+
 class HomeWatch:
     """The use of the process's own home, sampled while its command runs
     (DESIGN §6 *Every confined process has its own home*): `full` once a
@@ -1592,7 +1632,10 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             worker_root: str | None = None,
             home: str | None = None, home_layers: list[str] = (),
             home_bytes: int = 0,
-            home_upper: str | None = None) -> tuple[int, list[str]]:
+            home_upper: str | None = None,
+            layers: list[tuple[str, str]] = (),
+            layer_uppers: list[tuple[str, str]] = ()
+            ) -> tuple[int, list[str]]:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
     with `view`); returns how many mounts were made read-only and the read
     grants the worker view needs (`build_worker_view`; none without
@@ -1615,6 +1658,8 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
         private_home(home, list(home_layers), home_bytes, rw + ro,
                      upper=home_upper)
         roots.append(os.path.normpath(home))
+    # After the home: a layer's directory may lie beneath it.
+    roots += layer_mounts(list(layers), list(layer_uppers))
     if sandbox:
         assert view is not None
         kept += overlay_grants(rw, view)
@@ -1955,7 +2000,8 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                 report_fd: int | None, worker_root: str | None = None, *,
                 over_pairs: list[tuple[str, str]] = (),
                 remove_paths: list[str] = (), home: str | None = None,
-                home_layers: list[str] = (), home_bytes: int = 0) -> int:
+                home_layers: list[str] = (), home_bytes: int = 0,
+                layers: list[tuple[str, str]] = ()) -> int:
     """`--sandbox`: build it, fork PID 1 of the new PID namespace, forward
     a stop signal to it, and exit as `cmd` did."""
     enter = None
@@ -1966,7 +2012,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                               remove_paths=remove_paths,
                               worker_root=worker_root, home=home,
                               home_layers=home_layers,
-                              home_bytes=home_bytes)
+                              home_bytes=home_bytes, layers=layers)
         if worker_root is not None:
             ro = ro + view_ro
             enter = ("view", WORKER_VIEW, worker_env_changes(worker_root))
@@ -2095,7 +2141,7 @@ def _parse(argv: list[str]) -> dict | str:
                "worker_root": None, "cli": False, "refusal_fd": None,
                "taken_fd": None, "link_root": None,
                "home": None, "home_layer": [], "home_bytes": None,
-               "home_upper": None,
+               "home_upper": None, "layer": [], "layer_upper": [],
                "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
@@ -2110,12 +2156,20 @@ def _parse(argv: list[str]) -> dict | str:
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd",
                      "--link-root", "--home", "--home-layer",
-                     "--home-bytes", "--home-upper") \
+                     "--home-bytes", "--home-upper", "--layer",
+                     "--layer-upper") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
         if k in ("--rw", "--ro"):
             o[k[2:]].append(v)
+        elif k in ("--layer", "--layer-upper"):
+            d, eq, top = v.partition("=")
+            if not eq or not all(os.path.isabs(x) and os.path.normpath(x)
+                                 not in ("/", "//") for x in (d, top)):
+                return f"landlock_exec.py: bad {k} {v!r}"
+            o[k[2:].replace("-", "_")].append(
+                (os.path.normpath(d), os.path.normpath(top)))
         elif k in ("--place", "--replace"):
             src, eq, rel = v.partition("=")
             if not eq or not src or not rel:
@@ -2193,6 +2247,10 @@ def _parse(argv: list[str]) -> dict | str:
                 "--home-layer needs them")
     if o["home_upper"] and o["sandbox"]:
         return "landlock_exec.py: --home-upper needs --isolate"
+    if o["layer"] and not (o["isolate"] or o["sandbox"]):
+        return "landlock_exec.py: --layer needs --isolate or --sandbox"
+    if o["layer_upper"] and not o["isolate"]:
+        return "landlock_exec.py: --layer-upper needs --isolate"
     if o["link_root"] and not o["isolate"]:
         return "landlock_exec.py: --link-root needs --isolate"
     if o["cli"] and not (o["worker_root"] and o["isolate"]):
@@ -2230,7 +2288,8 @@ def main(argv: list[str]) -> int:
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
                            o["report_fd"], wr, over_pairs=o["replace"],
-                           remove_paths=o["remove"], **home)
+                           remove_paths=o["remove"], layers=o["layer"],
+                           **home)
     relays: list[tuple[socket.socket, str]] = []
     enter = None
     if o["isolate"]:
@@ -2240,7 +2299,9 @@ def main(argv: list[str]) -> int:
             _n, view_ro = isolate(rw, ro, sockets=[t for _p, t in targets],
                                   worker_root=wr,
                                   link_root=o["link_root"],
-                                  home_upper=o["home_upper"], **home)
+                                  home_upper=o["home_upper"],
+                                  layers=o["layer"],
+                                  layer_uppers=o["layer_upper"], **home)
             if wr is not None:
                 ro = ro + view_ro
                 enter = (("cli", WORKER_VIEW, wr) if o["cli"] else
@@ -2265,7 +2326,8 @@ def main(argv: list[str]) -> int:
         if o["egress"]:
             os.environ.update(proxy_env(relays[-1][0].getsockname()[1]))
         rw = rw + list(PRIVATE) + _watch_home(
-            o["home"], o["home_bytes"], watch=o["home_upper"] is None)
+            o["home"], o["home_bytes"], watch=o["home_upper"] is None) + [
+                d for d, _u in o["layer_upper"]]
     rc = _confine_or_126(rw, ro)
     if rc is not None:
         return rc
