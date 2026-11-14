@@ -71306,6 +71306,23 @@ def _redrive_met_unread(st: "State", sha: str) -> list[int]:
     return sorted(set(out))
 
 
+def _redrive_items_unread(st: "State", indices: Iterable[int], sha: str,
+                          det_sha: str) -> list[int]:
+    """Of `indices`, in index order, the items no read was made of on
+    `sha`: the commit each was last read on — its `delivery_gate.items`
+    row's `redrive_recheck.sha`, else `det_sha`, the detection the re-drive
+    routed from — is not `sha`. Decided per item: a round's re-check reads
+    only the items that round's groups drove, so the commit it ran on says
+    nothing of the others (DESIGN §8 *Every item verdict keyed to the tree
+    that ships was read on it*)."""
+    rows = {r.get("item_index"): r for r in (st.data.get("delivery_gate")
+                                             or {}).get("items") or []
+            if isinstance(r, dict)}
+    return sorted({i for i in indices if isinstance(i, int)
+                   and ((rows.get(i) or {}).get("redrive_recheck")
+                        or {}).get("sha", det_sha) != sha})
+
+
 def _redrive_kept_groups(rec: dict) -> list[tuple[int, int, dict]]:
     """`(round, group, entry)` for every re-drive group still in staging's
     history, in the order they landed: it committed (`post_sha` other than
@@ -73012,9 +73029,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             await _run_ci_parity_final(leerie_dir, st, caps)
             await _redrive_refresh_test_id_diff(leerie_dir, st, caps, staging)
             final_tree = await _committed_tree_sha(str(staging))
-            if start_items and rechecked_sha != final:
+            # Every open item is read on `final`, routed or not; the last
+            # round's re-check read only what its groups drove.
+            unread = _redrive_items_unread(
+                st, [*start_items,
+                     *(u.get("item_index") for u in (st.data.get(
+                         "delivery_gate") or {}).get("unmet_final") or []
+                       if isinstance(u, dict))], final, det_sha)
+            if unread:
                 ver = await _redrive_recheck_items(
-                    leerie_dir, st, caps, models, efforts, staging, start_items)
+                    leerie_dir, st, caps, models, efforts, staging, unread)
                 _redrive_apply_item_verdicts(st, ver, final, final_tree)
             # A kept group whose ratchet failed left items unverified: they are
             # read once more on `final`; a read that crashes again leaves them

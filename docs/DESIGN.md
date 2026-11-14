@@ -14914,10 +14914,31 @@ After the last round the sets are measured once more on the tree that
 ships, the merge checks re-run when the tree moved (read from the last
 kept group's measurement when it holds every gate green), the failing-test-ID
 diff (§9 *Which failures are new*) is measured again on that tree, and
-each routed item is re-checked: re-judged by the cited judge, and an item
-a falsifier proved unmet by re-running its saved probe on the new tree.
+every item open at the re-drive's start or unmet on that tree is
+re-checked there — routed or not — unless a re-check already read that
+item on that commit: re-judged by the cited judge, and an item a
+falsifier proved unmet by re-running its saved probe on the new tree.
 Every row's test-outcome part is then re-read from the diff of the tree
 that ships. That verdict is what `_decide_outcome` reads.
+
+**Every item verdict keyed to the tree that ships was read on it.** Which
+items still need a read on that tree is decided per item, from the commit
+that item was last read on (`redrive_recheck.sha`, or detection's
+`final_sha` for an item no re-check read), never from the commit the last
+re-check ran on: the re-check after a round reads only the items that
+round's groups drove, so its commit says nothing of the others. Before
+this the end of the re-drive skipped its read of the items open at its
+start whenever the last round's re-check had run on the commit it ended
+on, and the re-key below then stamped their verdicts with that commit.
+Measured over the recorded runs (lane W3, 2026-11-14): in 7 runs
+detection judged an earlier commit and the re-drive kept a group; in 2 of
+them, 7 unmet verdicts the re-drive never read on the tree that shipped
+carried its stamp — barnacle 59d17631 (leerie 0.65.0) items 3 (`budget`)
+and 4 (`no_code_target`), read on 4d8717bf while 03f67a05 shipped, and
+navegando 399f7c8b (0.65.0) items 82, 85, 86, 91 and 93 (`budget`), read
+on 775233fa while 52b66f72 shipped. The outcome and the PR said each was
+unmet on the tree that ships, and `_decide_outcome`'s "not read on the
+tree that ships" reason could not fire for them.
 
 **A re-check replaces a verdict only on a tree that changed, and only by
 the vote that made it.** A routed item is re-judged only when the tree has
@@ -16418,11 +16439,12 @@ spent on the tree it repaired (a HEAD where nothing can be measured keeps
 the last measured verdict, as at the end of the re-drive); the merge
 checks re-run. The re-drive's own verdict is re-keyed rather than
 re-measured: when the detection it routed from was of the commit it
-started on, and it has re-checked its routed items on the commit it ends
-on, and no item a failed ratchet left unverified remains, `final_sha`
-becomes that commit — every kept group's ratchet re-verified the items
-it did not route — so a resume after it keeps the verdict
-`_decide_outcome` reads instead of running detection over it. With an
+started on, and it has re-checked on the commit it ends on every item
+open at its start or unmet there (*Every item verdict keyed to the tree
+that ships was read on it*), and no item a failed ratchet left unverified
+remains, `final_sha` becomes that commit — every kept group's ratchet
+re-verified the met items it did not route — so a resume after it keeps
+the verdict `_decide_outcome` reads instead of running detection over it. With an
 item still unverified the key stays, and a resume runs detection.
 Until this rule, detection's skip read only the presence of `unmet_final`
 and the acceptance gate's only the presence of `final`: a resume after a

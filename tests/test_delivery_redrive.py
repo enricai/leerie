@@ -882,6 +882,12 @@ def test_items_go_to_every_claimer_process_items_never(
               claims={"s1": [{"item_index": 0, "kind": "deliverable"},
                              {"item_index": 1, "kind": "process"}],
                       "s2": [{"item_index": 0, "kind": "deliverable"}]})
+    # A row per item, as detection writes them: where each re-check's read
+    # is recorded (`redrive_recheck`).
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": i, "item": it["item"], "verdict": "unmet",
+         "by": ["judge"]} for i, it in enumerate(items)]
+    w.st.save()
     w.install(monkeypatch)
     w.edits = [lambda w: w.write("export const a = 1; // done\n"), None]
     judged = []
@@ -892,7 +898,10 @@ def test_items_go_to_every_claimer_process_items_never(
         # M4: indices are the run's, never positions in a subset).
         assert len(its) == len(items)
         judged.append([its[i]["item"] for i in kw["only"]])
-        return [], 1, None
+        # The process item stays unmet on the judge's prose.
+        return ([{"item_index": 1, "item": "run lint",
+                  "evidence": "still not run"}]
+                if 1 in kw["only"] else []), 1, None
     monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
     monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
     monkeypatch.setattr(leerie, "_delivery_typed_evidence",
@@ -904,8 +913,11 @@ def test_items_go_to_every_claimer_process_items_never(
     assert w.calls[1]["prompt"].startswith("Execute subtask `s2`.")
     for c in w.calls:
         assert "a does X" in c["prompt"] and "run lint" not in c["prompt"]
-    # Only the routed item is re-judged; met now, it leaves unmet_final.
-    assert judged == [["a does X"]]
+    # The round re-judges the routed item; met now, it leaves unmet_final.
+    # The process item, routed nowhere, is re-judged on the commit the
+    # re-drive ends on, the only read its verdict there may rest on (DESIGN
+    # §8 *Every item verdict keyed to the tree that ships was read on it*).
+    assert judged == [["a does X"], ["run lint"]]
     left = w.st.data["delivery_gate"]["unmet_final"]
     assert [u["item_index"] for u in left] == [1]
     # A process item unmet on a judge's prose names no code to hand on:
