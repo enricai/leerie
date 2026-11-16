@@ -10226,7 +10226,11 @@ create` when `run.json`'s `outcome` is `unconverged`.
 `_FINDINGS_HEADING = "## Reported findings"` (in `_PR_END_STATE_HEADINGS`,
 after `## Unconverged`), led by a sentence that the checks that may veto
 passed (on a `done` run), that these findings were reported, not verified,
-and that each needs a read before merging.
+and that each needs a read before merging. The `- **<sid>**: <reason>` line
+of each `unconverged_subtasks` entry whose status is `unconverged` follows
+the findings there when `outcome_findings` is non-empty and the outcome is
+`done`, or `unconverged` with `_check_vetoes("subtask_settle")` false;
+otherwise it follows the vetoes under `## Unconverged`.
 
 ### Delivery detection — `_run_delivery_detection`
 
@@ -14810,7 +14814,7 @@ command line overrides it.
 | `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
-| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
+| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`; a `done` run's has none, and starts with `## Reported findings` when there are findings. |
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged`: the vetoes (on a run with no commits, the findings too); empty otherwise. |
 | `outcome_findings` | list[str] | the failures of checks that may not veto (`_check_vetoes`), on a run with commits; rendered under `## Reported findings`. |
 | `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, conflicts_with?[], conflict_rolled_back?, objections?[{kind, reason}], artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |

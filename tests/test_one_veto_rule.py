@@ -156,6 +156,40 @@ def test_a_done_runs_findings_lead_the_pr_end_state(leerie, st):
     assert listed.splitlines() == [f"- {f}" for f in findings]
 
 
+@pytest.mark.parametrize("veto,commits,under", [
+    (False, True, "## Reported findings"),
+    (True, True, "## Reported findings"),
+    (False, False, "## Unconverged")],
+    ids=["done", "vetoed_by_a_merge_check", "no_commits"])
+def test_an_unconverged_subtasks_reason_goes_where_its_check_went(
+        leerie, st, veto, commits, under):
+    """A subtask's verify command does not veto: on a `done` run, and on one
+    a merge check vetoed, the subtask's own reason is listed with the
+    findings, and no `## Unconverged` section claims it made the PR a draft.
+    Only a run with no commits, whose findings all become vetoes, lists it
+    under `## Unconverged`."""
+    st.data["subtask_status"]["b"] = "unconverged"
+    st.data["unconverged_subtasks"] = {
+        "b": {"reason": "its verify command stayed red"}}
+    if veto:
+        st.data.update(_ci_red())
+    outcome = leerie._decide_outcome(st, any_commits=commits)
+    assert outcome == ("done" if commits and not veto else "unconverged")
+    end = leerie._format_pr_end_state_section(st.data)
+    headings = re.findall(r"^## .+$", end, flags=re.M)
+    line = "- **b**: its verify command stayed red"
+    sections = {h: b for h, b in (
+        (s_.split("\n", 1)[0], s_) for s_ in ("\n" + end).split("\n## ")[1:])}
+    assert line in sections[under[3:]].splitlines()
+    assert sum(line in b.splitlines() for b in sections.values()) == 1
+    if outcome == "done":
+        assert headings[0] == "## Reported findings"
+        assert "## Unconverged" not in headings
+    elif veto:
+        assert headings[:2] == ["## Unconverged", "## Reported findings"]
+        assert CI_RED in sections["Unconverged"]
+
+
 def test_a_clean_done_run_has_no_findings_section(leerie, st):
     assert leerie._decide_outcome(st, any_commits=True) == "done"
     assert "## Reported findings" not in \

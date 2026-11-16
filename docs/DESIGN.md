@@ -8216,12 +8216,16 @@ richer body must never block finalize success.
 
 **The PR's end-state section is rendered by code, from typed state, on
 every composition path.** `_format_pr_end_state_section` turns what the run
-recorded into at most eleven short lists, each under its own heading, each
+recorded into at most twelve short lists, each under its own heading, each
 present only when it has an entry:
 
-- `## Unconverged` — why the PR is a draft: the outcome decider's reasons
-  (§6 *The run outcome is decided once*) and every `unconverged` subtask
-  with its own reason.
+- `## Unconverged` — why the PR is a draft: the outcome decider's vetoes
+  (§6 *The run outcome is decided once*) and, when the subtask settle
+  vetoed, every `unconverged` subtask with its own reason.
+- `## Reported findings` — what the checks that may not veto reported
+  (§8 *A check vetoes `done` only when it is verifiable, actionable and
+  measured accurate*, *Honest status*), and, when the subtask settle was
+  one of them, every `unconverged` subtask with its own reason.
 - `## Still failing when the run ended` — every required item unmet on a
   confirmed falsifier probe and every held-out case still failing on the
   tree that ships, each as a test the reader can run (below, *What is
@@ -8622,7 +8626,7 @@ into `run.json`, and the host launcher opens the PR as a **draft** when it
 is `unconverged` — the PR still carries everything that did converge, but it
 cannot be mistaken for finished work — and the body says why: the end-state
 section (§6 *Finalization*) opens with `## Unconverged`, the decider's
-reasons followed by each unconverged subtask's own. A `done` run with findings
+vetoes. A `done` run with findings
 opens an ordinary PR whose end-state section opens with `## Reported
 findings` instead (§8, *Honest status*). Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
@@ -13069,7 +13073,11 @@ presented as clean: the PR's end-state section opens with `## Reported
 findings`, which says the checks that may veto passed, that these checks are
 not measured accurate enough to block, and that each needs a reviewer's
 read before merging, followed by every finding; the outcome log line and
-`run.json` (`findings`) carry the count. A run with no commits and findings
+`run.json` (`findings`) carry the count. Each `unconverged` subtask's own
+reason is listed where the decider put its check's reason: with the
+findings when the subtask settle reported, so a `done` run's PR has no
+`## Unconverged` section, and under `## Unconverged` only when it vetoed
+(or a run with no commits made every finding a veto). A run with no commits and findings
 stays `unconverged`, as before: nothing ships, and "no work required" would
 be a claim the findings dispute.
 

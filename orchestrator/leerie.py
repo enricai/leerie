@@ -8410,9 +8410,10 @@ def _format_pr_end_state_section(state: dict) -> str:
     rendered by code, from typed state*). Up to thirteen headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
     draft), `## Reported findings` (`outcome_findings`: what checks that may
-    not veto reported, DESIGN §8 *Honest status*), `## Still failing when
-    the run ended` (what is unmet, as the
-    tests that show it: `_pr_unmet_evidence_lines`), `## Held-out cases
+    not veto reported, DESIGN §8 *Honest status*; each unconverged
+    subtask's own reason goes where its check's reason went), `## Still
+    failing when the run ended` (what is unmet, as the tests that show it:
+    `_pr_unmet_evidence_lines`), `## Held-out cases
     accepted by the operator` (`_pr_operator_accepted_lines`), `## Scope reading`
     (the run took the broad reading of a task that reads two ways:
     `_pr_scope_reading_lines`),
@@ -8454,15 +8455,27 @@ def _format_pr_end_state_section(state: dict) -> str:
     lines: list[str] = []
     unconverged = {s: r for s, r in _dict("unconverged_subtasks").items()
                    if statuses.get(s) == "unconverged" and isinstance(r, dict)}
+    findings = state.get("outcome_findings")
+    findings = findings if isinstance(findings, list) else []
+    # Each unconverged subtask's own reason goes where the decider put its
+    # check's reason (DESIGN §8 *Honest status*): with the findings when the
+    # subtask settle reported, under Unconverged only when it vetoed — or
+    # when a run with no commits moved every finding into the vetoes.
+    sub_lines = [f"- **{sid}**: "
+                 f"{_pr_entry(unconverged[sid].get('reason')) or 'no reason recorded'}"
+                 for sid in sorted(unconverged)]
+    sub_reported = bool(findings) and (
+        state.get("outcome") == "done"
+        or (state.get("outcome") == "unconverged"
+            and not _check_vetoes("subtask_settle")))
     if state.get("outcome") == "unconverged":
         lines += ["This PR is a draft: the run did not finish its work.", ""]
         reasons = state.get("outcome_reasons")
         lines += [f"- {_pr_entry(r)}" for r in
                   (reasons if isinstance(reasons, list) else [])
                   if _pr_entry(r)]
-    lines += [f"- **{sid}**: "
-              f"{_pr_entry(unconverged[sid].get('reason')) or 'no reason recorded'}"
-              for sid in sorted(unconverged)]
+    if not sub_reported:
+        lines += sub_lines
     if lines and lines[-1] == "":
         lines.pop()
     if lines:
@@ -8470,9 +8483,7 @@ def _format_pr_end_state_section(state: dict) -> str:
     # A run with findings is not presented as clean (DESIGN §8 *A check
     # vetoes `done` only when it is verifiable, actionable and measured
     # accurate*, *Honest status*).
-    findings = state.get("outcome_findings")
-    lines = [f"- {_pr_entry(r)}" for r in
-             (findings if isinstance(findings, list) else []) if _pr_entry(r)]
+    lines = [f"- {_pr_entry(r)}" for r in findings if _pr_entry(r)]
     if lines:
         sections.append((_FINDINGS_HEADING, [
             ("The checks that may veto `done` passed"
@@ -8481,7 +8492,8 @@ def _format_pr_end_state_section(state: dict) -> str:
             + f", but {len(lines)} check finding(s) below were reported, "
             "not verified: these checks are not measured accurate enough "
             "to block the run, so each may be a real defect or a false "
-            "alarm. Read each before merging.", "", *lines]))
+            "alarm. Read each before merging.", "", *lines,
+            *(sub_lines if sub_reported else [])]))
 
     lines = _pr_unmet_evidence_lines(state)
     if lines:
