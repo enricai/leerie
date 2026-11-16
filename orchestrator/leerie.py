@@ -8316,9 +8316,12 @@ def _pr_unmet_evidence_lines(state: dict) -> list[str]:
             if conflicts:
                 b.append("- The probe conflicts with existing tests: a "
                          "re-drive change that made it pass broke "
-                         f"{len(conflicts)} case(s) they pin, so the change "
-                         "was rolled back and the probe was not driven "
-                         "again. Decide which is right: "
+                         f"{len(conflicts)} case(s) they pin"
+                         + (", so the change was rolled back"
+                            if e.get("conflict_rolled_back") else
+                            "; the change was kept")
+                         + ", and the probe was not driven again. Decide "
+                         "which is right: "
                          + ", ".join(_pr_code(x) for x in conflicts[:5])
                          + (f" (+{len(conflicts) - 5} more)"
                             if len(conflicts) > 5 else ""))
@@ -43807,7 +43810,9 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
             for i, c in _redrive_contests_by_item(
                     rd_.get("contested_probes")).items():
                 if i in open_idx:
-                    found.append(("required_items", _redrive_contest_text(c)))
+                    found.append(("required_items", _redrive_contest_text(
+                        c, rolled_back=_redrive_contest_rolled_back(
+                            rd_, c))))
             for i, objs in _redrive_objections_by_item(
                     rd_.get("probe_objections")).items():
                 if i in open_idx:
@@ -67045,8 +67050,27 @@ def _redrive_objections_by_item(raw: object) -> dict[int, list[dict]]:
     return out
 
 
-def _redrive_contest_text(c: dict) -> str:
-    """A contested probe in words, for the outcome's reasons."""
+def _redrive_contest_rolled_back(rec: dict, c: dict) -> bool:
+    """Whether the re-drive group that recorded contest `c` was rolled
+    back: that group's own `rolled_back` in `rec["rounds"]`, never assumed
+    from the contest — a pinned case rolls a group back only when its
+    check may veto (DESIGN §8 *Delivery re-drive* rule 4, *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*).
+    A reset that did not land (`rolled_back` False) left the change on
+    staging."""
+    for r in rec.get("rounds") or [] if isinstance(rec, dict) else []:
+        if not isinstance(r, dict) or r.get("round") != c.get("round"):
+            continue
+        for g in r.get("groups") or []:
+            if isinstance(g, dict) and g.get("group") == c.get("group"):
+                return g.get("rolled_back") is True
+    return False
+
+
+def _redrive_contest_text(c: dict, *, rolled_back: bool) -> str:
+    """A contested probe in words, for the outcome's reasons: whether the
+    change that made it pass was rolled back is `rolled_back`
+    (`_redrive_contest_rolled_back`)."""
     tests = [str(x.get("id")) for x in c.get("tests") or []
              if isinstance(x, dict)]
     shown = tests[:5]
@@ -67056,8 +67080,10 @@ def _redrive_contest_text(c: dict) -> str:
             f"group {c.get('group')}) broke {len(tests)} case(s) they pin: "
             + "; ".join(shown) + (f" (+{len(tests) - len(shown)} more)"
                                   if len(tests) > len(shown) else "")
-            + "; the change was rolled back and the probe is not driven "
-            "again — a person decides; the item stays unmet")
+            + "; the change "
+            + ("was rolled back" if rolled_back else "was kept")
+            + " and the probe is not driven again — a person decides; the "
+            "item stays unmet")
 
 
 # --- A pinned case a required item's probe contradicts is task-required ------
@@ -80424,6 +80450,8 @@ def _collect_unmet_evidence(st: "State",
             entry["conflicts_with"] = [
                 str(x.get("id")) for x in contests[i].get("tests") or []
                 if isinstance(x, dict)]
+            entry["conflict_rolled_back"] = _redrive_contest_rolled_back(
+                rd_, contests[i])
         if i in objections:
             # The fixer's words, never checked as true.
             entry["objections"] = [

@@ -499,6 +499,44 @@ def test_the_pr_shows_the_conflict_and_the_objection(
         ("breaks_existing_test", "add(2, 2) is pinned to 0")]
 
 
+@pytest.mark.parametrize("vetoes", [False, True], ids=["kept", "rolled_back"])
+def test_the_contest_says_whether_its_change_was_rolled_back(
+        leerie, tmp_path, monkeypatch, vetoes):
+    """The words read the group's own record: a contested group is rolled
+    back only when a check its pinned case fails may veto (DESIGN §8
+    *Delivery re-drive* rule 4). Today neither a new failing test nor a
+    base-form change may, so the change is kept, and the outcome reason and
+    the PR's *Still failing* line say so; with both allowed to veto, the
+    same run rolls it back and both say that. The item is held unmet on
+    the tree that ships, as final detection would leave it, so the words
+    are rendered."""
+    if vetoes:
+        monkeypatch.setattr(leerie, "OUTCOME_VETO_CHECKS", frozenset(
+            {"merge_checks", "new_failing_tests", "base_form"}))
+    w = World(leerie, tmp_path)
+    unmet = json.loads(json.dumps(w.st.data["delivery_gate"]["unmet_final"]))
+    w.edits = [lambda w: w.commit({"calc.py": HONEST})]
+    rec = w.run(monkeypatch)
+    [g] = _groups(rec)
+    assert (g.get("rolled_back") is True) is vetoes
+    [c] = rec["contested_probes"]
+    w.st.data["delivery_gate"]["unmet_final"] = unmet
+    leerie._decide_outcome(w.st, any_commits=True)
+    [line] = [r for r in (w.st.data["outcome_reasons"]
+                          + w.st.data["outcome_findings"])
+              if r.startswith("item 0: its falsifier probe")]
+    fate = "was rolled back" if vetoes else "was kept"
+    assert f"; the change {fate} and the probe is not driven again" in line
+    leerie._record_unmet_evidence(w.st)
+    end = leerie._format_pr_end_state_section(w.st.data)
+    [pr] = [x for x in end.splitlines()
+            if x.startswith("- The probe conflicts with existing tests")]
+    assert ("they pin, so the change was rolled back, and the probe was "
+            "not driven again" in pr) is vetoes
+    assert ("they pin; the change was kept, and the probe was not driven "
+            "again" in pr) is not vetoes
+
+
 def _selfcheck(w, *args: str) -> subprocess.CompletedProcess:
     """The fixer's self-check, as its shell runs it: the command the note
     names, with the PATH and environment the drive gave the worker."""

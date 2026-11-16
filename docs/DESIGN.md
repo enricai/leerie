@@ -14924,16 +14924,23 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    file the run's base had and the commit leaves as the base had it, whose
    base form is itself (`_redrive_pinned_breaks`). When the probe now
    passes and any such case fails, satisfying the probe is measured to
-   break what an existing test pins: the group is rolled back, and the
-   probe is recorded as contested (`delivery_redrive.contested_probes[]`,
-   `{item_index, probe_test_file, tests[], round, group}`). The probe is
-   never handed to a later group, so no round is spent against it again;
-   the item stays in `unmet_final`, re-checked at the end like any other,
-   so the run is `unconverged`; and the outcome's reasons and the PR's
-   *Still failing* entry for the item say that the probe conflicts with
-   the existing tests named, for a person to decide. A probe that still
-   fails is no conflict, whatever else broke: that commit is rolled back
-   as worse, or as zero progress (below), and the probe stays shown.
+   break what an existing test pins, and the probe is recorded as
+   contested (`delivery_redrive.contested_probes[]`, `{item_index,
+   probe_test_file, tests[], round, group}`). Each pinned case is a new
+   failing test or a base-form change, so the group is rolled back only
+   when one of those checks may veto (§8 *A check vetoes `done` only when
+   it is verifiable, actionable and measured accurate*; today neither
+   does) or another check that may veto failed it. Whether it was is read
+   from the group's own record (its `rolled_back`), never assumed from the
+   contest. The probe is never handed to a later group, so no round is
+   spent against it again; the item, when still unmet, stays in
+   `unmet_final`, re-checked at the end like any other; and the outcome's
+   reasons and the PR's *Still failing* entry for the item say that the
+   probe conflicts with the existing tests named, for a person to decide,
+   and whether the change that made it pass was rolled back or kept. A
+   probe that still fails is no conflict, whatever else broke: that commit is treated
+   as any group's, its breaks and zero progress (below) on its record, and
+   the probe stays shown.
 
    Nothing else contests a probe. A fixer may still say why it thinks a
    probe is wrong (an input the product never gives the entry point, a
