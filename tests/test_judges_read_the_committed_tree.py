@@ -37,7 +37,7 @@ def _staging(leerie, tmp_path):
 
 def _seen(kw) -> dict:
     cwd = kw["cwd"]
-    return {"cwd": cwd, "head": _git(cwd, "rev-parse", "HEAD"),
+    return {"key": kw["schema_key"], "cwd": cwd, "head": _git(cwd, "rev-parse", "HEAD"),
             "cited": open(os.path.join(cwd, DELIVERY_CITED_FILE)).read(),
             "helper": os.path.exists(os.path.join(cwd, "helper.py"))}
 
@@ -55,13 +55,18 @@ def test_the_judge_and_its_contract_read_a_checkout_of_the_commit(
 
     async def judge(**kw):
         seen.append(_seen(kw))
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         return {"verdicts": [_judge_verdict(0, True)],
                 "contract": {"verdict": "met", "evidence": "holds"}}
     monkeypatch.setattr(leerie, "claude_p", judge)
     unmet, _n, contract = _judge_unmet(
         leerie, st, staging, contract_ctx={"defect_shape": "x", "sites": []})
     assert unmet == [] and contract["verdict"] == "met"
-    (s,) = seen
+    # The pack's enumerator reads the same checkout, before the judge.
+    enum, s = seen
+    assert [enum["key"], s["key"]] == ["delivery_enumerator", "delivery_judge"]
+    assert enum["cwd"] == s["cwd"]
     assert s["cwd"] != str(staging) and s["head"] == _git(staging,
                                                          "rev-parse", "HEAD")
     assert s["cited"].startswith(DELIVERY_CITED_LINE)
@@ -122,11 +127,16 @@ def test_content_only_staging_holds_is_not_in_front_of_the_judge(
 
     async def judge(**kw):
         seen.append(_seen(kw))
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         return {"verdicts": [_judge_verdict(0, True)]}
     monkeypatch.setattr(leerie, "claude_p", judge)
     _judge_unmet(leerie, st, staging)
-    (s,) = seen
-    assert not s["helper"] and s["cited"].startswith(DELIVERY_CITED_LINE)
+    # Neither the enumerator nor the judge sees what staging holds.
+    assert [s["key"] for s in seen] == ["delivery_enumerator",
+                                        "delivery_judge"]
+    for s in seen:
+        assert not s["helper"] and s["cited"].startswith(DELIVERY_CITED_LINE)
 
 
 def test_a_judge_citing_the_checkouts_absolute_path_verifies(

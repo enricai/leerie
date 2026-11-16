@@ -200,6 +200,7 @@ def _judge_parts(met: bool) -> list[dict]:
     """One part citing the committed line — `met` or `unmet`."""
     return [{"requirement": "the delivered feature exists",
              "kind": "static", "status": "met" if met else "unmet",
+             "checklist_index": 0,
              "cites": [{"path": DELIVERY_CITED_FILE, "line_start": 1,
                         "line_end": 1, "quote": DELIVERY_CITED_LINE}]}]
 
@@ -209,3 +210,17 @@ def _judge_verdict(index: int, met: bool, evidence: str = "e") -> dict:
     `_delivery_tree`."""
     return {"item_index": index, "met": met, "parts": _judge_parts(met),
             "evidence": evidence}
+
+
+def _prompt_checklists(user_prompt: str) -> dict[int, list[int]]:
+    """The `checklist_index` values of each REQUIRED ITEMS entry of a
+    delivery-judge prompt, by `item_index` (DESIGN §8 *An item is judged on
+    its declared parts*): what a stub judge must answer for its verdict to
+    count. Parses the JSON the prompt embeds, never its prose."""
+    import json
+    head = user_prompt.index("REQUIRED ITEMS (")
+    start = user_prompt.index("\n", head) + 1
+    entries, _ = json.JSONDecoder().raw_decode(user_prompt, start)
+    return {e["item_index"]: [c["checklist_index"]
+                              for c in e.get("checklist") or []]
+            for e in entries}

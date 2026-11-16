@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from pathlib import Path
 
 import pytest
 
 from tests.conftest import run_git_out as _git
+from tests.stub_helpers import _prompt_checklists
 from tests.test_delivery_detection import (PROBE_REL, PROBE_SRC, _claim,
                                            _facts_for, _placed, _st, _staging)
 
@@ -148,24 +148,29 @@ class Replay:
                     {"item_index": e["item_index"], "met": True,
                      "parts": [], "evidence": "the round says add is fine",
                      "evidence_files": []} for e in listed]}
+            if key == "delivery_enumerator":
+                return {"sets": []}         # no item quantifies over a set
             if key == "delivery_judge":
                 if replay.drove and judge_crash_after_drive and \
                         '"item_index": 0' in kw["user_prompt"]:
                     raise leerie.WorkerError("judge down")
-                asked = sorted({int(x) for x in re.findall(
-                    r'"item_index": (\d+)', kw["user_prompt"])})
                 # A judge that reads item 1 off the tree: mul multiplies.
+                # One part per checklist entry (DESIGN §8 *An item is
+                # judged on its declared parts*).
                 now = (replay.staging / "calc.py").read_text()
                 return {"verdicts": [{
                     "item_index": i, "evidence": "read",
                     "met": not (judge_reads_tree and i == 1
                                 and FIXED_MUL not in now),
                     "parts": [{"requirement": "r", "kind": "static",
-                               "status": "met", "cites": [{
+                               "status": "met", "checklist_index": j,
+                               "cites": [{
                                    "path": "calc.py", "line_start": 1,
                                    "line_end": 1,
-                                   "quote": "def add(a, b):"}]}]}
-                    for i in asked]}
+                                   "quote": "def add(a, b):"}]}
+                              for j in entries]}
+                    for i, entries in sorted(
+                        _prompt_checklists(kw["user_prompt"]).items())]}
             assert key == "falsifier", key
             if falsify0 and ITEM0 in kw["user_prompt"]:
                 p = Path(kw["cwd"]) / PROBE_REL

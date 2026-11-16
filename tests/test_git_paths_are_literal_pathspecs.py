@@ -36,6 +36,8 @@ DELIBERATE = {
     "_verify_delivery_cite": "`ABSENT:<pathspec>` is a git pathspec by "
                              "contract (prompts/delivery_judge.md)",
     "_conflicted_area_tests": "`git grep -- *.py` globs on purpose",
+    "_delivery_enumeration": "a search's `pathspec` is a git pathspec by "
+                             "contract (prompts/delivery_enumerator.md)",
 }
 
 

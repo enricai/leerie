@@ -229,11 +229,15 @@ def test_a_recheck_of_item_1_keeps_item_0s_worker_only_entry(
     asked: list[str] = []
 
     async def judge(**kw):
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}             # the item quantifies over no set
         assert kw["schema_key"] == "delivery_judge"
         asked.append(kw["user_prompt"])
+        # Its one part answers the item's one checklist entry, its text.
         return {"verdicts": [{"item_index": 1, "met": True, "evidence": "e",
                               "parts": [{"requirement": "r",
                                          "kind": "behavioral",
+                                         "checklist_index": 0,
                                          "status": "met", "cites": [{
                                              "path": "src/a.ts",
                                              "line_start": 1, "line_end": 1,

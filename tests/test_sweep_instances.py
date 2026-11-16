@@ -351,6 +351,11 @@ def test_the_judge_sees_the_instances_and_what_is_left(leerie, tmp_path,
     prompts: list[str] = []
 
     async def fake(**kw):
+        # The pack's `delivery_enumerator` runs before its judge (DESIGN §8
+        # *… a set it quantifies over is listed before it is judged*): it
+        # lists no set here, and only the judge's prompts are recorded.
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         prompts.append(kw["user_prompt"])
         return {"verdicts": [
             {"item_index": i, "met": False, "evidence": "left",

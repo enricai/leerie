@@ -13475,9 +13475,15 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   payload names the classifier's `part_checks` for it), and code drops
   that part from the verdict before it is checked or voted: the item is
   met or unmet on its other parts, whatever the judge's own `met` said, in
-  either direction. A verdict whose every part is typed `test_outcome` has
-  no other part: the judge owns nothing in it, so its vote is met and the
-  row is the diff's. Read only for an unmet `met`, a met claim with nothing
+  either direction. On an item that declares no other part, a verdict
+  whose every part is typed `test_outcome` leaves the judge nothing it
+  owns, so its vote is met and the row is the diff's. On an item that
+  declares another part, that part is on the item's checklist and such a
+  verdict answered none of it: the diff does not settle it; it is
+  re-asked, and still so it is `unknown` (*An item is judged on its
+  declared parts*; barnacle 59d17631 item 4 declared "characterization
+  tests before changing functions" beside its test outcome, and no judge
+  read it). Read only for an unmet `met`, a met claim with nothing
   left became a verdict with no parts, rejected as uncited and counted as an
   unmet vote (barnacle 59d17631 item 4: all three judges said met on "no
   regressions" alone, citing the diff, and code made the item unmet). Its
@@ -13509,6 +13515,92 @@ packs of 30, and the per-item re-judge — was **not** adopted: its catch
 was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
 unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
 on average and 15–32× on large tasks.
+
+**An item is judged on its declared parts, and a set it quantifies over
+is listed before it is judged.** The judge used to write an item's parts itself, and code
+could only check that each part it wrote was cited. Measured on the 13
+false `met` verdicts the ground-truth lanes confirmed by execution (lane
+W6, 2026-11-14): the classifier's own `parts` reached the judge in no
+version (0 of 26 prompts read), and in 11 of the 13 a declared part or
+clause was never answered — narrowed ("preserves method and body on
+301/302/307/308", the declared 303 dropped), collapsed (three clauses
+into one), or left out. In 7 of the 13 the item quantified over a set
+("every place in `src/` that sends …", "every part of the site", "all
+site strings") and the judge searched one file or one directory and
+voted `met`; 7 of the 10 decided verdicts carrying that pattern were
+wrong. Two more voted `met` on a part they wrote down as not decidable
+on the tree ("justification belongs in the PR (not verifiable on
+tree)"). So the payload, not the judge, says what must be answered:
+
+- **Each item carries a numbered checklist.** Its entries are the
+  item's declared `parts` (less those `test_outcome_parts` names, which
+  the failing-test-ID diff settles), or the item text alone when it
+  declares none, then the members of every set one of them quantifies
+  over. Every part of a verdict names the `checklist_index` it answers
+  (`-1` for an extra part the judge adds). Alignment is by that
+  integer, never by matching the prose.
+- **A set is listed first, by a worker that searches.** Before a pack's
+  first judge sample, one `delivery_enumerator` (read-only,
+  TREE_READER_TOOLS, the same checkout) reads the pack's items and, for
+  each checklist entry that quantifies over a set, returns the set's
+  members it found — a place each, `path` and `line` — and the
+  searches it ran (`regex`, `pathspec`). Whether an entry quantifies at
+  all is the worker's typed answer (§12 *Language-to-JSON*). Code
+  re-runs every search with `git grep` on `HEAD`, and every file a
+  search hits that no member names becomes a member too: the list is at
+  least as complete as the worker's own searches, whatever it chose to
+  write down. A member whose `path` is not a file of `HEAD` is dropped.
+  An entry an item's `instances` already list (a sweep's) is not listed
+  again. A failed enumerator call lists nothing: the pass runs on the
+  declared parts alone.
+- **`met` needs every entry answered, with its own evidence.** A `met`
+  verdict counts only when every checklist entry has a part answering
+  it, every such part is `met`, and every part carries a citation that
+  verifies on `HEAD` (*Delivery detection*). A member is met when it is
+  handled, or when the part cites why the set's requirement does not
+  reach it (a log line no user sees, say); a member a part answers
+  `unmet` makes the vote unmet as any unmet part does. An entry no part
+  answers, or one answered `not_inspected` — the status for a part this
+  tree cannot decide, such as a PR's wording or how the run was
+  carried out — leaves the item uninspected in that sample, never met
+  and never an unmet vote, and it rides the re-ask and the `unknown`
+  rule of *Every item is judged before its vote counts*. So does a
+  verdict whose every part is a test outcome on an item that declares a
+  part the judge owns: it answered none of the checklist, and the
+  failing-test-ID diff settles only the test outcome (*A test outcome is
+  the failing-test-ID diff's to settle*).
+- **The turn budget counts the checklist.** A pack's budget adds one
+  turn per set member to the per-item allowance, under the same
+  ceiling.
+- **A set too large to list is left to a person.** A judge spends at
+  least a turn per member, and its budget stops at 90 turns past a
+  30-turn base, so a set of more than 60 members (`delivery_set_members`)
+  cannot be answered in one sample; listed whole, it can outgrow the
+  prompt and fail the call, and with it every other item in the pack.
+  Such a set is not listed: it is one entry no verdict answers, so its
+  item is never `met` on it and ends `unknown` unless a part shows it
+  unmet. A search lists each file once (its first match).
+
+The risk is new false unmets: a declared part no tree can decide, and a
+list wider than the requirement. Lane W6 measured the second on
+navegando-nv 399f7c8b, where a code-built instance list that included
+log-only strings drew 6 false unmet votes from 9 once a record entry
+primed the judge. So an entry the tree cannot decide is `unknown`, not
+unmet, and a member outside the requirement is met on a cite that shows
+why.
+
+Measured (lane S4, pre-registered, 2026-11-14): 25 items, each judged
+alone, 6 samples per arm on the run's own recorded payload and shipped
+tree, the old judge against this one. On the 13 confirmed false `met`
+items, `met` votes fell from 67 of 78 to 25; the other 53 were 22 unmet
+and 31 `unknown`. On 12 items confirmed met, `met` votes went from 65 to
+67 of 72 and unmet from 7 to 5. Most of the drop is `unknown`, not
+unmet: entries no tree decides (a PR's wording, how the run was carried
+out) and sets of hundreds of members end with a person. Two false `met`
+items stayed `met` in all 6 samples (behaviour judged by reading, and an
+item text the classifier hedged). A sample cost 2.4× the old judge's
+($0.112 against $0.046, sonnet at medium effort), for the enumerator
+call and the re-asks.
 
 **A sweep's instances are items.** Some requirements hold at every place
 a pattern occurs: "no user-facing text is hard-coded outside the message

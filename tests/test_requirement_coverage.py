@@ -470,8 +470,15 @@ class TestGroupedDeliveryJudge:
                     repo_state_before_planning={"head": base},
                     requirement_coverage={"spans": spans})
         calls: list[dict] = []
+        self.enumerated: list[str] = []
 
         async def fake_claude_p(**kw):
+            # Each pack's enumerator runs before its first judge sample and
+            # lists no set here (DESIGN §8 *… a set it quantifies over is
+            # listed before it is judged*).
+            if kw["schema_key"] == "delivery_enumerator":
+                self.enumerated.append(kw["sid"])
+                return {"sets": []}
             calls.append(kw)
             return verdict_for(kw)
 
@@ -515,6 +522,8 @@ class TestGroupedDeliveryJudge:
         assert sorted({c["sid"] for c in calls}) == [
             "delivery_judge-pre-p0-s0", "delivery_judge-pre-p0-s1",
             "delivery_judge-pre-p0-s2", "delivery_judge-pre-p1-s0"]
+        assert sorted(self.enumerated) == [
+            "delivery_enumerator-pre-p0", "delivery_enumerator-pre-p1"]
         assert contract is None
 
     def test_contract_is_asked_of_the_first_pack_only(
@@ -548,6 +557,8 @@ class TestGroupedDeliveryJudge:
 
         async def fake_claude_p(**kw):
             calls.append(kw)
+            if kw["schema_key"] == "delivery_enumerator":
+                return {"sets": []}
             return {"verdicts": [_judge_verdict(0, True, "ok")]}
 
         monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
@@ -555,8 +566,9 @@ class TestGroupedDeliveryJudge:
         asyncio.run(leerie._delivery_judge_unmet(
             "task", [{"item": "one"}], tree, st,
             dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS, phase_label="pre"))
-        assert [c["sid"] for c in calls] == ["delivery_judge-pre-s0"]
-        assert "(These are" not in calls[0]["user_prompt"]
+        assert [c["sid"] for c in calls] == ["delivery_enumerator-pre",
+                                             "delivery_judge-pre-s0"]
+        assert "(These are" not in calls[1]["user_prompt"]
 
 
 class TestCoverageJudgePayload:

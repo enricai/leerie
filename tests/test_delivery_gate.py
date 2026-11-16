@@ -73,10 +73,16 @@ def _caps(leerie):
 
 def _patch_judge(leerie, monkeypatch, queued: list[dict]):
     """Stub claude_p returning queued delivery_judge verdicts in order;
-    captures every call's kwargs."""
+    captures every judge call's kwargs. A pack's `delivery_enumerator`
+    (DESIGN §8 *… a set it quantifies over is listed before it is
+    judged*) runs before its first judge sample; it lists no set here, so
+    each item's checklist is its own text, which `_judge_verdict`'s part
+    answers (`checklist_index` 0)."""
     calls: list[dict] = []
 
     async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "delivery_enumerator":
+            return {"sets": []}
         assert kwargs.get("schema_key") == "delivery_judge", (
             f"unexpected worker {kwargs.get('schema_key')!r}")
         calls.append(kwargs)
