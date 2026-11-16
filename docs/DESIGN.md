@@ -8607,13 +8607,13 @@ writer of state's `outcome` — `done`, `no_work` or `unconverged` — and every
 terminal path reaches it: the planning-time no-work exits and finalize's
 empty-branch exit (both through `_finish_no_work_run`) and the normal
 finalize path. Which checks it reads as vetoes is §8 *A check vetoes `done`
-only when it is verifiable, actionable and measured accurate* (prototype,
-lane S3): today only a merge check confirmed red on the final tree vetoes,
+only when it is verifiable, actionable and measured accurate*: today only
+a merge check confirmed red on the final tree vetoes,
 and every other reason listed here is a *finding* — recorded in
 `outcome_findings`, shown in the PR under `## Reported findings`, never a
 veto — except on a run with no commits, where any of them still makes it
-`unconverged`. The reasons, as the decider computes them (before the
-prototype, each was a veto; benched as the P7 outcome simulation, 90
+`unconverged`. The reasons, as the decider computes them (before that
+rule, each was a veto; benched as the P7 outcome simulation, 90
 historical runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
@@ -12987,9 +12987,8 @@ the returned object, at a moment when the object still exists.
 
 ### A check vetoes `done` only when it is verifiable, actionable and measured accurate
 
-*Prototype (lane S3, 2026-11-14), not merged: on a branch for a
-pre-registered trial, pending the user's decision.* This rule is canonical
-over every veto and every rollback this section and §6 describe. Where a
+This rule is canonical over every veto and every rollback this section
+and §6 describe. Where a
 later subsection says a check's failure makes the run `unconverged`, or
 rolls a worker's round back, that holds only for a check this rule lets
 veto; any other check's failure is reported.

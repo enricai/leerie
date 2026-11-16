@@ -10146,8 +10146,8 @@ environment limit*.
 ### Run outcome — `_decide_outcome`
 
 DESIGN §6 *The run outcome is decided once*; §8 *A check vetoes `done` only
-when it is verifiable, actionable and measured accurate* (prototype, lane
-S3). `_decide_outcome(st, *, any_commits: bool) -> str` is the only writer
+when it is verifiable, actionable and measured accurate*. `_decide_outcome(st,
+*, any_commits: bool) -> str` is the only writer
 of `state.data["outcome"]` (`done` / `no_work` / `unconverged`,
 `OUTCOMES`), `state.data["outcome_reasons"]` and
 `state.data["outcome_findings"]`, and mirrors `outcome` and `findings`
