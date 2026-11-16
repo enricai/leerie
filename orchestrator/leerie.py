@@ -958,9 +958,11 @@ STATE_FIELDS = (
     # phases 3-6, and exits 0. Absent on every normal run.
     "no_work_required",
     "no_work_reasons",
-    # outcome / outcome_reasons: the run's single verdict, written only by
-    # _decide_outcome (DESIGN §6 *The run outcome is decided once*).
-    "outcome", "outcome_reasons",
+    # outcome / outcome_reasons / outcome_findings: the run's single verdict,
+    # its vetoes and its reported findings, written only by _decide_outcome
+    # (DESIGN §6 *The run outcome is decided once*; §8 *A check vetoes `done`
+    # only when it is verifiable, actionable and measured accurate*).
+    "outcome", "outcome_reasons", "outcome_findings",
     # unmet_evidence: what was still unmet when the run ended, as the tests
     # that show it — written only once the run has ended
     # (`_record_unmet_evidence`; DESIGN §6 *What is still unmet when the run
@@ -2078,6 +2080,29 @@ _SETTLED_STATUSES = frozenset({"complete", "unconverged",
                                "accepted_external"})
 # The run's single verdict (DESIGN §6 *The run outcome is decided once*).
 OUTCOMES = ("done", "no_work", "unconverged")
+# Every check whose failure `_decide_outcome` reads, or for which a worker's
+# round can be rolled back (DESIGN §8 *A check vetoes `done` only when it is
+# verifiable, actionable and measured accurate*).
+OUTCOME_CHECKS: tuple[str, ...] = (
+    "subtask_settle", "new_failing_tests", "held_out", "required_items",
+    "settled_bar", "base_form", "merge_checks", "redrive_conflict",
+    "conformance_residual", "unclean_tree")
+# The ones that may veto `done` or roll a round back: verifiable on the tree
+# that ships, actionable, and measured accurate against ground truth (lanes
+# GT and W1: the merge checks 0 false of 7; every other check measured false
+# on 25-98% of its vetoes, or unmeasured). Every other check reports.
+OUTCOME_VETO_CHECKS: frozenset[str] = frozenset({"merge_checks"})
+
+
+def _check_vetoes(check: str) -> bool:
+    """Whether `check` (one of `OUTCOME_CHECKS`) may veto `done` and roll a
+    worker's round back; otherwise its failure is a reported finding (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*). An unknown name raises: a typo must not silently
+    turn a check into a report."""
+    if check not in OUTCOME_CHECKS:
+        raise ValueError(f"unknown outcome check {check!r}")
+    return check in OUTCOME_VETO_CHECKS
 
 # Model selection — see IMPLEMENTATION.md §2 "Model selection". Aliases
 # are passed straight to `claude --model`; the CLI resolves them to the
@@ -7649,9 +7674,11 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
 _RISK_SECTION_HEADING = "## ⚠ Residual risks"
 _UNMET_HEADING = "## Still failing when the run ended"
 _OPERATOR_ACCEPTED_HEADING = "## Held-out cases accepted by the operator"
+_FINDINGS_HEADING = "## Reported findings"
 _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
     "## Unconverged",
+    _FINDINGS_HEADING,
     _UNMET_HEADING,
     _OPERATOR_ACCEPTED_HEADING,
     "## Scope reading",
@@ -8377,9 +8404,11 @@ def _pr_scope_reading_lines(state: dict) -> list[str]:
 def _format_pr_end_state_section(state: dict) -> str:
     """The PR body's end-state section, rendered from typed run state, or ""
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
-    rendered by code, from typed state*). Up to twelve headed lists, each
+    rendered by code, from typed state*). Up to thirteen headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
-    draft), `## Still failing when the run ended` (what is unmet, as the
+    draft), `## Reported findings` (`outcome_findings`: what checks that may
+    not veto reported, DESIGN §8 *Honest status*), `## Still failing when
+    the run ended` (what is unmet, as the
     tests that show it: `_pr_unmet_evidence_lines`), `## Held-out cases
     accepted by the operator` (`_pr_operator_accepted_lines`), `## Scope reading`
     (the run took the broad reading of a task that reads two ways:
@@ -8435,6 +8464,21 @@ def _format_pr_end_state_section(state: dict) -> str:
         lines.pop()
     if lines:
         sections.append(("## Unconverged", lines))
+    # A run with findings is not presented as clean (DESIGN §8 *A check
+    # vetoes `done` only when it is verifiable, actionable and measured
+    # accurate*, *Honest status*).
+    findings = state.get("outcome_findings")
+    lines = [f"- {_pr_entry(r)}" for r in
+             (findings if isinstance(findings, list) else []) if _pr_entry(r)]
+    if lines:
+        sections.append((_FINDINGS_HEADING, [
+            ("The checks that may veto `done` passed"
+             if state.get("outcome") == "done" else
+             "Besides what is listed under Unconverged")
+            + f", but {len(lines)} check finding(s) below were reported, "
+            "not verified: these checks are not measured accurate enough "
+            "to block the run, so each may be a real defect or a false "
+            "alarm. Read each before merging.", "", *lines]))
 
     lines = _pr_unmet_evidence_lines(state)
     if lines:
@@ -43556,7 +43600,7 @@ def _diff_base(st: "State") -> str | None:
     return st.data.get("base_sha") or None
 
 
-def _unmeasured_on_shipping_tree(st: State) -> list[str]:
+def _unmeasured_on_shipping_tree(st: State) -> list[tuple[str, str]]:
     """What `done` rests on that was not measured on the tree that ships
     (DESIGN §6 *The run outcome is decided once*, "`done` rests on
     measurements that ran"), one reason each, from what the measurements
@@ -43564,8 +43608,9 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
     the failing-test-ID diff is of that tree (and every failing test it
     names was rerun on the base); the held-out sets the final tree left
     unmeasured (`_acceptance_unmeasured_lines`). A test command the task
-    forbids is the task's own constraint, not a gap here."""
-    out: list[str] = []
+    forbids is the task's own constraint, not a gap here. Each reason is
+    `(check, text)`, the check one of `OUTCOME_CHECKS`."""
+    out: list[tuple[str, str]] = []
     data = st.data
     diff = data.get("test_id_diff")
     diff = diff if isinstance(diff, dict) else {}
@@ -43581,22 +43626,25 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
         if shipping and diff.get("tree_sha") == shipping:
             nv = [str(x) for x in diff.get("no_verdict") or []]
             if nv:
-                out.append(f"{len(nv)} test(s) failing on the tree that ships "
+                out.append(("new_failing_tests",
+                            f"{len(nv)} test(s) failing on the tree that ships "
                            "could not be rerun on the base, so whether the "
-                           "run made them fail is unknown")
+                           "run made them fail is unknown"))
         elif not (gap.get("tree_sha") == shipping and str(
                 gap.get("skip_kind") or "").startswith("forbidden_")):
             why = (gap.get("why") if shipping and gap.get("tree_sha")
                    == shipping else None)
-            out.append("the tests were not measured on the tree that ships"
+            out.append(("new_failing_tests",
+                        "the tests were not measured on the tree that ships"
                        + (f" ({why})" if why else
                           " (no failing-test-ID diff was taken of it)"
                           if shipping else
-                          " (the tree that ships could not be read)"))
+                          " (the tree that ships could not be read)")))
     sets = _acceptance_unmeasured_lines(data)
     if sets:
-        out.append(f"{len(sets)} held-out acceptance check(s) gave no "
-                   "verdict on the tree that ships")
+        out.append(("held_out",
+                    f"{len(sets)} held-out acceptance check(s) gave no "
+                   "verdict on the tree that ships"))
     behaviour = data.get("existing_behaviour")
     if isinstance(behaviour, dict):
         # Recorded only by phase 5's check: present, it must be of the tree
@@ -43606,20 +43654,23 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
         if behaviour.get("error") or (
                 behaviour.get("unmeasured_reason") and not behaviour.get(
                     "files") and not missed):
-            out.append("the existing tests the run changed were not run in "
+            out.append(("base_form",
+                        "the existing tests the run changed were not run in "
                        "their base form on the tree that ships ("
                        + str(behaviour.get("error")
-                             or behaviour.get("unmeasured_reason")) + ")")
+                             or behaviour.get("unmeasured_reason")) + ")"))
         elif shipping and behaviour.get("tree_sha") != shipping:
-            out.append("the existing tests the run changed were run in "
+            out.append(("base_form",
+                        "the existing tests the run changed were run in "
                        "their base form on another tree than the one that "
-                       "ships")
+                       "ships"))
         elif missed:
-            out.append(f"{len(missed)} existing test file(s) the run "
+            out.append(("base_form",
+                        f"{len(missed)} existing test file(s) the run "
                        "changed gave no verdict in their base form on the "
                        "tree that ships: " + ", ".join(missed[:5])
                        + (f" (+{len(missed) - 5} more)"
-                          if len(missed) > 5 else ""))
+                          if len(missed) > 5 else "")))
     return out
 
 
@@ -43628,16 +43679,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     written to `st.data["outcome"]` (and run.json) here and nowhere else
     (DESIGN §6 *The run outcome is decided once*). Unfinished work is
     consulted BEFORE the empty-branch check, so a run that left work
-    undone is never reported as "no work required". Benched as the P7
-    outcome simulation (90 historical runs)."""
-    reasons: list[str] = []
+    undone is never reported as "no work required". Each check's failure
+    is a veto (`outcome_reasons`) only when `_check_vetoes` says so; every
+    other is a finding (`outcome_findings`) the PR shows (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
+    # (check, reason): every check's failure, vetoing or not.
+    found: list[tuple[str, str]] = []
     statuses = st.data.get("subtask_status")
     if isinstance(statuses, dict):
         unconverged = sorted(s for s, v in statuses.items()
                              if v == "unconverged")
         if unconverged:
-            reasons.append(f"{len(unconverged)} subtask(s) unconverged: "
-                           + ", ".join(unconverged))
+            found.append(("subtask_settle",
+                          f"{len(unconverged)} subtask(s) unconverged: "
+                           + ", ".join(unconverged)))
     diff = st.data.get("test_id_diff")
     if isinstance(diff, dict) and diff.get("new"):
         short = [x for x in diff.get("budget_short") or []
@@ -43645,7 +43701,8 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # `stale_for_tree` is written by every refresh that could not
         # measure the tree that ships — the re-drive's tail and phase 5's
         # own — so the reason names that tree, not one stage.
-        reasons.append(f"{len(diff['new'])} test(s) newly failing on "
+        found.append(("new_failing_tests",
+                      f"{len(diff['new'])} test(s) newly failing on "
                        + ("an earlier tree (the tree that ships could not "
                           "be measured), "
                           if diff.get("stale_for_tree")
@@ -43653,7 +43710,7 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                        + "confirmed against the base"
                        + (f" ({len(short)} on fewer than every base/final "
                           "pair: the confirm budget cut the rest)"
-                          if short else ""))
+                          if short else "")))
     acc = st.data.get("acceptance") or {}
     gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
     if isinstance(gate, dict):
@@ -43676,7 +43733,8 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         if not failing and isinstance(residual, dict):
             failing = int(residual.get("failing_sets") or 0)
         if failing:
-            reasons.append(f"{failing} held-out acceptance set(s) still fail")
+            found.append(("held_out",
+                          f"{failing} held-out acceptance set(s) still fail"))
     delivery = st.data.get("delivery_gate")
     verdict = _delivery_latest_verdict(delivery)
     if verdict is not None:
@@ -43686,14 +43744,15 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         unmet, tree, which = verdict
         shipping = _shipping_tree(st)
         if not tree or tree != shipping:
-            reasons.append(
+            found.append(("required_items",
                 "the required items were not read on the tree that ships: "
                 f"the last delivery verdict ({which}) is of "
                 + (f"tree {tree[:12]}" if tree else "an unrecorded tree")
                 + (f", the PR ships tree {shipping[:12]}" if shipping
-                   else ", and the tree that ships could not be read"))
+                   else ", and the tree that ships could not be read")))
         elif unmet:
-            reasons.append(f"{len(unmet)} required item(s) still unmet")
+            found.append(("required_items",
+                          f"{len(unmet)} required item(s) still unmet"))
             # An unmet item the re-drive could hand to no worker is said
             # so, typed (DESIGN §8 *An unmet item reaches its owner, or is
             # recorded as reaching none*).
@@ -43704,11 +43763,11 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                         if isinstance(u, dict)
                         and u.get("item_index") in open_idx]
             if unrouted:
-                reasons.append(
+                found.append(("required_items",
                     f"{len(unrouted)} unmet item(s) reached no re-drive "
                     "worker (unrouted_item): " + ", ".join(
                         f"item {u['item_index']} ({u.get('reason')})"
-                        for u in unrouted))
+                        for u in unrouted)))
             # Why no worker was handed it, said where the reader looks
             # (DESIGN §8 *Delivery re-drive* rule 4): the probe is
             # held-out content, so only the item words it tested are named.
@@ -43718,29 +43777,29 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                 i = u["item_index"]
                 if u.get("reason") == "unreproducible":
                     probed = _normalize_risk_text(u.get("probed") or "", 120)
-                    reasons.append(
+                    found.append(("required_items",
                         f"item {i} is unmet on a confirmed falsifier probe"
                         + (f" of its words \"{probed}\"" if probed else "")
                         + ", which fails under B*; the probe is held-out "
                         "content no fixer could see, so "
                         + ("no re-drive worker was handed it (the item's "
                            "other evidence was driven)" if i in driven
-                           else "no re-drive round was spent on it"))
+                           else "no re-drive round was spent on it")))
                 elif u.get("reason") == "no_code_target":
-                    reasons.append(
+                    found.append(("required_items",
                         f"item {i} is a constraint over the whole change "
                         "whose unmet evidence names no code a subtask "
-                        "changed, so no re-drive worker could be handed it")
+                        "changed, so no re-drive worker could be handed it"))
                 elif u.get("reason") == "after_last_round":
-                    reasons.append(
+                    found.append(("required_items",
                         f"item {i}'s unmet evidence was confirmed on the "
                         "tree that ships after the re-drive's last round, "
-                        "so no re-drive worker was handed it")
+                        "so no re-drive worker was handed it"))
                 elif i in driven:
-                    reasons.append(
+                    found.append(("required_items",
                         f"item {i} was driven on earlier evidence; its "
                         "latest confirmed evidence reached no re-drive "
-                        f"worker ({u.get('reason')})")
+                        f"worker ({u.get('reason')})"))
             # A probe a measured conflict contested, for a person to decide
             # (rule 4): the item stays unmet, and the tests it conflicts
             # with are named. A fixer's objection is named as its words.
@@ -43748,18 +43807,20 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
             for i, c in _redrive_contests_by_item(
                     rd_.get("contested_probes")).items():
                 if i in open_idx:
-                    reasons.append(_redrive_contest_text(c))
+                    found.append(("required_items", _redrive_contest_text(c)))
             for i, objs in _redrive_objections_by_item(
                     rd_.get("probe_objections")).items():
                 if i in open_idx:
-                    reasons += [_redrive_objection_text(o) for o in objs]
+                    found += [("required_items", _redrive_objection_text(o))
+                              for o in objs]
     # A regressed bar is work: a run that changed nothing did not do it
     # (DESIGN §8 *Done is a fixed bar per task*).
     regressed = (acc.get("settled_bar") or {}) if isinstance(acc, dict) else {}
     if regressed.get("status") == "regressed" and not any_commits:
-        reasons.append(f"{int(regressed.get('failed') or 0)} test(s) that "
+        found.append(("settled_bar",
+                      f"{int(regressed.get('failed') or 0)} test(s) that "
                        "passed when this task last ended done fail on this "
-                       "tree, and the run changed nothing")
+                       "tree, and the run changed nothing"))
     behaviour = st.data.get("existing_behaviour")
     if isinstance(behaviour, dict) and behaviour.get("changed"):
         # Behaviour an existing test pinned on the base, gone from a tree:
@@ -43767,45 +43828,56 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # *What an existing test pins on the base holds on the tree that
         # ships*). Of the tree that ships, or `_unmeasured_on_shipping_tree`
         # says it was not measured.
-        reasons.append(_base_form_reason(
-            [r for r in behaviour["changed"] if isinstance(r, dict)]))
+        found.append(("base_form", _base_form_reason(
+            [r for r in behaviour["changed"] if isinstance(r, dict)])))
     if isinstance(behaviour, dict) and behaviour.get("literal_restored"):
         # Text the task asked to move into the message files, back in the
         # production code it left (DESIGN §8 *A broken base-form case whose
         # cause is a change the run made is a question first*).
-        reasons.append(_literal_restored_reason(
-            [r for r in behaviour["literal_restored"] if isinstance(r, dict)]))
+        found.append(("base_form", _literal_restored_reason(
+            [r for r in behaviour["literal_restored"]
+             if isinstance(r, dict)])))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
-        reasons.append(f"{len(ci_unmet)} of the repository's own merge "
+        found.append(("merge_checks",
+                      f"{len(ci_unmet)} of the repository's own merge "
                        "check(s) red on the final tree: "
-                       + ", ".join(str(u.get("id")) for u in ci_unmet))
+                       + ", ".join(str(u.get("id")) for u in ci_unmet)))
     redrive = st.data.get("delivery_redrive")
     conflict = (redrive.get("conflict") if isinstance(redrive, dict)
                 else None)
     if isinstance(conflict, dict) and conflict.get("reason"):
-        reasons.append(str(conflict["reason"]))
+        found.append(("redrive_conflict", str(conflict["reason"])))
     residual_defects = _residual_defects_reason(st)
     if residual_defects:
-        reasons.append(residual_defects)
+        found.append(("conformance_residual", residual_defects))
     unclean = st.data.get("unclean_trees")
     for rec in (unclean.values() if isinstance(unclean, dict) else ()):
         if isinstance(rec, dict):
-            reasons.append(_unclean_reason(
+            found.append(("unclean_tree", _unclean_reason(
                 f"the {rec.get('worker')} at {rec.get('where')}",
-                [str(x) for x in rec.get("lines") or []]))
+                [str(x) for x in rec.get("lines") or []])))
     # `done` only on what was measured on the tree that ships; a run with
     # no commits has nothing that ships to measure.
     if any_commits:
-        reasons += _unmeasured_on_shipping_tree(st)
-    if reasons:
+        found += _unmeasured_on_shipping_tree(st)
+    # Only a check that may veto does (DESIGN §8 *A check vetoes `done` only
+    # when it is verifiable, actionable and measured accurate*); every other
+    # check's failure is a finding the PR shows. A run with no commits and a
+    # finding is not "no work required": the finding disputes that claim.
+    reasons = [r for c, r in found if _check_vetoes(c)]
+    findings = [r for c, r in found if not _check_vetoes(c)]
+    if reasons or (findings and not any_commits):
         outcome = "unconverged"
     elif not any_commits:
         outcome = "no_work"
     else:
         outcome = "done"
+    if outcome == "unconverged" and not reasons:
+        reasons, findings = findings, []
     st.data["outcome"] = outcome
     st.data["outcome_reasons"] = reasons
+    st.data["outcome_findings"] = findings
     # This decision read every held-out case the operator accepted so far
     # (DESIGN §8 *An operator accepts a held-out case the task does not
     # require*).
@@ -43819,12 +43891,14 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # fixed bar per task, not re-sampled each run*).
         _record_settled_bar_safely(st)
     withheld = _settled_bar_advisory(st.data)
-    _write_run_json(st.run_dir, outcome=outcome,
+    _write_run_json(st.run_dir, outcome=outcome, findings=len(findings),
                     **({"settled_bar_advisory": {
                         "note": SETTLED_BAR_ADVISORY_NOTE,
                         "cases": withheld}} if withheld else {}))
     log(f"outcome: {outcome}"
-        + (f" — {'; '.join(reasons)}" if reasons else ""))
+        + (f" — {'; '.join(reasons)}" if reasons else "")
+        + (f" — with {len(findings)} reported finding(s) no vetoing check "
+           f"confirmed: {'; '.join(findings)}" if findings else ""))
     return outcome
 
 
@@ -61552,7 +61626,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     else:
         initial, gate["initial_sha"] = await _measure("gate-initial")
         gate["initial"] = initial
-        if "conformer_flip" not in gate:
+        if "conformer_flip" not in gate and _check_vetoes("held_out"):
             flip = await _conformer_flip_check(st, caps, str(staging), sets,
                                                initial, gate["initial_sha"])
             if flip is not None:
@@ -61701,9 +61775,14 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 entry["fixed_cases"] = fixed
                 broken = _acceptance_broken_cases(prev, entry["results"])
                 entry["broken_cases"] = broken
-                if fixed == []:
+                # Held-out cases roll a round back only when the held-out
+                # sets may veto `done` (DESIGN §8 *A check vetoes `done`
+                # only when it is verifiable, actionable and measured
+                # accurate*); otherwise both stay on the round's record.
+                held_vetoes = _check_vetoes("held_out")
+                if fixed == [] and held_vetoes:
                     entry["rollback_reason"] = "fixed no failing case"
-                elif broken:
+                elif broken and held_vetoes:
                     # Worse, counted in cases: a round that fixed one case by
                     # breaking a passing one is not progress (DESIGN §8).
                     entry["rollback_reason"] = (
@@ -61890,7 +61969,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             after_sha = await _branch_head_sha(str(staging))
             # An unreadable HEAD counts as moved.
             if not after_sha or after_sha != before_sha:
-                if pre_tests and pre_tests.get("passed") and test_cmd:
+                if (pre_tests and pre_tests.get("passed") and test_cmd
+                        and _check_vetoes("new_failing_tests")):
                     try:
                         post_tests = (await _measure_axes(
                             str(staging), {"tests": test_cmd}, st, caps,
@@ -61924,7 +62004,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                                 f"raised {confirm['error']} — treated as "
                                 "red")
                         gate["post_tests_confirm"] = confirm
-                if (not reason and _acceptance_measured(initial)
+                if (not reason and _check_vetoes("held_out")
+                        and _acceptance_measured(initial)
                         and not _acceptance_measured(final)):
                     # Nor make the held-out sets unmeasurable (a broken
                     # dependency manifest): the staging test axis would not
@@ -69060,15 +69141,18 @@ def _ratchet_mark_unverified(st: "State", items: list[int], sha: str,
 
 
 def _ratchet_rollback_reason(rat: dict) -> str | None:
-    """The rollback reason a ratchet verdict gives, or None."""
-    if rat.get("merge_checks_broke"):
+    """The rollback reason a ratchet verdict gives, or None. Only a check
+    that may veto rolls a round back (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*); the rest stay
+    on the round's record."""
+    if rat.get("merge_checks_broke") and _check_vetoes("merge_checks"):
         return ("turned the repository's merge check(s) red: "
                 + _ci_broke_text(rat["merge_checks_broke"]))
-    if rat.get("regressed"):
+    if rat.get("regressed") and _check_vetoes("required_items"):
         return "regressed a previously met required item"
-    if rat.get("new_failures"):
+    if rat.get("new_failures") and _check_vetoes("new_failing_tests"):
         return "broke an existing test"
-    if rat.get("base_form_changed"):
+    if rat.get("base_form_changed") and _check_vetoes("base_form"):
         return ("changed what an existing test pinned on the base: "
                 + _base_form_reason([{"id": i} for i in
                                      rat["base_form_changed"]]))
@@ -71756,9 +71840,13 @@ async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
     flipped item becomes a `met-item-<i>` note in
     `delivery_redrive.pending_controls`, and the sets, the shipping diff and
     detection are measured again on the restored commit — then the check
-    repeats over the rounds left. Advisory: never stops a run."""
+    repeats over the rounds left. Advisory: never stops a run. Only when the
+    required items may veto `done` (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*): otherwise
+    the item is reported unmet on the tree that ships, and no round is
+    taken away for it."""
     staging = (leerie_dir / "worktrees" / "staging").resolve()
-    if not staging.is_dir():
+    if not staging.is_dir() or not _check_vetoes("required_items"):
         return
     items = st.data.get("required_items") or []
     normalized = [_delivery_norm_item(it) for it in items]
@@ -72193,44 +72281,50 @@ def _redrive_rollback_reason(ge: dict) -> str:
     """Every condition of a group's record that rolls it back, in words
     (DESIGN §8 *A rollback says why*). `_run_delivery_redrive` reaches this
     only when one holds, and a group can meet several: all are named, so a
-    reader never has to re-derive which one voided it."""
+    reader never has to re-derive which one voided it. A condition whose
+    check may not veto (`_check_vetoes`) voids nothing and is not named
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     why: list[str] = []
+    held = _check_vetoes("held_out")
+    tests = _check_vetoes("new_failing_tests")
+    base_form = _check_vetoes("base_form")
     if ge.get("committed_staged"):
         why.append("its commits hold the source or path of a shown held-out "
                    "set or a shown falsifier probe: "
                    + ", ".join(ge["committed_staged"]))
-    if ge.get("zero_progress"):
+    if ge.get("zero_progress") and held:
         why.append("it fixed no failing case it could be measured on"
                    + (" (a shown falsifier probe counts as one)"
                       if ge.get("probes_after") else ""))
     pc = ge.get("probe_conflict") or {}
-    if pc.get("tests"):
+    if pc.get("tests") and (tests or base_form):
         why.append(f"making the falsifier probe(s) of item(s) "
                    f"{pc.get('items')} pass broke case(s) existing tests "
                    "pin: " + ", ".join(str(x.get("id"))
                                        for x in pc["tests"][:5]))
-    if ge.get("broke_cases") or ge.get("held_broke_cases"):
+    if held and (ge.get("broke_cases") or ge.get("held_broke_cases")):
         why.append(f"it broke {len(ge.get('broke_cases') or [])} shown and "
                    f"{len(ge.get('held_broke_cases') or [])} held-back "
                    "held-out case(s)")
-    if ge.get("ctl_new"):
+    if ge.get("ctl_new") and tests:
         why.append(f"it broke {len(ge['ctl_new'])} held-out control(s)")
-    if ge.get("new_failures"):
+    if ge.get("new_failures") and tests:
         why.append(f"{len(ge['new_failures'])} test(s) newly fail: "
                    + ", ".join(ge["new_failures"]))
-    if ge.get("test_closure_breach"):
+    if ge.get("test_closure_breach") and base_form:
         why.append("it changed what a base-form case's test is, which only "
                    "putting the original back may: "
                    + "; ".join(str(x) for x in ge["test_closure_breach"]
                                [:_BASE_FORM_SHOWN]))
-    if ge.get("dropped_cases"):
+    if ge.get("dropped_cases") and base_form:
         shown = [str(c) for c in ge["dropped_cases"][:_BASE_FORM_SHOWN]]
         why.append(
             "it dropped case(s) of a test it changed that still hold on its "
             "commit, or could not show it kept them: " + "; ".join(shown)
             + (f" (+{len(ge['dropped_cases']) - len(shown)} more)"
                if len(ge["dropped_cases"]) > len(shown) else ""))
-    if ge.get("base_form_changed"):
+    if ge.get("base_form_changed") and base_form:
         why.append("it changed what an existing test pinned on the base: "
                    + _base_form_reason([{"id": i} for i in
                                         ge["base_form_changed"]]))
@@ -72241,11 +72335,11 @@ def _redrive_rollback_reason(ge: dict) -> str:
         why.append("the escalation gate voided it"
                    + (f": {'; '.join(parts)}" if parts else
                       " (its check could not run)"))
-    if ge.get("ratchet_regressed"):
+    if ge.get("ratchet_regressed") and _check_vetoes("required_items"):
         why.append("it made required item(s) "
                    f"{ge['ratchet_regressed']}, met before it, unmet")
     broke = (ge.get("ratchet") or {}).get("merge_checks_broke") or []
-    if broke:
+    if broke and _check_vetoes("merge_checks"):
         why.append("it turned the repository's merge check(s) red: "
                    + _ci_broke_text(broke))
     return "; ".join(why) or ("its verdict was worse: a held-back round that "
@@ -73063,14 +73157,25 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             log(f"  delivery re-drive r{rnd} g{gi}: probe of "
                                 f"item {i} contested — making it pass broke "
                                 f"{len(pinned)} case(s) existing tests pin; "
-                                "rolled back, not driven again")
-                    # A conflict needs no rule of its own to roll the group
-                    # back: each pinned case is a confirmed new failure (worse)
-                    # or a base-form change (void).
-                    void = (void or ge["zero_progress"]
-                            or bool(ge.get("base_form_changed"))
-                            or bool(ge.get("dropped_cases"))
-                            or bool(ge.get("test_closure_breach")))
+                                "not driven again")
+                    # Each check that failed the group, and whether it may
+                    # roll it back (DESIGN §8 *A check vetoes `done` only
+                    # when it is verifiable, actionable and measured
+                    # accurate*). A conflict needs no rule of its own: each
+                    # pinned case is a confirmed new failure or a base-form
+                    # change. `void` so far is the integrity guard alone.
+                    failed = {
+                        "held_out": bool(
+                            v["broke_cases"] or v["held_broke_cases"]
+                            or v["held_broke"] or ge["zero_progress"]
+                            or (held_mode and H1 is not None
+                                and not v["held_fixed_cases"])),
+                        "new_failing_tests": bool(v["ctl_new"] or newv["new"]),
+                        "base_form": bool(ge.get("base_form_changed")
+                                          or ge.get("dropped_cases")
+                                          or ge.get("test_closure_breach"))}
+                    void = void or any(hit and _check_vetoes(c)
+                                       for c, hit in failed.items())
                     if escalate:
                         async with _exec_lock().shared():
                             eg = _redrive_escalation_gate(
@@ -73079,7 +73184,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         ge["gate"] = eg
                         void = void or eg["void"]
                     rat: dict = {}
-                    if not (v["worse"] or void):
+                    if not void:
                         # The delivery ratchet (DESIGN §8 *A repair that
                         # regresses met work is rolled back*): the items met
                         # before this group are re-verified on its tree. Its
@@ -73096,12 +73201,12 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         ge["ratchet"] = rat
                         if rat.get("regressed"):
                             ge["ratchet_regressed"] = list(rat["regressed"])
-                            void = True
+                            void = void or _check_vetoes("required_items")
                         if rat.get("merge_checks_broke"):
                             ge["merge_checks_broke"] = [
                                 b["id"] for b in rat["merge_checks_broke"]]
-                            void = True
-                    if v["worse"] or void:
+                            void = void or _check_vetoes("merge_checks")
+                    if void:
                         ge["rollback_reason"] = _redrive_rollback_reason(ge)
                         ok = await _roll_back_round(
                             st, staging, pre_sha, worker="delivery re-drive",
@@ -73301,7 +73406,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 # kept group that turns a met item's confirmed probe from
                 # passing to failing is rolled back*).
                 culprits: list[tuple[dict, dict]] = []
-                for i, v in sorted(ver.items()):
+                for i, v in (sorted(ver.items())
+                             if _check_vetoes("required_items") else ()):
                     smp = (_redrive_flip_probe({"falsifier": v.get("falsifier")})
                            if v.get("unmet") and not v.get("crashed") else None)
                     c = (await _redrive_flip_culprit(st, caps, rec, i, smp)

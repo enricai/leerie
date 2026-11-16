@@ -10142,11 +10142,53 @@ environment limit*.
 
 ### Run outcome — `_decide_outcome`
 
-DESIGN §6 *The run outcome is decided once*. `_decide_outcome(st, *,
-any_commits: bool) -> str` is the only writer of `state.data["outcome"]`
-(`done` / `no_work` / `unconverged`, `OUTCOMES`) and of
-`state.data["outcome_reasons"]`, and mirrors `outcome` into `run.json`.
-`unconverged` when any of: a `subtask_status` value is `unconverged`;
+DESIGN §6 *The run outcome is decided once*; §8 *A check vetoes `done` only
+when it is verifiable, actionable and measured accurate* (prototype, lane
+S3). `_decide_outcome(st, *, any_commits: bool) -> str` is the only writer
+of `state.data["outcome"]` (`done` / `no_work` / `unconverged`,
+`OUTCOMES`), `state.data["outcome_reasons"]` and
+`state.data["outcome_findings"]`, and mirrors `outcome` and `findings`
+(the findings' count) into `run.json`.
+
+**The veto rule.** `OUTCOME_CHECKS` names every check, as a string:
+`subtask_settle`, `new_failing_tests`, `held_out`, `required_items`,
+`settled_bar`, `base_form`, `merge_checks`, `redrive_conflict`,
+`conformance_residual`, `unclean_tree`. `OUTCOME_VETO_CHECKS =
+frozenset({"merge_checks"})` names the ones that may veto.
+`_check_vetoes(check) -> bool` is `check in OUTCOME_VETO_CHECKS`, and
+raises `ValueError` on a name not in `OUTCOME_CHECKS`. The decider collects
+every reason below as `(check, text)` (`_unmeasured_on_shipping_tree`
+returns `(check, text)` pairs too: the tests' lines are
+`new_failing_tests`, the held-out sets' `held_out`, the base forms'
+`base_form`). `outcome_reasons` is the texts whose check vetoes;
+`outcome_findings` the rest. `unconverged` when a veto holds, or when there
+is a finding and `any_commits` is False (then the findings move to
+`outcome_reasons` and `outcome_findings` is `[]`); otherwise `no_work` when
+`any_commits` is False, else `done`. The log line names the vetoes and,
+after them, the findings. The same predicate gates every rollback a check
+can cause: `_ratchet_rollback_reason` (each term only when its check
+vetoes: `merge_checks_broke` / `merge_checks`, `regressed` /
+`required_items`, `new_failures` / `new_failing_tests`, `base_form_changed`
+/ `base_form`); the acceptance gate's `_settle_round` ("fixed no failing
+case", "broke previously passing held-out case(s)": `held_out`) and its
+whole-gate rollback (the test axis turned red: `new_failing_tests`; the
+sets left unmeasurable: `held_out`); `_conformer_flip_check`, run only when
+`held_out` vetoes; `_acceptance_item_flips` and the delivery re-drive's
+flip culprits, only when `required_items` vetoes; and the re-drive group's
+rollback, which is `void` — a held-out source committed
+(`committed_staged`), the escalation gate's `void`, or a failed check that
+vetoes, from `{held_out: broke_cases, held_broke_cases, held_broke,
+zero_progress, or a held-back round that fixed no held-back case;
+new_failing_tests: ctl_new or the confirmed new test IDs; base_form:
+base_form_changed, dropped_cases or test_closure_breach}` and the ratchet's
+`regressed` (`required_items`) and `merge_checks_broke` (`merge_checks`).
+The ratchet runs on every group not already void. `_redrive_rollback_reason`
+names only the conditions whose check vetoes, and the integrity ones. A
+kept group's conditions stay on its record (`ge`). Unchanged: rollbacks for
+an unclean tree, a protected path, a clobber, an interrupted round, a
+coverage re-drive's status and the integration repair round.
+
+The reasons, each tagged with its check: a `subtask_status` value is `unconverged`;
 `test_id_diff.new` is non-empty (reason `"<N> test(s) newly failing on
 the final tree, confirmed against the base"`, or, when the diff carries
 `stale_for_tree`, `"… on an earlier tree (the tree that ships could not be
@@ -10173,6 +10215,11 @@ it sets `no_work_required` only when the outcome is `no_work`, and logs the
 unconverged reasons otherwise — and `phase_finalize`'s normal path with
 `any_commits=True`. `scripts/host-finalize.sh` passes `--draft` to `gh pr
 create` when `run.json`'s `outcome` is `unconverged`.
+`_format_pr_end_state_section` renders `outcome_findings` under
+`_FINDINGS_HEADING = "## Reported findings"` (in `_PR_END_STATE_HEADINGS`,
+after `## Unconverged`), led by a sentence that the checks that may veto
+passed (on a `done` run), that these findings were reported, not verified,
+and that each needs a read before merging.
 
 ### Delivery detection — `_run_delivery_detection`
 
@@ -14754,7 +14801,8 @@ command line overrides it.
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
-| `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
+| `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged`: the vetoes (on a run with no commits, the findings too); empty otherwise. |
+| `outcome_findings` | list[str] | the failures of checks that may not veto (`_check_vetoes`), on a run with commits; rendered under `## Reported findings`. |
 | `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, conflicts_with?[], objections?[{kind, reason}], artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |

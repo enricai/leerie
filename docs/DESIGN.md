@@ -8602,8 +8602,15 @@ completely scrub a finished run can do so with
 writer of state's `outcome` — `done`, `no_work` or `unconverged` — and every
 terminal path reaches it: the planning-time no-work exits and finalize's
 empty-branch exit (both through `_finish_no_work_run`) and the normal
-finalize path. The rule, benched as the P7 outcome simulation (90 historical
-runs, 2000 trials each): the run is `unconverged` when any subtask settled
+finalize path. Which checks it reads as vetoes is §8 *A check vetoes `done`
+only when it is verifiable, actionable and measured accurate* (prototype,
+lane S3): today only a merge check confirmed red on the final tree vetoes,
+and every other reason listed here is a *finding* — recorded in
+`outcome_findings`, shown in the PR under `## Reported findings`, never a
+veto — except on a run with no commits, where any of them still makes it
+`unconverged`. The reasons, as the decider computes them (before the
+prototype, each was a veto; benched as the P7 outcome simulation, 90
+historical runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
@@ -8615,7 +8622,9 @@ into `run.json`, and the host launcher opens the PR as a **draft** when it
 is `unconverged` — the PR still carries everything that did converge, but it
 cannot be mistaken for finished work — and the body says why: the end-state
 section (§6 *Finalization*) opens with `## Unconverged`, the decider's
-reasons followed by each unconverged subtask's own. Before this, no-work was decided in
+reasons followed by each unconverged subtask's own. A `done` run with findings
+opens an ordinary PR whose end-state section opens with `## Reported
+findings` instead (§8, *Honest status*). Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
 
 *A delivery verdict counts only on the tree it was measured on.* Each
@@ -8670,6 +8679,10 @@ the PR's "Needs human verification" listing it as before:
 
 The rule is in the decider, read from what the measurements recorded, so
 any future cause of an unmeasured tree ends the same way, whatever it is.
+Under §8 *A check vetoes `done` only when it is verifiable, actionable and
+measured accurate* none of these three checks vetoes, so each line is a
+finding on a run with commits: reported, with the PR saying so, never a
+veto.
 
 ### Credential strategy
 
@@ -12967,6 +12980,93 @@ line, now reads `confidence.basis` instead.
 This is not a retreat from "code enforces" (§12): a schema is not the
 enforcement layer for a discipline whose absence Python can check directly on
 the returned object, at a moment when the object still exists.
+
+### A check vetoes `done` only when it is verifiable, actionable and measured accurate
+
+*Prototype (lane S3, 2026-11-14), not merged: on a branch for a
+pre-registered trial, pending the user's decision.* This rule is canonical
+over every veto and every rollback this section and §6 describe. Where a
+later subsection says a check's failure makes the run `unconverged`, or
+rolls a worker's round back, that holds only for a check this rule lets
+veto; any other check's failure is reported.
+
+**The rule.** A check may veto `done` only when all three hold:
+
+1. **It is verifiable on the final code:** its verdict is of the tree that
+   ships, not of a subtask's tree or an earlier commit.
+2. **It is actionable:** a worker can act on its finding, or it is put to
+   the user.
+3. **It is measured accurate:** its vetoes were checked against ground
+   truth, and they were true.
+
+Every other check *reports*: its findings are written into the PR, and the
+PR says they are there (*honest status*, below). A check is named once, in
+one table (`OUTCOME_VETO_CHECKS`), and every place that decides the outcome
+or takes a worker's round away asks that table. A check earns a place in it
+by a measurement of rule 3, not by being added.
+
+**Why (measured).** Lane GT ground-truthed every veto in 26 runs (16
+`unconverged`, 10 `done`), and lane W1 re-decided 37 of those verdicts by
+execution (36 agreed). False vetoes, per check:
+
+| check | false / vetoed |
+|---|---|
+| existing tests' base form | 614 / 626 cases |
+| falsifier probe (with B\*) | 25 / 39 items |
+| contested probe (rollback) | 18 / 19 probes |
+| verify-command settle (subtask `unconverged`) | 5 / 6 |
+| delivery judge unmet vote | 4 / 8 items |
+| held-out acceptance sets | 3 / 6 sets |
+| the repository's merge checks (CI parity) | 0 / 7 |
+
+Eleven of the 16 `unconverged` runs carried at least one false veto. In four
+(4134b78c, 59d17631, d7bfaeee, 209d0814) every veto was false, and one
+(d7bfaeee) was done. False vetoes also took correct work away: 5ddc1d67's
+correct fix was rolled back three times by a contested probe, so the defect
+it fixed shipped; e0d101e3's base-form vetoes rolled back four re-drive
+rounds that had fixed a held-out set and the lint. Stacking checks with
+unmeasured false-positive rates multiplies them: a run is `done` only when
+every one is clean at once. The literature says the same (CF/W4): mature
+systems keep a hard block only for checks near-free of false positives,
+actionable and measured, and show the rest to a person.
+
+**Which checks veto today.** Only the repository's own merge checks
+(§9 *The repository's own merge checks run too*): a merge check confirmed
+red on the final tree under B\* against the base. It is of the final tree,
+a re-drive worker can act on it (`ci_check` notes), and it was true 7 of 7.
+Every other check — a subtask's verify command, newly failing tests, the
+held-out sets, the required items (judge and falsifier), a contested probe,
+the settled bar, an existing test's base form, the final conformer's
+residual defects, a re-drive conflict, a worker's unclean tree, and each of
+those checks' "not measured on the tree that ships" — reports. A newly
+failing test confirmed under B\* was true 1 of 1: one is not a measurement,
+and the merge checks run the repository's tests where its CI does.
+
+**Rollbacks follow the same rule.** A round rolled back because a check
+failed is that check vetoing the round's work, so it is subject to the same
+rule: a round is rolled back for a check only when that check vetoes. A
+re-drive group or acceptance-repair round that turned a merge check red is
+rolled back; one that broke a held-out case, made no measured progress,
+changed a base-form case, contested a probe, newly failed a test or turned
+a met item unmet is kept, and what it did is recorded on its record for the
+PR. The flip checks (a probe or held-out case that passed at a round's
+start and fails at its end) report and no longer roll back. Unchanged,
+because they are not checks of `done`: the integrity guards that keep a
+worker from touching the evidence (a held-out set's source in history; a
+weakened test, schema or AST hit under escalation), and a worker's own
+failure (an unclean tree after its re-asks, a protected path, a clobber, a
+crash or resume mid-round, an integrator's failure).
+
+**Honest status.** `outcome_reasons` holds the vetoes; the reports are
+`outcome_findings`. A run with no veto and commits is `done`; with a veto it
+is `unconverged`, a draft PR, as before. A `done` run with findings is not
+presented as clean: the PR's end-state section opens with `## Reported
+findings`, which says the checks that may veto passed, that these checks are
+not measured accurate enough to block, and that each needs a reviewer's
+read before merging, followed by every finding; the outcome log line and
+`run.json` (`findings`) carry the count. A run with no commits and findings
+stays `unconverged`, as before: nothing ships, and "no work required" would
+be a claim the findings dispute.
 
 ### The planner gate
 
