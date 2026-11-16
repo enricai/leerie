@@ -117,19 +117,26 @@ def _in_order(text: str, parts: list[str]) -> None:
         at = nxt
 
 
-def test_an_unconverged_run_shows_the_probe_and_the_held_out_case(
+def test_a_run_with_findings_shows_the_probe_and_the_held_out_case(
         leerie, tmp_path, monkeypatch):
     st, caps, _ = _run_to_the_end_of_execution(leerie, tmp_path, monkeypatch)
     worker_copy = ("Summary.\n\n" + HEADING + "\n\n- fabricated by the "
                    "worker\n\n## Notes\n\nkept")
     rj = _finalize(leerie, monkeypatch, st, caps, pr_body=worker_copy)
 
-    assert rj["outcome"] == "unconverged"
+    # The unmet item and the failing held-out set are reported findings,
+    # not vetoes (DESIGN §8 *A check vetoes `done` only when it is
+    # verifiable, actionable and measured accurate*): the run is `done`,
+    # and its end state opens with them before what is still failing.
+    assert rj["outcome"] == "done"
+    assert st.data["outcome_reasons"] == []
+    assert st.data["outcome_findings"]
     end = rj["pr_end_state"]
+    assert "## Unconverged" not in end
     item = st.data["required_items"][0]["item"]
     root = st.run_dir / "unmet-evidence"
     _in_order(end, [
-        "## Unconverged",
+        "## Reported findings",
         HEADING,
         str(root),
         # The falsifier's unmet item: its text, the probe, the case, the

@@ -62,9 +62,10 @@ def test_a_spent_claimer_leaves_a_typed_unrouted_item(
     rec = w.st.data["delivery_redrive"]
     assert rec["unrouted_items"] == [
         {"item_index": 0, "item": "a does X", "reason": "budget"}]
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
     assert any("unrouted_item" in r and "item 0 (budget)" in r
-               for r in w.st.data["outcome_reasons"])
+               for r in w.st.data["outcome_findings"])
 
 
 def test_a_blocked_only_claimer_is_no_owner(leerie, tmp_path, monkeypatch):
@@ -205,11 +206,14 @@ def test_a_falsifier_only_item_is_unrouted_unreproducible_never_driven(
     assert rec["unrouted_items"] == [
         {"item_index": 0, "item": "a does X", "reason": "unreproducible",
          "probed": QUOTE}]
-    # It stays unmet, and the outcome names it and why no worker had it.
+    # It stays unmet, and the outcome reports it and why no worker had it
+    # (a finding: DESIGN §8 *A check vetoes `done` only when it is
+    # verifiable, actionable and measured accurate*).
     assert [u["item_index"] for u in
             w.st.data["delivery_gate"]["unmet_final"]] == [0]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    reasons = w.st.data["outcome_reasons"]
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    reasons = w.st.data["outcome_findings"]
     assert "1 required item(s) still unmet" in reasons
     assert any("item 0 (unreproducible)" in r for r in reasons)
     why = [r for r in reasons if r.startswith("item 0 is unmet on a "
@@ -223,7 +227,7 @@ def test_a_falsifier_only_item_is_unrouted_unreproducible_never_driven(
 
 def test_the_pr_says_the_falsifier_found_it_and_no_fixer_saw_the_probe(
         leerie, tmp_path, monkeypatch):
-    """The rendered PR end state, not the reason list: the draft section
+    """The rendered PR end state, not the reason list: the findings section
     names the item, the probed words, and that the probe was not shown —
     and none of the probe's own text (its case title)."""
     unmet = [{"item_index": 0, "item": "a does X", "evidence": PROBE_EVIDENCE,
@@ -232,9 +236,10 @@ def test_the_pr_says_the_falsifier_found_it_and_no_fixer_saw_the_probe(
     w = _passing_sets_world(leerie, tmp_path, monkeypatch, unmet,
                             [_falsifier_row(0)])
     w.run()
-    leerie._decide_outcome(w.st, any_commits=True)
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
     body = leerie._format_pr_end_state_section(w.st.data)
-    section = body.split("## Unconverged", 1)[1].split("\n## ", 1)[0]
+    assert "## Unconverged" not in body
+    section = body.split("## Reported findings", 1)[1].split("\n## ", 1)[0]
     line = next(ln for ln in section.splitlines()
                 if "confirmed falsifier probe" in ln)
     assert line.startswith("- item 0 is unmet on a confirmed falsifier probe")
@@ -281,8 +286,9 @@ def test_a_mixed_item_is_driven_on_its_judge_part_alone(
     assert rec["unrouted_items"] == [
         {"item_index": 0, "item": "a does X", "reason": "unreproducible",
          "probed": QUOTE}]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    why = [r for r in w.st.data["outcome_reasons"]
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    why = [r for r in w.st.data["outcome_findings"]
            if r.startswith("item 0 is unmet on a confirmed falsifier probe")]
     assert len(why) == 1
     # Its judge part was driven, so the reason never says no round was.

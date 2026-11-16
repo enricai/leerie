@@ -218,7 +218,7 @@ def test_a_correct_run_ends_done_after_cleanup_removed_staging(
     assert run_json["outcome"] == "done"
 
 
-def test_a_verdict_of_another_tree_is_still_unconverged_after_cleanup(
+def test_a_verdict_of_another_tree_is_still_reported_after_cleanup(
         env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     st = env["st"]
@@ -228,8 +228,11 @@ def test_a_verdict_of_another_tree_is_still_unconverged_after_cleanup(
         "delivery_gate": {"unmet_final": [], "final_tree": "0" * 40}})
     st.save()
     _finalize(leerie, env, monkeypatch)
-    assert st.data["outcome"] == "unconverged"
-    (reason,) = st.data["outcome_reasons"]
+    # Reported, not vetoed (DESIGN §8 *A check vetoes `done` only when it is
+    # verifiable, actionable and measured accurate*).
+    assert st.data["outcome"] == "done"
+    assert st.data["outcome_reasons"] == []
+    (reason,) = st.data["outcome_findings"]
     tree = _git(env["st"].run_repo, "rev-parse",
                 f"{env['run_branch']}^{{tree}}")
     assert "not read on the tree that ships" in reason

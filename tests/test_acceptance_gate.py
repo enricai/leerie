@@ -2222,8 +2222,12 @@ def test_unfixed_tree_ships_with_a_residual_after_two_rounds(
     assert res["failing_sets"] == 5 and "case from set 1" in res["cases"]
 
 
-def test_repair_that_turns_the_test_axis_red_is_rolled_back(
+def test_a_repair_is_kept_and_the_test_axis_is_not_measured_after_it(
         leerie, tmp_path, monkeypatch):
+    """New failing tests may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*): the
+    gate-wide red-axis rule does not run, so no post-repair test run is taken
+    and the repair's fix ships."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2233,16 +2237,17 @@ def test_repair_that_turns_the_test_axis_red_is_rolled_back(
               measured=[{"passed": True, "measured": True},
                         {"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
-    assert gate["residual"]["failing_sets"] == 5
+    assert "rolled_back" not in gate and "post_tests_confirm" not in gate
+    assert _git(staging, "rev-parse", "HEAD") != before
+    assert (staging / "calc.py").read_text() == FIXED
+    assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
 
 
 def test_an_unconfirmed_red_test_axis_keeps_the_repair(
         leerie, tmp_path, monkeypatch):
-    """The gate-wide rule resets only a confirmed regression: one red run
-    with no failure confirmed new under B* (a flake) keeps the repair's
-    fixes (DESIGN §8)."""
+    """A red test axis after a repair is not even confirmed: new failing tests
+    may not roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*), so the repair's fixes stay."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2254,20 +2259,26 @@ def test_an_unconfirmed_red_test_axis_keeps_the_repair(
               confirm_red=False)
     gate = st.data["acceptance"]["gate"]
     assert "rolled_back" not in gate
-    assert gate["post_tests_confirm"] == {"new": []}
+    assert "post_tests_confirm" not in gate
     assert _git(staging, "rev-parse", "HEAD") != before
     assert (staging / "calc.py").read_text() == FIXED
 
 
-def test_a_confirmation_that_raises_falls_back_to_the_red_run(
+def test_a_confirmation_that_would_raise_is_never_called(
         leerie, tmp_path, monkeypatch):
+    """The red-axis confirmation does not run, as new failing tests may not
+    roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*): one that would raise cannot
+    reset the repair."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
     before = _git(staging, "rev-parse", "HEAD")
+    called = []
 
     async def boom(*a, **kw):
+        called.append(1)
         raise RuntimeError("no base worktree")
     seq = [{"passed": True, "measured": True},
            {"passed": False, "measured": True}]
@@ -2284,18 +2295,19 @@ def test_a_confirmation_that_raises_falls_back_to_the_red_run(
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
-    assert gate["post_tests_confirm"]["error"].startswith("RuntimeError")
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert called == []
+    assert "rolled_back" not in gate and "post_tests_confirm" not in gate
+    assert _git(staging, "rev-parse", "HEAD") != before
 
 
 @needs_landlock
 @skip_without_landlock
-def test_resume_mid_repair_still_rolls_back_a_red_repair(
+def test_resume_mid_repair_keeps_a_red_repair(
         leerie, tmp_path, monkeypatch):
-    """Round-2 M2: the pre-repair verdict is persisted, so a resume after a
-    red repair round still rolls back, and spent rounds count against the
-    cap."""
+    """Round-2 M2's resume: the pre-repair verdict is persisted, and spent
+    rounds count against the cap. A red test axis no longer rolls the repair
+    back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*): the interrupted round's commit stays."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2305,6 +2317,7 @@ def test_resume_mid_repair_still_rolls_back_a_red_repair(
     # spent, its (bad) commit on staging, no final verdict.
     (staging / "calc.py").write_text("def add(a, b):\n    raise SystemExit(3)\n")
     _git(staging, "commit", "-qam", "conformer: r1")
+    r1 = _git(staging, "rev-parse", "HEAD")
     st.data["acceptance"] = {"sets": sets, "gate": {
         "before_sha": before, "pre_tests_passed": True,
         "rounds": [{"round": 1, "results": []}]}}
@@ -2312,8 +2325,8 @@ def test_resume_mid_repair_still_rolls_back_a_red_repair(
                       measured=[{"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 1                      # only round 2 left
-    assert gate["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert "rolled_back" not in gate
+    assert _git(staging, "rev-parse", "HEAD") == r1
 
 
 @needs_landlock
@@ -2406,13 +2419,14 @@ def test_evaluation_installs_deps_before_running(leerie, tmp_path, monkeypatch):
 
 @needs_landlock
 @skip_without_landlock
-def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
-                                                      monkeypatch):
-    """Round 1 commits a repair that turns the test axis red; round 2's
-    `bump_workers` exhausts the budget. The rollback check must still run
-    (the budget error used to escape the gate before it). The repair fixes
-    no failing case either, so it is the per-round rule that resets it,
-    before round 2 — and nothing is left for the gate-wide one."""
+def test_budget_exhaustion_mid_repair_keeps_the_round_and_its_record(
+        leerie, tmp_path, monkeypatch):
+    """Round 1 commits a repair that fixes no failing case; round 2's
+    `bump_workers` exhausts the budget. The settle check still runs (the budget
+    error used to escape the gate before it) and records that round 1 fixed
+    nothing — but a held-out verdict may not roll a round back (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*), so round 1 is kept."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2440,9 +2454,10 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 1
     assert "budget exhausted" in gate["rounds"][-1]["error"]
-    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
-    assert gate["rounds"][0]["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert gate["rounds"][0]["fixed_cases"] == []
+    assert "rollback_reason" not in gate["rounds"][0]
+    assert not gate["rounds"][0].get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") != before
     assert gate["final"] is not None
 
 
@@ -2595,18 +2610,20 @@ def _failing(n):
 
 
 @pytest.mark.parametrize("with_initial", [True, False])
-def test_resume_after_a_passing_but_red_round_still_rolls_back(
+def test_resume_after_a_passing_round_keeps_it_whatever_the_test_axis(
         leerie, tmp_path, monkeypatch, with_initial):
-    """Round-3 H1: round 1 made the sets pass but turned the test axis red,
-    then the process died before the rollback check. Re-measured on resume,
-    `initial` read the repaired tree as passing and skipped the check. Now
-    `initial` is persisted, and a recorded before_sha alone resumes the
-    repair (the `with_initial=False` case)."""
+    """Round-3 H1's resume: round 1 made the sets pass, then the process died.
+    `initial` is persisted, and a recorded before_sha alone resumes the repair
+    (the `with_initial=False` case). A red test axis no longer rolls the repair
+    back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*): the passing round is kept, with no
+    further round."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     before = _git(staging, "rev-parse", "HEAD")
     _commit_fix(staging)
+    fixed = _git(staging, "rev-parse", "HEAD")
     gate = {"before_sha": before, "pre_tests_passed": True,
             "rounds": [{"round": 1, "results": _passing(5)}]}
     if with_initial:
@@ -2616,13 +2633,9 @@ def test_resume_after_a_passing_but_red_round_still_rolls_back(
                       measured=[{"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
     assert calls == []                  # the round already passed
-    assert gate["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
-    if with_initial:
-        # What ships is the pre-repair tree, so its persisted verdict — not
-        # one re-measured on the repaired tree — is the record.
-        assert _no_cases(gate["final"]) == _failing(5)
-        assert gate["residual"]["failing_sets"] == 5
+    assert "rolled_back" not in gate
+    assert _git(staging, "rev-parse", "HEAD") == fixed
+    assert "residual" not in gate
 
 
 def test_the_pre_repair_verdict_is_on_disk_before_round_one(
@@ -2665,10 +2678,13 @@ def test_resume_after_a_passing_round_runs_no_further_round(
     assert "residual" not in gate
 
 
-def test_every_round_is_on_disk_before_the_rollback_check(
+def test_every_round_is_on_disk_and_no_post_repair_test_run_follows(
         leerie, tmp_path, monkeypatch):
-    """A crash between the last round and the rollback check must not lose
-    the round, or a resume would run it again past the cap."""
+    """Each round is saved as it settles, so a crash after it cannot lose it.
+    No post-repair test run follows the last round any more — new failing tests
+    may not roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*) — so an axis that would kill
+    the process there is never reached."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -2678,19 +2694,19 @@ def test_every_round_is_on_disk_before_the_rollback_check(
     async def axes(tree, axes_, st_, caps, **kw):
         if seq:
             return {"tests": seq.pop(0)}
-        raise _Killed("killed before the post-repair measurement")
+        raise _Killed("killed at a post-repair measurement")
 
     async def fixer_claude_p(**kw):
         _commit_fix(Path(kw["cwd"]))
         return {}
     _script_axes(leerie, monkeypatch, axes)
     monkeypatch.setattr(leerie, "claude_p", fixer_claude_p)
-    with pytest.raises(_Killed):
-        asyncio.run(leerie._run_acceptance_gate(
-            st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
     assert [r["round"] for r in disk["acceptance"]["gate"]["rounds"]] == [1]
     assert _no_cases(disk["acceptance"]["gate"]["initial"]) == _failing(5)
+    assert "rolled_back" not in disk["acceptance"]["gate"]
 
 
 def test_resume_after_the_rollback_decision_finishes_the_reset(
@@ -2743,8 +2759,11 @@ def test_a_recorded_rollback_runs_no_further_round(leerie, tmp_path,
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
-def test_the_rollback_decision_is_on_disk_before_the_reset(
+def test_a_repair_with_a_red_test_axis_runs_no_reset(
         leerie, tmp_path, monkeypatch):
+    """New failing tests may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*): no
+    rollback is decided and no `reset --hard` runs."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -2762,13 +2781,17 @@ def test_the_rollback_decision_is_on_disk_before_the_reset(
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": False, "measured": True}])
-    assert at_reset == [True]
+    assert at_reset == []
+    assert "rolled_back" not in st.data["acceptance"]["gate"]
 
 
 def test_an_errored_round_is_saved_and_the_round_before_still_counts(
         leerie, tmp_path, monkeypatch):
-    """Round-4: an errored round is on disk before the rollback check, and a
-    resume after it reads the last round WITH results, not `initial`."""
+    """Round-4: an errored round is on disk as it settles, and a resume after
+    it reads the last round WITH results, not `initial`. No post-repair test
+    run follows (new failing tests may not roll a round back (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*)), so the axis that would kill the process is not reached."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -2781,17 +2804,15 @@ def test_an_errored_round_is_saved_and_the_round_before_still_counts(
         raise _Killed("killed before the post-repair measurement")
 
     async def fails(**kw):
-        # Commits, then errors: the rollback check then measures, and the
-        # process dies there.
+        # Commits, then errors.
         _commit_fix(Path(kw["cwd"]))
         raise leerie.WorkerError("conformer crashed")
     _script_axes(leerie, monkeypatch, axes)
     monkeypatch.setattr(leerie, "claude_p", fails)
     caps = _caps(leerie, 5)
     caps["acceptance_repair_rounds"] = 1
-    with pytest.raises(_Killed):
-        asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, MODELS,
-                                                EFFORTS))
+    asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, MODELS,
+                                            EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
     assert "error" in disk["acceptance"]["gate"]["rounds"][0]
     # Resume shape: round 1 with results, round 2 errored.
@@ -2833,11 +2854,12 @@ def test_a_round_that_commits_then_errors_is_measured_again(
     assert "residual" not in gate
 
 
-def test_a_red_repair_rolls_back_even_when_evaluation_breaks(
+def test_an_evaluation_that_breaks_after_a_repair_does_not_escape_the_gate(
         leerie, tmp_path, monkeypatch):
-    """Round-5 M2: an exception while placing a set after a red repair
-    escaped the gate before the rollback check, and the red repair
-    shipped."""
+    """Round-5 M2: an exception while placing a set after a repair escaped the
+    gate. It no longer does, and the repair is kept: a red test axis may not
+    roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2859,16 +2881,19 @@ def test_a_red_repair_rolls_back_even_when_evaluation_breaks(
               measured=[{"passed": True, "measured": True},
                         {"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert "rolled_back" not in gate
+    assert gate["rounds"] and gate["final"] is not None
+    assert _git(staging, "rev-parse", "HEAD") != before
 
 
 @needs_landlock
 @skip_without_landlock
-def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
+def test_an_evaluation_that_cannot_be_set_up_after_a_repair_does_not_escape(
         leerie, tmp_path, monkeypatch):
     """Round-6 M2: an exception setting up the evaluation worktree after a
-    repair commit escaped the gate before the rollback check."""
+    repair commit escaped the gate. It no longer does, and the repair is kept:
+    a red test axis may not roll a round back (DESIGN §8 *A check vetoes `done`
+    only when it is verifiable, actionable and measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2890,8 +2915,9 @@ def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
               measured=[{"passed": True, "measured": True},
                         {"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert "rolled_back" not in gate
+    assert gate["rounds"] and gate["final"] is not None
+    assert _git(staging, "rev-parse", "HEAD") != before
 
 
 @needs_landlock
@@ -3003,10 +3029,13 @@ def test_branch_head_sha_never_raises(leerie, tmp_path, monkeypatch):
 
 @needs_landlock
 @skip_without_landlock
-def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
+def test_a_fork_failure_reading_head_after_a_repair_does_not_escape_the_gate(
         leerie, tmp_path, monkeypatch):
     """Round-7 M3: reading HEAD after a red repair raised EAGAIN out of the
-    gate, past the rollback check."""
+    gate, past the settle check. The check runs and records that the round
+    fixed nothing; the round is kept, as a held-out verdict may not roll a
+    round back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -3042,20 +3071,24 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert failed == [1]
     gate = st.data["acceptance"]["gate"]
-    # The bad commit fixed no failing case: reset by the per-round rule,
-    # through the errored-round path.
-    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
-    assert gate["rounds"][0]["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    # The bad commit fixed no failing case: recorded through the
+    # errored-round path, and kept.
+    assert gate["rounds"][0]["fixed_cases"] == []
+    assert "rollback_reason" not in gate["rounds"][0]
+    assert not gate["rounds"][0].get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") != before
 
 
 @needs_landlock
 @skip_without_landlock
-def test_a_failure_spawning_a_later_round_still_rolls_back(
+def test_a_failure_spawning_a_later_round_does_not_escape_the_gate(
         leerie, tmp_path, monkeypatch):
     """Round-8 M1: `claude_p` lets an OSError spawning the worker through;
-    raised in round 2 after round 1's red commit, it escaped the gate past
-    the rollback check."""
+    raised in round 2 after round 1's red commit, it escaped the gate past the
+    settle check. It is recorded as round 2's error; round 1, which fixed
+    nothing, is kept, as a held-out verdict may not roll a round back (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -3082,16 +3115,19 @@ def test_a_failure_spawning_a_later_round_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 2 and "error" in gate["rounds"][1]
-    # Round 1's red commit fixed no failing case: the per-round rule reset
-    # it before round 2's spawn failure.
-    assert gate["rounds"][0]["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == before
+    # Round 1's red commit fixed no failing case: recorded, and kept.
+    assert gate["rounds"][0]["fixed_cases"] == []
+    assert not gate["rounds"][0].get("rolled_back")
+    assert _git(staging, "log", "-1", "--format=%s") == "conformer: red"
 
 
-def test_a_repair_that_breaks_the_install_is_rolled_back(
+def test_a_repair_that_breaks_the_install_is_kept_and_its_sets_unmeasured(
         leerie, tmp_path, monkeypatch):
     """Round-7 M4: staging's memoised install never noticed; every set went
-    unmeasured and the broken manifest shipped."""
+    unmeasured. The held-out sets may not roll a round back (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*), so the repair is kept, and the residual says the final tree was
+    not measured."""
     repo, head = _repo(tmp_path)
     (repo / "requirements.txt").write_text("ok\n")
     _git(repo, "add", "-A")
@@ -3110,13 +3146,10 @@ def test_a_repair_that_breaks_the_install_is_rolled_back(
     _run_gate(leerie, monkeypatch, st, breaks_manifest,
               measured=[{"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
-    assert gate["rollback_reason"] == "left the held-out sets unmeasurable"
-    assert _git(staging, "rev-parse", "HEAD") == before
-    (row,) = st.data["round_rollbacks"]
-    assert (row["worker"], row["label"]) == ("acceptance repair", "whole gate")
-    assert row["reason"] == "left the held-out sets unmeasurable"
-    assert gate["residual"]["failing_sets"] == 5
+    assert "rolled_back" not in gate and "rollback_reason" not in gate
+    assert _git(staging, "log", "-1", "--format=%s") == "conformer: deps"
+    assert "round_rollbacks" not in st.data
+    assert gate["residual"]["unmeasured_final"] is True
 
 
 def _counted_recipe(leerie, monkeypatch, st, fail_from: int, fail_to: int):
@@ -3160,6 +3193,10 @@ def test_a_one_off_install_failure_keeps_a_correct_repair(
 
 def test_a_lasting_environment_failure_keeps_the_repair(
         leerie, tmp_path, monkeypatch, capsys):
+    """The unmeasurable-sets rule does not run, as the held-out sets may not
+    roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*): the repair is kept with no
+    control evaluation of the pre-repair tree."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -3171,14 +3208,17 @@ def test_a_lasting_environment_failure_keeps_the_repair(
     gate = st.data["acceptance"]["gate"]
     assert "rolled_back" not in gate
     assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
-    assert "an environment failure" in capsys.readouterr().out
+    assert "an environment failure" not in capsys.readouterr().out
     assert gate["residual"]["unmeasured_final"] is True
 
 
-def test_a_failed_reset_is_recorded_not_assumed(leerie, tmp_path,
-                                                monkeypatch, capsys):
-    """Round-7 L1: a stale index.lock makes `reset --hard` fail; the gate
-    recorded `rolled_back` while the red repair shipped."""
+def test_a_red_repair_with_a_stale_lock_runs_no_reset(leerie, tmp_path,
+                                                     monkeypatch, capsys):
+    """Round-7 L1's shape: a stale index.lock would make `reset --hard` fail.
+    No reset is tried — a red test axis may not roll a round back (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*) — so nothing fails and nothing is recorded as reset; the
+    repair's tree ships and its record describes it."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -3191,22 +3231,20 @@ def test_a_failed_reset_is_recorded_not_assumed(leerie, tmp_path,
               measured=[{"passed": True, "measured": True},
                         {"passed": False, "measured": True}])
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True and gate["rollback_failed"] is True
-    assert "FAILED" in capsys.readouterr().out
+    assert "rolled_back" not in gate and "rollback_failed" not in gate
+    assert "FAILED" not in capsys.readouterr().out
     assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
-    # What ships is the repair's tree, so the record describes it, not the
-    # pre-repair tree (round-8 L) — and the next run hears that a repair
-    # the gate meant to revert is on the branch, though its sets pass
-    # (round-9 L).
     assert all(r["passed"] for r in gate["final"])
-    assert gate["residual"] == {"failing_sets": 0, "total_sets": 5,
-                                "cases": [], "rollback_failed": True}
+    assert "residual" not in gate
 
 
-def test_an_unmeasurable_repair_whose_reset_fails_says_so(
+def test_an_unmeasurable_repair_is_kept_and_handed_on_unmeasured(
         leerie, tmp_path, monkeypatch):
-    """Round-9 M: the residual read "environment failure" when a repair had
-    broken the measurement and its rollback then failed."""
+    """Round-9 M's shape: a repair breaks the measurement (and a stale lock
+    would fail a reset). No rollback is tried — the held-out sets may not roll
+    a round back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*) — so no reset fails; the residual, and
+    the next run, hear that the final tree was not measured."""
     repo, head = _repo(tmp_path)
     (repo / "requirements.txt").write_text("ok\n")
     _git(repo, "add", "-A")
@@ -3226,7 +3264,7 @@ def test_an_unmeasurable_repair_whose_reset_fails_says_so(
     _run_gate(leerie, monkeypatch, st, breaks_and_locks,
               measured=[{"passed": False, "measured": True}])
     res = st.data["acceptance"]["gate"]["residual"]
-    assert res["rollback_failed"] is True and res["unmeasured_final"] is True
+    assert "rollback_failed" not in res and res["unmeasured_final"] is True
     d = st.run_dir.parent / "run-next"
     d.mkdir()
     (d / "orchestrator.exit_code").write_text("0")
@@ -3235,7 +3273,7 @@ def test_an_unmeasurable_repair_whose_reset_fails_says_so(
     st.save()
     (st.run_dir / "orchestrator.exit_code").write_text("0")
     unmet = leerie._prior_delivery_residual(nxt)["acceptance_unmet"]
-    assert unmet["rollback_failed"] is True
+    assert unmet["rollback_failed"] is False
     assert unmet["unmeasured_final"] is True
 
 
@@ -3338,7 +3376,10 @@ def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
 def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
         leerie, tmp_path, monkeypatch):
     """The post-loop retry is skipped for a commit the round's own retry
-    already measured: straight to the pre-repair control."""
+    already measured, and no pre-repair control follows: the unmeasurable-sets
+    rule does not run, as the held-out sets may not roll a round back (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -3354,8 +3395,7 @@ def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
     _run_gate(leerie, monkeypatch, st, _commit_fix,
               measured=[{"passed": True, "measured": True},
                         {"passed": True, "measured": True}])
-    assert labels == ["gate-initial", "gate-r1", "gate-r1-retry",
-                      "gate-before"]
+    assert labels == ["gate-initial", "gate-r1", "gate-r1-retry"]
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
@@ -3396,9 +3436,12 @@ def test_a_finished_gate_of_another_commit_is_measured_again(
     assert gate["final"][0]["failing_files"] == ["acc/test_defect_1.py"]
     assert gate["residual"]["failing_sets"] == 1
     assert gate["rounds"] == []
-    leerie._decide_outcome(st, any_commits=True)
+    # Reported, not vetoed (DESIGN §8 *A check vetoes `done` only when it
+    # is verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
     assert ("1 held-out acceptance set(s) still fail"
-            in st.data["outcome_reasons"])
+            in st.data["outcome_findings"])
 
 
 # --- cross-run residual, hiding, wiring --------------------------------------
@@ -3469,8 +3512,10 @@ def test_wiring_order_in_run_phases(leerie):
     assert i_recheck < i_gate < i_final
 
 
-# --- per-round rollback: a repair round that fixes nothing (DESIGN §8 *A
-# repair round that fixes nothing is rolled back*) -----------------------
+# --- per-round record: a repair round that fixes nothing (DESIGN §8 *A
+# repair round that fixes nothing is rolled back*) is kept with its record,
+# as a held-out verdict may not roll a round back (DESIGN §8 *A check vetoes
+# `done` only when it is verifiable, actionable and measured accurate*) -----
 
 def _hedge(staging: Path):
     """What the replayed rounds did: a change that fixes no failing case."""
@@ -3479,49 +3524,54 @@ def _hedge(staging: Path):
     _git(staging, "commit", "-qam", "conformer: defensive fallback")
 
 
-def test_a_round_that_fixes_no_failing_case_is_reset_to_its_own_start(
+def test_a_round_that_fixes_no_failing_case_is_kept_and_recorded(
         leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
     start = _git(staging, "rev-parse", "HEAD")
-    # Round 1 hedges, round 2 fixes: round 2 starts from the tree before
-    # round 1, and its fix is kept.
+    # Round 1 hedges, round 2 fixes: round 2 starts from round 1's tree,
+    # and both are kept.
     fixers = [_hedge, _commit_fix]
     calls = _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
     assert len(calls) == 2
     gate = st.data["acceptance"]["gate"]
     r1, r2 = gate["rounds"]
     assert r1["pre_sha"] == start and r1["fixed_cases"] == []
-    assert r1["rollback_reason"] == "fixed no failing case"
-    assert r1["rolled_back"] is True
-    assert r2["pre_sha"] == start and r2["fixed_cases"]
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
+    assert r2["pre_sha"] == r1["sha"] and r2["fixed_cases"]
     assert not r2.get("rollback_reason")
     log = _git(staging, "log", "--format=%s", f"{start}..HEAD")
-    assert log == "conformer: fix add"           # the hedge is gone
-    assert "_fallback" not in (staging / "calc.py").read_text()
+    assert log == "conformer: fix add\nconformer: defensive fallback"
     assert all(r["passed"] for r in gate["final"])
     assert "round_pre" not in gate
 
 
 @needs_landlock
 @skip_without_landlock
-def test_two_rounds_that_fix_nothing_leave_the_tree_they_started_from(
+def test_two_rounds_that_fix_nothing_are_both_kept_and_recorded(
         leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
     start = _git(staging, "rev-parse", "HEAD")
-    _run_gate(leerie, monkeypatch, st, _hedge)
+    n = []
+
+    def hedge_again(p):
+        n.append(1)
+        (p / "calc.py").write_text(
+            BUGGY + f"\n\ndef _fallback_{len(n)}(a, b):\n    return a - b\n")
+        _git(p, "commit", "-qam", f"conformer: fallback {len(n)}")
+    _run_gate(leerie, monkeypatch, st, hedge_again)
     gate = st.data["acceptance"]["gate"]
-    assert [r["rollback_reason"] for r in gate["rounds"]] == [
-        "fixed no failing case"] * 2
-    assert _git(staging, "rev-parse", "HEAD") == start
+    assert [r["fixed_cases"] for r in gate["rounds"]] == [[], []]
+    assert not any(r.get("rollback_reason") for r in gate["rounds"])
+    assert _git(staging, "rev-parse", "HEAD") == gate["rounds"][-1]["sha"]
     # The residual is the measured verdict of the tree that ships.
     assert gate["residual"]["failing_sets"] == 5
-    assert gate["final_sha"] == start
+    assert gate["final_sha"] == gate["rounds"][-1]["sha"] != start
 
 
 TWO_CASES = ("from calc import add\n\n"
@@ -3563,12 +3613,14 @@ TRADE_FIX = ("def add(a, b):\n"
              "    return a + b if a == 2 else a * b\n")
 
 
-def test_a_round_that_fixes_one_case_by_breaking_passing_ones_is_reset(
+def test_a_round_that_fixes_one_case_by_breaking_passing_ones_records_it(
         leerie, tmp_path, monkeypatch):
     """Review round 1 M4: worse is counted in cases, like progress. The round
     fixes one failing case and makes two passing cases of the same set fail;
-    counted in files nothing changed (one failing file before and after),
-    and the round stood with the held-out verdict strictly worse."""
+    counted in files nothing changed (one failing file before and after).
+    Counted in cases, the round's record says so — and it is kept, as a
+    held-out verdict may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -3588,10 +3640,9 @@ def test_a_round_that_fixes_one_case_by_breaking_passing_ones_is_reset(
     assert "test_two_and_three" in r1["fixed_cases"][0]
     assert len(r1["broken_cases"]) == 2
     assert all("zero" in c for c in r1["broken_cases"])
-    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
-    assert r1["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == start
-    assert (staging / "calc.py").read_text() == BUGGY
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") == r1["sha"] != start
+    assert (staging / "calc.py").read_text() == TRADE_FIX
 
 
 def test_acceptance_broken_cases_counts_a_passing_set_that_fails(leerie):
@@ -3641,12 +3692,15 @@ HELPER_TEST = ("from helper import mul\n\n"
                "def test_mul_zero():\n    assert mul(0, 0) == 0\n")
 
 
-def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_is_reset(
+def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_records_it(
         leerie, tmp_path, monkeypatch):
     """Review round 2 M4, end to end: the round fixes one case of set 1 and
-    deletes the module set 2 imports, so set 2's file — failing one named
-    case and passing another before — now fails to collect. Counted only
-    by name, nothing newly failed and the round stood."""
+    deletes the module set 2 imports, so set 2's file — failing one named case
+    and passing another before — now fails to collect. Counted only by name,
+    nothing newly failed; counted as the file, the round's record names it —
+    and the round is kept, as a held-out verdict may not roll a round back
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable, actionable
+    and measured accurate*)."""
     repo, head = _repo(tmp_path)
     (repo / "helper.py").write_text(HELPER_BUGGY)
     _git(repo, "add", "-A")
@@ -3670,10 +3724,9 @@ def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_is_reset(
     r1 = st.data["acceptance"]["gate"]["rounds"][0]
     assert any("test_two_and_three" in c for c in r1["fixed_cases"])
     assert r1["broken_cases"] == ["2:acc/test_defect_2.py"]
-    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
-    assert r1["rolled_back"] is True
-    assert _git(staging, "rev-parse", "HEAD") == start
-    assert (staging / "helper.py").read_text() == HELPER_BUGGY
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") == r1["sha"] != start
+    assert not (staging / "helper.py").exists()
 
 
 def _timeout_first_after_run(leerie, monkeypatch, rel: str, nth: int,

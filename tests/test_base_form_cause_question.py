@@ -14,7 +14,9 @@ Each such cause is one intent question (does the task ask for this change?);
 `yes` makes a case task-required only when the run's own form of it still
 asserts the new behaviour, checked mechanically; `no` keeps it a regression;
 an open question keeps it from any round. Text a `yes` let move that comes
-back into production is `literal_restored`, an `unconverged` reason.
+back into production is `literal_restored`, a reported finding (a base
+form may not veto `done`: DESIGN §8 *A check vetoes `done` only when it is
+verifiable, actionable and measured accurate*).
 
 Real path: a real git repository, the run's own repository and a real
 staging worktree (`tests/test_run_final_conformance.py`'s `env`); the real
@@ -215,8 +217,13 @@ def _check(w) -> dict:
 
 
 def _reasons(w) -> list[str]:
-    w["leerie"]._decide_outcome(w["st"], any_commits=True)
-    return w["st"].data.get("outcome_reasons") or []
+    """The base-form reasons the decider reports. A base form may not veto
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*): they are findings, the run is
+    `done`, and none is a veto."""
+    assert w["leerie"]._decide_outcome(w["st"], any_commits=True) == "done"
+    assert w["st"].data["outcome_reasons"] == []
+    return w["st"].data["outcome_findings"]
 
 
 def test_one_question_per_cause_and_kept_updates_are_task_required(world):

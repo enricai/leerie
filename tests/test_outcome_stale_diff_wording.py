@@ -19,8 +19,12 @@ class _St:
 
 def _reason(leerie, tmp_path, diff: dict) -> str:
     st = _St(diff, tmp_path)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    (reason,) = [r for r in st.data["outcome_reasons"] if "newly" in r]
+    # A newly failing test is a reported finding: that check may not veto
+    # `done` (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    # actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    (reason,) = [r for r in st.data["outcome_findings"] if "newly" in r]
     return reason
 
 

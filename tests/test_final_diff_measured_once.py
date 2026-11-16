@@ -87,14 +87,18 @@ def test_an_untracked_file_the_conformer_wrote_never_reaches_a_measurement(
     never committed, so the refresh measured the clean checkout. The
     conformer is now held to a clean tree: it is re-asked, and, still
     dirty, its round is rolled back before any measurement of it — the
-    file is gone and the run is unconverged with it named."""
+    file is gone and the run reports it, named (a finding: DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     run, calls = _drive(leerie, tmp_path, monkeypatch, "__pycache__/\n",
                         worker_file="tests/test_w.py")
     assert not (run["staging"] / "tests" / "test_w.py").exists()
     (rec,) = run["st"].data["unclean_trees"].values()
     assert rec["lines"] == ["?? tests/test_w.py"]
-    assert leerie._decide_outcome(run["st"], any_commits=True) == \
-        "unconverged"
+    assert leerie._decide_outcome(run["st"], any_commits=True) == "done"
+    assert run["st"].data["outcome_reasons"] == []
+    assert any("tests/test_w.py" in r
+               for r in run["st"].data["outcome_findings"])
 
 
 def test_a_tracked_edit_never_reaches_a_measurement(leerie, tmp_path,
@@ -152,8 +156,13 @@ def test_an_untracked_module_that_made_the_suite_pass_is_never_reused(
     diff = st.data["test_id_diff"]
     assert diff["tree_sha"] == _git(staging, "rev-parse", "HEAD^{tree}")
     assert any("test_m" in i for i in diff["new"])
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert leerie._format_pr_end_state_section(st.data) != ""
+    # The new failure is reported, not a veto (DESIGN §8 *A check vetoes
+    # `done` only when it is verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("newly failing" in r for r in st.data["outcome_findings"])
+    assert "## Reported findings" in leerie._format_pr_end_state_section(
+        st.data)
     # What ships really fails test_m.
     co = tmp_path / "co"
     _git(st.run_repo, "worktree", "add", "-q", "--detach", str(co),

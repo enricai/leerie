@@ -94,7 +94,7 @@ def _residual(failing: dict) -> dict:
 
 @pytest.fixture
 def finished_run(leerie, tmp_path):
-    """A run that finalized `unconverged` on one held-out set, its PR
+    """A run that finalized `done` with one held-out set reported failing, its PR
     already open: a real run repository holding the run branch, and the
     outcome and end state the real decider and renderer gave it."""
     user = init_git_repo(tmp_path / "user")
@@ -120,12 +120,17 @@ def finished_run(leerie, tmp_path):
                                       "final": _final(failing),
                                       "residual": _residual(failing)}}
     st.save()
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert st.data["outcome_reasons"] == [
+    # The held-out sets report, they do not veto (DESIGN §8 *A check vetoes
+    # `done` only when it is verifiable, actionable and measured accurate*):
+    # the run is `done`, the failing set a reported finding.
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert st.data["outcome_findings"] == [
         "1 held-out acceptance set(s) still fail"]
     leerie._record_unmet_evidence(st)
     end = leerie._format_pr_end_state_section(st.data)
-    assert "## Unconverged" in end
+    assert "## Reported findings" in end
+    assert "## Unconverged" not in end
     leerie._write_run_json(
         st.run_dir, finished_at=st.data["finished_at"], no_push=False,
         branch=f"leerie/runs/{RUN}", working_branch="main",
@@ -173,7 +178,7 @@ def _state(run) -> dict:
 
 # --- the verb, then a real resume of the finished run ------------------------
 
-def test_an_accepted_case_turns_a_finished_run_done_and_the_pr_says_so(
+def test_an_accepted_case_clears_a_finished_runs_finding_and_the_pr_says_so(
         leerie, finished_run, monkeypatch):
     r = _accept(finished_run, f"1/{OVER_TITLE}")
     assert r.returncode == 0, r.stderr
@@ -184,9 +189,12 @@ def test_an_accepted_case_turns_a_finished_run_done_and_the_pr_says_so(
     assert calls == [], "a re-decided outcome calls no worker"
     assert st.data["outcome"] == "done"
     assert st.data["outcome_reasons"] == []
+    # The accepted case was the set's only counted failure: no finding left.
+    assert st.data["outcome_findings"] == []
     rj = _run_json(finished_run)
     assert rj["outcome"] == "done"
     end = rj["pr_end_state"]
+    assert "## Reported findings" not in end
     assert "## Held-out cases accepted by the operator" in end
     assert f"`{OVER_TITLE}`" in end and f"`{F1}`" in end
     assert "operator's call, not leerie's" in end
@@ -207,19 +215,24 @@ def test_a_finished_run_without_an_acceptance_is_not_redecided(
     """Control: the re-decision is keyed to the operator's acceptance, not
     to every resume of a finished run."""
     st, _ = _resume(leerie, finished_run, monkeypatch)
-    assert st.data["outcome"] == "unconverged"
+    assert st.data["outcome"] == "done"
+    assert st.data["outcome_findings"] == [
+        "1 held-out acceptance set(s) still fail"]
     assert "pr_refresh" not in _run_json(finished_run)
 
 
-def test_a_variant_accepted_alone_leaves_the_run_unconverged(
+def test_a_variant_accepted_alone_leaves_the_runs_finding(
         leerie, finished_run, monkeypatch):
     """Accepting a case that was not counted changes no outcome: the counted
-    one still fails."""
+    one still fails, and is still reported."""
     r = _accept(finished_run, "1/write body a variant the judge left out")
     assert r.returncode == 0, r.stderr
     assert "it was not counted already" in r.stdout
     st, _ = _resume(leerie, finished_run, monkeypatch)
-    assert st.data["outcome"] == "unconverged"
+    assert st.data["outcome"] == "done"
+    assert st.data["outcome_reasons"] == []
+    assert st.data["outcome_findings"] == [
+        "1 held-out acceptance set(s) still fail"]
     assert "## Held-out cases accepted by the operator" in _run_json(
         finished_run)["pr_end_state"]
 

@@ -206,10 +206,10 @@ def test_a_kept_group_that_undoes_a_met_item_is_falsified_on_its_tree(
     """The replay: the group is kept (its ratchet judge says met), and the
     tree it left gets a falsifier pass on item 0, whose probe — `add(2, 3)
     == 5` — is confirmed under B* there. The probe passed on the group's
-    start, so the group wrote that failure: it is rolled back (DESIGN §8 *A
-    kept group that turns a met item's confirmed probe from passing to
-    failing is rolled back*, tests/test_flipped_probe_rolls_back_its_group.py),
-    and item 0 is read met again on the tree that ships."""
+    start, but the flip check does not run: the required items may not roll
+    a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*). The group stays, and
+    item 0 is read unmet on the tree that ships — reported, not hidden."""
     r = Replay(leerie, tmp_path, monkeypatch, edit=_fix_mul_undo_add)
     r.run()
     (g,) = r.st.data["delivery_redrive"]["rounds"][0]["groups"]
@@ -217,15 +217,14 @@ def test_a_kept_group_that_undoes_a_met_item_is_falsified_on_its_tree(
     assert g["ratchet"]["prior_met"] == [0]
     f0 = r.falsified(0)
     assert f0 and f0[0]["head"] == g["post_sha"] != r.head
-    assert g["rolled_back"] is True
-    assert [c["item_index"] for c in g["flip_regressed"]] == [0]
+    assert not g.get("rolled_back") and "flip_regressed" not in g
+    assert "flip_rollbacks" not in r.st.data["delivery_redrive"]
     final = _git(r.staging, "rev-parse", "HEAD")
-    assert final == r.head
+    assert final == g["post_sha"]
     gate = r.st.data["delivery_gate"]
     row0 = next(x for x in gate["items"] if x["item_index"] == 0)
-    assert row0["verdict"] == "met"
-    assert row0["redrive_recheck"] == {"sha": final}
-    assert 0 not in [u["item_index"] for u in gate["unmet_final"]]
+    assert row0["verdict"] == "unmet"
+    assert 0 in [u["item_index"] for u in gate["unmet_final"]]
 
 
 def test_a_kept_group_that_keeps_the_met_item_leaves_it_met_on_final(

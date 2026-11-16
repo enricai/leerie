@@ -132,7 +132,9 @@ def test_a_round_that_breaks_before_its_post_keeps_its_pre_ids(
     """H1, every early exit the reviewer named: round 0's pre-measurement
     failed `test_x`, the tree did not move, so its IDs are confirmed against
     the base there and then. Before: no `test_id_diff`, outcome `done`, an
-    empty end-state section."""
+    empty end-state section. Now the failure is a reported finding (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
     st, run_dir = broken_run["st"], broken_run["run_dir"]
     caps = breaker(leerie, monkeypatch, broken_run["caps"])
     run = leerie._run_final_conformance(
@@ -149,9 +151,11 @@ def test_a_round_that_breaks_before_its_post_keeps_its_pre_ids(
         leerie._worktree_tree_sha(str(broken_run["staging"])))
     warns = st.data["conformance"]["_final"]["warnings"]
     assert any("test_x" in w for w in warns), warns
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert "1 test(s) newly failing" in leerie._format_pr_end_state_section(
-        st.data)
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    end = leerie._format_pr_end_state_section(st.data)
+    findings = end.split("## Reported findings", 1)[1]
+    assert "1 test(s) newly failing" in findings
 
 
 def test_a_round_whose_tree_moved_leaves_it_to_the_shipping_refresh(
@@ -178,7 +182,10 @@ def test_a_round_whose_tree_moved_leaves_it_to_the_shipping_refresh(
     assert diff["tree_sha"] == asyncio.run(
         leerie._worktree_tree_sha(str(staging)))
     assert [x.rsplit(".", 1)[-1] for x in diff["new"]] == ["test_x"]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("1 test(s) newly failing" in r
+               for r in st.data["outcome_findings"])
 
 
 def test_a_redrive_with_nothing_routed_no_longer_leaves_a_stale_new(

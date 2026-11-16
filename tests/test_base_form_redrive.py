@@ -112,6 +112,11 @@ def test_the_round_that_keeps_both_is_kept_and_not_escalated(
 
 def test_a_case_sonnet_could_not_keep_gets_one_round_on_opus(
         leerie, tmp_path, monkeypatch):
+    """Sonnet's round fixes nothing; it is kept all the same, as a round
+    that fixes no held-out or base-form case is no longer rolled back
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*), and the case, still failing, gets
+    its round on opus."""
     w = _world(leerie, tmp_path, monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
     w.edits = [lambda w: w.write("export const a = 1; // other\n"),
@@ -119,8 +124,9 @@ def test_a_case_sonnet_could_not_keep_gets_one_round_on_opus(
     w.run()
     assert len(w.calls) == 2
     first, second = _driven(w)["attempts"]
-    assert first["outcome"] == "rolled_back"
-    assert "fixed no failing case" in first["reason"]
+    assert first["outcome"] == "kept" and first["fixed"] == []
+    g1 = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert g1["zero_progress"] is True and not g1.get("rolled_back")
     assert (second["model"], second["effort"], second["escalation"]) == (
         leerie.MODEL_BASE_FORM_ESCALATION,
         leerie.EFFORT_BASE_FORM_ESCALATION, True)
@@ -134,8 +140,10 @@ def test_a_case_sonnet_could_not_keep_gets_one_round_on_opus(
 def test_a_case_neither_round_keeps_stays_a_change(leerie, tmp_path,
                                                    monkeypatch):
     """Two finished attempts and no third, whatever the budget: the case is
-    still failing, so the run stays unconverged on it — nothing reads the
-    task to accept it."""
+    still failing, so the run reports it — nothing reads the task to accept
+    it. Neither round is rolled back, and base form may not veto `done`
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     w = _world(leerie, tmp_path, monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
     w.caps["subtask_redrive_rounds"] = 5
@@ -143,14 +151,15 @@ def test_a_case_neither_round_keeps_stays_a_change(leerie, tmp_path,
     w.run()
     assert len(w.calls) == 2 and w.models == ["sonnet", "opus"]
     d = _driven(w)
-    assert [a["outcome"] for a in d["attempts"]] == ["rolled_back",
-                                                     "rolled_back"]
-    assert d["fixed"] == [] and _git(w.staging, "rev-parse", "HEAD") == start
+    # The second round wrote what the first already had: no change.
+    assert [a["outcome"] for a in d["attempts"]] == ["kept", "no_change"]
+    assert d["fixed"] == [] and _git(w.staging, "rev-parse", "HEAD") != start
     assert leerie._redrive_base_form_open(
         w.st.data["delivery_redrive"]) == []
-    leerie._decide_outcome(w.st, any_commits=True)
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
     assert any("existing_behaviour_changed" in r and CASE_A in r
-               for r in w.st.data["outcome_reasons"])
+               for r in w.st.data["outcome_findings"])
 
 
 def test_the_escalation_drives_only_the_cases_still_failing(
@@ -185,21 +194,25 @@ def test_the_escalation_is_driven_alone(leerie, tmp_path, monkeypatch):
     assert '"kind": "unmet_item"' not in esc
 
 
-def test_a_round_that_drops_a_case_that_still_holds_is_rolled_back(
+def test_a_round_that_drops_a_case_that_still_holds_is_kept_and_records_it(
         leerie, tmp_path, monkeypatch):
     """Putting an original test back is allowed; dropping a case of the file
-    it found that still passes on its commit is not, and neither is a drop
-    it could not measure."""
+    it found that still passes on its commit is recorded on the round — and
+    the round is kept, as base form may not roll a round back (DESIGN §8
+    *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
     w = _world(leerie, tmp_path, monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
     w.dropped = ["src/a.test.ts :: credits the late body"]
     w.edits = [lambda w: w.write("export const a = 1; // PINNED\n")] * 2
     w.run()
-    first, second = _driven(w)["attempts"]
-    assert first["outcome"] == second["outcome"] == "rolled_back"
-    assert "still hold on its commit" in first["reason"]
-    assert "credits the late body" in first["reason"]
-    assert _git(w.staging, "rev-parse", "HEAD") == start
+    (first,) = _driven(w)["attempts"]
+    assert first["outcome"] == "kept" and first["fixed"] == [CASE_A]
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert g["dropped_cases"] == ["src/a.test.ts :: credits the late body"]
+    assert not g.get("rolled_back") and "rollback_reason" not in g
+    assert _git(w.staging, "rev-parse", "HEAD") != start
+    assert "PINNED" in w.a_text("HEAD")
 
 
 def test_an_interrupted_attempt_is_replaced_not_counted(leerie):
@@ -366,8 +379,11 @@ def test_a_round_that_changes_the_closure_or_a_run_test_breaches(
     assert len(got) == 1 and got[0].startswith(hit + " (")
 
 
-def test_a_round_that_breaches_the_closure_is_rolled_back(
+def test_a_round_that_breaches_the_closure_is_kept_and_records_it(
         leerie, tmp_path, monkeypatch):
+    """The breach is on the round's record; base form may not roll a round
+    back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     w = _world(leerie, tmp_path, monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
     monkeypatch.setattr(leerie, "_base_form_closure_breach",
@@ -376,11 +392,12 @@ def test_a_round_that_breaches_the_closure_is_rolled_back(
                                          "at the run's base)"])
     w.edits = [lambda w: w.write("export const a = 1; // PINNED\n")] * 2
     w.run()
-    first, second = _driven(w)["attempts"]
-    assert first["outcome"] == second["outcome"] == "rolled_back"
-    assert "changed what a base-form case's test is" in first["reason"]
-    assert "vitest.setup.ts" in first["reason"]
-    assert _git(w.staging, "rev-parse", "HEAD") == start
+    (first,) = _driven(w)["attempts"]
+    assert first["outcome"] == "kept" and first["fixed"] == [CASE_A]
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert any("vitest.setup.ts" in x for x in g["test_closure_breach"])
+    assert not g.get("rolled_back") and "rollback_reason" not in g
+    assert _git(w.staging, "rev-parse", "HEAD") != start
 
 
 # --- a case pinning text the run moved to the message files --------------------
@@ -471,7 +488,9 @@ def _moved_world(leerie, tmp_path, monkeypatch, answer: str | None,
 def test_a_case_whose_causes_question_is_open_gets_no_round(
         leerie, tmp_path, monkeypatch):
     """Its base form passes only if the run's change is undone: while the
-    task's answer is open it gets no round, and the run stops on it."""
+    task's answer is open it gets no round, and the run reports it (base
+    form may not veto `done`: DESIGN §8 *A check vetoes `done` only when it
+    is verifiable, actionable and measured accurate*)."""
     w = _moved_world(leerie, tmp_path, monkeypatch, None)
     w.edits = [lambda w: w.write("export const a = 1; // PIN_B\n")]
     w.run()
@@ -485,9 +504,10 @@ def test_a_case_whose_causes_question_is_open_gets_no_round(
     lines = "\n".join(leerie._pr_tracked_test_lines(w.st.data))
     assert ("whether the task changes what it pins is an open question "
             f"(`{MOVED_QID}`): `{CASE_A}`") in lines
-    leerie._decide_outcome(w.st, any_commits=True)
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
     assert any("existing_behaviour_changed" in r and CASE_A in r
-               for r in w.st.data["outcome_reasons"])
+               for r in w.st.data["outcome_findings"])
 
 
 def test_a_case_whose_cause_the_task_did_not_ask_for_gets_its_round(
@@ -738,10 +758,11 @@ def test_a_flip_rollback_unkeeps_the_groups_base_form_attempt(leerie):
     assert first["outcome"] == "kept" and d["fixed"] == [CASE_A]
 
 
-def test_the_flip_rollback_path_unkeeps_each_group_it_rolls_back(
+def test_with_the_flip_check_off_no_group_is_unkept(
         leerie, tmp_path, monkeypatch):
-    """Driven through the real flip rollback (the 22a30525 replay): every
-    group it rolls back is passed on, with that group's own reason."""
+    """The 22a30525 replay: the flip check does not run (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*), so no group is rolled back and none is passed on."""
     from tests.test_met_items_refalsified_after_kept_rounds import (
         Replay, _fix_mul, _fix_mul_undo_add)
     seen: list[tuple[int, int, str]] = []
@@ -754,5 +775,5 @@ def test_the_flip_rollback_path_unkeeps_each_group_it_rolls_back(
                edit=[_fix_mul_undo_add, _fix_mul])
     r.run()
     g1 = r.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
-    assert g1["rolled_back"] is True
-    assert seen == [(1, 0, g1["rollback_reason"])]
+    assert not g1.get("rolled_back") and "flip_regressed" not in g1
+    assert seen == []

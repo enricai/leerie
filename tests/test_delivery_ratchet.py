@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,8 +128,13 @@ def _gate(leerie, monkeypatch, st, workers):
 
 # --- the acceptance gate ----------------------------------------------------
 
-def test_a_round_that_regresses_a_met_item_is_reset_and_the_next_kept(
+def test_a_round_that_regresses_a_met_item_is_kept_with_the_regression_recorded(
         leerie, tmp_path, monkeypatch):
+    """The ratchet still judges the round and records the regression; the
+    round is kept, as the required items may not roll a round back (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*). Its fix makes every set pass, so no second round
+    runs."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main",
              required_items=ITEMS)
@@ -137,14 +143,14 @@ def test_a_round_that_regresses_a_met_item_is_reset_and_the_next_kept(
     st.data["delivery_gate"] = {"judged_before": _judged_before(start, [])}
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
     # Round 1 fixes the case but hedges: the judge marks item 1 unmet in 2
-    # of 3 samples. Round 2 fixes it cleanly.
+    # of 3 samples.
     w = Workers([_hedge_and_fix, _fix],
                 regress={1: [[1], [], [1]]})
     gate = _gate(leerie, monkeypatch, st, w)
-    r1, r2 = gate["rounds"]
+    (r1,) = gate["rounds"]
+    assert len(w.of("conformer")) == 1
     assert r1["fixed_cases"] and r1["pre_sha"] == start
-    assert r1["rollback_reason"] == "regressed a previously met required item"
-    assert r1["rolled_back"] is True
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
     rat = r1["ratchet"]
     # Routes: 3 external never re-verified, 4 settled in code, 2 execution
     # (not judged; no test newly failed), 0 and 1 judged.
@@ -155,19 +161,13 @@ def test_a_round_that_regresses_a_met_item_is_reset_and_the_next_kept(
     assert rat["judge"]["sample1_flags"] == [1]
     assert rat["judge"]["confirmed"] == [1] and rat["regressed"] == [1]
     assert rat["judge"]["samples"] == 3
-    # Round 2 starts from the tree before round 1, and is kept.
-    assert r2["pre_sha"] == start and not r2.get("rollback_reason")
-    assert r2["ratchet"]["regressed"] == []
-    assert r2["ratchet"]["judge"]["samples"] == 1     # nothing flagged
+    # The hedge ships, reported, never reset.
     assert _git(staging, "log", "--format=%s", f"{start}..HEAD") == \
-        "conformer: fix add"
-    assert "_fallback" not in (staging / "calc.py").read_text()
+        "conformer: fix add, keep a fallback"
+    assert "_fallback" in (staging / "calc.py").read_text()
     assert all(r["passed"] for r in gate["final"])
-    # The classifier ran once for the two ratchets.
     assert len(w.of("verifiability_classifier")) == 1
-    # The kept round's verdicts are the next ratchet's prior evidence.
-    ev = st.data["delivery_ratchet"]["evidence"]
-    assert ev["0"] == {"sha": r2["sha"], "evidence": "ok r2 i0"}
+    assert "round_rollbacks" not in st.data
 
 
 def test_the_ratchet_judge_sees_prior_evidence_and_the_round_diff(
@@ -236,12 +236,15 @@ def test_evidence_files_touching_the_diff_buy_two_more_samples(
     assert not gate["rounds"][0].get("rollback_reason")
 
 
-def test_a_round_that_breaks_a_passing_test_is_reset_though_the_axis_was_red(
+def test_a_round_that_breaks_a_passing_test_is_kept_with_it_recorded(
         leerie, tmp_path, monkeypatch):
     """The test axis always runs after a repair: the start is red (one
-    failing test), so the gate-wide red-axis rule cannot fire, yet the
-    round that newly breaks another test is reset — confirmed under B*
-    against its own start — and flags the `execution` item."""
+    failing test), and the round newly breaks another — confirmed under B*
+    against its own start — and flags the `execution` item. Both are on
+    the round's ratchet record; the round is kept, as neither new failing
+    tests nor the required items may roll a round back (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     repo, head = _repo(tmp_path)
     (repo / "calc.py").write_text(BUGGY + "\n\ndef mul(a, b):\n"
                                   "    return a * b\n")
@@ -276,7 +279,7 @@ def test_a_round_that_breaks_a_passing_test_is_reset_though_the_axis_was_red(
                                             EFFORTS))
     gate = st.data["acceptance"]["gate"]
     assert gate["pre_tests_passed"] is False
-    r1, r2 = gate["rounds"]
+    (r1,) = gate["rounds"]
     # The start's red test is not a candidate; only the newly broken one is.
     pre_ids = gate["test_ids"][start]["ids"]
     assert len(pre_ids) == 1 and pre_ids[0].startswith("test_red.py")
@@ -284,11 +287,9 @@ def test_a_round_that_breaks_a_passing_test_is_reset_though_the_axis_was_red(
     assert len(rat["new_failures"]) == 1
     assert rat["new_failures"][0].startswith("test_mul.py")
     assert rat["exec_flagged"] == [2] and 2 in rat["regressed"]
-    assert r1["rollback_reason"] == "regressed a previously met required item"
-    assert r1["rolled_back"] is True
-    assert r2["ratchet"]["new_failures"] == [] and \
-        not r2.get("rollback_reason")
-    assert "return a * b" in (staging / "calc.py").read_text()
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
+    assert "return a + b" in (staging / "calc.py").read_text().split(
+        "def mul", 1)[1]
     assert not gate.get("rolled_back")
 
 
@@ -310,8 +311,12 @@ def test_with_no_recorded_delivery_verdict_only_the_test_axis_ratchets(
 
 # --- the delivery re-drive --------------------------------------------------
 
-def test_a_redrive_group_that_regresses_a_met_item_is_rolled_back(
+def test_a_redrive_group_that_regresses_a_met_item_is_kept_with_it_recorded(
         leerie, tmp_path, monkeypatch):
+    """The ratchet judges the group and records the regression; the group
+    is kept, as the required items may not roll a round back (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     items = [{"item": "a keeps its guard", "span": "S1",
               "verifiability": "tree"}]
     w = World(leerie, tmp_path, items=items)
@@ -343,19 +348,16 @@ def test_a_redrive_group_that_regresses_a_met_item_is_rolled_back(
     w.run()
     rec = w.st.data["delivery_redrive"]
     g1 = rec["rounds"][0]["groups"][0]
-    assert g1["ratchet_regressed"] == [0] and g1["rolled_back"] is True
+    assert g1["ratchet_regressed"] == [0]
+    assert not g1.get("rolled_back") and "rollback_reason" not in g1
     assert g1["ratchet"]["judge"]["confirmed"] == [0]
     assert g1["ratchet"]["prior_met"] == [0]
     assert "src/a.ts guards" in judged[0]["user_prompt"]
-    # The regressed item goes to the next round as a typed note.
-    assert len(w.calls) == 2
-    note = w.calls[1]["prompt"]
-    assert '"test": "required item 0"' in note
-    assert "a keeps its guard" in note
-    g2 = rec["rounds"][1]["groups"][0]
-    assert not g2.get("rolled_back") and g2["ratchet"]["regressed"] == []
-    assert _git(w.staging, "log", "--format=%s", f"{start}..HEAD") == "fix"
-    assert "no guard" not in (w.staging / "src" / "a.ts").read_text()
+    # Its commit stays in what ships.
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", g1["post_sha"], "HEAD"],
+        cwd=w.staging).returncode == 0
+    assert "round_rollbacks" not in w.st.data
 
 
 # --- units ------------------------------------------------------------------

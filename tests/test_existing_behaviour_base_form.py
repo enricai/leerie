@@ -222,21 +222,26 @@ def test_a_round_whose_change_reaches_a_changed_test_runs_it(
 
 # --- the outcome and the PR -------------------------------------------------------
 
-def test_a_changed_case_makes_the_run_unconverged_and_names_it(
-        leerie, tmp_path):
+def test_a_changed_case_is_a_reported_finding_and_named(leerie, tmp_path):
+    """Base form may not veto `done` (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*): the changed
+    case is a finding the PR names before anything else."""
     w = World(leerie, tmp_path)
     w.commit({"lib.py": LIB.replace("return 5", "return 2"),
               "tests/test_gone.py": None})
     asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     rec = w.st.data["existing_behaviour"]
     assert rec["tree_sha"] == leerie._shipping_tree(w.st)
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    (why,) = [r for r in w.st.data["outcome_reasons"]
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    (why,) = [r for r in w.st.data["outcome_findings"]
               if "existing_behaviour_changed" in r]
     assert "tests/test_gone.py" in why and "test_gone_pins_rounds" in why
     body = leerie._format_pr_end_state_section(w.st.data)
-    assert "## Unconverged" in body
-    assert "test_gone_pins_rounds" in body.split("## Unconverged", 1)[1]
+    assert "## Unconverged" not in body
+    assert body.startswith("\n## Reported findings")
+    assert "test_gone_pins_rounds" in body.split(
+        "## Reported findings", 1)[1].split("\n## ", 1)[0]
 
 
 def test_an_unchanged_behaviour_leaves_the_run_done(leerie, tmp_path):
@@ -247,8 +252,9 @@ def test_an_unchanged_behaviour_leaves_the_run_done(leerie, tmp_path):
     assert w.st.data["existing_behaviour"]["files"] == [
         "tests/test_append.py"]
     reasons = leerie._unmeasured_on_shipping_tree(w.st)
-    assert not any("base form" in r for r in reasons)
-    assert not any("existing_behaviour" in r for r in reasons)
+    assert not any("base form" in r for _, r in reasons)
+    assert not any("existing_behaviour" in r for _, r in reasons)
+    assert not any(c == "base_form" for c, _ in reasons)
 
 
 def test_a_check_that_could_not_run_is_unmeasured_never_a_pass(
@@ -267,8 +273,8 @@ def test_a_check_that_could_not_run_is_unmeasured_never_a_pass(
     assert rec["unmeasured_reason"] == ("the base form's path is a link or "
                                         "not a file")
     reasons = leerie._unmeasured_on_shipping_tree(w.st)
-    assert any("gave no verdict in their base form" in r
-               and "tests/test_gone.py" in r for r in reasons)
+    assert any(c == "base_form" and "gave no verdict in their base form" in r
+               and "tests/test_gone.py" in r for c, r in reasons)
     nhv = str(w.st.data["needs_human_verification"])
     assert "base form" in nhv and "tests/test_gone.py" in nhv
 
@@ -278,8 +284,8 @@ def test_a_record_of_another_tree_is_not_the_shipping_trees(leerie, tmp_path):
     w.commit({"tests/test_append.py": APPEND + "\n"})
     asyncio.run(leerie._check_existing_behaviour(w.st.run_dir, w.st, w.caps, {}, {}))
     w.commit({"calc.py": FIXED})
-    assert any("another tree" in r
-               for r in leerie._unmeasured_on_shipping_tree(w.st))
+    assert any(c == "base_form" and "another tree" in r
+               for c, r in leerie._unmeasured_on_shipping_tree(w.st))
 
 
 # --- the acceptance repair round of a79384a4 -------------------------------------
@@ -298,11 +304,14 @@ class _Repair:
         return {}
 
 
-def test_a_repair_that_deletes_the_tests_it_disagrees_with_is_rolled_back(
+def test_a_repair_that_deletes_the_tests_it_disagrees_with_is_kept_and_recorded(
         leerie, tmp_path, monkeypatch):
     """Round 1 fixes the held-out case, changes the pinned behaviour and
-    deletes the case that pinned it — every test passes in its new form, so
-    nothing else rolls it back. Round 2 fixes the case alone and is kept."""
+    deletes the case that pinned it — every test passes in its new form.
+    The base-form change is on the round's ratchet record, and the round is
+    kept: base form may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*).
+    The sets pass, so no second round runs."""
     w = World(leerie, tmp_path)
     start = _git(w.staging, "rev-parse", "HEAD")
     w.st.data["acceptance"] = {"sets": _make_sets(leerie, w.st, 2)}
@@ -327,21 +336,17 @@ def test_a_repair_that_deletes_the_tests_it_disagrees_with_is_rolled_back(
         w.st.run_dir, w.st, w.caps, {"conformer": "sonnet"},
         {"conformer": "low"}))
     gate = w.st.data["acceptance"]["gate"]
-    r1, r2 = gate["rounds"]
+    (r1,) = gate["rounds"]
+    assert len(worker.calls) == 1
     assert r1["fixed_cases"] and not r1["broken_cases"]
     assert r1["ratchet"]["new_failures"] == []          # nothing newly fails
     assert any("test_spends_the_whole_budget" in i
                for i in r1["ratchet"]["base_form_changed"])
-    assert r1["rollback_reason"].startswith(
-        "changed what an existing test pinned on the base")
-    assert r1["rolled_back"] is True
-    (row,) = w.st.data["round_rollbacks"]
-    assert "test_spends_the_whole_budget" in row["reason"]
-    assert not r2.get("rollback_reason")
-    assert r2["ratchet"]["base_form_changed"] == []
+    assert "rollback_reason" not in r1 and not r1.get("rolled_back")
+    assert "round_rollbacks" not in w.st.data
     assert _git(w.staging, "log", "--format=%s", f"{start}..HEAD") == \
-        "conformer: fix add"
-    assert (w.staging / "lib.py").read_text() == LIB
+        "conformer: bound the budget"
+    assert (w.staging / "lib.py").read_text() == SPENT
 
 
 # --- paths -----------------------------------------------------------------------
@@ -391,11 +396,13 @@ def test_a_runner_with_no_report_is_listed_not_run(leerie, tmp_path):
 
 # --- the delivery re-drive's group ------------------------------------------------
 
-def test_a_redrive_group_that_changes_pinned_behaviour_is_rolled_back(
+def test_a_redrive_group_that_changes_pinned_behaviour_is_kept_and_recorded(
         leerie, tmp_path, monkeypatch):
     """The re-drive's group goes through the same check (`_ratchet_exec(…,
     base_form=True)`); a group that fixed its case but changed what an
-    existing test pinned is reset, and its reason names the case. The
+    existing test pinned keeps the change on its record and is kept: base
+    form may not roll a round back (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*). The
     measurement is the real one above; here it answers for the World's
     JS-shaped tree, which its pytest cannot run."""
     from tests.test_delivery_redrive import World as RedriveWorld
@@ -416,6 +423,6 @@ def test_a_redrive_group_that_changes_pinned_behaviour_is_rolled_back(
     assert ge["fixed_cases"] and not ge["worse"]
     assert seen == [start]                      # measured against its start
     assert ge["base_form_changed"] == ["src/pin.test.ts :: pins the budget"]
-    assert ge["rolled_back"] is True
-    assert "pins the budget" in ge["rollback_reason"]
-    assert _git(w.staging, "rev-parse", "HEAD") == start
+    assert not ge.get("rolled_back") and "rollback_reason" not in ge
+    assert _git(w.staging, "rev-parse", "HEAD") != start
+    assert "FIXED" in w.a_text("HEAD")

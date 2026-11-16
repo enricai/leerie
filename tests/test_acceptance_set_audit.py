@@ -741,8 +741,15 @@ def test_a_broken_set_is_not_unfinished_work(leerie, tmp_path, monkeypatch):
             "failing_sets": 1, "total_sets": 1, "sets": [1], "cases": ["c"],
             "cases_by_set": {"1": ["c"]}}}}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert "1 held-out acceptance set(s) still fail" not in st.data[
+        "outcome_findings"]
     st.data["acceptance"]["sets"][0]["broken"] = False
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    # Reported, not vetoed (DESIGN §8 *A check vetoes `done` only when it is
+    # verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert "1 held-out acceptance set(s) still fail" in st.data[
+        "outcome_findings"]
 
 
 # --- M1/M2 and the harness section on a real JS tree --------------------------

@@ -272,4 +272,9 @@ def test_a_crashed_final_conformer_is_held_to_a_clean_tree(
     _phase5(leerie, run)                       # no stop: staging is clean
     assert st.data["test_id_diff"]["tree_sha"] == _git(
         staging, "rev-parse", "HEAD^{tree}")
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    # Reported, not vetoed (DESIGN §8 *A check vetoes `done` only when it is
+    # verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("half.py" in r for r in st.data["outcome_findings"]), \
+        st.data["outcome_findings"]

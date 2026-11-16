@@ -729,7 +729,9 @@ def test_e3_a_regression_the_budget_cut_short_is_still_new(
     on the final tree and passes on the base — and the next final rerun is
     cut by the budget. Before: `resource_affected`, no `new`, and the run
     `done`. The cut is not a run: the regression is `new` on the pair the
-    budget allowed, and the run is `unconverged`."""
+    budget allowed, and the run reports it (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
     st, staging = e3_repo["st"], e3_repo["staging"]
     stable = "tests/test_suite.py :: tests.test_suite.test_stable"
@@ -759,8 +761,9 @@ def test_e3_a_regression_the_budget_cut_short_is_still_new(
     assert v["pairs_run"] == 1 and v["budget_exhausted"] is True
     assert v["new"] == [stable] and v["budget_short"] == [stable]
     st.data["subtask_status"] = {}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("newly failing" in r for r in st.data["outcome_reasons"])
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("newly failing" in r for r in st.data["outcome_findings"])
 
 
 def test_e3_unknown_base_ids_leaves_the_axis_verdict_but_runs_discovery(

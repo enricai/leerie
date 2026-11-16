@@ -167,14 +167,24 @@ def _outcome(leerie, st, sets, res):
     return leerie._decide_outcome(st, any_commits=True)
 
 
+def _held_out_reported(leerie, st, sets, res) -> None:
+    """The held-out set is a reported finding of a `done` run, never a veto:
+    the held-out sets may not veto `done` (DESIGN §8 *A check vetoes `done`
+    only when it is verifiable, actionable and measured accurate*)."""
+    assert _outcome(leerie, st, sets, res) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("held-out" in r for r in st.data["outcome_findings"]), \
+        st.data["outcome_findings"]
+
+
 # --- the replay ------------------------------------------------------------
 
 def test_the_replay_shape_is_a_failure_not_unmeasured(leerie, tmp_path,
                                                       capsys):
     """First run fails on an assertion, confirm 1 fails, confirms 2 and 3
     pass — the exact sequence of `acceptance-gate-initial.log` set 1. Before:
-    `unmeasured: true` and outcome `done`. Now: failing, no vote, and the
-    run is `unconverged`."""
+    `unmeasured: true` and outcome `done` with nothing said. Now: failing,
+    no vote, and the run reports the failing set."""
     repo, own = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, own)
     marker = _Counter(st.run_dir, "runs")
@@ -189,7 +199,7 @@ def test_the_replay_shape_is_a_failure_not_unmeasured(leerie, tmp_path,
     assert marker.read_text() == "1"
     assert "B* acceptance" not in capsys.readouterr().out
     assert leerie._acceptance_any_fails([res]) is True
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
 
 
 @pytest.mark.parametrize("pattern", ["PF", "PPPF", "PPPPPPF"])
@@ -207,7 +217,7 @@ def test_a_first_run_that_passes_is_found_by_discovery(leerie, tmp_path,
     assert res["discovery"]["found"] == [REL]
     # Stopped at the first failure: exactly len(pattern) runs of the file.
     assert marker.read_text() == str(len(pattern))
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
 
 
 @pytest.mark.parametrize("seed_pattern", [
@@ -342,7 +352,7 @@ def test_a_held_case_failing_only_on_timeouts_is_intermittent(leerie,
     assert "resource_affected_files" not in res
     residual = leerie._acceptance_residual_of([res], [s_])
     assert residual["intermittent"] == [1]
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
 
 
 def test_a_held_case_failing_on_every_timeout_rerun_is_confirmed(leerie,
@@ -541,10 +551,10 @@ def test_a_vote_rerun_the_budget_cut_is_not_a_run_and_never_a_pass(
     assert res.get("budget_short_files") == [REL]
     assert "resource_affected_files" not in res
     assert leerie._acceptance_any_fails([res]) is True
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
 
 
-def test_an_always_failing_set_slower_than_its_reruns_is_unconverged(
+def test_an_always_failing_set_slower_than_its_reruns_is_reported(
         leerie, tmp_path, monkeypatch):
     """The review's driver (round 5 H1): each run costs 0.4 s and fails
     deterministically on a non-held case (an assertion, no resource
@@ -581,8 +591,7 @@ def test_an_always_failing_set_slower_than_its_reruns_is_unconverged(
     assert res["budget_short_files"] == [REL]
     assert res["failing_cases"] == {REL: [f"{REL}::test_b"]}
     assert leerie._acceptance_any_fails([res]) is True
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
-    assert any("held-out" in r for r in st.data["outcome_reasons"])
+    _held_out_reported(leerie, st, [s_], res)
 
 
 def test_a_budget_short_vote_that_saw_a_pass_stays_resource_affected(
@@ -666,7 +675,7 @@ def test_a_vote_file_seen_failing_only_by_a_timeout_is_unsettled_not_failing(
     assert res["unmeasured"] is True and res["passed"] is False
     assert res["budget_short_unsettled_files"] == [REL]
     assert leerie._acceptance_any_fails([res]) is False
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
 
 
 def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
@@ -698,7 +707,7 @@ def test_a_timeout_only_vote_file_is_named_in_the_pr(leerie, tmp_path,
         wt, [s_], "t"))
     assert res["unmeasured"] is True
     assert res["unmeasured_files"] == {REL: "timed_out"}
-    assert _outcome(leerie, st, [s_], res) == "unconverged"
+    _held_out_reported(leerie, st, [s_], res)
     body = leerie._format_pr_end_state_section(st.data)
     nhv = body.split("## Not verified by this run", 1)[1]
     line = next(x for x in nhv.splitlines() if "held-out set 1" in x)

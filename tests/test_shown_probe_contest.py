@@ -10,10 +10,12 @@ worker's quoted say-so, was used once in 14 samples. A quote check is no
 evidence (lane TB: 4 of 6 real weakenings passed it). So the conflict is
 measured: after a group handed a probe commits, the probe is re-run on the
 commit, and when it passes while a case an existing test pins fails, the
-group is rolled back and the probe recorded as contested, never driven
-again. A group whose probe still fails is zero progress, like a group that
-fixed no set case. A fixer's objection is kept as its words, never an
-exemption.
+probe is recorded as contested, never driven again, and the question put to
+a person. A group whose probe still fails is zero progress, like a group that
+fixed no set case. Neither rolls the group back: no check but the
+repository's merge checks may (DESIGN §8 *A check vetoes `done` only when it
+is verifiable, actionable and measured accurate*). A fixer's objection is
+kept as its words, never an exemption.
 
 Every test drives the real `_run_delivery_redrive` over a real git
 repository and a real pytest: the probe re-run in the held-out sandbox, the
@@ -301,49 +303,51 @@ def _groups(rec: dict) -> list[dict]:
             if not g.get("skipped")]
 
 
-def test_a_probe_that_conflicts_with_an_existing_test_is_contested(
+def test_a_probe_that_conflicts_with_an_existing_test_is_contested_and_kept(
         leerie, tmp_path, monkeypatch):
     """N3's shape: the fixer obeys the probe and breaks a case a test the
-    base had pins, in a file the run never changed."""
+    base had pins, in a file the run never changed. The conflict is
+    measured and recorded, the probe contested and never driven again, and
+    the question put to a person — but the group is kept: neither a new
+    failing test nor a base-form change may roll a round back (DESIGN §8
+    *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*). Its fix met the item."""
     w = World(leerie, tmp_path)
     w.edits = [lambda w: w.commit({"calc.py": HONEST})]
     rec = w.run(monkeypatch)
     [g] = _groups(rec)
     assert g["probes_after"] == {"0": "pass"}
-    assert g["rolled_back"] is True
-    assert _git(w.staging, "rev-parse", "HEAD") == w.head
+    assert not g.get("rolled_back") and "rollback_reason" not in g
+    assert any(PIN_ID in x for x in g["new_failures"])
+    assert _git(w.staging, "show", "HEAD:calc.py") == HONEST.rstrip("\n")
     [c] = rec["contested_probes"]
     assert c["item_index"] == 0 and c["probe_test_file"] == PROBE_REL
     assert (c["round"], c["group"]) == (1, 0)
     assert [t["file"] for t in c["tests"]] == [PIN_REL]
     assert PIN_ID in c["tests"][0]["id"]
     assert g["probe_conflict"]["items"] == [0]
-    assert ("making the falsifier probe(s) of item(s) [0] pass broke "
-            "case(s) existing tests pin: ") in g["rollback_reason"]
     # Never retried: two rounds were open, one implementer ran.
     assert len(w.calls) == 1
     assert "unrouted_items" not in rec
-    # Never dropped: the item stays unmet, the run is unconverged, and the
-    # conflict is named for a person.
-    assert [u["item_index"] for u in
-            w.st.data["delivery_gate"]["unmet_final"]] == [0]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    [line] = [r for r in w.st.data["outcome_reasons"]
-              if r.startswith("item 0: its falsifier probe")]
-    assert line.startswith(
-        f"item 0: its falsifier probe {PROBE_REL} conflicts with existing "
-        "tests — the re-drive change that made it pass (round 1, group 0) "
-        "broke 1 case(s) they pin: ")
-    assert PIN_ID in line and line.endswith(
-        "the change was rolled back and the probe is not driven again — a "
-        "person decides; the item stays unmet")
+    # The kept fix met the item; the run is done, and the conflict is the
+    # person's question in the PR.
+    assert w.st.data["delivery_gate"]["unmet_final"] == []
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    end = leerie._format_pr_end_state_section(w.st.data)
+    intent = end.split("## Intent decisions", 1)[1]
+    [line] = [x for x in intent.splitlines() if "(contradiction)" in x]
+    assert PIN_ID in line and line.endswith("**open**")
 
 
 def test_loosening_the_pinning_test_is_a_conflict_too(
         leerie, tmp_path, monkeypatch):
     """G4-shown-2's shape, made worse: the fixer also edits the existing
     test so its final form passes. Its base form, run against the commit,
-    still fails, so the conflict stands."""
+    still fails, so the conflict stands — recorded, and the group kept, as
+    a base-form change may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     w = World(leerie, tmp_path)
     w.edits = [lambda w: w.commit({"calc.py": HONEST,
                                    PIN_REL: PIN_LOOSENED})]
@@ -351,16 +355,20 @@ def test_loosening_the_pinning_test_is_a_conflict_too(
     [g] = _groups(rec)
     assert g["probes_after"] == {"0": "pass"}
     assert any(PIN_ID in x for x in g["base_form_changed"])
-    assert g["rolled_back"] is True
+    assert not g.get("rolled_back") and "rollback_reason" not in g
     [c] = rec["contested_probes"]
     assert [t["file"] for t in c["tests"]] == [PIN_REL]
     assert len(w.calls) == 1
+    assert _git(w.staging, "show", f"HEAD:{PIN_REL}") == \
+        PIN_LOOSENED.rstrip("\n")
 
 
 def test_a_probe_that_still_fails_is_zero_progress_and_stays_shown(
         leerie, tmp_path, monkeypatch):
-    """The commit breaks nothing and fixes nothing: before, a group handed
-    only a probe could never be zero progress, and this was kept."""
+    """The commit breaks nothing and fixes nothing: zero progress on the
+    group's record. It is kept, as a held-out verdict may not roll a round
+    back (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*), and the probe is shown again."""
     w = World(leerie, tmp_path)
     w.edits = [lambda w: w.commit({"calc.py": TIDIED}),
                lambda w: w.commit({"calc.py": TIDIED + "# again\n"})]
@@ -368,23 +376,25 @@ def test_a_probe_that_still_fails_is_zero_progress_and_stays_shown(
     g1, g2 = _groups(rec)
     for g in (g1, g2):
         assert g["probes_after"] == {"0": "fail"}
-        assert g["zero_progress"] is True and g["rolled_back"] is True
-        assert g["rollback_reason"] == (
-            "it fixed no failing case it could be measured on (a shown "
-            "falsifier probe counts as one)")
+        assert g["zero_progress"] is True and not g.get("rolled_back")
+        assert "rollback_reason" not in g
         assert not g.get("new_failures")
     assert rec["contested_probes"] == []
     # Still shown: the second round was handed the same probe.
     assert len(w.calls) == 2
     assert all(PROBE_REL in c["prompt"] for c in w.calls)
-    assert _git(w.staging, "rev-parse", "HEAD") == w.head
+    assert _git(w.staging, "show", "HEAD:calc.py") == TIDIED + "# again"
+    assert [u["item_index"] for u in
+            w.st.data["delivery_gate"]["unmet_final"]] == [0]
 
 
 def test_a_probe_still_failing_is_no_conflict_whatever_broke(
         leerie, tmp_path, monkeypatch):
     """The commit breaks the existing test and leaves the probe failing:
-    nothing measured says satisfying the probe breaks the test. Rolled back
-    as worse, and the probe goes to the next round."""
+    nothing measured says satisfying the probe breaks the test, so no
+    conflict. The new failure is on the group's record, and the group is
+    kept (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*); the probe goes to the next round."""
     w = World(leerie, tmp_path)
     product = "def add(a, b):\n    return a * b\n"
     w.edits = [lambda w: w.commit({"calc.py": product}),
@@ -393,7 +403,7 @@ def test_a_probe_still_failing_is_no_conflict_whatever_broke(
     g1 = _groups(rec)[0]
     assert g1["probes_after"] == {"0": "fail"}
     assert any(PIN_ID in x for x in g1["new_failures"])
-    assert g1["rolled_back"] is True and "probe_conflict" not in g1
+    assert not g1.get("rolled_back") and "probe_conflict" not in g1
     assert rec["contested_probes"] == []
     assert len(w.calls) == 2
 
@@ -401,18 +411,20 @@ def test_a_probe_still_failing_is_no_conflict_whatever_broke(
 def test_breaking_a_test_the_run_added_is_no_contest(
         leerie, tmp_path, monkeypatch):
     """A test the run itself added pins what the run wrote, not the
-    repository's behaviour: the group is rolled back as worse, and the
-    probe goes to the next round."""
+    repository's behaviour: no contest. The new failure is on the group's
+    record and the group is kept (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*); its fix met
+    the item, so no second round runs."""
     w = World(leerie, tmp_path, pin_added_by_run=True)
     w.edits = [lambda w: w.commit({"calc.py": HONEST}),
                lambda w: w.commit({"calc.py": HONEST + "# again\n"})]
     rec = w.run(monkeypatch)
-    g1 = _groups(rec)[0]
+    [g1] = _groups(rec)
     assert g1["probes_after"] == {"0": "pass"}
     assert any(PIN_ID in x for x in g1["new_failures"])
-    assert g1["rolled_back"] is True and "probe_conflict" not in g1
+    assert not g1.get("rolled_back") and "probe_conflict" not in g1
     assert rec["contested_probes"] == []
-    assert len(w.calls) == 2
+    assert len(w.calls) == 1
 
 
 def test_a_probe_made_to_pass_without_a_conflict_is_kept(
@@ -449,8 +461,11 @@ def test_a_fixer_objection_is_its_words_and_exempts_nothing(
             for o in rec["probe_objections"]] == [
         (0, PROBE_REL, "contradicts_task", 1),
         (0, PROBE_REL, "contradicts_task", 2)]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    lines = [r for r in w.st.data["outcome_reasons"]
+    # Reported, never a veto (DESIGN §8 *A check vetoes `done` only when it
+    # is verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    lines = [r for r in w.st.data["outcome_findings"]
              if "objected to its falsifier probe" in r]
     assert len(lines) == 2 and lines[0].endswith(
         "its own words, not verified by leerie; it exempts nothing")
@@ -458,32 +473,30 @@ def test_a_fixer_objection_is_its_words_and_exempts_nothing(
 
 def test_the_pr_shows_the_conflict_and_the_objection(
         leerie, tmp_path, monkeypatch):
-    """The consumer: the run ends, `_record_unmet_evidence` records what is
-    still unmet, and the PR's end-state section is rendered from it."""
+    """The consumer: the run ends and the PR's end-state section is
+    rendered. The conflicting change is kept (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*)
+    and met the item, so nothing is still failing; the conflict is the
+    open question the PR names, and the fixer's objection is on record."""
     w = World(leerie, tmp_path)
     objection = {"probe_test_file": PROBE_REL,
                  "kind": "breaks_existing_test",
                  "reason": "add(2, 2) is pinned to 0"}
     w.edits = [lambda w: w.commit({"calc.py": HONEST})]
     w.answers = [{"probe_objections": [objection]}]
-    w.run(monkeypatch)
-    leerie._decide_outcome(w.st, any_commits=True)
+    rec = w.run(monkeypatch)
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
     leerie._record_unmet_evidence(w.st)
     end = leerie._format_pr_end_state_section(w.st.data)
-    section = end.split("## Still failing when the run ended", 1)[1]
-    section = section.split("\n## ", 1)[0]
-    head = ("- The probe conflicts with existing tests: a re-drive change "
-            "that made it pass broke 1 case(s) they pin, so the change was "
-            "rolled back and the probe was not driven again. Decide which "
-            "is right: `")
-    assert head in section
-    tail = section.split(head, 1)[1].split("\n", 1)[0]
-    assert PIN_REL in tail and PIN_ID in tail
-    assert ("- A fixer's objection, in its own words (not verified by "
-            "leerie; it exempts nothing): breaks_existing_test: add(2, 2) "
-            "is pinned to 0") in section
-    # In the item's own entry, after its probe line.
-    assert section.index(f"### Item 0: `{PROBE_REL}`") < section.index(head)
+    assert "## Still failing when the run ended" not in end
+    assert "## Reported findings" not in end
+    intent = end.split("## Intent decisions", 1)[1]
+    [line] = [x for x in intent.splitlines() if "(contradiction)" in x]
+    assert PIN_ID in line and line.endswith("**open**")
+    [c] = rec["contested_probes"]
+    assert PIN_ID in c["tests"][0]["id"]
+    assert [(o["kind"], o["reason"]) for o in rec["probe_objections"]] == [
+        ("breaks_existing_test", "add(2, 2) is pinned to 0")]
 
 
 def _selfcheck(w, *args: str) -> subprocess.CompletedProcess:
@@ -555,7 +568,7 @@ def test_a_suite_probe_still_failing_is_measured_failing(
     rec = w.run(monkeypatch)
     for g in _groups(rec):
         assert g["probes_after"] == {"0": "fail"}
-        assert g["zero_progress"] is True and g["rolled_back"] is True
+        assert g["zero_progress"] is True and not g.get("rolled_back")
     assert len(w.calls) == 2
     # The `fail` is the suite's: every run of the probe on a commit went
     # through its command (the test command fails a spec it cannot load on
@@ -572,24 +585,21 @@ def test_a_suite_probe_still_failing_is_measured_failing(
 def test_a_suite_probe_that_conflicts_with_an_existing_test_is_contested(
         leerie, tmp_path, monkeypatch):
     """The conflict is measured through the suite too: the spec passes on
-    the commit while the existing test it breaks fails, so the group is
-    rolled back and the probe recorded contested; the PR names the suite's
-    own command for it."""
+    the commit while the existing test it breaks fails, so the probe is
+    recorded contested. The group is kept (DESIGN §8 *A check vetoes `done`
+    only when it is verifiable, actionable and measured accurate*), its
+    fix meets the item, and nothing is left unmet."""
     w = World(leerie, tmp_path, via_suite=True)
     w.edits = [lambda w: w.commit({"calc.py": HONEST})]
     rec = w.run(monkeypatch)
     [g] = _groups(rec)
     assert g["probes_after"] == {"0": "pass"}
-    assert g["rolled_back"] is True
+    assert not g.get("rolled_back") and "rollback_reason" not in g
     [c] = rec["contested_probes"]
     assert c["probe_test_file"] == SPEC_REL
     assert [t["file"] for t in c["tests"]] == [PIN_REL]
     assert len(w.calls) == 1
-    leerie._decide_outcome(w.st, any_commits=True)
-    leerie._record_unmet_evidence(w.st)
-    [e] = [x for x in w.st.data["unmet_evidence"]["entries"]
-           if x.get("kind") == "falsifier"]
-    assert e["cmd"] == f"{SUITE_RUNNER_REL} test --project=chromium {SPEC_REL}"
+    assert w.st.data["delivery_gate"]["unmet_final"] == []
 
 
 def test_a_suite_command_the_task_forbids_never_launches(

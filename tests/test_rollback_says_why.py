@@ -82,35 +82,56 @@ def test_a_group_voided_by_the_span_check_says_so_everywhere(
 
 
 def test_every_reason_a_group_can_be_rolled_back_for_is_named(leerie):
+    """Every condition that may roll a group back is named; a condition
+    whose check may not veto (`_check_vetoes`: held-out cases, new failing
+    tests, base form, required items) voids nothing and is not named
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     reason = leerie._redrive_rollback_reason
-    assert "fixed no failing case" in reason({"zero_progress": True})
-    assert "1 held-out control" in reason({"ctl_new": ["1:c"]})
-    got = reason({"new_failures": ["t::x"], "broke_cases": ["a", "b"]})
-    assert "t::x" in got and "broke 2 shown and 0 held-back" in got
+    fallback = reason({})
+    # Conditions of checks that may not veto: none of them is a reason.
+    for ge in ({"zero_progress": True}, {"ctl_new": ["1:c"]},
+               {"new_failures": ["t::x"], "broke_cases": ["a", "b"]},
+               {"ratchet_regressed": [3]}):
+        assert reason(ge) == fallback, ge
+    # Integrity and the merge checks still are, all of them, none hidden
+    # by the first.
     got = reason({"gate": {"void": True, "weakened": ["w.test.ts"]},
                   "ratchet_regressed": [3]})
-    assert "w.test.ts" in got and "[3]" in got
+    assert "w.test.ts" in got and "[3]" not in got
     assert "could not run" in reason({"gate": {"void": True, "ast": None}})
-    # Several conditions: all of them, none hidden by the first.
     got = reason({"committed_staged": ["p"], "zero_progress": True})
-    assert "p" in got and "fixed no failing case" in got
+    assert "p" in got and "fixed no failing case" not in got
+    got = reason({"committed_staged": ["p"], "ratchet": {
+        "merge_checks_broke": [{"id": "ci-lint"}]}})
+    assert "p" in got and "merge check(s) red" in got
     # `worse` from the held-back rule alone has no list of its own to read.
     assert "held-back" in reason({"worse": True})
 
 
-def test_a_zero_progress_group_says_why(leerie, tmp_path, monkeypatch):
+def test_a_zero_progress_group_is_kept_and_records_it(leerie, tmp_path,
+                                                      monkeypatch):
+    """Zero progress is a held-out verdict, which may not roll a group back
+    (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*): the group is kept, its record still
+    says it fixed nothing, and no rollback is listed."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     w.edits = [lambda w: w.write("export const a = 1; // nothing\n")]
     w.caps["subtask_redrive_rounds"] = 1
     w.run()
     ge = _group(w)
-    assert ge["rolled_back"] is True and ge["zero_progress"] is True
-    assert "fixed no failing case" in ge["rollback_reason"]
-    assert ge["rollback_reason"] in str(w.st.data["needs_human_verification"])
+    assert ge["zero_progress"] is True
+    assert not ge.get("rolled_back") and "rollback_reason" not in ge
+    assert "round_rollbacks" not in w.st.data
+    assert "nothing" in w.a_text("HEAD")
 
 
-def test_a_trade_names_the_control_it_broke(leerie, tmp_path, monkeypatch):
+def test_a_trade_is_kept_and_records_the_control_it_broke(leerie, tmp_path,
+                                                          monkeypatch):
+    """A broken held-out control may not roll a group back (DESIGN §8 *A
+    check vetoes `done` only when it is verifiable, actionable and measured
+    accurate*): the group is kept and its record names the control."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     w.edits = [lambda w: w.write("export const a = 1; // FIXED BROKE\n")]
@@ -118,7 +139,8 @@ def test_a_trade_names_the_control_it_broke(leerie, tmp_path, monkeypatch):
     w.run()
     ge = _group(w)
     assert ge["ctl_new"] == [f"1:{CONTROL}"]
-    assert "held-out control" in ge["rollback_reason"]
+    assert not ge.get("rolled_back") and "rollback_reason" not in ge
+    assert "FIXED BROKE" in w.a_text("HEAD")
 
 
 def test_a_kept_group_records_no_rollback(leerie, tmp_path, monkeypatch):

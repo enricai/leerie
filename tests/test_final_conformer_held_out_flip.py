@@ -1,5 +1,8 @@
-"""A final-conformer round that turns a passing held-out case failing is
-rolled back (DESIGN §8; lane FC, barnacle 39c4c5ad).
+"""A final-conformer round that turns a passing held-out case failing was
+rolled back (DESIGN §8; lane FC, barnacle 39c4c5ad). Held-out cases may no
+longer roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+verifiable, actionable and measured accurate*): the flip check does not run,
+and a flip decided before is still finished on resume.
 
 39c4c5ad's shape on real git, real pytest held-out sets and the real
 final-conformance pass and acceptance gate: on the integrated tree set 1
@@ -161,9 +164,13 @@ def _passing(results: list[dict]) -> list[int]:
     return [x["index"] for x in results if x.get("passed")]
 
 
-def test_replay_39c4c5ad_the_conformers_breaking_round_is_rolled_back(run):
-    """Round 0 breaks sets 2-5, round 1 commits on top. The gate rolls the
-    pass back to round 0's start and repairs only set 1 from there."""
+def test_replay_39c4c5ad_the_flip_check_does_not_run_and_the_round_is_kept(
+        run):
+    """Round 0 breaks sets 2-5, round 1 commits on top. The flip check does
+    not run: held-out cases may not roll a round back (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*). The gate measures the conformer's end, where all five sets
+    fail, and repairs from there."""
     staging = run["staging"]
     start = _git(staging, "rev-parse", "HEAD")
     heads = _final_conformer(run, [_break_add, _add_doc("NOTES.md")])
@@ -172,57 +179,54 @@ def test_replay_39c4c5ad_the_conformers_breaking_round_is_rolled_back(run):
     fin = run["st"].data["conformance"]["_final"]
     assert fin["round_starts"] == [start, heads[0]]
     assert fin["end_sha"] == end
+    c = run["leerie"]
+    evals: list[str] = []
+    real = c._evaluate_acceptance_sets
+
+    async def spy(st, caps, tree, sets, label, **kw):
+        evals.append(label)
+        return await real(st, caps, tree, sets, label, **kw)
+    run["monkeypatch"].setattr(c, "_evaluate_acceptance_sets", spy)
 
     calls = _gate(run, repair=_add_sub)
 
     gate = run["st"].data["acceptance"]["gate"]
-    flip = gate["conformer_flip"]
-    assert flip["start_sha"] == start and flip["end_sha"] == end
-    assert flip["culprit_round"] == 0 and flip["rollback_to"] == start
-    assert flip["rolled_back"] is True
-    # Every case of sets 2-5 passed on the start and fails on the end.
-    assert {b.split(":", 1)[0] for b in flip["broken_cases"]} == {
-        "2", "3", "4", "5"}
-    # The gate's pre-repair verdict is the start's: only set 1 fails there.
-    assert gate["initial_sha"] == start
-    assert _passing(gate["initial"]) == [2, 3, 4, 5]
-    # The repair then worked from the start and fixed set 1 alone.
+    assert "conformer_flip" not in gate
+    assert "conformer-start" not in evals
+    # The gate's pre-repair verdict is the conformer's end: every set fails.
+    assert gate["initial_sha"] == end
+    assert _passing(gate["initial"]) == []
+    # The repair worked from the end and fixed every set.
     assert len(calls) == 1
     assert _passing(gate["final"]) == [1, 2, 3, 4, 5]
     assert (staging / "calc.py").read_text() == WITH_SUB
-    # Round 1, built on the culprit, went with it.
-    assert not (staging / "NOTES.md").exists()
-    rows = run["st"].data["round_rollbacks"]
-    assert [(x["worker"], x["label"], x["reason"], x["pre_sha"])
-            for x in rows] == [("final conformer", "round 0",
-                                "broke previously passing held-out case(s)",
-                                start)]
+    # Round 1, built on round 0, stays.
+    assert (staging / "NOTES.md").exists()
+    assert "round_rollbacks" not in run["st"].data
 
 
-def test_a_conformer_that_broke_nothing_is_kept(run):
-    """Control: set 1 fails at the end, as on the start; nothing passing
-    on the start fails at the end, so the conformer's commit stands."""
+def test_a_conformer_that_broke_nothing_is_kept_and_no_flip_check_runs(run):
+    """Control: set 1 fails at the end, as on the start; the conformer's
+    commit stands, and no flip check is recorded."""
     staging = run["staging"]
-    start = _git(staging, "rev-parse", "HEAD")
     heads = _final_conformer(run, [_add_doc("NOTES.md")])
     _gate(run)
     gate = run["st"].data["acceptance"]["gate"]
-    assert gate["conformer_flip"] == {"start_sha": start, "end_sha": heads[-1],
-                                      "broken_cases": []}
+    assert "conformer_flip" not in gate
     assert gate["initial_sha"] == heads[-1]
     assert (staging / "NOTES.md").exists()
     assert "round_rollbacks" not in run["st"].data
 
 
-def test_the_culprit_is_the_round_that_broke_the_case(run):
-    """Round 0 is harmless and round 1 breaks `add`: only round 1 goes."""
+def test_no_culprit_round_is_sought(run):
+    """Round 0 is harmless and round 1 breaks `add`: no flip check, so no
+    round is named culprit and none goes; the repair fixes `add`."""
     staging = run["staging"]
-    start = _git(staging, "rev-parse", "HEAD")
     heads = _final_conformer(run, [_add_doc("NOTES.md"), _break_add])
     _gate(run, repair=_add_sub)
-    flip = run["st"].data["acceptance"]["gate"]["conformer_flip"]
-    assert flip["start_sha"] == start
-    assert flip["culprit_round"] == 1 and flip["rollback_to"] == heads[0]
+    gate = run["st"].data["acceptance"]["gate"]
+    assert "conformer_flip" not in gate
+    assert gate["initial_sha"] == heads[-1]
     assert (staging / "NOTES.md").exists()
     assert (staging / "calc.py").read_text() == WITH_SUB
 

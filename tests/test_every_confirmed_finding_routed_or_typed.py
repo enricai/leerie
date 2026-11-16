@@ -220,8 +220,11 @@ def test_a_process_item_confirmed_after_the_last_round_is_typed(
     assert rec["unrouted_items"] == [
         {"item_index": 0, "item": NO_REGRESSIONS,
          "reason": "after_last_round"}]
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
-    reasons = w.st.data["outcome_reasons"]
+    # Required items report, they do not veto (DESIGN §8 *A check vetoes
+    # `done` only when it is verifiable, actionable and measured accurate*).
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    reasons = w.st.data["outcome_findings"]
     assert any("item 0 (after_last_round)" in r for r in reasons)
     assert ("item 0's unmet evidence was confirmed on the tree that ships "
             "after the re-drive's last round, so no re-drive worker was "
@@ -257,10 +260,11 @@ def test_a_process_item_with_no_code_target_is_typed(
     assert rec["unrouted_items"] == [
         {"item_index": 0, "item": NO_REGRESSIONS,
          "reason": "no_code_target"}]
-    w.L._decide_outcome(w.st, any_commits=True)
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
     assert ("item 0 is a constraint over the whole change whose unmet "
             "evidence names no code a subtask changed, so no re-drive worker "
-            "could be handed it") in w.st.data["outcome_reasons"]
+            "could be handed it") in w.st.data["outcome_findings"]
 
 
 # === a driven item's later probe ============================================
@@ -299,8 +303,9 @@ def test_a_driven_items_unshown_later_probe_is_recorded(
     assert [x["probe"]["test_file"] for x in work] == [first]
     assert rec["items_driven"] == [0]
     assert rec["items_budget_skipped"] == [0]
-    w.L._decide_outcome(w.st, any_commits=True)
-    reasons = w.st.data["outcome_reasons"]
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    reasons = w.st.data["outcome_findings"]
     if same_probe:
         assert "unrouted_items" not in rec
         assert not any("unrouted_item" in r for r in reasons)

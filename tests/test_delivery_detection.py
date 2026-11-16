@@ -1848,9 +1848,13 @@ class TestRunDeliveryDetection:
         assert p0["allowed_tools"] == leerie.ACT_TOOLS and p0["autonomous"]
         # Every checkout is gone.
         assert not list((st.run_dir / "worktrees").glob("falsifier-*"))
-        # The outcome reads the final verdict.
-        assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-        assert "1 required item(s) still unmet" in st.data["outcome_reasons"]
+        # The outcome reads the final verdict: a reported finding, as the
+        # required items may not veto `done` (DESIGN §8 *A check vetoes
+        # `done` only when it is verifiable, actionable and measured
+        # accurate*).
+        assert leerie._decide_outcome(st, any_commits=True) == "done"
+        assert st.data["outcome_reasons"] == []
+        assert "1 required item(s) still unmet" in st.data["outcome_findings"]
 
     def test_a_confirmed_samples_evidence_carries_no_falsifier_text(
             self, leerie, tmp_path, monkeypatch):
@@ -2057,8 +2061,9 @@ class TestRunDeliveryDetection:
         assert [u["item_index"] for u in gate["unmet_final"]] == [0]
         assert [(r["item_index"], r["verdict"]) for r in gate["items"]] == [
             (0, "unmet"), (1, "external"), (2, "met"), (3, "met")]
-        assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-        assert "1 required item(s) still unmet" in st.data["outcome_reasons"]
+        assert leerie._decide_outcome(st, any_commits=True) == "done"
+        assert st.data["outcome_reasons"] == []
+        assert "1 required item(s) still unmet" in st.data["outcome_findings"]
 
     def test_a_stale_verdict_is_dropped_before_the_rerun(
             self, leerie, tmp_path, monkeypatch):
@@ -2182,11 +2187,16 @@ def test_outcome_prefers_unmet_final_over_unmet_after(leerie, tmp_path,
                                  "judged_after": {"tree": "T"},
                                  "unmet_final": [], "final_tree": "T"}}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert not any("required item" in r for r in st.data["outcome_findings"])
     st.data = {"delivery_gate": {"unmet_after": [],
                                  "judged_after": {"tree": "T"},
                                  "unmet_final": [
         {"item": "x", "by": ["falsifier"]}], "final_tree": "T"}}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    # Reported, not vetoed (DESIGN §8 *A check vetoes `done` only when it
+    # is verifiable, actionable and measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert "1 required item(s) still unmet" in st.data["outcome_findings"]
 
 
 def test_a_test_outcome_item_is_settled_in_code_never_re_driven(
@@ -2225,8 +2235,9 @@ def test_a_test_outcome_item_is_settled_in_code_never_re_driven(
     assert gate["unmet_final"] == []
     assert not [e for e in st.data["needs_human_verification"]
                 if e["source"] == "test_outcome"]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("newly failing" in r for r in st.data["outcome_reasons"])
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("newly failing" in r for r in st.data["outcome_findings"])
 
 
 def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
@@ -2270,7 +2281,11 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
            if e["source"] == "test_outcome"]
     assert len(gap) == 1
     assert cand in gap[0]["detail"] and item["item"] in gap[0]["detail"]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("could not be rerun on the base" in r
+               for r in st.data["outcome_findings"]), st.data[
+        "outcome_findings"]
     pr = leerie._format_pr_end_state_section(st.data)
     section = pr.split("## Not verified by this run", 1)[1]
     assert cand in section and "no rerun produced a verdict" in section
@@ -2334,7 +2349,11 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     gap = [e for e in st.data["needs_human_verification"]
            if e["source"] == "test_outcome"]
     assert len(gap) == 1 and item["item"] in gap[0]["detail"]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("could not be rerun on the base" in r
+               for r in st.data["outcome_findings"]), st.data[
+        "outcome_findings"]
     # Its met part is still protected by the delivery ratchet.
     assert 0 in leerie._ratchet_prior_met(st)
     # A re-drive recheck that holds the other part met keeps the part's

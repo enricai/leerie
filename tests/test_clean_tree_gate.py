@@ -197,14 +197,19 @@ def test_no_session_means_no_reask_and_no_worker_spent(leerie, tmp_path,
 
 # --- the outcome -----------------------------------------------------------
 
-def test_a_recorded_unclean_round_makes_the_run_unconverged(leerie,
-                                                            tmp_path):
+def test_a_recorded_unclean_round_is_a_reported_finding(leerie, tmp_path):
     st = leerie.State(tmp_path / "state", "run-c")
     st.data = {"subtask_status": {"s1": "complete"}}
     leerie._record_unclean_tree(st, "final conformer", "round 0",
                                 ["?? helpers.py"])
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    (reason,) = st.data["outcome_reasons"]
+    # Reported, not vetoed: the unclean round was rolled back, and the
+    # unclean-tree check may not veto `done` (DESIGN §8 *A check vetoes
+    # `done` only when it is verifiable, actionable and measured
+    # accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    (reason,) = [r for r in st.data["outcome_findings"]
+                 if "final conformer" in r]
     assert "final conformer" in reason and "?? helpers.py" in reason
     body = leerie._format_pr_end_state_section(st.data)
     assert "?? helpers.py" in body
@@ -254,12 +259,12 @@ def test_redrive_bash_made_file_is_committed_by_the_worker_on_reask(
     assert "unclean_trees" not in w.st.data
 
 
-def test_redrive_bash_made_file_left_uncommitted_ends_unconverged(
+def test_redrive_bash_made_file_left_uncommitted_is_rolled_back_and_reported(
         leerie, tmp_path, monkeypatch):
     """The same case when the implementer never commits it: the group is
     rolled back (its fix with it — HEAD could not import what staging
-    could), the lines are recorded, and the run is unconverged with them
-    named. Never dropped silently, never committed by leerie."""
+    could), the lines are recorded, and the run reports them as a finding.
+    Never dropped silently, never committed by leerie."""
     w, tdr = _world(leerie, tmp_path, monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
 
@@ -283,8 +288,9 @@ def test_redrive_bash_made_file_left_uncommitted_ends_unconverged(
     assert (row["worker"], row["label"]) == ("delivery re-drive", "r1g0")
     assert row["reason"] == ge["rollback_reason"]
     assert "src/helpers.ts" in row["reason"]
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
-    assert any("src/helpers.ts" in r for r in w.st.data["outcome_reasons"])
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    assert any("src/helpers.ts" in r for r in w.st.data["outcome_findings"])
 
 
 # --- the acceptance-repair conformer ----------------------------------------

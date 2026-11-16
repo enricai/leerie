@@ -576,7 +576,7 @@ def test_final_conformer_reasked_commits_and_round_completes(env,
     assert "unclean_trees" not in env["st"].data
 
 
-def test_final_conformer_left_dirty_is_rolled_back_and_unconverged(
+def test_final_conformer_left_dirty_is_rolled_back_and_reported(
         env, monkeypatch):
     c = env["leerie"]
     monkeypatch.setattr(c, "_log_session_id", lambda p: "sess-final")
@@ -605,7 +605,13 @@ def test_final_conformer_left_dirty_is_rolled_back_and_unconverged(
     assert (row["worker"], row["label"]) == ("final conformer", "round 0")
     assert row["pre_sha"] == before and "?? helper.py" in row["reason"]
     assert row["post_sha"] not in ("", before)
-    assert c._decide_outcome(env["st"], any_commits=True) == "unconverged"
+    # Rolled back, then reported: the unclean-tree check may not veto `done`
+    # (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    # actionable and measured accurate*).
+    assert c._decide_outcome(env["st"], any_commits=True) == "done"
+    assert env["st"].data["outcome_reasons"] == []
+    assert any("?? helper.py" in r
+               for r in env["st"].data["outcome_findings"])
 
 
 # --- clobbered owned files: strict mode rolls back and blocks --------------

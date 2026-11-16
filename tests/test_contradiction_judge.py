@@ -196,20 +196,25 @@ def test_an_exclusive_verdict_keeps_the_fix_and_the_test_update(
     (BOTH_CAN_HOLD, "both_can_hold"),
     ({**EXCLUSIVE, "same_input_by_meaning": False}, "unsettled"),
 ], ids=["both_can_hold", "exclusive_without_its_facts"])
-def test_a_verdict_that_is_not_exclusive_keeps_the_rollback(
+def test_a_verdict_that_is_not_exclusive_keeps_the_conflict_on_record(
         leerie, tmp_path, monkeypatch, verdict, status):
-    """Today's rule, unchanged: rolled back, the probe contested and never
-    handed on again, the case a base-form change."""
+    """The probe contested and never handed on again, the case a base-form
+    change on the group's record — but the group is kept: base form and
+    the contested probe may not roll a round back (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     w = Judged(leerie, tmp_path, [verdict])
     w.edits = [_fix_and_update_test]
     rec = w.run(monkeypatch)
     [g] = _groups(rec)
-    assert g["rolled_back"] is True and "task_required" not in g
+    assert not g.get("rolled_back") and "task_required" not in g
+    assert "rollback_reason" not in g
     assert any(PIN_ID in x for x in g["base_form_changed"])
     [c] = rec["contested_probes"]
     assert c["item_index"] == 0 and PIN_ID in c["tests"][0]["id"]
     assert [v["status"] for v in rec["contradiction_verdicts"]] == [status]
-    assert _git(w.staging, "rev-parse", "HEAD") == w.head
+    assert _git(w.staging, "rev-parse", "HEAD") != w.head
+    assert _git(w.staging, "show", "HEAD:calc.py") == HONEST.rstrip("\n")
     assert len(w.calls) == 1
     # Only an unsettled verdict is handed to the intent resolver; its `no`
     # leaves the rule.
@@ -274,15 +279,19 @@ def test_an_unsettled_verdict_nobody_settles_stops_and_asks(
     (QUOTE_NOT_FOUND, "pinned quote not found: assert add(2, 2) == 0.0"),
     (NOT_AN_ASSERTION, "no quote of an assertion of the pinned case"),
 ], ids=["quote_not_verbatim", "quote_not_an_assertion"])
-def test_an_unverified_exclusive_keeps_the_rollback(
+def test_an_unverified_exclusive_keeps_the_conflict_on_record(
         leerie, tmp_path, monkeypatch, verdict, failure):
     """The judge says exclusive with every fact true, but code cannot verify
-    its evidence: unsettled, and the conflict rule stands."""
+    its evidence: unsettled, and the conflict is recorded — the group kept,
+    as a conflict may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured
+    accurate*)."""
     w = Judged(leerie, tmp_path, [verdict])
     w.edits = [_fix_and_update_test]
     rec = w.run(monkeypatch)
     [g] = _groups(rec)
-    assert g["rolled_back"] is True and "task_required" not in g
+    assert not g.get("rolled_back") and "task_required" not in g
+    assert "rollback_reason" not in g
     [v] = rec["contradiction_verdicts"]
     assert v["status"] == "unsettled" and failure in v["failures"]
     assert len(rec["contested_probes"]) == 1
@@ -316,23 +325,20 @@ def test_the_judge_never_sees_the_rewrite(leerie, tmp_path, monkeypatch):
 @pytest.mark.usefixtures("pytest_facts")
 def test_a_task_required_case_left_failing_is_still_a_failure(
         leerie, tmp_path, monkeypatch):
-    """The first group fixes the code and leaves the pinned test as the base
-    had it, red: a new failure, so it is rolled back — but not contested,
-    and the next group is told the item contradicts the test. That group
-    updates the test and is kept on the verdict already recorded: one judge
-    call for both."""
+    """The group fixes the code and leaves the pinned test as the base had
+    it, red: a new failure on its record, not contested — and kept, as a
+    new failing test may not roll a round back (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*).
+    Its fix met the item, so no second group is driven."""
     w = Judged(leerie, tmp_path, [EXCLUSIVE])
     w.edits = [lambda w: w.commit({"calc.py": HONEST}), _fix_and_update_test]
     rec = w.run(monkeypatch)
-    g1, g2 = _groups(rec)
-    assert g1["rolled_back"] is True
+    [g1] = _groups(rec)
+    assert not g1.get("rolled_back") and "rollback_reason" not in g1
     assert any(PIN_ID in x for x in g1["new_failures"])
     assert "probe_conflict" not in g1 and rec["contested_probes"] == []
-    assert PIN_ID in w.calls[1]["prompt"]
-    assert ("required item 0 contradicts this existing test case"
-            in w.calls[1]["prompt"])
-    assert not g2.get("rolled_back"), g2.get("rollback_reason")
-    assert [x["item_index"] for x in g2["task_required"]] == [0]
+    assert len(w.calls) == 1
+    assert _git(w.staging, "show", "HEAD:calc.py") == HONEST.rstrip("\n")
     assert len(w.judged) == 1
     assert len(rec["contradiction_verdicts"]) == 1
 

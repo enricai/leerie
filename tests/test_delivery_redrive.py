@@ -843,8 +843,13 @@ def test_kept_fix_updates_the_final_verdict(leerie, tmp_path, monkeypatch):
     assert w.L._decide_outcome(w.st, any_commits=True) == "done"
 
 
-def test_worse_round_rolls_back_then_recurring_trade_is_a_conflict(
+def test_a_worse_round_is_kept_with_its_trade_recorded(
         leerie, tmp_path, monkeypatch):
+    """A group that fixes the defect and breaks a held-out control is worse
+    and a trade on its record — and kept: held-out cases may not roll a
+    round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*). No trade recurs, so no
+    conflict is recorded; the broken control is a reported finding."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
@@ -854,20 +859,20 @@ def test_worse_round_rolls_back_then_recurring_trade_is_a_conflict(
     w.edits = [trade, trade]
     w.run()
     rec = w.st.data["delivery_redrive"]
-    assert len(w.calls) == 2
-    # Every attempt was reset away.
-    assert _git(w.staging, "rev-parse", "HEAD") == start
+    assert _git(w.staging, "rev-parse", "HEAD") != start
+    assert "FIXED BROKE" in w.a_text("HEAD")
     g1 = rec["rounds"][0]["groups"][0]
-    assert g1["worse"] and g1["rolled_back"] and g1["trade"]
+    assert g1["members"] == ["s1"] and len(w.calls) == 3
+    assert g1["worse"] and g1["trade"] and not g1.get("rolled_back")
+    assert "rollback_reason" not in g1
     assert g1["ctl_new"] == [f"1:{CONTROL}"]
-    # Round 2 carries the broken control as a typed note.
+    # The later rounds carry the broken control as a typed note.
     assert '"kind": "control_regression"' in w.calls[1]["prompt"]
     assert CONTROL in w.calls[1]["prompt"].split("SELF-CHECK")[0]
-    assert rec["conflict"]["pairs"] == [[f"1:{DEFECT}", f"1:{CONTROL}"]]
-    reason = rec["conflict"]["reason"]
-    assert f"held-out set 1's {DEFECT}" in reason
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
-    assert reason in w.st.data["outcome_reasons"]
+    assert "conflict" not in rec
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_findings"] == [
+        "1 held-out acceptance set(s) still fail"]
 
 
 def test_items_go_to_every_claimer_process_items_never(
@@ -1167,10 +1172,12 @@ def test_run_phases_redrives_after_the_merge_checks(leerie):
     assert "delivery re-drive raised" in src[i_rd:i_fin]
 
 
-def test_a_group_that_fixes_no_failing_case_is_rolled_back(
+def test_a_group_that_fixes_no_failing_case_is_kept_and_recorded(
         leerie, tmp_path, monkeypatch):
     """Zero progress: a commit that measurably fixes none of the group's
-    failing cases is reset, even though nothing got worse."""
+    failing cases says so on its record, and is kept — held-out cases may
+    not roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*)."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     start = _git(w.staging, "rev-parse", "HEAD")
@@ -1185,10 +1192,11 @@ def test_a_group_that_fixes_no_failing_case_is_rolled_back(
     driven = [g for g in groups if "skipped" not in g]
     # Two rounds from the shared counter, then nothing left to spend.
     assert len(driven) == 2 and groups[-1]["skipped"] == "budget"
+    assert driven[0]["zero_progress"] and not driven[0]["worse"]
     for g in driven:
-        assert g["zero_progress"] and not g["worse"] and g["rolled_back"]
-    assert _git(w.staging, "rev-parse", "HEAD") == start
-    assert "fallback" not in w.a_text("HEAD")
+        assert not g.get("rolled_back") and "rollback_reason" not in g
+    assert _git(w.staging, "rev-parse", "HEAD") != start
+    assert "fallback" in w.a_text("HEAD")
 
 
 def test_fixing_one_case_of_a_still_failing_file_is_progress(
@@ -1247,8 +1255,9 @@ def test_residual_solution_defect_goes_to_its_file_owner_once(
     """Replay shape (barnacle 45fa4253 pass 1): the final conformance left one
     unfixed solution defect in src/b.ts after its last round. The re-drive
     hands it, typed, to the subtask whose integrated diff touches that file
-    (s2, not s1), drives it once, and the run settles `unconverged` with the
-    defect named — never a stop."""
+    (s2, not s1), drives it once, and the run reports the defect, named —
+    never a stop, and never a veto (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*)."""
     w = World(leerie, tmp_path, n_sets=0)
     w.st.data["conformance"] = {"_final": {
         "result": None, "warnings": [], "blocked": False,
@@ -1269,8 +1278,9 @@ def test_residual_solution_defect_goes_to_its_file_owner_once(
     assert rec["defects_driven"] == ["solution-defect-0"]
     assert rec["rounds"][0]["groups"][0]["no_change"] is True
     assert rec["done"]
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
-    reason = w.st.data["outcome_reasons"][-1]
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    reason = w.st.data["outcome_findings"][-1]
     assert reason.startswith("1 solution defect(s) the final conformance "
                              "left unfixed")
     assert "(1 of them driven by the delivery re-drive" in reason

@@ -92,7 +92,14 @@ def test_a_regression_in_a_longer_file_is_no_longer_sized_out(
     assert not v.get("sized_out")
     assert any("test_flake" in x for x in v["resource_affected"]
                + v["candidates"])
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    # The confirmed regression is reported, not vetoed (DESIGN §8 *A check
+    # vetoes `done` only when it is verifiable, actionable and measured
+    # accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("1 test(s) newly failing" in r
+               for r in st.data["outcome_findings"]), st.data[
+        "outcome_findings"]
 
 
 def test_the_budget_a_pass_leaves_goes_to_the_files_it_left_out(
@@ -136,7 +143,14 @@ def test_the_budget_a_pass_leaves_goes_to_the_files_it_left_out(
     assert [x.rsplit(".", 1)[-1] for x in v["new"]] == ["test_reg"]
     assert len(v["passes"]) == 2 and not v.get("sized_out")
     assert len(gates) == 1          # a later pass waits on no second gate
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    # The confirmed regression is reported, not vetoed (DESIGN §8 *A check
+    # vetoes `done` only when it is verifiable, actionable and measured
+    # accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("1 test(s) newly failing" in r
+               for r in st.data["outcome_findings"]), st.data[
+        "outcome_findings"]
 
 
 def _fake_confirm(used_per_pass: list[float]):

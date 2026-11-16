@@ -87,15 +87,19 @@ def _ship(leerie, tmp_path):
     return st, wt
 
 
-def test_a_verdict_of_an_earlier_tree_never_decides_done(leerie, tmp_path):
+def test_a_verdict_of_an_earlier_tree_never_reads_as_met(leerie, tmp_path):
     st, staging = _ship(leerie, tmp_path)
     earlier = _tree(staging)
     (staging / "a.py").write_text("x = 2\n")
     _git(staging, "commit", "-qam", "later repair")
     st.data["delivery_gate"] = {"unmet_after": [], "judged_after": {
         "sha": "x", "tree": earlier, "unmet": [], "details": []}}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    (reason,) = st.data["outcome_reasons"]
+    # Reported, not vetoed: the required items may not veto `done` (DESIGN
+    # §8 *A check vetoes `done` only when it is verifiable, actionable and
+    # measured accurate*).
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    (reason,) = st.data["outcome_findings"]
     assert "not read on the tree that ships" in reason
     assert earlier[:12] in reason and _tree(staging)[:12] in reason
 
@@ -105,9 +109,11 @@ def test_a_verdict_of_the_shipping_tree_decides(leerie, tmp_path):
     st.data["delivery_gate"] = {"unmet_final": [], "final_tree":
                                 _tree(staging)}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_findings"] == []
     st.data["delivery_gate"]["unmet_final"] = [{"item": "i"}]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert st.data["outcome_reasons"] == ["1 required item(s) still unmet"]
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert st.data["outcome_findings"] == ["1 required item(s) still unmet"]
 
 
 def test_final_detection_wins_over_an_older_pass(leerie, tmp_path):
@@ -118,11 +124,14 @@ def test_final_detection_wins_over_an_older_pass(leerie, tmp_path):
     st.data["delivery_gate"] = {
         "unmet_after": [], "judged_after": {"tree": ship},
         "unmet_final": [], "final_tree": "f" * 40}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    (stale,) = st.data["outcome_findings"]
+    assert "not read on the tree that ships" in stale
     st.data["delivery_gate"] = {
         "unmet_after": [{"item": "i"}], "judged_after": {"tree": "f" * 40},
         "unmet_final": [], "final_tree": ship}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_findings"] == []
 
 
 # --- M3 ---------------------------------------------------------------------
@@ -176,7 +185,10 @@ def test_an_unmeasured_execution_item_is_unverified_not_met(
     assert "the integration suite passes" in body
     w.st.data["subtask_status"] = {"s1": "complete", "s2": "complete"}
     w.st.data.pop("acceptance", None)
-    assert leerie._decide_outcome(w.st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
+    assert any("required item" in f for f in w.st.data["outcome_findings"]), \
+        w.st.data["outcome_findings"]
 
 
 def test_the_ratchet_derives_unverified_from_what_it_read(leerie, tmp_path,

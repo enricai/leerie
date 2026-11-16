@@ -55,8 +55,13 @@ def test_an_unclean_final_conformer_is_rolled_back_not_died_on(
             env["efforts"]))
         assert "final conformer:round 0" in env["st"].data["unclean_trees"]
         assert _porcelain(staging) == ""
-        assert leerie._decide_outcome(env["st"], any_commits=True) == \
-            "unconverged"
+        # Rolled back, then reported: the unclean-tree check may not veto
+        # `done` (DESIGN §8 *A check vetoes `done` only when it is
+        # verifiable, actionable and measured accurate*).
+        assert leerie._decide_outcome(env["st"], any_commits=True) == "done"
+        assert env["st"].data["outcome_reasons"] == []
+        assert any("final conformer" in r
+                   for r in env["st"].data["outcome_findings"])
     finally:
         ro = staging / "fixtures-ro"
         if ro.exists():

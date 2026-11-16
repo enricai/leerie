@@ -178,6 +178,9 @@ def test_residual_drops_variant_sets_at_read_time(leerie):
         old, [_set(1, BOUND_NONE), _set(2)])["sets"] == [2]
 
 
+_HELD = "1 held-out acceptance set(s) still fail"
+
+
 def _outcome_state(leerie, tmp_path, sets, final):
     st = mock.Mock()
     st.data = {"subtask_status": {"a": "complete"},
@@ -192,12 +195,20 @@ def test_decide_outcome_ignores_a_failing_variant_set(leerie, tmp_path,
     monkeypatch.setattr(leerie, "_write_run_json", lambda *a, **k: None)
     final = [{"index": 1, "passed": False, "unmeasured": False,
               "failing_files": ["t/d.test.ts"]}]
+    # A failing counted set is a reported finding, never a veto (DESIGN §8
+    # *A check vetoes `done` only when it is verifiable, actionable and
+    # measured accurate*); a failing variant set is not even that.
     st = _outcome_state(leerie, tmp_path, [_set(1, BOUND_NONE)], final)
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert _HELD not in st.data["outcome_findings"]
     st = _outcome_state(leerie, tmp_path, [_set(1, BOUND_ONE)], final)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert _HELD in st.data["outcome_findings"]
+    assert st.data["outcome_reasons"] == []
     st = _outcome_state(leerie, tmp_path, [_set(1)], final)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert _HELD in st.data["outcome_findings"]
+    assert st.data["outcome_reasons"] == []
 
 
 # --- per case, not per file (barnacle 7cc87f9a replay) ------------------------
@@ -233,17 +244,22 @@ def test_decide_outcome_reads_failing_cases_not_files(leerie, tmp_path,
                                                       monkeypatch):
     """The replay ended `unconverged` on a variant: its file also held a
     counted case. Per case, it is `done` with the variant left over — and
-    the same file failing on the counted case is still work."""
+    the same file failing on the counted case is still work, reported as a
+    finding (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*)."""
     monkeypatch.setattr(leerie, "_write_run_json", lambda *a, **k: None)
     variant = [{"index": 5, "passed": False, "unmeasured": False,
                 "failing_files": ["t/d.test.ts"],
                 "failing_cases": {"t/d.test.ts": ["no $"]}}]
     st = _outcome_state(leerie, tmp_path, [_set(5, BOUND_MIXED)], variant)
     assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert _HELD not in st.data["outcome_findings"]
     counted = [dict(variant[0], failing_cases={
         "t/d.test.ts": ["special chars"]})]
     st = _outcome_state(leerie, tmp_path, [_set(5, BOUND_MIXED)], counted)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert _HELD in st.data["outcome_findings"]
 
 
 def test_residual_is_read_per_case(leerie):

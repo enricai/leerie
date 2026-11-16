@@ -62,24 +62,33 @@ def _shipping(leerie, st) -> str:
     return leerie._shipping_tree(st)
 
 
+def _reported(leerie, st, phrase: str) -> None:
+    """The gap is a reported finding, not a veto: no check that measures
+    tests or held-out sets may veto `done` (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*),
+    so the run is `done` and the PR names what was not measured."""
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any(phrase in r for r in st.data["outcome_findings"]), \
+        st.data["outcome_findings"]
+
+
 def test_a_diff_of_the_tree_that_ships_is_done(leerie, st):
     st.data["test_id_diff"] = {"new": [], "tree_sha": _shipping(leerie, st)}
     assert leerie._decide_outcome(st, any_commits=True) == "done"
 
 
-def test_no_diff_at_all_is_not_done(leerie, st):
+def test_no_diff_at_all_is_reported(leerie, st):
     """The case the round measured: nothing measured, no diff recorded."""
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("not measured on the tree that ships" in r
-               for r in st.data["outcome_reasons"])
+    _reported(leerie, st, "not measured on the tree that ships")
 
 
-def test_a_diff_of_another_tree_is_not_done(leerie, st):
+def test_a_diff_of_another_tree_is_reported(leerie, st):
     st.data["test_id_diff"] = {"new": [], "tree_sha": "0" * 40}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    _reported(leerie, st, "not measured on the tree that ships")
 
 
-def test_a_failed_install_on_the_tree_that_ships_is_not_done(
+def test_a_failed_install_on_the_tree_that_ships_is_reported(
         leerie, st, monkeypatch):
     """Through the real refresh: the test axis on the tree that ships was
     measured without its dependencies, so the diff is not taken; the
@@ -102,9 +111,7 @@ def test_a_failed_install_on_the_tree_that_ships_is_not_done(
         log_path=st.run_dir / "logs" / "t.log", label="t", log_prefix="t"))
     gap = st.data["shipping_tests_gap"]
     assert gap["tree_sha"] == _shipping(leerie, st)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("dependency install failed" in r
-               for r in st.data["outcome_reasons"])
+    _reported(leerie, st, "dependency install failed")
 
 
 def test_a_test_command_the_task_forbids_is_its_own_gap(leerie, st):
@@ -114,15 +121,13 @@ def test_a_test_command_the_task_forbids_is_its_own_gap(leerie, st):
     assert leerie._decide_outcome(st, any_commits=True) == "done"
 
 
-def test_failing_tests_the_base_could_not_rerun_are_not_done(leerie, st):
+def test_failing_tests_the_base_could_not_rerun_are_reported(leerie, st):
     st.data["test_id_diff"] = {"new": [], "no_verdict": ["t::x"],
                                "tree_sha": _shipping(leerie, st)}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("could not be rerun on the base" in r
-               for r in st.data["outcome_reasons"])
+    _reported(leerie, st, "could not be rerun on the base")
 
 
-def test_an_unmeasured_held_out_set_is_not_done(leerie, st):
+def test_an_unmeasured_held_out_set_is_reported(leerie, st):
     st.data["test_id_diff"] = {"new": [], "tree_sha": _shipping(leerie, st)}
     st.data["acceptance"] = {
         "sets": [{"index": 0, "valid": True, "defect_files": ["t_a.py"],
@@ -130,8 +135,7 @@ def test_an_unmeasured_held_out_set_is_not_done(leerie, st):
         "gate": {"final": [{"index": 0, "passed": False, "unmeasured": True,
                             "unmeasured_reason": "deps_failed"}]}}
     assert leerie._acceptance_unmeasured_lines(st.data)
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert any("held-out" in r for r in st.data["outcome_reasons"])
+    _reported(leerie, st, "held-out")
 
 
 def test_a_repository_with_no_test_command_rests_on_no_test_run(

@@ -914,8 +914,10 @@ def test_phase_finalize_writes_the_end_state_after_the_outcome(
         leerie, monkeypatch, st):
     """DESIGN §6 *The PR's end-state section is rendered by code, from typed
     state*: phase_finalize renders the section AFTER `_decide_outcome`, so
-    an unconverged run's `pr_end_state` (the text the launcher's fallback
-    appends) already says why the PR is a draft."""
+    a run's `pr_end_state` (the text the launcher's fallback appends)
+    already says what it reported. An unconverged subtask is a reported
+    finding (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    actionable and measured accurate*), not a draft."""
     _finalize_ready_state(st)
     st.data["subtask_status"]["feat-002"] = "unconverged"
     st.data["unconverged_subtasks"] = {
@@ -929,9 +931,13 @@ def test_phase_finalize_writes_the_end_state_after_the_outcome(
         st.leerie_root, st, no_push=True, no_verify=False,
         caps=_caps(leerie), models={}, efforts={}))
     run_json = json.loads((st.run_dir / "run.json").read_text())
-    assert run_json["outcome"] == "unconverged"
+    assert run_json["outcome"] == "done"
+    assert st.data["outcome_reasons"] == []
+    assert "1 subtask(s) unconverged: feat-002" in st.data["outcome_findings"]
     end = run_json["pr_end_state"]
     assert end == leerie._format_pr_end_state_section(st.data)
-    assert end.startswith("\n## Unconverged\n\nThis PR is a draft")
-    assert "- 1 subtask(s) unconverged: feat-002" in end
+    assert "This PR is a draft" not in end
+    findings = end.split("\n## Reported findings\n\n", 1)[1]
+    assert findings.startswith("The checks that may veto `done` passed")
+    assert "- 1 subtask(s) unconverged: feat-002" in findings
     assert "- **feat-002**: re-drive budget spent on the parser" in end

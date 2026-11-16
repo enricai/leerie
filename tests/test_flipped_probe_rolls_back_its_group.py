@@ -1,6 +1,9 @@
 """A kept group that turns a met item's confirmed probe from passing to
-failing is rolled back (DESIGN §8 *A kept group that turns a met item's
-confirmed probe from passing to failing is rolled back*).
+failing was rolled back (DESIGN §8 *A kept group that turns a met item's
+confirmed probe from passing to failing is rolled back*). The required items
+may no longer roll a round back (DESIGN §8 *A check vetoes `done` only when it
+is verifiable, actionable and measured accurate*), so the flip check does not
+run in the re-drive; the item is reported unmet on the tree that ships.
 
 Live (barnacle 22a30525, leerie 0.58.0): re-drive round 1's group, sent for
 item 13 (clear the field before typing), deleted a guard in
@@ -38,51 +41,45 @@ def _prompts(r: Replay) -> list[str]:
             for c in r.calls if c["schema_key"] == "implementer"]
 
 
-def test_the_group_that_wrote_the_regression_is_rolled_back_and_redriven(
+def test_the_flip_check_does_not_run_and_the_group_that_wrote_the_regression_is_kept(
         leerie, tmp_path, monkeypatch):
     """The 22a30525 shape. Round 1's group fixes item 1 and undoes met item
-    0; the re-check after the last round confirms item 0's probe; the probe
-    passed on the group's start and fails on its commit under B*, so the
-    group is rolled back. Its member still has a round: it goes back to it
-    with the probe's case as a `control_regression` note, and the second
-    attempt, which keeps item 0, ships with both items met."""
+    0; the re-check after the last round confirms item 0's probe. The flip
+    check that would roll the group back does not run: the required items
+    may not roll a round back (DESIGN §8 *A check vetoes `done` only when
+    it is verifiable, actionable and measured accurate*). The group is
+    kept, and item 0 ships unmet on its confirmed probe — reported."""
     r = Replay(leerie, tmp_path, monkeypatch, judge_reads_tree=True,
                edit=[_fix_mul_undo_add, _fix_mul])
+    flips: list = []
+    real = leerie._redrive_probe_flips
+
+    async def spy(*a, **k):
+        flips.append(a)
+        return await real(*a, **k)
+    monkeypatch.setattr(leerie, "_redrive_probe_flips", spy)
     r.run()
+    assert flips == []
     rec = r.st.data["delivery_redrive"]
     g1 = rec["rounds"][0]["groups"][0]
-    assert g1["rolled_back"] is True
-    (flip,) = g1["flip_regressed"]
-    assert flip["item_index"] == 0 and flip["pre_sha"] == r.head
-    assert flip["b_star"]["new"] == [flip["case_id"]]
-    assert "from passing on its start to failing on its commit" in \
-        g1["rollback_reason"]
-    assert rec["flip_rollbacks"][0]["items"] == [0]
-    # The member is told what broke, by the probe's own case.
-    p1, p2 = _prompts(r)
-    assert "required item 0" not in p1
-    assert '"test": "required item 0"' in p2 and flip["case_id"] in p2
-    assert '"kind": "control_regression"' in p2
-    # Its second attempt is kept, and what ships has both items met.
-    g2 = rec["rounds"][1]["groups"][0]
-    assert not g2.get("rolled_back") and "flip_regressed" not in g2
+    assert not g1.get("rolled_back") and "flip_regressed" not in g1
+    assert "flip_rollbacks" not in rec
+    assert "required item 0" not in _prompts(r)[0]
     final = _git(r.staging, "rev-parse", "HEAD")
-    assert final == g2["post_sha"]
-    assert (r.staging / "calc.py").read_text() == FIXED_ADD + "\n\n" + \
-        FIXED_MUL
+    assert final == g1["post_sha"] != r.head
+    assert (r.staging / "calc.py").read_text() == (
+        "def add(a, b):\n    return a - b\n\n\n" + FIXED_MUL)
     gate = r.st.data["delivery_gate"]
-    assert gate["unmet_final"] == []
+    assert [u["item_index"] for u in gate["unmet_final"]] == [0]
     assert {x["item_index"]: x["verdict"] for x in gate["items"]} == {
-        0: "met", 1: "met"}
-    assert rec["final_sha"] == final
+        0: "unmet", 1: "met"}
 
 
-def test_with_no_round_left_the_regression_is_still_not_shipped(
+def test_with_no_round_left_the_flip_check_does_not_run_either(
         leerie, tmp_path, monkeypatch):
-    """The member has spent its rounds (22a30525's bugfix-004 had): the
-    group is rolled back all the same, and the run ships its start, where
-    item 1 is unmet as it was before the re-drive — an honest unmet, never
-    a regression it wrote."""
+    """The member has spent its rounds (22a30525's bugfix-004 had): no flip
+    check, no rollback, and what ships is the group's commit, item 0 unmet
+    on its confirmed probe and item 1 met."""
     r = Replay(leerie, tmp_path, monkeypatch, judge_reads_tree=True,
                edit=[_fix_mul_undo_add])
     r.caps["subtask_redrive_rounds"] = 1
@@ -90,15 +87,14 @@ def test_with_no_round_left_the_regression_is_still_not_shipped(
     rec = r.st.data["delivery_redrive"]
     assert len([c for c in r.calls if c["schema_key"] == "implementer"]) == 1
     g1 = rec["rounds"][0]["groups"][0]
-    assert g1["rolled_back"] is True and g1["flip_regressed"]
-    assert _git(r.staging, "rev-parse", "HEAD") == r.head
-    assert (r.staging / "calc.py").read_text() == FIXED_ADD + "\n\n" + \
-        BUGGY_MUL
+    assert not g1.get("rolled_back") and "flip_regressed" not in g1
+    assert _git(r.staging, "rev-parse", "HEAD") == g1["post_sha"] != r.head
     gate = r.st.data["delivery_gate"]
-    assert [u["item_index"] for u in gate["unmet_final"]] == [1]
-    row0 = next(x for x in gate["items"] if x["item_index"] == 0)
-    assert row0["verdict"] == "met"
-    assert [n["key"] for n in rec["pending_controls"]] == ["met-item-0"]
+    assert [u["item_index"] for u in gate["unmet_final"]] == [0]
+    row1 = next(x for x in gate["items"] if x["item_index"] == 1)
+    assert row1["verdict"] == "met"
+    assert "met-item-0" not in [n["key"] for n in
+                                rec.get("pending_controls") or []]
 
 
 def test_a_probe_failing_on_the_groups_start_too_is_a_verdict_only(
@@ -153,23 +149,27 @@ def test_a_start_where_the_probe_never_ran_is_not_a_pass(
             if u["item_index"] == 0] == [["falsifier"]]
 
 
-def test_the_flip_reads_the_probe_on_both_commits_under_b_star(
+def test_the_flip_check_does_not_run_but_reads_the_probe_on_both_commits_under_b_star(
         leerie, tmp_path, monkeypatch):
-    """`_redrive_probe_flips` on its own, over the real commits: pass on
-    the start and fail on the commit is a flip only through B*'s pairs; a
-    start where the probe fails is no flip and runs no pairs."""
+    """The re-drive runs no flip check (DESIGN §8 *A check vetoes `done`
+    only when it is verifiable, actionable and measured accurate*): the
+    group keeps no `flip_regressed`. `_redrive_probe_flips` on its own,
+    over the real commits and the confirmed probe the re-check recorded:
+    pass on the start and fail on the commit is a flip only through B*'s
+    pairs; a start where the probe fails is no flip and runs no pairs."""
     r = Replay(leerie, tmp_path, monkeypatch, edit=_fix_mul_undo_add)
     r.run()
     g = r.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
-    flip = g["flip_regressed"][0]
-    smp = leerie._redrive_flip_probe({"falsifier": {"samples": [{
-        "confirmed": True, "case_id": flip["case_id"],
-        "probe_saved": flip["probe_saved"]}]}})
+    assert "flip_regressed" not in g and not g.get("rolled_back")
+    row0 = next(x for x in r.st.data["delivery_gate"]["items"]
+                if x["item_index"] == 0)
+    smp = leerie._redrive_flip_probe(row0)
     assert smp is not None
     yes = asyncio.run(leerie._redrive_probe_flips(
         r.st, r.caps, smp, g["pre_sha"], g["post_sha"], label="t-yes"))
     assert (yes["pre"], yes["post"], yes["flip"]) == ("pass", "fail", True)
     assert yes["b_star"]["pairs_run"] == r.caps["confirm_pairs"]
+    assert yes["b_star"]["new"] == [smp["case_id"]]
     no = asyncio.run(leerie._redrive_probe_flips(
         r.st, r.caps, smp, g["post_sha"], g["post_sha"], label="t-no"))
     assert (no["pre"], no["post"], no["flip"]) == ("fail", "fail", False)

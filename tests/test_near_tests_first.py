@@ -327,11 +327,14 @@ def _gate_world(leerie, tmp_path):
     return st, staging, start
 
 
-def test_the_gate_rolls_back_a_round_on_its_near_tests_alone(
+def test_the_gate_finds_a_rounds_new_failure_on_its_near_tests_alone(
         leerie, tmp_path, monkeypatch):
     """a79384a4 round 1 through the real gate: fixed its held-out cases, broke
-    a test importing what it edited. Rolled back with that test named, no
-    closure of its tree, no discovery, and the next round starts clean."""
+    a test importing what it edited. The near tests find it, named on the
+    round's ratchet record, with no closure of its tree; the round is kept,
+    as a new failing test may not roll a round back (DESIGN §8 *A check
+    vetoes `done` only when it is verifiable, actionable and measured
+    accurate*), and its fix ends the repair."""
     st, staging, start = _gate_world(leerie, tmp_path)
     monkeypatch.setattr(leerie, "_host_cpu_psi", lambda *a, **k: 0.0)
 
@@ -359,31 +362,28 @@ def test_the_gate_rolls_back_a_round_on_its_near_tests_alone(
     asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, T.MODELS,
                                             T.EFFORTS))
     gate = st.data["acceptance"]["gate"]
-    r1, r2 = gate["rounds"]
+    (r1,) = gate["rounds"]
+    assert len(w.of("conformer")) == 1
     assert [i.split(" :: ")[0] for i in r1["ratchet"]["new_failures"]] == [
         "test_mul.py"]
-    assert r1["rolled_back"] is True
+    assert not r1.get("rolled_back") and "rollback_reason" not in r1
     assert r1["sha"] not in gate["test_ids"]
     # Its tree: the stage and B* on the one failing file, and nothing else.
     r1_runs = [c for lab, c in labels if lab.startswith("acceptance-r1")
                and "install" not in lab]
     assert r1_runs and not any("test_far" in c for c in r1_runs), r1_runs
-    # One round's worth of discovery: round 2's, which is a keeper.
-    assert len(discovery) == 1
-    # The keeper's closure ran what the stage left, once.
-    r2_runs = [c for lab, c in labels if lab.startswith("acceptance-r2-")
-               and "install" not in lab and "discovery" not in lab]
-    assert sum("test_mul" in c for c in r2_runs) == 1, r2_runs
-    assert sum("test_far" in c for c in r2_runs) == 1, r2_runs
-    assert r2["ratchet"]["new_failures"] == []
-    assert not r2.get("rollback_reason")
+    assert discovery == []
+    assert "return a + b" in (staging / "calc.py").read_text()
 
 
-def test_a_redrive_group_is_rolled_back_on_its_near_tests_naming_its_controls(
+def test_a_redrive_groups_near_tests_name_its_controls_and_the_group_is_kept(
         leerie, tmp_path, monkeypatch):
-    """The re-drive's call: the group's near tests reject it, the rollback goes
-    through the same path, the test goes to the controls for the next group,
-    and a control from an earlier group is near at any distance."""
+    """The re-drive's call: the group's near tests find a new failure, and a
+    control from an earlier group is near at any distance. The failure is
+    on the group's record; the group is kept, as a new failing test may not
+    roll a round back (DESIGN §8 *A check vetoes `done` only when it is
+    verifiable, actionable and measured accurate*), so no control is added
+    for a next group."""
     w = RD.World(leerie, tmp_path)
     w.install(monkeypatch)
     bad = "src/a.test.ts :: broke"
@@ -413,12 +413,14 @@ def test_a_redrive_group_is_rolled_back_on_its_near_tests_naming_its_controls(
     w.run()
     g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
     assert g["new_failures"] == [bad]
-    assert g["rolled_back"] is True
+    assert not g.get("rolled_back") and "rollback_reason" not in g
     assert closure == []
     assert seen[0]["named"] == [control]
     assert seen[0]["near_of"] == g["pre_sha"]
-    keys = {n["key"] for n in w.st.data["delivery_redrive"]["pending_controls"]}
-    assert bad in keys
+    keys = {n["key"] for n in
+            w.st.data["delivery_redrive"].get("pending_controls") or []}
+    assert bad not in keys
+    assert "FIXED" in w.a_text("HEAD")
 
 
 # --- The final conformer's real loop ----------------------------------------

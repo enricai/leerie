@@ -117,8 +117,8 @@ def test_the_diff_is_measured_again_on_the_tree_the_redrive_ships(
 def test_a_diff_that_cannot_be_measured_again_is_marked_stale(
         leerie, redriven, monkeypatch):
     """No test command on the shipping tree: the old diff is kept, marked
-    `stale_for_tree`. Its confirmed `new` still counts (unmet, outcome
-    `unconverged`), the reason saying it was confirmed on an earlier tree;
+    `stale_for_tree`. Its confirmed `new` still counts (unmet, a reported
+    finding of a `done` run), the reason saying it was confirmed on an earlier tree;
     with no `new`, the part reads unknown ("not of the final tree") —
     never met over a tree the diff never measured."""
     st, staging = redriven["st"], redriven["staging"]
@@ -133,8 +133,9 @@ def test_a_diff_that_cannot_be_measured_again_is_marked_stale(
         redriven["sha"], redriven["t1"])
     row = st.data["delivery_gate"]["items"][0]
     assert row["verdict"] == "unmet" and redriven["x"] in row["reason"]
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert "an earlier tree" in st.data["outcome_reasons"][0]
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert "an earlier tree" in st.data["outcome_findings"][0]
     # Detection's diff said "no regressions" instead: on the shipping tree
     # that reads unknown, never met.
     st.data["test_id_diff"] = {**st.data["test_id_diff"], "new": []}

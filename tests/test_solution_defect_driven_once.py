@@ -89,9 +89,12 @@ def test_a_defect_a_kept_group_drove_is_not_handed_to_the_next_group(
     assert g1["skipped"] == "nothing_left" and "pre_sha" not in g1
     assert w.st.data["redrive_rounds"] == {"s1": 1}
     assert rec["defects_driven"] == [KEY]
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
+    # Reported, not a veto (DESIGN §8 *A check vetoes `done` only when it
+    # is verifiable, actionable and measured accurate*).
+    assert w.L._decide_outcome(w.st, any_commits=True) == "done"
+    assert w.st.data["outcome_reasons"] == []
     assert "(1 of them driven by the delivery re-drive" in \
-        w.st.data["outcome_reasons"][-1]
+        w.st.data["outcome_findings"][-1]
 
 
 def test_the_next_group_is_driven_on_its_own_work_without_the_defect(
@@ -176,13 +179,14 @@ def test_two_owners_of_the_defect_file_drive_it_once_as_one_group(
     assert w.st.data["redrive_rounds"] == {"s1": 1, "s3": 1}
 
 
-def test_a_group_a_flip_rolls_back_leaves_its_defect_open(
+def test_with_the_flip_check_off_a_driven_defect_stays_closed(
         leerie, tmp_path, monkeypatch):
     # The 22a30525 shape (tests/test_flipped_probe_rolls_back_its_group.py)
     # with a residual defect in calc.py: round 1's group drives it and is
-    # kept, then rolled back after the last round for turning met item 0's
-    # probe failing. The defect is open again, and round 2's group, which
-    # is kept, is handed it.
+    # kept. The flip check that rolled it back after the last round does
+    # not run (DESIGN §8 *A check vetoes `done` only when it is verifiable,
+    # actionable and measured accurate*), so the group stays kept and the
+    # defect it drove stays closed: no later group is handed it.
     r = Replay(leerie, tmp_path, monkeypatch, judge_reads_tree=True,
                edit=[_fix_mul_undo_add, _fix_mul])
     r.st.data["conformance"] = _residual("calc.py:4")
@@ -190,13 +194,11 @@ def test_a_group_a_flip_rolls_back_leaves_its_defect_open(
     r.run()
     rec = r.st.data["delivery_redrive"]
     g1 = rec["rounds"][0]["groups"][0]
-    g2 = rec["rounds"][1]["groups"][0]
-    assert g1["rolled_back"] is True and g1["flip_regressed"]
+    assert not g1.get("rolled_back") and "flip_regressed" not in g1
     assert g1["defects_driven"] == [KEY]
-    p1, p2 = _prompts(r)
-    assert DEFECT_NOTE in p1 and CASE in p1
-    assert DEFECT_NOTE in p2 and CASE in p2
-    assert not g2.get("rolled_back") and g2["defects_driven"] == [KEY]
+    prompts = _prompts(r)
+    assert DEFECT_NOTE in prompts[0] and CASE in prompts[0]
+    assert not any(DEFECT_NOTE in p for p in prompts[1:])
     assert rec["defects_driven"] == [KEY]
 
 

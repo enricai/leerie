@@ -81,13 +81,22 @@ def test_clean_run(leerie, st, any_commits, expected):
      "not read on the tree that ships"),
 ])
 @pytest.mark.parametrize("any_commits", [True, False])
-def test_unfinished_work_is_unconverged_before_the_empty_branch_check(
+def test_unfinished_work_is_reported_and_never_no_work(
         leerie, st, extra, reason_word, any_commits):
+    """None of these checks may veto `done` (DESIGN §8 *A check vetoes
+    `done` only when it is verifiable, actionable and measured accurate*):
+    with commits the run is `done` and the failure a reported finding;
+    without, it is still consulted before the empty-branch check, so the
+    run is `unconverged`, never "no work required"."""
     st.data.update(_ship(st, extra))
-    assert leerie._decide_outcome(st, any_commits=any_commits) == "unconverged"
-    assert any(reason_word in r for r in st.data["outcome_reasons"]), \
-        st.data["outcome_reasons"]
-    assert _run_json(st)["outcome"] == "unconverged"
+    expected = "done" if any_commits else "unconverged"
+    assert leerie._decide_outcome(st, any_commits=any_commits) == expected
+    vetoes, findings = (st.data["outcome_reasons"],
+                        st.data["outcome_findings"])
+    shown = findings if any_commits else vetoes
+    assert any(reason_word in r for r in shown), (vetoes, findings)
+    assert (vetoes if any_commits else findings) == []
+    assert _run_json(st)["outcome"] == expected
 
 
 @pytest.mark.parametrize("extra", [
@@ -102,15 +111,17 @@ def test_resolved_signals_do_not_unconverge(leerie, st, extra):
     assert leerie._decide_outcome(st, any_commits=True) == "done"
 
 
-def test_an_unmeasured_held_out_set_is_not_done(leerie, st):
+def test_an_unmeasured_held_out_set_is_reported_not_passed(leerie, st):
     """No verdict is not a pass (DESIGN §6 *The run outcome is decided
-    once*, "`done` rests on measurements that ran"; it was `done` before
-    review round 19)."""
+    once*, "`done` rests on measurements that ran"): it is reported, as the
+    held-out sets may not veto `done` (DESIGN §8 *A check vetoes `done` only
+    when it is verifiable, actionable and measured accurate*)."""
     st.data.update(_ship(st, {"acceptance": {"gate": {"final": [
         {"index": 0, "passed": False, "unmeasured": True}]}}}))
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
     assert any("gave no verdict on the tree that ships" in r
-               for r in st.data["outcome_reasons"])
+               for r in st.data["outcome_findings"])
 
 
 def test_decide_outcome_is_the_only_writer_of_outcome():
@@ -159,15 +170,18 @@ def test_phase_finalize_normal_path_decides_with_commits(leerie):
     assert i < src.index('st.data["finished_at"] = now()')
 
 
-@pytest.mark.parametrize("statuses,expected", [
-    ({"feat-001": "complete"}, "done"),
-    ({"feat-001": "complete", "feat-002": "unconverged"}, "unconverged"),
+@pytest.mark.parametrize("statuses,expected,findings", [
+    ({"feat-001": "complete"}, "done", []),
+    ({"feat-001": "complete", "feat-002": "unconverged"}, "done",
+     ["1 subtask(s) unconverged: feat-002"]),
 ])
 def test_phase_finalize_records_the_outcome_in_run_json(
-        leerie, monkeypatch, tmp_path, statuses, expected):
-    """Executes the consumer: a branch with commits finalizes `done`, or
-    `unconverged` when a subtask did not converge — the run.json field the
-    host launcher reads to open a draft PR."""
+        leerie, monkeypatch, tmp_path, statuses, expected, findings):
+    """Executes the consumer: a branch with commits finalizes `done` — the
+    run.json field the host launcher reads to decide a draft PR — and a
+    subtask that did not converge is a reported finding, not a veto (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*)."""
     import asyncio
     import subprocess
 
@@ -196,17 +210,21 @@ def test_phase_finalize_records_the_outcome_in_run_json(
     finally:
         s.release_lock()
     assert s.data["outcome"] == expected
-    assert json.loads((s.run_dir / "run.json").read_text())["outcome"] \
-        == expected
+    assert s.data["outcome_reasons"] == []
+    assert s.data["outcome_findings"] == findings
+    rj = json.loads((s.run_dir / "run.json").read_text())
+    assert rj["outcome"] == expected
+    assert rj["findings"] == len(findings)
     assert s.data["finished_at"]
 
 
-def test_residual_solution_defects_are_unconverged(leerie, st):
+def test_residual_solution_defects_are_reported(leerie, st):
     st.data["conformance"] = {"_final": {"blocked": False, "residual_defects": [
         {"kind": "unhandled_path", "where": "src/x.ts:8",
          "concrete_case": "late results", "why_ships_a_defect": "w"}]}}
-    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert st.data["outcome_reasons"] == [
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    assert st.data["outcome_reasons"] == []
+    assert st.data["outcome_findings"] == [
         "1 solution defect(s) the final conformance left unfixed after its "
         "last round (0 of them driven by the delivery re-drive, none "
         "re-verified): [unhandled_path] src/x.ts:8: late results"]

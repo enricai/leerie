@@ -77,6 +77,16 @@ def _finish(leerie, st, sets, final):
     return outcome, leerie._format_pr_end_state_section(st.data)
 
 
+def _reported(leerie, st, outcome: str) -> None:
+    """A held-out set with no verdict is a reported finding of a `done` run:
+    the held-out sets may not veto `done` (DESIGN §8 *A check vetoes `done`
+    only when it is verifiable, actionable and measured accurate*)."""
+    assert outcome == "done"
+    assert st.data["outcome_reasons"] == []
+    assert any("held-out" in r for r in st.data["outcome_findings"]), \
+        st.data["outcome_findings"]
+
+
 def _nhv_line(body: str, needle: str) -> str:
     assert "## Not verified by this run" in body, body
     nhv = body.split("## Not verified by this run", 1)[1]
@@ -123,7 +133,7 @@ def test_a_first_run_resource_signature_every_rerun_cut(
     assert res["unmeasured"] is True and res["failing_files"] == []
     assert res["unmeasured_files"] == {REL: code}
     outcome, body = _finish(leerie, st, [s_], [res])
-    assert outcome == "unconverged"
+    _reported(leerie, st, outcome)
     line = _nhv_line(body, "held-out set 1")
     assert f"`{REL}` {words}" in line
 
@@ -282,7 +292,7 @@ def test_a_whole_set_cause_reaches_the_pr(leerie, tmp_path, code):
     res = {"index": 1, "passed": False, "unmeasured": True,
            "failing_files": [], "unmeasured_reason": code}
     outcome, body = _finish(leerie, st, [s_], [res])
-    assert outcome == "unconverged"
+    _reported(leerie, st, outcome)
     line = _nhv_line(body, "held-out set 1")
     assert leerie.ACCEPTANCE_UNMEASURED_WHY[code] in line
     assert f"`{REL}`" in line and f"`{CONTROL}`" in line
@@ -333,7 +343,7 @@ def test_a_remeasure_that_measured_nothing_is_marked_and_listed(
                                           "label": "redrive-final"}
     outcome, body = (leerie._decide_outcome(st, any_commits=True),
                      leerie._format_pr_end_state_section(st.data))
-    assert outcome == "unconverged"
+    _reported(leerie, st, outcome)
     line = _nhv_line(body, "re-measuring them on the final commit")
     assert "`bbbbbbbbbbbb`" in line and "`aaaaaaaaaaaa`" in line
     # A later re-measure that measures clears it.
