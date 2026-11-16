@@ -2785,6 +2785,42 @@ def test_a_repair_with_a_red_test_axis_runs_no_reset(
     assert "rolled_back" not in st.data["acceptance"]["gate"]
 
 
+@pytest.mark.parametrize("vetoes", [False, True], ids=["reports", "vetoes"])
+def test_the_whole_gate_rollback_is_decided_only_when_its_check_vetoes(
+        leerie, tmp_path, monkeypatch, vetoes):
+    """The whole-gate rollback is reached today only from a decision already
+    on disk (`test_resume_after_the_rollback_decision_finishes_the_reset`):
+    the table keeps new failing tests from vetoing, not dead code (DESIGN §8
+    *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*: the table is asked when a rollback is decided). The
+    same repair, its test axis turned red, is kept under today's table and
+    rolled back, the decision saved first, under one that lets new failing
+    tests veto."""
+    if vetoes:
+        monkeypatch.setattr(leerie, "OUTCOME_VETO_CHECKS", frozenset(
+            {"merge_checks", "new_failing_tests"}))
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": False, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    (rnd,) = gate["rounds"]
+    assert not rnd.get("rolled_back")
+    if vetoes:
+        assert gate["rolled_back"] is True
+        assert gate["rollback_reason"] == "turned the test axis red"
+        assert _git(staging, "rev-parse", "HEAD") == before
+        assert _no_cases(gate["final"]) == _failing(5)
+    else:
+        assert "rolled_back" not in gate
+        assert _git(staging, "rev-parse", "HEAD") == rnd["sha"] != before
+        assert all(r["passed"] for r in gate["final"])
+
+
 def test_an_errored_round_is_saved_and_the_round_before_still_counts(
         leerie, tmp_path, monkeypatch):
     """Round-4: an errored round is on disk as it settles, and a resume after
