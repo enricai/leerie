@@ -71866,13 +71866,14 @@ async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
     flipped item becomes a `met-item-<i>` note in
     `delivery_redrive.pending_controls`, and the sets, the shipping diff and
     detection are measured again on the restored commit — then the check
-    repeats over the rounds left. Advisory: never stops a run. Only when the
-    required items may veto `done` (DESIGN §8 *A check vetoes `done` only
-    when it is verifiable, actionable and measured accurate*): otherwise
-    the item is reported unmet on the tree that ships, and no round is
-    taken away for it."""
+    repeats over the rounds left. Advisory: never stops a run. A new
+    decision is made only when the required items may veto `done` (DESIGN
+    §8 *A check vetoes `done` only when it is verifiable, actionable and
+    measured accurate*): otherwise the item is reported unmet on the tree
+    that ships, and no round is taken away for it. A decision already on
+    disk is finished whatever the table says: its reset may have landed."""
     staging = (leerie_dir / "worktrees" / "staging").resolve()
-    if not staging.is_dir() or not _check_vetoes("required_items"):
+    if not staging.is_dir():
         return
     items = st.data.get("required_items") or []
     normalized = [_delivery_norm_item(it) for it in items]
@@ -71895,7 +71896,8 @@ async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
             kept = _acceptance_kept_rounds(gate)
             # Only detection's verdict of the tree that ships is tried, and
             # only once per commit (a resume reuses the answer).
-            if (not head or not kept or dg.get("final_sha") != head
+            if (not _check_vetoes("required_items") or not head or not kept
+                    or dg.get("final_sha") != head
                     or gate.get("item_flip_checked") == head):
                 return
             steps = [({"round": int(e.get("round") or 0)},

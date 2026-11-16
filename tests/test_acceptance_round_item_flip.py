@@ -369,13 +369,15 @@ def test_the_check_runs_once_per_detected_commit(
     assert seen == []
 
 
-def test_a_decided_flip_is_not_acted_on_while_the_check_is_off(
+def test_a_decided_flip_is_finished_by_a_resume(
         leerie, tmp_path, monkeypatch):
-    """A flip decision on disk from before (a run that crashed between the
-    decision and the reset): the check does not run while the required
-    items may not roll a round back (DESIGN §8 *A check vetoes `done` only
-    when it is verifiable, actionable and measured accurate*), so nothing
-    is measured, reset or noted — the round stays what ships."""
+    """A flip decision on disk from before (a run that decided it while the
+    required items could roll a round back, and crashed between the
+    decision and the reset) is finished, as every recorded rollback
+    decision is: its reset may already have landed, and the record must
+    say what staging holds (DESIGN §8 *A check vetoes `done` only when it
+    is verifiable, actionable and measured accurate*). Nothing new is
+    decided: the probe is not measured again."""
     r = Run(leerie, tmp_path, monkeypatch, repair=repair_breaking_add)
     r.finalize(flips=False)
     st = r.st
@@ -400,13 +402,21 @@ def test_a_decided_flip_is_not_acted_on_while_the_check_is_off(
     asyncio.run(leerie._acceptance_item_flips(
         st.run_dir, st, r.caps, MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
-    assert gate["item_flips"][0]["landed"] is None
-    assert not gate["rounds"][0].get("rolled_back")
-    assert "rollback_reason" not in gate["rounds"][0]
-    assert _git(r.staging, "rev-parse", "HEAD") == rnd["sha"]
-    assert st.data["delivery_gate"]["final_sha"] == rnd["sha"]
-    assert _unmet(st) == [0]
-    assert "pending_controls" not in (st.data.get("delivery_redrive") or {})
+    [flip] = gate["item_flips"]
+    assert flip["landed"] is True
+    assert gate["rounds"][0]["rolled_back"] is True
+    assert gate["rounds"][0]["rollback_reason"] == "decided before a crash"
+    assert gate["rounds"][0]["flip_regressed"] == [culprit]
+    assert _git(r.staging, "rev-parse", "HEAD") == r.head
+    assert (r.staging / "calc.py").read_text() == FIXED_ADD
+    # The tree that ships was measured again: detection reads the restored
+    # commit, where the probe passes.
+    assert st.data["delivery_gate"]["final_sha"] == r.head
+    assert _unmet(st) == []
+    assert "met-item-0" in [
+        n["key"] for n in st.data["delivery_redrive"]["pending_controls"]]
+    # No new decision follows: the check itself stays off.
+    assert "item_flip_checked" not in gate
 
 
 def test_kept_rounds_are_the_committed_ones_still_in_history(leerie):

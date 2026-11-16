@@ -13050,7 +13050,12 @@ rolled back; one that broke a held-out case, made no measured progress,
 changed a base-form case, contested a probe, newly failed a test or turned
 a met item unmet is kept, and what it did is recorded on its record for the
 PR. The flip checks (a probe or held-out case that passed at a round's
-start and fails at its end) report and no longer roll back. Unchanged,
+start and fails at its end) report and no longer roll back. The table is
+asked when a rollback is *decided*. Every rollback decision is saved
+before its reset, so that a crash between them resumes into the reset; a
+decision already on disk is finished by the resume whatever the table says
+then, as its reset may have landed and the record must say what staging
+holds. Unchanged,
 because they are not checks of `done`: the integrity guards that keep a
 worker from touching the evidence (a held-out set's source in history; a
 weakened test, schema or AST hit under escalation), and a worker's own

@@ -10177,7 +10177,11 @@ case", "broke previously passing held-out case(s)": `held_out`) and its
 whole-gate rollback (the test axis turned red: `new_failing_tests`; the
 sets left unmeasurable: `held_out`); `_conformer_flip_check`, run only when
 `held_out` vetoes; `_acceptance_item_flips` and the delivery re-drive's
-flip culprits, only when `required_items` vetoes; and the re-drive group's
+flip culprits, only when `required_items` vetoes (each decides a new
+rollback only then; a decision already on disk — the gate's
+`conformer_flip` with `rolled_back` None, a round's `rollback_reason`
+without `rolled_back`, `gate.rolled_back`, an `item_flips[-1]` with
+`landed` None — is finished first, whatever `_check_vetoes` says); and the re-drive group's
 rollback, which is `void` — a held-out source committed
 (`committed_staged`), the escalation gate's `void`, or a failed check that
 vetoes, from `{held_out: broke_cases, held_broke_cases, held_broke,
@@ -10974,9 +10978,9 @@ passing to failing is rolled back*. `_run_phases` calls
 proceeds). `_acceptance_kept_rounds(gate) -> list[dict]` is every
 `gate.rounds` entry kept by `_acceptance_round_kept` with `pre_sha`,
 `results` and a `sha` other than `pre_sha`, in order — none when
-`gate.rolled_back`. The check runs only when there is one, when
-`delivery_gate.final_sha` is staging's HEAD, and when
-`gate.item_flip_checked` is not that HEAD. Each `delivery_gate.items` row
+`gate.rolled_back`. The check runs only when `_check_vetoes(
+"required_items")`, when there is one, when `delivery_gate.final_sha` is
+staging's HEAD, and when `gate.item_flip_checked` is not that HEAD. Each `delivery_gate.items` row
 with `verdict: "unmet"` and a sample `_redrive_flip_probe(row)` returns
 goes to `_probe_flip_culprit(st, caps, steps, i, smp, where=) -> dict |
 None`, the culprit search `_redrive_flip_culprit` also calls, over `steps
@@ -11002,7 +11006,8 @@ same save. Then `_acceptance_remeasure_final(…, rollback_to,
 "gate-item-flip")` over every set, `_refresh_shipping_test_id_diff(label=
 "test-id-diff-item-flip")` and `_run_delivery_detection`, and the check
 loops. On entry, an `item_flips` entry with `landed: None` is reset first
-(no probe runs), then finished as above.
+(no probe runs), then finished as above, whatever `_check_vetoes` says: the
+table gates a new decision, never one already on disk.
 
 ### Delivery ratchet — `_delivery_ratchet`
 
