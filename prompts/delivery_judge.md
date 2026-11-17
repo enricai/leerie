@@ -58,6 +58,26 @@ positions in your list). Items that only a person can confirm (a PR
 description, a deploy) and items that only require some paths to stay
 unchanged are settled elsewhere and never reach you.
 
+## Each item's checklist
+
+An item entry may carry a numbered `checklist`: the item's declared
+parts and, after them, the **members** of a set one of those parts
+covers (an entry with `member_of` names one place of that set — a file,
+or a line of one — that a search of this tree found). Answer **every**
+entry: give each one at least one part whose `checklist_index` is that
+entry's number, and use `checklist_index: -1` only for an extra part
+you add. Do not merge entries into one part or narrow an entry to what
+is easy to check: an entry you leave unanswered means the item was not
+judged.
+
+- A member is `met` when the set's requirement is satisfied there, or
+  when it does not reach that place — a line no user ever sees, a test
+  fixture, a format string — with a cite of the line that shows why.
+  A member where the requirement is not satisfied is `unmet`.
+- An entry this tree cannot decide — the wording of a pull request,
+  how the run was carried out, what someone will do later — is
+  `not_inspected`, never `met`: say in `requirement` what it would take.
+
 ## Verdict bias
 
 `met: true` **only** with cited on-tree evidence. When an item is
@@ -82,8 +102,11 @@ Per item:
   behaviour gets its own part. An item that names "every reader" has
   one part per reader you find (find them with `grep`); an item that
   names two locales has a part per locale. For each part:
+  - `checklist_index`: the number of the checklist entry this part
+    answers, or `-1` (see *Each item's checklist*).
   - `status`: `"met"`, `"unmet"`, or `"not_inspected"` (you did not
-    open the artifact that decides it — say so here, not in prose).
+    open the artifact that decides it, or this tree cannot decide it —
+    say so here, not in prose).
   - `kind`: `"test_outcome"` when the part is only that the
     repository's existing tests do not newly fail ("no regressions",
     "existing tests still pass", "don't break the X tests") — an item's
@@ -112,8 +135,9 @@ Per item:
     `path: "ABSENT:<pathspec>"` (a git pathspec such as `ABSENT:src/` or
     `ABSENT:*.ts`); the orchestrator then runs
     `git grep -E <quote> HEAD -- <pathspec>`.
-- `met: true` **only** when every part is `"met"` and every met part
-  carries at least one citation. A `"behavioral"` met part cites the
+- `met: true` **only** when every checklist entry is answered, every
+  part is `"met"` and every met part carries at least one citation of
+  its own. A `"behavioral"` met part cites the
   production line that sets or decides the behaviour on the code path
   the requirement names (not only a test); also cite the test line that
   asserts it when one exists. A missing test makes a part `"unmet"` only
@@ -129,8 +153,9 @@ Per item:
 What the code does with this: a `met` whose parts are not all `met`, or
 whose every part does not carry a citation found in that file on `HEAD`
 (after whitespace normalisation), is **rejected** and counted as an
-unmet vote. So never cite from memory: open the file (`Read` shows line
-numbers) and copy the lines.
+unmet vote; an item with a checklist entry no part answers, or one
+`not_inspected`, is not judged and is asked again. So never cite from
+memory: open the file (`Read` shows line numbers) and copy the lines.
 
 Example:
 
@@ -140,7 +165,7 @@ Example:
     {"item_index": 0, "met": true,
      "parts": [
        {"requirement": "check rejects an empty name", "kind": "behavioral",
-        "status": "met",
+        "checklist_index": 0, "status": "met",
         "cites": [
           {"path": "src/example_module.py", "line_start": 42, "line_end": 43,
            "quote": "if not name:\n        raise ValueError(\"empty name\")"},
@@ -150,7 +175,7 @@ Example:
     {"item_index": 1, "met": false,
      "parts": [
        {"requirement": "no occurrence of the forbidden term", "kind": "static",
-        "status": "unmet",
+        "checklist_index": 0, "status": "unmet",
         "cites": [{"path": "tests/fixtures/sample.json", "line_start": 3,
                    "line_end": 3, "quote": "\"vendor\": \"forbidden-term\""}]}],
      "evidence": "grep found the term in a fixture"}

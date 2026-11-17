@@ -389,6 +389,8 @@ def test_digest_failure_degrades_to_items_only_judging(
     calls: list[dict] = []
 
     async def fake_claude_p(**kwargs):
+        if kwargs["schema_key"] == "delivery_enumerator":
+            return {"sets": []}         # the item quantifies over no set
         calls.append(kwargs)
         return {"verdicts": [_judge_verdict(0, True, "ok")]}
 

@@ -273,6 +273,10 @@ def test_judgment_workers_pinned_set(leerie):
         # Verifies the integrated staging tree against required_items at
         # finalize (DESIGN §8 *The delivery gate*).
         "delivery_judge",
+        # Lists the members of a set a judged item quantifies over before
+        # the delivery judge reads it (DESIGN §8 *An item is judged on its
+        # declared parts*), at the judge's own tier.
+        "delivery_enumerator",
         # Pre-planning defect-shape site enumeration on defect-fix tasks
         # (DESIGN §5 *Defect-scope audit*).
         "defect_scope_auditor",

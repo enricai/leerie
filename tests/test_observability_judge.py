@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from pathlib import Path
 
+from tests.stub_helpers import _prompt_checklists
 from tests.test_delivery_detection import (EFFORTS, MODELS, _detection_env,
                                            _demonstrate)
 
@@ -130,17 +130,22 @@ def _stub(leerie, monkeypatch, *, obs, falsify_i0=False):
     async def fake(**kw):
         calls.append(kw)
         key = kw["schema_key"]
+        if key == "delivery_enumerator":
+            return {"sets": []}             # no item quantifies over a set
         if key == "delivery_judge":
-            asked = sorted({int(x) for x in re.findall(
-                r'"item_index": (\d+)', kw["user_prompt"])})
+            # One part per checklist entry (DESIGN §8 *An item is judged on
+            # its declared parts*).
             return {"verdicts": [{
                 "item_index": i, "met": True, "evidence": "read",
                 "parts": [{"requirement": "r", "kind": "static",
-                           "status": "met", "cites": [{
+                           "status": "met", "checklist_index": j,
+                           "cites": [{
                                "path": "calc.py", "line_start": 1,
                                "line_end": 1,
-                               "quote": "def add(a, b):"}]}]}
-                for i in asked]}
+                               "quote": "def add(a, b):"}]}
+                          for j in entries]}
+                for i, entries in sorted(
+                    _prompt_checklists(kw["user_prompt"]).items())]}
         if key == "observability_judge":
             n = sum(1 for c in calls if c["schema_key"] == key) - 1
             return obs(n, kw)

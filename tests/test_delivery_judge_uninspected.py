@@ -66,10 +66,15 @@ def _asked(prompt: str) -> list[int]:
 
 def _judge(leerie, monkeypatch, respond):
     """Stub claude_p: `respond(indices, sid)` returns the verdict list for a
-    prompt asking `indices`; every call is recorded."""
+    prompt asking `indices`; every judge call is recorded. Each pack's
+    `delivery_enumerator` lists no set (DESIGN §8 *… a set it quantifies
+    over is listed before it is judged*), so an item's checklist is its own
+    text, which `_judge_verdict`'s part answers."""
     calls: list[dict] = []
 
     async def fake(**kw):
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         assert kw["schema_key"] == "delivery_judge"
         idx = _asked(kw["user_prompt"])
         calls.append({"sid": kw["sid"], "indices": idx,

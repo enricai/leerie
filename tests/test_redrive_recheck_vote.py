@@ -25,7 +25,9 @@ def _judge(leerie, tmp_path, monkeypatch, samples, **kw):
     st = leerie.State(tmp_path / "s", "r")
     st.data = {"task": "t", "worker_count": 0}
 
-    async def fake_claude_p(**_kw):
+    async def fake_claude_p(**kw):
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}         # the item quantifies over no set
         return samples.pop(0)
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     unmet, n, _ = asyncio.run(leerie._delivery_judge_unmet(

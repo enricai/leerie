@@ -204,6 +204,8 @@ class TestGate:
         calls: list[dict] = []
 
         async def fake_claude_p(**kw):
+            if kw["schema_key"] == "delivery_enumerator":
+                return {"sets": []}         # the item quantifies over no set
             calls.append(kw)
             return {"verdicts": [_judge_verdict(0, True, "ok")]}
         monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
@@ -211,6 +213,7 @@ class TestGate:
         unmet, n, _c = asyncio.run(leerie._delivery_judge_unmet(
             "task", items, tree, st, dict(leerie.DEFAULT_CAPS), MODELS,
             EFFORTS, phase_label="final", routing=routing))
+        assert {c["schema_key"] for c in calls} == {"delivery_judge"}
         entries = json.loads(
             calls[0]["user_prompt"].split("):\n", 1)[1].split("\n(These")[0])
         assert [e["item_index"] for e in entries] == [0]

@@ -34,7 +34,8 @@ from unittest import mock
 import pytest
 
 from tests.stub_helpers import (DELIVERY_CITED_FILE, DELIVERY_CITED_LINE,
-                                _delivery_tree, _judge_verdict)
+                                _delivery_tree, _judge_verdict,
+                                _prompt_checklists)
 from tests.conftest import (fake_run_dir, register_worker_transcript,
                              transcript_path)
 from tests.conftest import run_git_out  # noqa: E402
@@ -322,6 +323,9 @@ class TestJudgeScreen:
         calls = []
 
         async def fake_claude_p(**kw):
+            # The pack's enumerator runs first and lists no set here.
+            if kw["schema_key"] == "delivery_enumerator":
+                return {"sets": []}
             calls.append(kw)
             return samples.pop(0)
         monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
@@ -520,6 +524,8 @@ def test_the_judge_payload_carries_the_orchestrator_results(
 
     async def fake_claude_p(**kw):
         calls.append(kw)
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         v = _judge_verdict(0, True)
         v["parts"][0]["cites"] = [{"path": "RECORD", "line_start": 0,
                                    "line_end": 0,
@@ -529,10 +535,12 @@ def test_the_judge_payload_carries_the_orchestrator_results(
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS))
     # The RECORD citation verified against the orchestrator's own line, so
-    # the clean first pass cost one sample.
-    assert unmet == [] and len(calls) == 1
+    # the clean first pass cost one sample, after the pack's one
+    # enumerator call.
+    assert unmet == [] and [c["schema_key"] for c in calls] == [
+        "delivery_enumerator", "delivery_judge"]
     assert ("[orchestrator final-tree tests] $ pytest -q"
-            in calls[0]["user_prompt"])
+            in calls[1]["user_prompt"])
     gate = st.data["delivery_gate"]
     assert gate["judged_before"]["sha"] == _git(
         run_dir / "worktrees" / "staging", "rev-parse", "HEAD")
@@ -1749,23 +1757,28 @@ def _falsifier_stub(leerie, monkeypatch, st, behave):
     """Stub claude_p: a falsifier call runs `behave(kw, n)` (n = how many
     falsifier calls so far) in its own cwd and returns its result; a judge
     call is recorded and answered all-met — one verdict per item it is
-    asked, citing the base tree's `calc.py` (an omitted item is re-asked,
-    not met: DESIGN §8 *Every item is judged before its vote counts*)."""
+    asked, one part per checklist entry, citing the base tree's `calc.py`
+    (an omitted item or entry is re-asked, not met: DESIGN §8 *Every item
+    is judged before its vote counts*, *An item is judged on its declared
+    parts*); the pack's enumerator lists no set."""
     calls: list[dict] = []
 
     async def fake_claude_p(**kw):
         calls.append(kw)
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         if kw["schema_key"] == "delivery_judge":
-            asked = sorted({int(x) for x in re.findall(
-                r'"item_index": (\d+)', kw["user_prompt"])})
             return {"verdicts": [{
                 "item_index": i, "met": True, "evidence": "read",
                 "parts": [{"requirement": "r", "kind": "static",
-                           "status": "met", "cites": [{
+                           "status": "met", "checklist_index": j,
+                           "cites": [{
                                "path": "calc.py", "line_start": 1,
                                "line_end": 1,
-                               "quote": "def add(a, b):"}]}]}
-                for i in asked]}
+                               "quote": "def add(a, b):"}]}
+                          for j in entries]}
+                for i, entries in sorted(
+                    _prompt_checklists(kw["user_prompt"]).items())]}
         if kw["schema_key"] == "observability_judge":
             return {"items": []}        # every part observable
         assert kw["schema_key"] == "falsifier"
@@ -1908,6 +1921,8 @@ class TestRunDeliveryDetection:
 
         async def fake_claude_p(**kw):
             calls.append(kw)
+            if kw["schema_key"] == "delivery_enumerator":
+                return {"sets": []}
             assert kw["schema_key"] == "delivery_judge"
             vs = [_judge_verdict(0, True), _judge_verdict(3, False, "renamed")]
             return {"verdicts": vs}
@@ -1919,8 +1934,8 @@ class TestRunDeliveryDetection:
         # tests/test_observability_judge.py.
         assert [c["sid"] for c in calls
                 if c["schema_key"] != "observability_judge"] == [
-            "delivery_judge-final-s0", "delivery_judge-final-s1",
-            "delivery_judge-final-s2"]
+            "delivery_enumerator-final", "delivery_judge-final-s0",
+            "delivery_judge-final-s1", "delivery_judge-final-s2"]
         assert gate["final_judge"]["source"] == "final"
         assert [(u["item_index"], u["by"]) for u in gate["unmet_final"]] == [
             (3, ["judge"])]
@@ -2324,7 +2339,8 @@ def test_a_compound_items_unknown_test_part_is_never_read_met(
     asyncio.run(leerie._run_delivery_detection(
         st.run_dir, st, caps, MODELS, EFFORTS))
     assert [c["schema_key"] for c in calls
-            if c["schema_key"] != "observability_judge"] == ["delivery_judge"]
+            if c["schema_key"] != "observability_judge"] == [
+        "delivery_enumerator", "delivery_judge"]
     row = st.data["delivery_gate"]["items"][0]
     assert row["verdict"] == "unknown" and row["by"] == ["test_id_diff"]
     assert row["reason"].startswith(f"met except: {part}, unknown — ")
@@ -2378,6 +2394,8 @@ def _test_outcome_only_judge(leerie, monkeypatch, met: bool):
 
     async def fake_claude_p(**kw):
         calls.append(kw)
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         if kw["schema_key"] == "delivery_judge":
             asked = sorted({int(x) for x in re.findall(
                 r'"item_index": (\d+)', kw["user_prompt"])})
@@ -2406,15 +2424,16 @@ def test_a_verdict_on_only_the_test_outcome_reads_the_diff_either_way(
     with no parts, rejected `no_parts` and counted as an unmet vote
     (barnacle 59d17631 item 4: the item went unmet on three met votes).
     Through `_run_delivery_detection`, both polarities give the row the
-    diff's verdict: met, unmet or unknown, and never a re-drive note."""
+    diff's verdict: met, unmet or unknown, and never a re-drive note.
+    The item declares no part the judge owns (its checklist is empty, so
+    the judge has nothing else to answer); one that does is
+    `test_a_verdict_on_only_the_test_outcome_answers_no_declared_part`."""
     repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
                                           judged=False, k=0)
     part = "existing tests do not newly fail"
-    item = {"item": "Characterization tests pin today's redirect handling, "
-                    "and existing tests do not newly fail",
+    item = {"item": "Existing tests do not newly fail",
             "span": "S9",
-            "parts": ["characterization tests pin today's redirect handling",
-                      part],
+            "parts": [part],
             "part_checks": [{"part": part, "check": "test_id_diff",
                              "verifiability": "execution"}]}
     st.data["required_items"] = [item]
@@ -2446,6 +2465,49 @@ def test_a_verdict_on_only_the_test_outcome_reads_the_diff_either_way(
     row = gate["items"][0]
     assert row["verdict"] == "unknown" and row["by"] == ["test_id_diff"]
     assert gate["unmet_final"] == []
+
+
+@pytest.mark.parametrize("met", [True, False])
+def test_a_verdict_on_only_the_test_outcome_answers_no_declared_part(
+        leerie, tmp_path, monkeypatch, met):
+    """DESIGN §8 *An item is judged on its declared parts*: an item that
+    declares a part the judge owns beside its test outcome has that part on
+    its checklist. A verdict answering only the test outcome answered none
+    of the checklist, so the diff does not settle it: the item is re-asked
+    and, still unanswered, `unknown` — never met on the diff, never an
+    unmet vote. Barnacle 59d17631 item 4 has this shape ("characterization
+    tests before changing functions" beside "existing tests do not newly
+    fail"); with the diff settling it, the characterization part was read
+    by no one."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          judged=False, k=0)
+    part = "existing tests do not newly fail"
+    item = {"item": "Characterization tests pin today's redirect handling, "
+                    "and existing tests do not newly fail",
+            "span": "S9",
+            "parts": ["characterization tests pin today's redirect handling",
+                      part],
+            "part_checks": [{"part": part, "check": "test_id_diff",
+                             "verifiability": "execution"}]}
+    st.data["required_items"] = [item]
+    st.data.pop("acceptance")
+    calls = _test_outcome_only_judge(leerie, monkeypatch, met)
+    tree = asyncio.run(leerie._worktree_tree_sha(
+        str(st.run_dir / "worktrees" / "staging")))
+    st.data["test_id_diff"] = {"candidates": [], "new": [], "tree_sha": tree}
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    gate = st.data["delivery_gate"]
+    row = gate["items"][0]
+    assert row["verdict"] == "unknown" and row["by"] == []
+    assert "did not inspect it" in row["reason"]
+    assert gate["unmet_final"] == []
+    judges = [c for c in calls if c["schema_key"] == "delivery_judge"]
+    # Each of the three samples is re-asked once for the unanswered entry.
+    assert len(judges) == 6
+    assert '"part": "characterization tests pin today\'s redirect ' \
+        'handling"' in judges[0]["user_prompt"]
 
 
 def test_an_unmet_judge_owned_part_still_makes_the_item_unmet(

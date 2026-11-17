@@ -53,11 +53,17 @@ def world(leerie, tmp_path, monkeypatch):
         record = leerie._ExecutedRecord(entry, "", [(entry, cmd)])
 
         async def judge(**kw):
+            # The item quantifies over no set; its one part answers its one
+            # checklist entry, its text (DESIGN §8 *An item is judged on its
+            # declared parts*).
+            if kw["schema_key"] == "delivery_enumerator":
+                return {"sets": []}
             calls.append(kw)
             return {"verdicts": [{
                 "item_index": 0, "met": True, "evidence": "ran it",
                 "parts": [{"requirement": "the e2e suite passes",
                            "kind": "execution", "status": "met",
+                           "checklist_index": 0,
                            "cites": [{"path": "RECORD", "line_start": 0,
                                       "line_end": 0, "quote": quote}]},
                           *extra_parts]}]}
@@ -178,10 +184,13 @@ def test_the_pass_records_the_item_as_worker_only(leerie, world, monkeypatch):
     record = leerie._ExecutedRecord(entry, "", [(entry, "python3 e2e.py")])
 
     async def judge(**kw):
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         return {"verdicts": [{
             "item_index": 0, "met": True, "evidence": "ran it",
             "parts": [{"requirement": "the e2e suite passes",
                        "kind": "execution", "status": "met",
+                       "checklist_index": 0,
                        "cites": [{"path": "RECORD", "line_start": 0,
                                   "line_end": 0, "quote": QUOTE}]}]}]}
     monkeypatch.setattr(leerie, "claude_p", judge)
@@ -212,10 +221,13 @@ def test_a_recheck_writes_the_row_unknown_not_met(leerie, world, monkeypatch):
                         lambda *a, **k: ([], {}))
 
     async def judge(**kw):
+        if kw["schema_key"] == "delivery_enumerator":
+            return {"sets": []}
         return {"verdicts": [{
             "item_index": 0, "met": True, "evidence": "ran it",
             "parts": [{"requirement": "the e2e suite passes",
                        "kind": "execution", "status": "met",
+                       "checklist_index": 0,
                        "cites": [{"path": "RECORD", "line_start": 0,
                                   "line_end": 0, "quote": QUOTE}]}]}]}
     monkeypatch.setattr(leerie, "claude_p", judge)

@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from pathlib import Path
 
 import pytest
 
 from tests.conftest import run_git_out as _git
+from tests.stub_helpers import _prompt_checklists
 from tests.test_delivery_detection import (_claim, _facts_for, _placed, _st,
                                            _staging)
 from tests.test_met_items_refalsified_after_kept_rounds import (
@@ -91,9 +91,13 @@ def _replay(leerie, tmp_path, monkeypatch, *, item2_met_when_fixed: bool):
             return {"verdicts": [
                 {"item_index": e["item_index"], "met": True, "parts": [],
                  "evidence": "kept", "evidence_files": []} for e in listed]}
+        if key == "delivery_enumerator":
+            return {"sets": []}             # no item quantifies over a set
         if key == "delivery_judge":
-            asked = sorted({int(x) for x in re.findall(
-                r'"item_index": (\d+)', kw["user_prompt"])})
+            # One part per checklist entry (DESIGN §8 *An item is judged on
+            # its declared parts*).
+            lists = _prompt_checklists(kw["user_prompt"])
+            asked = sorted(lists)
             judged.append((now, asked))
             fixed = FIXED_MUL in (staging / "calc.py").read_text()
             return {"verdicts": [{
@@ -101,9 +105,11 @@ def _replay(leerie, tmp_path, monkeypatch, *, item2_met_when_fixed: bool):
                 "met": (i == 0 or (fixed and (
                     i == 1 or item2_met_when_fixed))),
                 "parts": [{"requirement": "r", "kind": "static",
-                           "status": "met", "cites": [{
+                           "status": "met", "checklist_index": j,
+                           "cites": [{
                                "path": "calc.py", "line_start": 1,
-                               "line_end": 1, "quote": "def add(a, b):"}]}]}
+                               "line_end": 1, "quote": "def add(a, b):"}]}
+                          for j in lists[i]]}
                 for i in asked]}
         assert key == "falsifier", key
         return _claim(verdict="could_not_demonstrate", probe_path="")

@@ -507,12 +507,16 @@ def _kept_group_world(leerie, tmp_path, monkeypatch, *, fail, recheck_ok):
                                "reason": "r"}]}
         if key == "delivery_ratchet":
             raise leerie.WorkerError("ratchet judge down")
+        if key == "delivery_enumerator":
+            return {"sets": []}             # the item quantifies over no set
         assert key == "delivery_judge"
         if not recheck_ok:
             raise leerie.WorkerError("judge down")
+        # Its one part answers the item's one checklist entry, its text.
         return {"verdicts": [{"item_index": 0, "met": True,
                               "parts": [{"requirement": "r",
                                          "kind": "behavioral",
+                                         "checklist_index": 0,
                                          "status": "met", "cites": [{
                                              "path": "src/a.ts",
                                              "line_start": 1, "line_end": 1,
