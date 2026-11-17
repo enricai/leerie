@@ -19,8 +19,7 @@ member is fixed.
 
 1. For each checklist entry, decide whether it quantifies over a set of
    places in this tree. An entry about one named file, function or
-   behaviour does not; return nothing for it. An entry whose item
-   already lists its `instances` does not need listing again.
+   behaviour does not; return nothing for it.
 2. For each entry that does, find the set's members by searching the
    tree: `git grep`, `grep`, `Glob`, `ls`, reading the files that route
    or register them. Search for what the set **is**, not for the

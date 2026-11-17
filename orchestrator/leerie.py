@@ -400,15 +400,16 @@ DEFAULT_CAPS = {
     # file with hits becomes one derived required item.
     "sweep_max_instances": 500,
     "sweep_max_files": 80,
-    # Members one enumerated set may list into the delivery judge's
-    # checklist (DESIGN §8 *An item is judged on its declared parts, and a
-    # set it quantifies over is listed before it is judged*). A judge spends
-    # at least a turn per member and its budget stops at 90 turns past a
-    # 30-turn base, so a longer list cannot be answered in one sample — and
-    # an unbounded one can outgrow the prompt, which fails the call and with
-    # it every other item's verdict. Past this the set is not listed: its
-    # entry cannot be met and the item ends `unknown`, with a person.
-    "delivery_set_members": 60,
+    # Members one item's enumerated sets may list into its delivery-judge
+    # checklist, all its sets together (DESIGN §8 *An item with a listed
+    # set is judged alone, and a set too large to list is left to a
+    # person*). An item with members is judged alone, and a
+    # judge spends at least a turn per member within a budget of 30 + 6 per
+    # item, stopped at 90: 90 - 30 - 6 = 54 is what one item alone can be
+    # answered on. Unbounded, a list can also outgrow the prompt, which
+    # fails the call. Past this the item's largest sets are not listed: each
+    # is one entry no verdict answers, so the item is never met.
+    "delivery_set_members": 54,
     # Independent `falsifier` samples per judged required item on the final
     # tree (DESIGN §8 *Delivery detection*): the item is unmet when any one
     # is confirmed by code. Bench Q2 F+ (held-out, 31 targets / 148
@@ -54627,6 +54628,18 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
         if not isinstance(v, dict):
             continue
         entries = list((checklists or {}).get(v.get("item_index")) or ())
+        unlisted = {j for j, e in enumerate(entries)
+                    if isinstance(e, dict) and e.get("unlisted")}
+        if unlisted and isinstance(v.get("parts"), list):
+            # No verdict answers a set too large to list, met or unmet: its
+            # members were never shown (DESIGN §8 *An item with a listed
+            # set is judged alone, and a set too large to list is left to a
+            # person*).
+            v = {**v, "parts": [
+                p for p in v["parts"] if not (
+                    isinstance(p, dict)
+                    and p.get("checklist_index") in unlisted
+                    and not isinstance(p.get("checklist_index"), bool))]}
         v = _drop_test_outcome_parts(v, owns=bool(entries))
         if v.get("settled_by") == "test_id_diff":
             out.append(v)
@@ -55343,10 +55356,11 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
     `checklists` and its `checklist_index` is one of the item's declared
     entries; a search git rejects adds nothing. A member's path is made
     relative to `cwd` (the checkout the worker read, default `tree`).
-    Members are `{member_of, path, line, place}`. A set with more than
-    `cap` members is not listed: it becomes one `{member_of, unlisted: n}`
-    member, n the members found, which `_delivery_checklist` makes an
-    entry no verdict can answer."""
+    Members are `{member_of, path, line, place}`. When an item's sets
+    together hold more than `cap` members, its largest sets are not listed
+    until the rest fit: each becomes one `{member_of, unlisted: n}` member,
+    n the members found, which `_delivery_checklist` makes an entry no
+    verdict can answer. Malformed fields are skipped, never raised on."""
     ls = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r",
                          "--name-only", "-z", "HEAD"],
                         capture_output=True, check=False)
@@ -55364,7 +55378,8 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
         got = out.setdefault(i, [])
         seen = {(m["member_of"], m["path"], m["line"]) for m in got}
         named = {m["path"] for m in got if m["member_of"] == j}
-        for m in s.get("members") or []:
+        members = s.get("members")
+        for m in members if isinstance(members, list) else []:
             if not isinstance(m, dict):
                 continue
             path = _delivery_cite_rel(str(m.get("path") or ""),
@@ -55378,11 +55393,14 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
             named.add(path)
             got.append({"member_of": j, "path": path, "line": line,
                         "place": str(m.get("place") or "")[:200]})
-        for q in s.get("searches") or []:
-            regex = str((q or {}).get("regex") or "").strip()
+        searches = s.get("searches")
+        for q in searches if isinstance(searches, list) else []:
+            if not isinstance(q, dict):
+                continue
+            regex = str(q.get("regex") or "").strip()
             if not regex:
                 continue
-            spec = str((q or {}).get("pathspec") or "").strip()
+            spec = str(q.get("pathspec") or "").strip()
             # One line per file (`--max-count=1`): a member is a file, so
             # the output grows with the files hit, never their lines.
             r = subprocess.run(
@@ -55409,12 +55427,39 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
                             "place": f"matches the search /{regex[:80]}/"})
     for i, ms in out.items():
         sizes = Counter(m["member_of"] for m in ms)
-        over = {j for j, n in sizes.items() if n > cap}
+        over: set[int] = set()
+        # Largest first: an unlisted set still costs its one entry.
+        for j in sorted(sizes, key=lambda j: (-sizes[j], j)):
+            if sum(1 if k in over else n for k, n in sizes.items()) <= cap:
+                break
+            over.add(j)
         if over:
             out[i] = ([m for m in ms if m["member_of"] not in over]
                       + [{"member_of": j, "unlisted": sizes[j]}
                          for j in sorted(over)])
     return {i: ms for i, ms in out.items() if ms}
+
+
+def _delivery_repack(packs: list[list[int]],
+                     checklists: dict[int, list[dict]],
+                     with_contract: bool) -> list[list[int]]:
+    """`packs` with every item whose checklist lists set members moved to a
+    pack of its own, after what is left of the pack it came from (DESIGN
+    §8 *An item with a listed set is judged alone, and a set too large to
+    list is left to a person*): its members are sized to one item's
+    budget. When the contract
+    is asked and nothing is left of the first pack, an empty first pack
+    keeps it (the contract rides pack 0). Packs without members are
+    unchanged."""
+    out: list[list[int]] = []
+    for p, pack in enumerate(packs):
+        alone = [i for i in pack
+                 if any("member_of" in e for e in checklists.get(i) or ())]
+        rest = [i for i in pack if i not in alone]
+        if rest or not alone or (p == 0 and with_contract):
+            out.append(rest)
+        out.extend([i] for i in alone)
+    return out
 
 
 async def _delivery_judge_unmet(
@@ -55566,7 +55611,8 @@ async def _delivery_judge_unmet(
 
     # Each item's numbered checklist (DESIGN §8 *An item is judged on its
     # declared parts*): its declared parts here, the members of the sets
-    # its pack's `delivery_enumerator` lists added in `_judge_pack`.
+    # its pack's `delivery_enumerator` lists added by `_enumerate`, which
+    # runs for every pack before any judge (then `_delivery_repack`).
     checklists: dict[int, list[dict]] = {
         i: _delivery_checklist(normalized[i]) for i in judge_idx}
 
@@ -55664,8 +55710,10 @@ async def _delivery_judge_unmet(
         # The sets the pack's checklist entries quantify over, listed once
         # per pack before its first sample (DESIGN §8 *… a set it
         # quantifies over is listed before it is judged*). A failed call
-        # lists nothing: the pack is judged on its declared parts.
-        declared = {i: checklists[i] for i in pack if checklists.get(i)}
+        # lists nothing: the pack is judged on its declared parts. A sweep's
+        # derived item is not asked: its entries already are its instances.
+        declared = {i: checklists[i] for i in pack
+                    if checklists.get(i) and not normalized[i].get("sweep_of")}
         if not declared:
             return
         st.bump_workers(caps)
@@ -55701,7 +55749,6 @@ async def _delivery_judge_unmet(
 
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
-        await _enumerate(p, pack)
         members = sum(1 for i in pack for e in checklists.get(i) or ()
                       if "member_of" in e)
         user_prompt = _pack_prompt(pack, with_contract)
@@ -55805,19 +55852,33 @@ async def _delivery_judge_unmet(
                     samples.append(await _sample(k))
         return samples
 
-    async with _judge_checkout(st, staging, "delivery-judge") as cwd:
-        judge_cwd[0] = cwd
-        tasks = [asyncio.ensure_future(_judge_pack(p, pack))
-                 for p, pack in enumerate(packs)]
+    async def _gather(coros: list) -> list:
+        tasks = [asyncio.ensure_future(c) for c in coros]
         try:
-            per_pack = await asyncio.gather(*tasks)
+            return await asyncio.gather(*tasks)
         except BaseException:
             # One pack's failure ends the gate (the callers treat it as
-            # advisory); the others must not keep spawning judges after it.
+            # advisory); the others must not keep spawning workers after it.
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    async def _enumerate_limited(p: int, pack: list[int]) -> None:
+        async with limit:
+            await _enumerate(p, pack)
+
+    async with _judge_checkout(st, staging, "delivery-judge") as cwd:
+        judge_cwd[0] = cwd
+        await _gather([_enumerate_limited(p, pack)
+                       for p, pack in enumerate(packs)])
+        # An item a set was listed for is judged alone
+        # (`_delivery_repack`).
+        packs = _delivery_repack(packs, checklists, contract_ctx is not None)
+        if routing is not None:
+            routing["packs"] = len(packs)
+        per_pack = await _gather([_judge_pack(p, pack)
+                                  for p, pack in enumerate(packs)])
     human: dict[int, dict] = {}
     unread: dict[int, str] = {}
     n_samples = 0

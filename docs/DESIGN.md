@@ -13536,8 +13536,9 @@ tree)"). So the payload, not the judge, says what must be answered:
   item's declared `parts` (less those `test_outcome_parts` names, which
   the failing-test-ID diff settles), or the item text alone when it
   declares none, then the members of every set one of them quantifies
-  over. Every part of a verdict names the `checklist_index` it answers
-  (`-1` for an extra part the judge adds). Alignment is by that
+  over. Every part of a verdict is asked to name the `checklist_index` it
+  answers (`-1` for an extra part the judge adds); a part that names none
+  answers no entry. Alignment is by that
   integer, never by matching the prose.
 - **A set is listed first, by a worker that searches.** Before a pack's
   first judge sample, one `delivery_enumerator` (read-only,
@@ -13550,8 +13551,8 @@ tree)"). So the payload, not the judge, says what must be answered:
   search hits that no member names becomes a member too: the list is at
   least as complete as the worker's own searches, whatever it chose to
   write down. A member whose `path` is not a file of `HEAD` is dropped.
-  An entry an item's `instances` already list (a sweep's) is not listed
-  again. A failed enumerator call lists nothing: the pass runs on the
+  A sweep's derived item is not enumerated: its entries already are its
+  instances (*A sweep's instances are items*). A failed enumerator call lists nothing: the pass runs on the
   declared parts alone.
 - **`met` needs every entry answered, with its own evidence.** A `met`
   verdict counts only when every checklist entry has a part answering
@@ -13572,14 +13573,24 @@ tree)"). So the payload, not the judge, says what must be answered:
 - **The turn budget counts the checklist.** A pack's budget adds one
   turn per set member to the per-item allowance, under the same
   ceiling.
-- **A set too large to list is left to a person.** A judge spends at
-  least a turn per member, and its budget stops at 90 turns past a
-  30-turn base, so a set of more than 60 members (`delivery_set_members`)
-  cannot be answered in one sample; listed whole, it can outgrow the
-  prompt and fail the call, and with it every other item in the pack.
-  Such a set is not listed: it is one entry no verdict answers, so its
-  item is never `met` on it and ends `unknown` unless a part shows it
-  unmet. A search lists each file once (its first match).
+- **An item with a listed set is judged alone, and a set too large to
+  list is left to a person.** The enumerators run before any judge,
+  bounded by `max_parallel` like the judges; then every item a set was
+  listed for leaves its pack for a pack of its own, so its members are
+  sized to one item's budget, not shared with up to 29 others (a pack
+  holds up to 30). A judge
+  spends at least a turn per member, within 30 + 6 per item, stopped at
+  90: one item alone can be answered on 54 members
+  (`delivery_set_members`). Listed past that, it cannot be answered in
+  one sample, and an unbounded list can outgrow the prompt and fail the
+  call. So when an item's sets together hold more, its largest sets are
+  not listed until the rest fit: each is one entry no verdict answers,
+  met or unmet — a part answering it is dropped, since none of its
+  members was shown — so the item is never `met`; what the gate finds
+  unmet by other means still counts. A search lists each file once (its
+  first match). An item judged alone costs calls of its own, and one with
+  an unlisted set takes all three samples, each re-asked once — up to 6
+  judge calls a pass — though it can never come out `met`.
 
 The risk is new false unmets: a declared part no tree can decide, and a
 list wider than the requirement. Lane W6 measured the second on
