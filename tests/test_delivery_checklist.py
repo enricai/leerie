@@ -220,9 +220,10 @@ def test_the_judge_is_handed_the_checklist_and_its_members(
 
 def test_a_set_past_the_cap_is_one_entry_no_verdict_answers(leerie,
                                                             tmp_path):
-    """A set larger than `delivery_set_members` is not listed into the
-    prompt (it could outgrow it and fail every item of the pack): it is one
-    `unlisted` entry, a met answering every index is still not met, and the
+    """An item whose sets hold more than `delivery_set_members` members is
+    not listed whole (it could not be answered in one sample, and could
+    outgrow the prompt): its set is one `unlisted` entry, a met answering
+    every index is still not met, a part on that entry is dropped, and the
     item is uninspected (ends `unknown`) — never an unmet vote."""
     tree = _sender_tree(tmp_path)
     lists = {4: leerie._delivery_checklist(ITEM)}
@@ -249,11 +250,18 @@ def test_a_set_past_the_cap_is_one_entry_no_verdict_answers(leerie,
     assert smp["verdicts"][0]["met"] is False
     assert smp["verdicts"][0]["rejected"] == "checklist_unanswered"
     assert leerie._delivery_uninspected(smp, [4], lists) == [4]
-    # A part shown unmet is still a finding.
+    # A part shown unmet on a declared entry is still a finding.
     found = {**every, "met": False, "parts": [_part(0, "unmet")]}
     smp = leerie._delivery_screen_sample({"verdicts": [found]}, tree, "", {},
                                          lists)
     assert leerie._delivery_uninspected(smp, [4], lists) == []
+    # One answering the unlisted entry is dropped: none of its members was
+    # shown, so it is no unmet vote; the item is uninspected.
+    on_unlisted = {**every, "met": False, "parts": [_part(2, "unmet")]}
+    smp = leerie._delivery_screen_sample({"verdicts": [on_unlisted]}, tree,
+                                         "", {}, lists)
+    assert smp["verdicts"][0]["parts"] == []
+    assert leerie._delivery_uninspected(smp, [4], lists) == [4]
 
 
 def test_a_search_lists_each_file_once(leerie, tmp_path):
@@ -266,3 +274,97 @@ def test_a_search_lists_each_file_once(leerie, tmp_path):
     got = leerie._delivery_enumeration(raw, tree, lists)
     assert [(m["path"], m["line"]) for m in got[4]] == [
         ("src/a.py", 2), ("src/b.py", 2), ("src/many.py", 1)]
+
+
+def test_the_cap_counts_an_items_sets_together_largest_unlisted_first(
+        leerie, tmp_path):
+    tree = _sender_tree(tmp_path)
+    lists = {4: leerie._delivery_checklist(ITEM)}
+    raw = {"sets": [
+        {"item_index": 4, "checklist_index": 0, "set": "senders",
+         "members": [], "searches": [{"regex": r"send\(", "pathspec": ""}]},
+        {"item_index": 4, "checklist_index": 1, "set": "copies",
+         "members": [{"path": "src/c.py", "line": 1, "place": "c"}],
+         "searches": []}]}
+    # 3 + 1 members fit a cap of 4; under 3 the larger set (3) goes, and
+    # its one entry plus the other's member fit.
+    assert len(leerie._delivery_enumeration(raw, tree, lists, cap=4)[4]) == 4
+    got = leerie._delivery_enumeration(raw, tree, lists, cap=3)[4]
+    assert got == [{"member_of": 1, "path": "src/c.py", "line": 1,
+                    "place": "c"},
+                   {"member_of": 0, "unlisted": 3}]
+
+
+def test_malformed_enumerator_fields_are_skipped(leerie, tmp_path):
+    tree = _sender_tree(tmp_path)
+    lists = {4: leerie._delivery_checklist(ITEM)}
+    raw = {"sets": [
+        {"item_index": 4, "checklist_index": 0, "set": "x", "members": 5,
+         "searches": ["send", None, {"regex": 3}]},
+        {"item_index": 4, "checklist_index": 1, "set": "x",
+         "members": ["src/a.py", None], "searches": {"regex": "send"}}]}
+    assert leerie._delivery_enumeration(raw, tree, lists) == {}
+
+
+def test_an_item_with_members_is_judged_alone(leerie):
+    lists = {0: [{"checklist_index": 0, "part": "a"}],
+             1: [{"checklist_index": 0, "part": "b"},
+                 {"checklist_index": 1, "part": "m", "member_of": 0}],
+             2: [{"checklist_index": 0, "part": "c"}],
+             3: [{"checklist_index": 0, "part": "d", "member_of": 0}]}
+    assert leerie._delivery_repack([[0, 1, 2], [3]], lists, False) == [
+        [0, 2], [1], [3]]
+    # The contract rides pack 0: kept, empty, when its items all left.
+    assert leerie._delivery_repack([[1], [2]], lists, True) == [[], [1], [2]]
+    assert leerie._delivery_repack([[1], [2]], lists, False) == [[1], [2]]
+    assert leerie._delivery_repack([[]], {}, True) == [[]]
+
+
+def test_enumerators_are_bounded_and_set_items_judged_alone(
+        leerie, tmp_path, monkeypatch):
+    """Real `_delivery_judge_unmet` over three packs at `max_parallel` 1:
+    no two enumerators run at once, a sweep's derived item is not sent,
+    and the item a set was listed for gets a judge call of its own."""
+    root = tmp_path / ".leerie"
+    staging = _sender_tree(tmp_path)
+    st = leerie.State(root, "chk")
+    items = [{"item": f"item {k}", "span": f"S{k}"} for k in range(45)]
+    items[1] = {**ITEM, "span": "S1"}
+    items[2] = {"item": "sweep", "span": "S2", "parts": ["src/a.py:2 x"],
+                "sweep_of": {"file": "src/a.py"}}
+    st.data = {"task": "t", "worker_count": 0, "required_items": items}
+    st.save()
+    active = [0, 0]
+    enum_items: list[set] = []
+    judged: list[list[int]] = []
+
+    async def fake(**kw):
+        found = sorted({int(x) for x in re.findall(r'"item_index": (\d+)',
+                                                  kw["user_prompt"])})
+        if kw["schema_key"] == "delivery_enumerator":
+            active[0] += 1
+            active[1] = max(active)
+            await asyncio.sleep(0.05)
+            active[0] -= 1
+            enum_items.append(set(found))
+            sets = ([{"item_index": 1, "checklist_index": 0, "set": "s",
+                      "members": [{"path": "src/a.py", "line": 2,
+                                   "place": "a"}], "searches": []}]
+                    if 1 in found else [])
+            return {"sets": sets}
+        judged.append(found)
+        return {"verdicts": [
+            {"item_index": i, "met": False, "evidence": "e",
+             "parts": [{**_part(0, "unmet"), "cites": []}]}
+            for i in found]}
+    monkeypatch.setattr(leerie, "claude_p", fake)
+    caps = {**leerie.DEFAULT_CAPS, "max_parallel": 1}
+    routing: dict = {}
+    asyncio.run(leerie._delivery_judge_unmet(
+        "t", items, staging, st, caps, MODELS, EFFORTS, "pre",
+        routing=routing))
+    assert len(enum_items) >= 2 and active[1] == 1
+    assert all(2 not in e for e in enum_items)
+    assert [1] in judged
+    assert all(1 not in j for j in judged if j != [1])
+    assert routing["packs"] == len({tuple(j) for j in judged})

@@ -74,6 +74,9 @@ judged.
   when it does not reach that place — a line no user ever sees, a test
   fixture, a format string — with a cite of the line that shows why.
   A member where the requirement is not satisfied is `unmet`.
+- An entry marked `unlisted` is a set too large to list here. Do not
+  answer it or search it out: no answer to it counts, so the item cannot
+  be `met`. Still answer the item's other entries; an `unmet` one counts.
 - An entry this tree cannot decide — the wording of a pull request,
   how the run was carried out, what someone will do later — is
   `not_inspected`, never `met`: say in `requirement` what it would take.
@@ -99,9 +102,9 @@ Per item:
 
 - `parts` — split the item into **every concrete thing it requires**:
   each named site, reader, caller, string, file, page, locale, value or
-  behaviour gets its own part. An item that names "every reader" has
-  one part per reader you find (find them with `grep`); an item that
-  names two locales has a part per locale. For each part:
+  behaviour gets its own part. An item whose set is listed in its
+  checklist has one part per member entry; an item that names two
+  locales has a part per locale. For each part:
   - `checklist_index`: the number of the checklist entry this part
     answers, or `-1` (see *Each item's checklist*).
   - `status`: `"met"`, `"unmet"`, or `"not_inspected"` (you did not
