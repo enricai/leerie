@@ -26,13 +26,24 @@ from pathlib import Path
 
 import pytest
 
-from tests.launcher_stub_run import launch, make_world, marked_pids, reap
+from tests.launcher_stub_run import (describe_marked, launch, make_world,
+                                    marked_pids, reap)
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
                                 reason="reads /proc")
 
 CONTAINER_SECONDS = "300"
 PROMPT_S = 20.0
+
+
+def _where_it_waits(w: dict) -> str:
+    """What a launcher still running PROMPT_S after the signal was doing:
+    the stub's calls (a `kill stubcid` means its trap ran) and every process
+    of the launch. Taken before `reap`, which kills them."""
+    calls = w["world"] / "nerdctl.calls"
+    return ("\nnerdctl calls:\n"
+            + (calls.read_text() if calls.exists() else "(none)\n")
+            + "processes:\n" + describe_marked(w["mark"]))
 
 
 @pytest.mark.parametrize("sig,rc", [(signal.SIGTERM, 143),
@@ -58,7 +69,8 @@ def test_a_signal_stops_the_run_promptly(tmp_path: Path, sig, rc):
             got = proc.wait(timeout=PROMPT_S)
         except subprocess.TimeoutExpired:
             pytest.fail(f"the launcher was still running {PROMPT_S}s after "
-                        f"{sig.name}: its trap waits for the run to finish")
+                        f"{sig.name}: its trap waits for the run to finish"
+                        + _where_it_waits(w))
         took = time.monotonic() - sent
         assert got == rc, got
         assert took < PROMPT_S
@@ -94,7 +106,7 @@ def test_a_signal_in_the_created_window_stops_the_run_promptly(
             got = proc.wait(timeout=PROMPT_S)
         except subprocess.TimeoutExpired:
             pytest.fail("the launcher waited for the run after a TERM in "
-                        "the created window")
+                        "the created window" + _where_it_waits(w))
         assert got == 143, got
         assert time.monotonic() - sent < 5.0
         # The client was stopped before it started the container.
