@@ -599,6 +599,139 @@ def test_the_runs_records_stay_read_only_beside_the_link_root(root):
     assert (tree / "own.txt").stat().st_mode & 0o777 == 0o600
 
 
+# --- a shield is read-only when it is made -----------------------------------
+#
+# DESIGN §6 *A shield is read-only when it is made*: the other trees beneath
+# the link root were bound onto themselves writable, then looked up again by
+# path and remounted read-only. A tree the orchestrator removed in between
+# (a sibling subtask finishing) took its mount with it — the kernel detaches
+# every mount on a removed directory, in every namespace, whatever its
+# propagation — and the remount answered ENOENT: the command did not run and
+# the run stopped (navegando trial A-T2-3, 2026-11-18). Each test drives the
+# removal at that point, deterministically, through pipes: a real git
+# worktree, removed by `git worktree remove` from the orchestrator's
+# namespace while the shim waits.
+
+_SHIELD_DRIVER = """
+import importlib.util, json, os, sys
+shim, own, store, trees, gone, kept, go, done, hook = sys.argv[1:10]
+spec = importlib.util.spec_from_file_location("ll", shim)
+LL = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(LL)
+def wait():
+    os.write(int(go), b"g")
+    os.read(int(done), 1)
+seen = {}
+real_read, real_ro = LL._mountinfo, LL.readonly_mounts
+def read():
+    out = real_read()
+    if hook == "read" and "read" not in seen and any(
+            mp == gone for mp, _ in out):
+        seen["read"] = True
+        wait()
+    return out
+def readonly(*a, **k):
+    seen["shields"] = {mp: sorted(o) for mp, o in real_read()
+                       if mp in (gone, kept)}
+    if hook == "made":
+        wait()
+    return real_ro(*a, **k)
+LL._mountinfo, LL.readonly_mounts = read, readonly
+os.chdir(own)
+try:
+    LL.isolate([own, store, "/dev/null"], ["/"], link_root=trees)
+except LL.IsolationError as e:
+    print(json.dumps({"error": str(e), "shields": seen.get("shields")}))
+    sys.exit(3)
+probe = {}
+for name, p in (("kept", kept), ("own", own)):
+    try:
+        os.chmod(p, 0o755)
+        probe[name] = "CHANGED"
+    except OSError as e:
+        probe[name] = e.errno
+print(json.dumps({"shields": seen.get("shields"), "probe": probe,
+                  "gone": os.path.exists(gone)}))
+"""
+
+
+def _trees_with_siblings(root: Path) -> tuple[Path, Path, Path, Path, Path]:
+    """`(repo, link root, own tree, store, removed sibling)`: real git
+    worktrees of one repository beneath the link root — the command's own
+    and two siblings (`gone`, which the orchestrator removes while the shim
+    builds, and `kept`)."""
+    from tests.conftest import init_git_repo, run_git_repo_first
+    repo = init_git_repo(root / "repo")
+    trees = root / "worktrees"
+    store = trees / ".stores" / "stores"
+    store.mkdir(parents=True)
+    for name in ("own", "gone", "kept"):
+        run_git_repo_first(repo, "worktree", "add", "-q", "-b", name,
+                           str(trees / name))
+    return repo, trees, trees / "own", store, trees / "gone"
+
+
+def _remove_sibling_while_the_shim_builds(root: Path, hook: str) -> dict:
+    """Run the shim's `isolate` with the link root in a child, stop it at
+    `hook` ("read": the first read of the mount table that lists the
+    siblings' shields; "made": the shields made, before the read-only
+    pass), remove the sibling there with `git worktree remove`, let it go
+    on, and return what it reported (its exit as `rc`)."""
+    repo, trees, own, store, gone = _trees_with_siblings(root)
+    kept = trees / "kept"
+    go_r, go_w = os.pipe()
+    done_r, done_w = os.pipe()
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", _SHIELD_DRIVER, str(SHIM),
+         str(own), str(store), str(trees), str(gone), str(kept),
+         str(go_w), str(done_r), hook],
+        cwd=str(own), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, pass_fds=(go_w, done_r))
+    os.close(go_w)
+    os.close(done_r)
+    try:
+        # Empty: the child ended before it reached `hook`.
+        reached = os.read(go_r, 1)
+        if reached:
+            from tests.conftest import run_git_repo_first
+            run_git_repo_first(repo, "worktree", "remove", "--force",
+                               str(gone))
+            assert not gone.exists()
+            os.write(done_w, b"d")
+        out, err = child.communicate(timeout=120)
+        assert reached, err
+    finally:
+        os.close(go_r)
+        os.close(done_w)
+    assert out.strip(), err
+    return {**json.loads(out.splitlines()[-1]), "rc": child.returncode,
+            "stderr": err}
+
+
+def test_a_tree_removed_after_the_mount_table_is_read_does_not_stop_the_build(
+        root):
+    """The trial's order: the shim has read the mount table, the sibling's
+    tree is removed, then the read-only pass runs. It builds, the tree that
+    stayed is still read-only to the command, its own tree is not."""
+    got = _remove_sibling_while_the_shim_builds(root, "read")
+    assert got["rc"] == 0, got
+    assert got["gone"] is False
+    assert got["probe"] == {"kept": errno.EROFS, "own": "CHANGED"}, got
+
+
+def test_every_shield_is_read_only_when_it_is_made(root):
+    """The rule itself: before the read-only pass, every other tree's mount
+    is already read-only, so the pass never has to find it again — and a
+    tree removed at that point changes nothing."""
+    got = _remove_sibling_while_the_shim_builds(root, "made")
+    assert got["rc"] == 0, got
+    shields = got["shields"]
+    assert set(shields) == {str(root / "worktrees" / "gone"),
+                            str(root / "worktrees" / "kept")}, got
+    assert all("ro" in opts for opts in shields.values()), shields
+    assert got["probe"] == {"kept": errno.EROFS, "own": "CHANGED"}, got
+
+
 def test_a_confined_pnpm_install_links_from_its_store(root):
     import shutil
     pnpm = shutil.which("pnpm")

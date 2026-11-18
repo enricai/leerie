@@ -5561,13 +5561,23 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   one mount are one mount*) — of the `rw` paths that exist and are not
   beneath `/tmp` or `/dev` (`_bindable`), each strictly beneath
   `link_root` (`--link-root DIR`, absolute, not `/`, only with
-  `--isolate`) is bound with the others there: `link_root` bound onto
-  itself once (`MS_BIND | MS_REC`, step `bind grant <path>`), then
-  `_shield(link_root, grants)`: every entry beneath it that is no grant,
-  beneath none and leads to none bound onto itself (`MS_BIND | MS_REC`,
-  step `bind <path>`; a symbolic link skipped, an entry gone `ENOENT`
-  skipped, a directory that cannot be listed step `list <path>`), the
-  directories leading to a grant walked. Every other grant is bound onto
+  `--isolate`) is bound with the others there: first
+  `_readonly_source(link_root)` binds `link_root` at `_SHIELD_SOURCE =
+  "/tmp/.leerie-shield"` (on the process's own `/tmp`; `MS_BIND | MS_REC`,
+  steps `make /tmp/.leerie-shield: …` and `bind <link_root> at
+  /tmp/.leerie-shield`) and remounts it read-only with its locked flags
+  (`_remount_readonly`, step `remount /tmp/.leerie-shield read-only`); then
+  `link_root` is bound onto itself once (`MS_BIND | MS_REC`, step `bind
+  grant <path>`), then `_shield(link_root, grants, source)`: every entry
+  beneath it that is no grant, beneath none and leads to none bound onto
+  itself from its path beneath `source` (`MS_BIND | MS_REC`, step `bind
+  <path>`), so the clone is read-only in the call that makes it and
+  `readonly_mounts` never looks it up again (DESIGN §6 *A shield is
+  read-only when it is made*); a symbolic link skipped, an entry gone
+  `ENOENT` skipped, a directory that cannot be listed step `list <path>`;
+  the directories leading to a grant walked. `source` is then detached
+  (`umount2(MNT_DETACH)`, step `detach /tmp/.leerie-shield`) and its
+  directory removed before anything else is mounted. Every other grant is bound onto
   itself apart. Returns `(grants, roots)`: the grants, and `[link_root]`
   when it was bound. `isolate(..., link_root=)` passes it through.
 - `private_home(home, layers, size, grants) -> None` (`--home DIR
@@ -5646,8 +5656,13 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   failure is step `build the worker view`. `isolate` then adds `WORKER_VIEW
   + k` for each kept mount point to `keep`, and the view's own `/tmp`,
   `/dev/shm` and `/dev/pts` to the private mounts `readonly_mounts` skips.
+- `_remount_readonly(mp: str, opts: set[str]) -> None` — `mp` remounted
+  `MS_REMOUNT | MS_BIND | MS_RDONLY` with the locked flags among `opts`
+  (its mountinfo options); a refused remount is step `remount <mp>
+  read-only`. `readonly_mounts` and `_readonly_source` call it.
 - `readonly_mounts(keep: list[str], private=PRIVATE, roots=()) -> int` —
-  every `/proc/self/mountinfo` entry not already `ro`, not in `keep` or
+  every `/proc/self/mountinfo` entry not already `ro` (`_shield`'s binds
+  are, from the start), not in `keep` or
   beneath one, not exactly one of `roots` (`bind_grants`'s, and with a
   worker view `WORKER_VIEW + root` too), and not one of `private` (`/tmp`,
   `/dev/shm`, `/dev/pts`), remounted `MS_REMOUNT | MS_BIND | MS_RDONLY`
@@ -6212,7 +6227,10 @@ a database it lacks. The set's validation runs keep `require=False`.
   removes from it but a change carrying its own migration.
 - `container-entry.sh` and the image: no change but the removed `ENV`.
 - Tests: `tests/test_landlock_isolation.py` (every channel of the
-  measured design's §1.2 closed, in a real sandbox; skipped where
+  measured design's §1.2 closed, in a real sandbox; a sibling git worktree
+  removed by `git worktree remove` while the shim builds, stopped through
+  pipes after it read the mount table and after its shields were made, the
+  build going on with every shield read-only from the start; skipped where
   `isolation_error()` is not None), `tests/test_heldout_sandbox_preflight.py`
   (the die messages from the shim's measured failure lines, `_sandbox_fix`,
   the argv, the order of the confinement check every entry runs
