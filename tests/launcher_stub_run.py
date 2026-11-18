@@ -351,7 +351,6 @@ def launch_env(w: dict, **extra: str) -> dict:
         "PATH": f"{w['bin']}{os.pathsep}{env['PATH']}",
         "HOME": str(w["home"]),
         "LEERIE_STATE_DIR": str(w["state"]),
-        "LEERIE_HOST_DIR": str(w["world"] / "host"),
         "LEERIE_TEST_MARK": w["mark"],
     })
     env.update(extra)

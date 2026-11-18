@@ -47,7 +47,10 @@ def test_the_default_state_dir_is_keyed_by_the_top_level(tmp_path: Path):
                          env_extra={"LEERIE_STATE_DIR": ""})
     assert rc == 0, out
     leerie = w["home"] / ".leerie"
-    assert sorted(d.name for d in leerie.iterdir()) == ["repo"]
+    # Beside the state dir, only the host-wide dir, which is always there
+    # (DESIGN §6 *A guard on a host-wide resource lives at that resource's
+    # scope, which no launch repoints*).
+    assert sorted(d.name for d in leerie.iterdir()) == [".host", "repo"]
     assert (leerie / "repo" / ".owner").read_text().strip() == str(
         w["repo"].resolve())
 

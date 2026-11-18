@@ -3680,6 +3680,51 @@ they are confined.
   their Docker config and so pulled as no one; with
   `docker-credential-secretservice` on PATH they pulled with the
   operator's login (the review's proof, through `build_repo_image`).
+- *A guard on a host-wide resource lives at that resource's scope, which
+  no launch repoints.* A lock or a hold guards a resource only among the
+  launches that look for it in one place, so it lives where every launch
+  that uses the resource looks, whatever else a launch is told. Every guard
+  leerie keeps in the host-wide directory guards something the whole host
+  shares: the build slots, the host's memory (*A host-wide build
+  semaphore*); the toolchain-install lock, the toolchain cache
+  `~/.cache/leerie/toolchains` (*One toolchain install at a time on a
+  host*); the image lock and the image holds, the images in the
+  operator's containerd (*A host-wide image step runs once, under a host
+  lock*, *An image no launch can use any more is removed by leerie*). So
+  the host-wide directory is always `~/.leerie/.host`, and no setting
+  repoints it: the launcher refuses a `LEERIE_HOST_DIR` set on the host
+  rather than read it. A run given guards of its own still shares the
+  memory, the toolchains and the images; it only stops seeing the other
+  runs' guards on them. A run that must be apart from the host's other
+  runs needs its own host, not its own guards.
+  The scope of all three resources is the operator's home. On rootless
+  containerd the daemon is the operator's own, one per user; on macOS
+  Colima's VM is the operator's (`~/.colima`), and the launcher's
+  `nerdctl` a shim into it, so its containerd is reached only by that
+  user's launches, and the hold files are on the macOS host beside every
+  other launch's; the toolchain cache is beneath `$HOME` on both. On Fly
+  and EC2 the orchestrator, alone on its machine, keeps its guards under
+  its state root's `.host` (no host-wide directory is mounted there), host
+  wide there; the launcher on the operator's machine takes no image hold
+  and reaps nothing, and its image steps run under the image lock in its
+  own `~/.leerie/.host`.
+  Why holds where the images are scoped, rather than reading use from
+  containerd itself: containerd refuses to remove only an image a
+  container names, and a run's containers name its repository image,
+  built `FROM` the base, never the base; and a launch between its image
+  check and its container's start has nothing in containerd naming its
+  images at all, the window the holds exist for (*The hold*, below).
+  *Designed 2026-11-17 (the operator's host):* runs of 0.70.2 launched
+  with `LEERIE_HOST_DIR` pointing at a bench's directory held its
+  `image-holds/0.70.2.lock`; a 0.72.0 launch under the default directory
+  found no hold there and removed `leerie:0.70.2`, which containerd did
+  not refuse, since the running containers used repository images built
+  on it. Every later 0.70.2 launch built its base again with `--no-cache`,
+  changing its packages in the middle of the runs that used it. The hold's
+  own design had listed this as a residual. mise's own install lock had
+  failed the same way, kept in a cache directory each command has its own
+  of, over a data directory every run shares (*One toolchain install at a
+  time on a host*).
 - *A host-wide image step runs once, under a host lock.* Leerie's base
   image, its copy in the namespace BuildKit's worker reads, the frontend
   pulled there and the sweep of an earlier leerie's images are each one
@@ -3848,9 +3893,13 @@ they are confined.
   *Residuals.* A launcher from before this change takes no hold, so a
   launch of such a version can lose its images to a newer launch between
   its check and its run; it fails at `nerdctl run` and builds them again on
-  its next launch. The holds are as wide as the host-wide directory, as
-  the image lock is: launches given different `LEERIE_HOST_DIR`s on one
-  containerd do not see each other's holds. An older base's copy where
+  its next launch; so can a launch of an earlier leerie given
+  `LEERIE_HOST_DIR`, whose hold is in that directory, which no launcher
+  since reads (*A guard on a host-wide resource lives at that
+  resource's scope*). A launch given a different `HOME` with the same
+  containerd looks in a different directory too: the guards are the
+  operator's home's, and leerie does not ask containerd whose it is.
+  An older base's copy where
   BuildKit reads stays until the next launch on the host that builds a
   repository image. `leerie prune` does not remove images: its scope is one
   repository's state, chosen by age, and the images are host-wide and need
@@ -9917,8 +9966,9 @@ peak is measured and never fewer than one, so a build too large for the
 host still runs alone rather than deadlocking. Before a peak is known the
 measured-constant build peak sizes it. The slots are lock files in a host
 directory the launcher creates and mounts into every run's container
-(`~/.leerie/.host` → `/leerie-host`), so runs of different repos share
-one count; the kernel drops a slot when its holder dies, even on SIGKILL.
+(`~/.leerie/.host` → `/leerie-host`, which no setting repoints: §6 *A
+guard on a host-wide resource lives at that resource's scope*), so runs of
+different repos share one count; the kernel drops a slot when its holder dies, even on SIGKILL.
 Workers are never gated as a whole — only these commands. Ownership
 follows the runtime rule (§6 *Rootless exception*): rootless sees the
 host user's directory as its own (outer UID 0 → inner leerie), rootful's

@@ -1788,8 +1788,7 @@ def test_stop_and_kill_remove_the_container_they_end(tmp_path, verb):
         [str(LAUNCHER), *verb, run, "--runtime", "local"],
         capture_output=True, text=True, timeout=120, cwd=repo,
         env={"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(home),
-             "LEERIE_STATE_DIR": str(state),
-             "LEERIE_HOST_DIR": str(tmp_path / "host")})
+             "LEERIE_STATE_DIR": str(state)})
     calls = log.read_text().splitlines() if log.exists() else []
     end = "stop" if verb[0] == "stop" else "kill"
     i = calls.index(f"--namespace default {end} {run}")

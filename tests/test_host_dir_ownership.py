@@ -19,6 +19,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from tests.stub_helpers import _entry_sh_rootful_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -60,40 +62,41 @@ def _resolve_host_dir(env: dict[str, str]) -> subprocess.CompletedProcess:
     """Execute the launcher's REAL host-dir resolution block and print the
     directory it would create and mount."""
     text = LAUNCHER.read_text()
-    start = text.index('_leerie_host_dir="${LEERIE_HOST_DIR:-')
-    first = text.index("\nesac\n", start)
-    end = text.index("\nesac\n", first + 1) + len("\nesac\n")
+    start = text.index('if [ -n "${LEERIE_HOST_DIR+x}" ]; then')
+    line = '_leerie_host_dir="$HOME/.leerie/.host"\n'
+    end = text.index(line, start) + len(line)
     script = text[start:end] + 'printf %s "$_leerie_host_dir"\n'
     return subprocess.run(["bash", "-c", script], env=env,
                           capture_output=True, text=True)
 
 
-def test_host_dir_defaults_to_the_shared_home_dir():
+def test_host_dir_is_the_shared_home_dir():
     r = _resolve_host_dir({"HOME": "/h", "PATH": "/usr/bin:/bin"})
     assert r.returncode == 0 and r.stdout == "/h/.leerie/.host"
 
 
-def test_leerie_host_dir_repoints_it_for_an_isolated_run():
-    """IMPLEMENTATION §2½: a bench sets LEERIE_HOST_DIR so its runs never
-    touch ~/.leerie; `~` expands like the state dir's."""
-    base = {"HOME": "/h", "PATH": "/usr/bin:/bin"}
-    r = _resolve_host_dir({**base, "LEERIE_HOST_DIR": "/bench/host"})
-    assert r.returncode == 0 and r.stdout == "/bench/host"
-    r = _resolve_host_dir({**base, "LEERIE_HOST_DIR": "~/bench/host"})
-    assert r.returncode == 0 and r.stdout == "/h/bench/host"
-
-
-def test_a_relative_leerie_host_dir_is_refused():
+@pytest.mark.parametrize("value", ["/bench/host", "~/bench/host",
+                                   "bench/host", ""])
+def test_no_launch_repoints_the_host_dir(value):
+    """DESIGN §6 *A guard on a host-wide resource lives at that resource's
+    scope, which no launch repoints*: every guard in the host-wide dir
+    guards something every launch on the host shares, so a launch given
+    LEERIE_HOST_DIR (any value, empty included) stops rather than keep its
+    guards where the host's other launches never look. Falsified: the
+    refusal removed and the old `${LEERIE_HOST_DIR:-...}` read restored
+    (the absolute and `~/` values resolved, exit 0)."""
     r = _resolve_host_dir({"HOME": "/h", "PATH": "/usr/bin:/bin",
-                           "LEERIE_HOST_DIR": "bench/host"})
-    assert r.returncode == 1
-    assert "not an absolute path" in r.stderr and r.stdout == ""
+                           "LEERIE_HOST_DIR": value})
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert r.stdout == ""
+    assert "LEERIE_HOST_DIR is not a setting" in r.stderr
+    assert "~/.leerie/.host" in r.stderr
 
 
 def test_the_launcher_has_one_host_dir_and_no_hardcoded_mount():
     text = LAUNCHER.read_text()
-    assert '"$HOME/.leerie/.host"' not in text
     assert text.count("$HOME/.leerie/.host") == 1
+    assert '\n_leerie_host_dir="$HOME/.leerie/.host"\n' in text
     mounts = [ln for ln in text.splitlines()
               if ln.strip().startswith("-v ") and ":/leerie-host" in ln]
     assert mounts == ['    -v "$_leerie_host_dir:/leerie-host"']
