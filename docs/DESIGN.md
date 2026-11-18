@@ -15327,6 +15327,29 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    counter (§13 *One re-drive budget per subtask*) and its wall time from
    `redrive_budget_sec`, the hard stop.
 
+*One routing table.* Every confirmed finding goes to the owners its kind names, each a worker
+handed evidence it can run or read on its own tree, or it becomes one question to the user, or
+it is reported. The held-back names of rule 6 are the one deliberate exception. Rules 2-4 and 6
+decide that per kind of finding, and the code holds the decision in one table, not in each step
+that reads it. Each kind has three settings:
+
+- **owner** (rule 2): every claimer of an item; the subtasks a failing file, a check, a defect's
+  `where` or a base-form note touches; the defect notes together.
+- **open** (rule 3): whether the finding is still open at a group's start. A set file is
+  re-measured. A red check is read from the start's kept measurement. A solution defect is read
+  from its record. A base-form note is driven once a round. An item is re-checked after its
+  round.
+- **runnable** (rule 4): what of the finding the group's self-check must reproduce before the
+  group is driven. That is a set's file and an item's shown probe. A check, a defect or a
+  base-form note is evidence the fixer reads, and a held-back name is neither.
+
+The kinds differ in those settings, and each difference is the rule that decided it. One place
+holds them all, so a kind added later states all three, not only the one its first use needed.
+Before this, the owner of a kind was a branch in the router, its "still open?" a clause in a
+boolean beside the loop, and its reproduction a kind list in the pre-drive check. The reason a
+finding reached no worker was worked out twice: once while the notes were built, and again from
+the same inputs when it was recorded.
+
 After the last round the sets are measured once more on the tree that
 ships, the merge checks re-run when the tree moved (read from the last
 kept group's measurement when it holds every gate green), the failing-test-ID

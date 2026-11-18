@@ -66866,19 +66866,73 @@ def _redrive_checks_cleared(st: "State", caps: dict, notes: list[dict],
     return out
 
 
+# The delivery re-drive's one routing table (DESIGN §8 *Delivery re-drive*,
+# *One routing table*): per note kind, its `owner` (`defects`: every defect
+# note together, to the subtasks whose files meet any defect file's
+# `exercised` files, else the caller's fallback, else everyone; `touching`:
+# the subtasks its own `exercised` files touch, else the defect claimers,
+# else everyone; `claimers`: every subtask in its `claimed_by`, else the
+# defect claimers, else everyone), whether it is still `open` at a group's
+# start (`_redrive_open_at_start`), and what of it the group's self-check
+# must reproduce before the group is driven (`runnable`, read by
+# `_redrive_unreproducible`; None: nothing it can run, rule 4's readable
+# evidence, or a held-back set's names, rule 6). A kind not in it is never
+# routed and never open.
+_REDRIVE_ROUTES: dict[str, dict] = {
+    "defect": {"owner": "defects", "open": "failing", "runnable": "set_file"},
+    "control_regression": {"owner": "touching", "open": "failing_file",
+                           "runnable": "set_file"},
+    "held_defect": {"owner": "defects", "open": "held", "runnable": None},
+    "held_control": {"owner": "touching", "open": "held", "runnable": None},
+    "unmet_item": {"owner": "claimers", "open": "always", "runnable": "item"},
+    "ci_check": {"owner": "touching", "open": "uncleared", "runnable": None},
+    "solution_defect": {"owner": "touching", "open": "undriven",
+                        "runnable": None},
+    "base_form_case": {"owner": "touching", "open": "base_form",
+                       "runnable": None},
+}
+
+
+def _redrive_open_at_start(n: dict, *, failing: Iterable[str],
+                           held: Iterable[str], cleared: Iterable[str],
+                           closed: Iterable[str],
+                           base_forms_open: Iterable[str],
+                           round_bf: Iterable[str]) -> bool:
+    """Whether a routed note is still open at its group's start, by its
+    kind's `open` rule (`_REDRIVE_ROUTES`): a shown set's file still
+    failing (`failing`, the keys of F; a control only with a set file), a
+    held-back one still failing (`held`, the keys of H), a red check not
+    cleared by the start's kept measurement (`cleared`), a solution defect
+    no earlier kept group drove (`closed`), a base-form note still open and
+    not yet driven this round (`base_forms_open`, `round_bf`), or always
+    (an item: re-checked after the round)."""
+    rule = (_REDRIVE_ROUTES.get(n["kind"]) or {}).get("open")
+    key = n["key"]
+    if rule == "failing":
+        return key in failing
+    if rule == "failing_file":
+        return bool(n.get("file")) and key in failing
+    if rule == "held":
+        return key in held
+    if rule == "always":
+        return True
+    if rule == "uncleared":
+        return key not in cleared
+    if rule == "undriven":
+        return key not in closed
+    if rule == "base_form":
+        return key in base_forms_open and key not in round_bf
+    return False
+
+
 def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
                    fallback: list[str], pending: list[dict]) -> list[dict]:
     """Rules 2-4 (bench P8d `route`): the groups `[{members, files, notes}]`
-    in plan order (`subfiles`' order). Defect notes go together to the
-    subtasks whose files meet any defect file's `exercised` files, else
-    `fallback`, else everyone; a control-shaped note (`control_regression`,
-    `held_control`, `ci_check`, `solution_defect`, `base_form_case`) to
-    the subtasks its
-    `exercised` files
-    touch, else the defect claimers, else everyone; an item to every
-    claimer in `claimed_by`, else the defect claimers, else everyone.
-    Subtasks sharing a file are one group; `pending` (X3') rides along in
-    every group."""
+    in plan order (`subfiles`' order), each note to its kind's `owner`
+    (`_REDRIVE_ROUTES`), defect notes first; `fallback` is the defect
+    notes' (the audited fix sites' claimers, or in a held-back round the
+    subtasks earlier groups drove). Subtasks sharing a file are one group;
+    `pending` (X3') rides along in every group."""
     order = list(subfiles)
     rank = {s: i for i, s in enumerate(order)}
     targets: dict[str, list[dict]] = {}
@@ -66891,7 +66945,10 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
         ex = set(n.get("exercised") or ())
         return [s for s in order if ex & set(subfiles[s])]
 
-    defects = [n for n in notes if n.get("kind") in ("defect", "held_defect")]
+    def owner(n: dict) -> str | None:
+        return (_REDRIVE_ROUTES.get(n.get("kind")) or {}).get("owner")
+
+    defects = [n for n in notes if owner(n) == "defects"]
     claimers: list[str] = []
     for n in defects:
         claimers += [s for s in touching(n) if s not in claimers]
@@ -66900,11 +66957,10 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     for n in defects:
         give(claimers, n)
     for n in notes:
-        k = n.get("kind")
-        if k in ("control_regression", "held_control", "ci_check",
-                 "solution_defect", "base_form_case"):
+        o = owner(n)
+        if o == "touching":
             give(touching(n) or claimers or order, n)
-        elif k == "unmet_item":
+        elif o == "claimers":
             cl = [s for s in (n.get("claimed_by") or []) if s in rank]
             give(cl or claimers or order, n)
     ids = sorted(targets, key=lambda s: rank.get(s, len(order)))
@@ -66950,7 +67006,7 @@ def _redrive_unrouted_items(open_items: list[dict], handed: Iterable[str],
     """The still-open unmet items whose latest evidence reached no re-drive
     worker, typed `unrouted_item` (DESIGN §8 *An unmet item reaches its
     owner, or is recorded as reaching none*): `{item_index, item, reason,
-    probed?}`. `open_items` are `_redrive_open_evidence` entries, `handed`
+    probed?}`. `open_items` are `_redrive_unrouted_entries` entries, `handed`
     the `"<i>:<key>"` evidence keys a group that drove was handed. An item
     every evidence key of which was handed reached a worker. Otherwise, when
     a key its note carries was not handed, `reason` is `budget` when a group
@@ -67039,52 +67095,31 @@ def _redrive_evidence_keys(u: dict, row: object, *,
     return sorted(out)
 
 
-def _redrive_open_evidence(unmet_final: list, n_items: int, rows: list,
-                           notes: Iterable[dict], records: Iterable[dict],
-                           *, contested: Iterable[int] = ()) -> list[dict]:
-    """Per still-open item, what `_redrive_unrouted_items` accounts:
-    `{item_index, item, keys, drivable, reason, probed}` — `keys` every
-    evidence key of the item (`_redrive_evidence_keys`), `drivable` those
-    its note carries (`evidence_keys`), `reason` why the rest reach no
-    fixer: a whole-item record's own reason (`_redrive_item_notes`), else
-    `unreproducible` for a probe no fixer may be shown, else
-    `no_code_target` (a process item's evidence other than a probe with a
-    code target). An item that is neither a note nor a record (its probe
-    contested, nothing else open) is not listed."""
-    by_row = {r.get("item_index"): r for r in rows or []
-              if isinstance(r, dict)}
-    note_by = {n.get("item_index"): n for n in notes}
-    rec_by = {r.get("item_index"): r for r in records}
-    contested = set(contested)
-    out: list[dict] = []
-    done: set[int] = set()
-    for u in unmet_final or []:
-        i = u.get("item_index") if isinstance(u, dict) else None
-        if (not isinstance(i, int) or i >= n_items or i in done
-                or (i not in note_by and i not in rec_by)):
-            continue
-        done.add(i)
-        keys = _redrive_evidence_keys(u, by_row.get(i),
-                                      contested=i in contested)
-        n = note_by.get(i)
-        r = rec_by.get(i)
-        drivable = list(n.get("evidence_keys") or []) if n else []
-        probed = ""
-        if r is not None:
-            reason = str(r.get("reason") or "unreproducible")
-            probed = str(r.get("probed") or "")
-        else:
-            rest = [k for k in keys if k not in drivable]
-            reason = ("unreproducible" if any(
-                k.startswith("falsifier") for k in rest)
-                and n.get("probe") is None else "no_code_target"
-                if n.get("process") else "unreproducible")
-            if reason == "unreproducible":
-                probed = _redrive_probed(by_row.get(i))
-        out.append({"item_index": i, "item": u.get("item", ""),
-                    "keys": keys, "drivable": drivable, "reason": reason,
-                    "probed": probed})
-    return out
+def _redrive_unrouted_entries(notes: Iterable[dict],
+                              records: Iterable[dict]) -> list[dict]:
+    """What `_redrive_unrouted_items` accounts, per still-open item, read
+    off `_redrive_item_notes`' own output: `{item_index, item, keys,
+    drivable, reason, probed}` — `keys` every evidence key of the item,
+    `drivable` those its note carries (`evidence_keys`; none for a record),
+    `reason` and `probed` why the rest reach no fixer: a record's own, else
+    the note's `undriven`. An item that is neither a note nor a record (its
+    probe contested, nothing else open) is not listed."""
+    out: dict[int, dict] = {}
+    for n in notes:
+        un = n.get("undriven") or {}
+        out[n.get("item_index")] = {
+            "item_index": n.get("item_index"), "item": n.get("item", ""),
+            "keys": list(n.get("keys") or []),
+            "drivable": list(n.get("evidence_keys") or []),
+            "reason": str(un.get("reason") or "unreproducible"),
+            "probed": str(un.get("probed") or "")}
+    for r in records:
+        out[r.get("item_index")] = {
+            "item_index": r.get("item_index"), "item": r.get("item", ""),
+            "keys": list(r.get("keys") or []), "drivable": [],
+            "reason": str(r.get("reason") or "unreproducible"),
+            "probed": str(r.get("probed") or "")}
+    return list(out.values())
 
 
 def _redrive_probed(row: object) -> str:
@@ -67226,6 +67261,8 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
               else ["judge"])
         probe = (_falsifier_shown_probe(by_row.get(i), shown_idx, suite)
                  if "falsifier" in by and i not in contested else None)
+        keys = _redrive_evidence_keys(u, by_row.get(i),
+                                      contested=i in contested)
         owners: list[str] = []
         if process:
             owners = (list(probe_owners(probe))
@@ -67241,12 +67278,12 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
                             and i not in contested)
             if process and not unrepro_only:
                 unrepro.append({"item_index": i, "item": u.get("item", ""),
-                                "reason": "no_code_target"})
+                                "reason": "no_code_target", "keys": keys})
                 continue
             unrepro.append({
                 "item_index": i, "item": u.get("item", ""),
                 "reason": "unreproducible",
-                "probed": _redrive_probed(by_row.get(i))})
+                "probed": _redrive_probed(by_row.get(i)), "keys": keys})
             continue
         eb = u.get("evidence_by")
         if isinstance(eb, dict):
@@ -67266,6 +67303,15 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
             note["process"] = True
         if probe is not None and "falsifier" in repro:
             note["probe"] = probe
+        # Why the evidence the note does not carry reaches no fixer: a
+        # process item's is evidence that names no code a subtask changed
+        # (its note always carries its probe); any other item's is a probe
+        # no fixer may be shown.
+        why = "no_code_target" if process else "unreproducible"
+        note["keys"] = keys
+        note["undriven"] = {"reason": why, "probed": (
+            _redrive_probed(by_row.get(i)) if why == "unreproducible"
+            else "")}
         notes.append(note)
     return notes, unrepro
 
@@ -67859,12 +67905,13 @@ def _redrive_unreproducible(notes: list[dict],
                                   + list(s_.get("control_files") or []))
              for s_ in shown if isinstance(s_, dict)
              and not _acceptance_set_broken(s_)}
+    def runnable(n: dict) -> str | None:
+        return (_REDRIVE_ROUTES.get(n.get("kind")) or {}).get("runnable")
     return [str(n.get("key")) for n in notes
             if isinstance(n, dict) and (
-                "set_index" in n
-                and n.get("kind") in ("defect", "control_regression")
+                "set_index" in n and runnable(n) == "set_file"
                 and n.get("file") not in files.get(n["set_index"], ())
-                or n.get("kind") == "unmet_item"
+                or runnable(n) == "item"
                 and not _redrive_item_note_reproducible(n, files))]
 
 
@@ -72725,14 +72772,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     seen_keys: set[str] = set()
 
     def record_unrouted() -> None:
-        dg = st.data.get("delivery_gate") or {}
         notes, records = item_split()
         unrouted = _redrive_unrouted_items(
-            _redrive_open_evidence(
-                dg.get("unmet_final") or [], len(normalized),
-                dg.get("items") or [], notes, records,
-                contested=set(_redrive_contests_by_item(
-                    rec["contested_probes"]))),
+            _redrive_unrouted_entries(notes, records),
             rec["evidence_handed"], rec["items_budget_skipped"],
             stopped_on_budget, seen=seen_keys)
         if unrouted:
@@ -73027,20 +73069,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     log(f"  delivery re-drive r{rnd} g{gi}: solution "
                         f"defect(s) {', '.join(closed)} driven by an earlier "
                         "kept group — not handed on")
-                live = [n for n in g["notes"] if
-                        (n["kind"] in ("defect",) or (n["kind"] ==
-                                                      "control_regression"
-                                                      and n.get("file")))
-                        and n["key"] in F
-                        or n["kind"].startswith("held_") and n["key"] in H
-                        or n["kind"] == "unmet_item"
-                        or n["kind"] == "solution_defect"
-                        and n["key"] not in closed
-                        or n["kind"] == "ci_check"
-                        and n["key"] not in cleared
-                        or n["kind"] == "base_form_case"
-                        and n["key"] in {x["key"] for x in open_base_forms()}
-                        and n["key"] not in round_bf]
+                bf_open = {x["key"] for x in open_base_forms()}
+                live = [n for n in g["notes"] if _redrive_open_at_start(
+                    n, failing=F, held=H, cleared=cleared, closed=closed,
+                    base_forms_open=bf_open, round_bf=round_bf)]
                 # A base-form escalation is driven alone: the model it is
                 # escalated to works on those cases only (DESIGN §8 *A fix that
                 # keeps both, on opus when sonnet could not*).
