@@ -15327,6 +15327,28 @@ on 775233fa while 52b66f72 shipped. The outcome and the PR said each was
 unmet on the tree that ships, and `_decide_outcome`'s "not read on the
 tree that ships" reason could not fire for them.
 
+**A re-judge that crashed read nothing.** When the item re-judge raises,
+the re-check keeps each of its items unmet with the evidence it had, and
+marks them `crashed`. No such verdict is a read of the commit. Wherever
+the re-drive applies a re-check, its crashed items are therefore applied
+the way a failed ratchet read is: listed unverified on that commit
+(`_ratchet_mark_unverified`). They are never stamped as read there.
+Being listed unverified does three things:
+- the item is read once more on the tree that ships (the unverified items'
+  read, below);
+- the gate's `final_sha` is not re-keyed while it stays unread;
+- the outcome says it was not read on the tree that ships.
+
+The met read and the unverified read already did this. The routed read
+after a round and the end-of-pass read of unread items did not. They
+stamped `redrive_recheck.sha` with the commit, so the item counted as read
+there, the gate was re-keyed to it, and the outcome called the earlier
+tree's evidence unmet "on the tree that ships". This is the #401 class on
+the two paths #401 did not reach. It is a defect of the statement, not the
+verdict: the item stays unmet either way. No recorded run shows it: 0
+"item re-judge failed" lines in the recorded runs (lane S9-R3,
+2026-11-18).
+
 **A re-check replaces a verdict only on a tree that changed, and only by
 the vote that made it.** A routed item is re-judged only when the tree has
 moved since the verdict it would replace: the commit the detection verdict

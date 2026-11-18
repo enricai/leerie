@@ -154,6 +154,6 @@ def test_the_redrive_tail_refreshes_and_resettles(leerie):
     import inspect
     src = inspect.getsource(leerie._run_delivery_redrive)
     i_ref = src.index("_redrive_refresh_test_id_diff(")
-    i_app = src.index("_redrive_apply_item_verdicts(st, ver, final,")
+    i_app = src.index("_redrive_apply_read(st, ver, final,")
     i_res = src.index("_resettle_test_outcome_rows(st, final_tree)")
     assert i_ref < i_app < i_res

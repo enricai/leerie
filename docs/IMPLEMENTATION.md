@@ -11733,7 +11733,12 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `_redrive_apply_item_verdicts` writes onto the row, so the next re-check
   re-runs the new probe; `delivery_gate.final_progress` is restored to
   what it was, and a falsifier that cannot run leaves the re-check's
-  verdict), and `_run_ci_parity_final` re-runs when a check was routed. When the re-drive
+  verdict); the verdicts that did not crash are applied
+  (`_redrive_apply_item_verdicts(st, ..., HEAD, <its tree>)`), a crashed
+  one goes to `_ratchet_mark_unverified(st, crashed, HEAD, "the delivery
+  re-drive")` instead of being stamped `redrive_recheck.sha` (DESIGN §8 *A
+  re-judge that crashed read nothing*), and `items_rechecked_sha` moves to
+  HEAD; and `_run_ci_parity_final` re-runs when a check was routed. When the re-drive
   ends on a HEAD other than its start, every valid set is measured once:
   `acceptance.gate.final` / `final_sha` and `residual`
   (`_acceptance_residual_of`) are rewritten, or kept when nothing measured;
@@ -11748,6 +11753,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   re-check moves after reading only its routed items: DESIGN §8 *Every
   item verdict keyed to the tree that ships was read on it*); those are
   re-checked, and `delivery_gate.unmet_final` / `items[]` are rewritten
+  with the verdicts that did not crash (a crashed one goes to
+  `_ratchet_mark_unverified(st, crashed, final, "the delivery
+  re-drive")`, as below; DESIGN §8 *A re-judge that crashed read nothing*)
   (`_redrive_apply_item_verdicts(st, verdicts, sha, tree_sha)`, which
   settles each re-checked row on its stored `test_outcome_part` and then,
   given `tree_sha`, calls `_resettle_test_outcome_rows`); then
