@@ -223,21 +223,129 @@ def test_a_failed_install_is_not_recorded(leerie, env, monkeypatch):
     assert os.path.realpath(v1) not in leerie._VIEW_INSTALLS
 
 
-def test_the_install_key_reads_the_inputs_by_commit(leerie, env):
-    """The key changes with an input and with the recipe's install
-    entries, and not with any other file; it is read from the run
-    repository."""
-    st, staging, _caps, _count = env
+# An install as some package managers' is: it adds what its manifest names
+# and never removes what the manifest no longer names. Its manifest's name
+# is on no list.
+INCREMENTAL = (
+    "import pathlib\n"
+    "for name in open('deps.manifest').read().split():\n"
+    "    p = pathlib.Path('deps', name)\n"
+    "    p.parent.mkdir(exist_ok=True)\n"
+    "    p.write_text(name)\n")
+
+
+def test_an_input_named_on_no_list_makes_a_fresh_view(leerie, env, hold):
+    """The install read `deps.manifest`, so a tip that changes it gets a
+    fresh view: a dependency the manifest dropped is not left there, as a
+    moved view's incremental install would leave it."""
+    st, staging, caps, _count = env
+    st.data["provision"]["recipe"] = [
+        {"kind": "install", "command": [sys.executable, "-c", INCREMENTAL],
+         "working_dir": "."}]
+    _commit(leerie, staging, {".gitignore": "deps/\n",
+                              "deps.manifest": "kept\ndropped\n"})
+    v1 = _measure(leerie, st, staging, caps)
+    assert (v1 / "deps" / "dropped").is_file()
+    held = hold(v1 / "deps" / "kept")
+    c = _commit(leerie, staging, {"deps.manifest": "kept\n"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert _git(v2, "rev-parse", "HEAD") == c
+    assert not os.path.lexists(v2 / "deps" / "dropped")
+    assert (v2 / "deps" / "kept").read_text() == "kept"
+    assert not _is_held(held, v2 / "deps" / "kept")
+    files, _opened = leerie._VIEW_INSTALLS[os.path.realpath(v2)][2]
+    assert "deps.manifest" in files
+
+
+class _LimitedLibc:
+    """The real libc, but the kernel refuses `refused` (`inotify_init1`: no
+    inotify instance left for this user, EMFILE; `inotify_add_watch`: the
+    user's watches are spent, ENOSPC). Both are shared by every process of
+    the user, a run's, another run's and an editor's alike."""
+
+    def __init__(self, real, refused: str):
+        self._real = real
+        self._refused = refused
+
+    def __getattr__(self, name):
+        if name == self._refused:
+            return lambda *a: -1
+        return getattr(self._real, name)
+
+
+@pytest.mark.parametrize("unseen", ["no_instance", "no_watch",
+                                    "overflowed", "nothing_seen"])
+def test_an_install_whose_reads_are_not_all_seen_is_not_recorded(
+        leerie, env, hold, monkeypatch, unseen):
+    """No inotify instance, a watch refused, an event lost, or an install
+    seen opening nothing (as one whose tree the kernel reports by another
+    name would be): the reads are not known, so no key is recorded and the
+    next tip gets a fresh view."""
+    st, staging, caps, _count = env
+    if unseen in ("no_instance", "no_watch"):
+        refused = {"no_instance": "inotify_init1",
+                   "no_watch": "inotify_add_watch"}[unseen]
+        real_cdll = leerie.ctypes.CDLL
+        monkeypatch.setattr(
+            leerie.ctypes, "CDLL",
+            lambda *a, **k: _LimitedLibc(real_cdll(*a, **k), refused))
+    elif unseen == "nothing_seen":
+        real_watch = leerie._watch_reads
+
+        def _blind(tree):
+            w = real_watch(tree)
+            return w and w._replace(dirs={})    # every event unattributed
+        monkeypatch.setattr(leerie, "_watch_reads", _blind)
+    else:
+        real = leerie._drain_reads
+        monkeypatch.setattr(leerie, "_drain_reads",
+                            lambda w: real(w) and False)
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    assert (v1 / "node_modules" / "dep" / "index.js").is_file()
+    assert os.path.realpath(v1) not in leerie._VIEW_INSTALLS
+    held = hold(v1 / "node_modules" / "dep" / "index.js")
+    _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert not _is_held(held, v2 / "node_modules/dep/index.js")
+
+
+def test_the_install_key_is_what_the_install_read(leerie, env):
+    """The key changes with a file read, a file appearing where one was
+    read or in a directory read, and the recipe's install entries; not with
+    any other file. It is read from the run repository, by commit."""
+    st, staging, caps, _count = env
+    a = _commit(leerie, staging, {"src/a.txt": "2"})
+    v = _measure(leerie, st, staging, caps)
+    files, opened = leerie._VIEW_INSTALLS[os.path.realpath(v)][2]
+    assert "package.json" in files
+    assert "src/a.txt" not in files    # the build read it, not the install
+    b = _commit(leerie, staging, {"src/a.txt": "3"})
     repo = st.run_dir / "repo"
     recipe = st.data["provision"]["recipe"]
-    a = _commit(leerie, staging, {"src/a.txt": "2"})
-    b = _commit(leerie, staging, {"src/a.txt": "3"})
-    c = _commit(leerie, staging, {"patches/dep.patch": "p"})
-    d = _commit(leerie, staging, {"notes.md": "n"})
-    e = _commit(leerie, staging, {"pkg/b/package.json": "{}"})
+    reads = (frozenset({"cfg/lock.txt", "cfg/absent.txt"}),
+             frozenset({"pkgs"}))
+    base = _commit(leerie, staging, {"cfg/lock.txt": "1", "pkgs/a/m": "1",
+                                     "other/x": "1"})
+    same = [_commit(leerie, staging, {"other/x": "2"}),
+            _commit(leerie, staging, {"other/y": "1"}),
+            _commit(leerie, staging, {"pkgs/a/m": "2"})]
+    moved = [_commit(leerie, staging, {"cfg/lock.txt": "2"}),
+             _commit(leerie, staging, {"cfg/absent.txt": "1"}),
+             _commit(leerie, staging, {"cfg/beside": "1"}),
+             _commit(leerie, staging, {"pkgs/b/m": "1"})]
 
-    def key(t, r=recipe):
-        return leerie._install_key(repo, t, r)
-    assert key(a) == key(b) != key(c) == key(d) != key(e)
-    assert key(a) != key(a, [{"kind": "install", "command": ["other"]}])
-    assert key(a) != key(a, [{**recipe[0], "env": {"X": "1"}}, recipe[1]])
+    def key(t, r=recipe, rd=reads):
+        return leerie._install_key(repo, t, r, rd)
+    k = key(base)
+    # Each `same` commit adds to the one before; each `moved` one to the
+    # last `same`, so each is compared with its own parent.
+    assert [key(t) for t in same] == [k] * 3
+    parents = [same[-1], *moved[:-1]]
+    for parent, t in zip(parents, moved):
+        assert key(t) != key(parent), t
+    assert key(a, rd=(files, opened)) == key(b, rd=(files, opened))
+    assert key(base) != key(base, [{"kind": "install",
+                                    "command": ["other"]}])
+    assert key(base) != key(base, [{**recipe[0], "env": {"X": "1"}},
+                                   recipe[1]])

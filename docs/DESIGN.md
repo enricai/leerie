@@ -15764,14 +15764,21 @@ and a run makes several views per subtask. So a view is kept per tree and,
 when the tree's tip moves, moved rather than made again, if the install it
 holds is one leerie made from the same inputs and is as that install left
 it:
-- the *install key* is the recipe's `install` entries (command, working
-  directory, environment) and the git blob of every install input at the
-  tip: every tracked file named as a manifest, lockfile or package-manager
-  configuration (`_INSTALL_INPUT_NAMES`), everything under a `patches/`
-  directory, and every path the dependency capture's `copy_inputs` names.
-  The blobs are read from the run repository at the tip, never from a tree.
-  The key is recorded with the view's install only when that install
-  succeeded;
+- the install's *reads* are what its `install` entries opened in the
+  view: while leerie runs each one there it watches every tracked
+  directory of the view (inotify `IN_OPEN`), and every file and directory
+  opened under them is a read. The *install key* is the recipe's `install`
+  entries (command, working directory, environment) and, at the tip, the
+  git blob of each file read (or that it is absent) and the tracked names
+  in each directory read or holding a file read. The blobs and names are
+  read from the run repository at the tip, never from a tree. The key is
+  recorded, with the reads, with the view's install only when that install
+  succeeded and every read was seen: when a directory cannot be watched
+  (no inotify instance or watch left for the user, whose limits every run
+  and editor share), the kernel's event queue overflowed, or an `install`
+  entry was seen opening nothing — an install opens at least its manifest,
+  so that is an install not seen, never one that read nothing — nothing is
+  recorded, and the next tip gets a fresh view;
 - the install's *outputs* are the ignored paths that appeared while leerie
   ran the recipe's `install` entries in the view. When the last of them is
   done, before any build runs, leerie records every entry under those paths
@@ -15806,6 +15813,24 @@ the key does not name leaves no stale install either: the install runs
 again on the new tip and reads it, over its own earlier output — the package
 manager's incremental install, which is the residual difference from a fresh
 view.
+
+*The install key is what the install read.* *Designed 2026-11-18 (lane
+S9-R8, B9).* The key named its inputs by a list of file names — the
+manifests, lockfiles and configuration of the package managers someone had
+listed — so an install reading any other file was keyed on none of it: the
+.NET recipe's `packages.lock.json`, a JVM, Elixir, Dart, Swift or Zig
+manifest. A view whose such input changed was moved with its install kept,
+and an incremental install that does not remove what the input no longer
+names (a dependency dropped from it) left that in the view, where a fresh
+view would not have it. The text above also named the dependency capture's
+`copy_inputs`, a field the code no longer had. A list cannot be complete:
+what an install reads is the repository's and its manager's, any language.
+So the key is derived from what the install did read, observed by the
+kernel. A file read at the tip is keyed whatever its name; a file it only
+tests for, which opens nothing, is keyed through the names of its directory
+when that directory was read or holds a file read — a new `.npmrc` beside a
+`package.json` read. One that is neither is the residual named above: the
+install runs again over the moved view and reads it there, incrementally.
 
 *A view lives no longer than its tree.* *Designed 2026-11-03 (the live
 0.43.0 barnacle runs).* A view was replaced or moved only when its tree's

@@ -7107,7 +7107,7 @@ sample's probe never counts for the next.
   `shutil.rmtree` only inside `_rm_owned`; every `rm -rf` in
   `scripts/*.sh` is inside `leerie_rm_owned` or of a `mktemp` directory the
   same script made.
-- `tests/test_view_moves.py` (6 tests, DESIGN §8 *A view moves to the next
+- `tests/test_view_moves.py` (11 tests, DESIGN §8 *A view moves to the next
   tip when the install's inputs are unchanged*; review round 18 L1), real
   git, the real scripts and `_measured_tree` with an incremental stand-in
   install: a new tip with the same inputs moves the view — the install's
@@ -7118,10 +7118,16 @@ sample's probe never counts for the next.
   a changed `package.json` makes a fresh view; an in-place edit of an
   installed file that keeps its size and resets its mtime makes a fresh
   view; a rewritten `.git` is pointed back at the view's own repository and
-  the other repository is untouched; a failed install is not recorded; the
-  install key changes with an input, a `patches/` file, a nested manifest,
-  the install entries, their environment and a named copy input, and with
-  nothing else.
+  the other repository is untouched; a failed install is not recorded, nor
+  one whose reads were not all seen (no inotify instance, a watch refused,
+  an overflow, an install seen opening nothing); a manifest on
+  no list that the install read (`deps.manifest`, an incremental install
+  that never removes) makes a fresh view without the dependency it dropped
+  — at 102df873 the view moved and kept it; the install key is what the
+  install read: it changes with a file read, a file appearing where one was
+  read, beside one or in a directory read, the install entries and their
+  environment, and with nothing else, and the install's recorded reads hold
+  `package.json` and not the file only the build read.
 - `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
   committing tree (I6)*): staging and a subtask tree are worktrees of their
   own bare repositories (the run repository's objects through the
