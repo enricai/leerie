@@ -745,6 +745,9 @@ _OVERLAY_DIR = "/tmp/.leerie-overlay"
 # command starts, so nothing reaches either but through `$HOME`.
 _HOME_UPPER = "/tmp/.leerie-home"
 _HOME_REAL = "/tmp/.leerie-home-real"
+# Where the link root is bound read-only while its shields are bound from it
+# (`_readonly_source`); detached before the command starts.
+_SHIELD_SOURCE = "/tmp/.leerie-shield"
 # A home with less than this free is full (`HomeWatch`): a write that does
 # not fit fails with ENOSPC once the `tmpfs` has no page left.
 HOME_FULL_MARGIN = 1 << 20
@@ -962,12 +965,14 @@ def _bindable(p: str) -> bool:
     return not (_beneath(p, TMP) or _beneath(p, "/dev"))
 
 
-def _shield(top: str, grants: list[str]) -> list[str]:
+def _shield(top: str, grants: list[str], source: str) -> list[str]:
     """Every entry beneath `top` that is no grant, lies beneath none and
-    leads to none, bound onto itself (`readonly_mounts` then makes it
-    read-only); the directories that lead to a grant are walked. Returns
-    the entries bound. A symbolic link is not bound (a mount follows it);
-    an entry removed while this runs needs nothing."""
+    leads to none, bound onto itself from `source` (a read-only bind of
+    `top`'s link root, `_readonly_source`), so it is a read-only mount from
+    the moment it is one: nothing looks it up again (DESIGN §6 *A shield is
+    read-only when it is made*). The directories that lead to a grant are
+    walked. Returns the entries bound. A symbolic link is not bound (a
+    mount follows it); an entry removed while this runs needs nothing."""
     out = []
     try:
         names = sorted(os.listdir(top))
@@ -980,11 +985,12 @@ def _shield(top: str, grants: list[str]) -> list[str]:
         if any(_beneath(p, g) for g in grants):
             continue
         if any(_beneath(g, p) for g in grants):
-            out += _shield(p, grants)
+            out += _shield(p, grants, os.path.join(source, name))
             continue
         if os.path.islink(p):
             continue
-        if _mount(p, p, None, MS_BIND | MS_REC) != 0:
+        if _mount(os.path.join(source, name), p, None,
+                  MS_BIND | MS_REC) != 0:
             err = ctypes.get_errno()
             if err == errno.ENOENT:
                 continue
@@ -993,14 +999,29 @@ def _shield(top: str, grants: list[str]) -> list[str]:
     return out
 
 
+def _readonly_source(root: str) -> str:
+    """`root` bound read-only at `_SHIELD_SOURCE`, on the process's own
+    `/tmp`, where no other process can unlink it: the source `_shield` binds
+    from. The caller detaches it once the shields are made."""
+    try:
+        os.mkdir(_SHIELD_SOURCE, 0o700)
+    except OSError as e:
+        raise IsolationError(f"make {_SHIELD_SOURCE}: {e}", e.errno or 0) \
+            from None
+    _must(f"bind {root} at {_SHIELD_SOURCE}",
+          _mount(root, _SHIELD_SOURCE, None, MS_BIND | MS_REC))
+    opts = [o for mp, o in _mountinfo() if mp == _SHIELD_SOURCE][-1]
+    _remount_readonly(_SHIELD_SOURCE, opts)
+    return _SHIELD_SOURCE
+
+
 def bind_grants(rw: list[str], link_root: str | None = None
                 ) -> tuple[list[str], list[str]]:
     """The write grants bound so they stay writable when every other mount
     is made read-only (DESIGN §6 *The write grants on one mount are one
     mount*). Those beneath `link_root` are bound together: `link_root`
     bound onto itself once, and everything beneath it that no grant covers
-    or leads to bound apart (`_shield`) for `readonly_mounts` to make
-    read-only. One mount, because a hard link cannot cross mounts (`EXDEV`)
+    or leads to bound apart, read-only from the start (`_shield`). One mount, because a hard link cannot cross mounts (`EXDEV`)
     even on one filesystem: bound one by one, a tree and the store it
     installs from lie on two, and every package manager that links from its
     store (pnpm, bun, uv) copies instead. `link_root` is the caller's
@@ -1023,9 +1044,13 @@ def bind_grants(rw: list[str], link_root: str | None = None
     roots: list[str] = []
     if linked:
         assert root is not None
+        source = _readonly_source(root)
         _must(f"bind grant {root}", _mount(root, root, None,
                                            MS_BIND | MS_REC))
-        _shield(root, linked)
+        _shield(root, linked, source)
+        _must(f"detach {source}", _libc().umount2(os.fsencode(source),
+                                                  MNT_DETACH))
+        os.rmdir(source)
         roots.append(root)
         kept += linked
     return kept, roots
@@ -1256,6 +1281,16 @@ def _mountinfo() -> list[tuple[str, set[str]]]:
     return out
 
 
+def _remount_readonly(mp: str, opts: set[str]) -> None:
+    """`mp` remounted read-only, its locked flags (`opts`, from mountinfo)
+    repeated."""
+    flags = MS_REMOUNT | MS_BIND | MS_RDONLY
+    for name, bit in _LOCKED_FLAGS.items():
+        if name in opts:
+            flags |= bit
+    _must(f"remount {mp} read-only", _mount(None, mp, None, flags))
+
+
 def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE,
                     roots: tuple[str, ...] | list[str] = ()) -> int:
     """Every mount not already read-only, not a kept grant (or beneath one),
@@ -1270,11 +1305,7 @@ def readonly_mounts(keep: list[str], private: tuple[str, ...] = PRIVATE,
             continue
         if any(_beneath(mp, k) for k in keep):
             continue
-        flags = MS_REMOUNT | MS_BIND | MS_RDONLY
-        for name, bit in _LOCKED_FLAGS.items():
-            if name in opts:
-                flags |= bit
-        _must(f"remount {mp} read-only", _mount(None, mp, None, flags))
+        _remount_readonly(mp, opts)
         n += 1
     return n
 

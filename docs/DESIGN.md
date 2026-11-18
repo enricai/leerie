@@ -5323,8 +5323,9 @@ and runs anything (`--isolate`):
    command's private temp directory `/tmp/l/<id>/`, a host's state root)
    is carried into the new `/tmp` at its own path;
 4. the write grants bound so they stay writable, those that lie on one
-   mount bound together (below), then every other mount remounted
-   read-only, its locked flags kept. A file outside the grants can then
+   mount bound together (below) with everything else beneath them bound
+   read-only from the start (*A shield is read-only when it is made*),
+   then every other mount remounted read-only, its locked flags kept. A file outside the grants can then
    not have its mode, times or extended attributes changed (EROFS), and a
    device node on a read-only mount still writes;
 5. its own session keyring, then a seccomp filter that refuses every
@@ -5376,7 +5377,8 @@ store a tree installs from lives beside the trees, in
 directory as its link root (`WorkerGrants.link`, the shim's `--link-root`):
 the grants beneath it are bound as one mount rooted there, everything else
 beneath it that no grant covers or leads to — the other trees, the other
-trees' stores — is bound apart and made read-only (`_shield`), and every
+trees' stores — is bound apart, read-only from the call that makes it
+(`_shield`; *A shield is read-only when it is made*, below), and every
 grant outside it (a measurement directory, a worker's own directories, a
 tree repository, notes) is its own mount as before. `state.json`, the
 logs, `run.json`, `claude-config` and every other record of the run stay
@@ -5403,6 +5405,72 @@ confined process with `--link-root <run>/worktrees`: `chmod`, `touch -d`
 and `setxattr` on `state.json`, a log and a tree that existed at its start
 all answered read-only; on a file of a tree made after it started, and on
 `worktrees` itself, all three succeeded.
+
+**A shield is read-only when it is made** (*designed 2026-11-18, the
+navegando trial A-T2-3*). The invariant: *building a confined process's
+mounts never looks up again a mount it made on a directory another process
+can remove; such a mount has, in the one call that makes it, the access it
+keeps.* Through 0.73.0 `_shield` bound each other tree and tree's store
+onto itself writable, and step 4's read-only pass found it again by its path
+in `/proc/self/mountinfo` and remounted it. Those directories are the
+orchestrator's, removed whenever a subtask's tree is done with, and a
+shield is a mount on one of them. When a directory is removed in one mount
+namespace the kernel detaches every mount on it in every other
+(`vfs_rmdir`'s `detach_mounts`, Linux 3.18 and later), whatever their
+propagation: the shim's namespace was already private (`make / rprivate`,
+and its mountinfo carries no `shared:` or `master:` tag), and the tree was
+no mount at all in the orchestrator's namespace — the shield was the shim's
+own. A tree removed between the read and the remount left a path that no
+longer resolved, the remount answered `ENOENT`, and the shim refused the
+command: in the navegando trial A-T2-3 (0.70.2) `bugfix-001-2` completed
+and its tree was removed while `bugfix-003`'s post-install `pnpm install
+--frozen-lockfile` was being isolated, and the run stopped (exit 78,
+"confinement refused", nothing of the step recorded). Reproduced with real
+git worktrees: a sibling removed by `git worktree remove` after the shim
+read the mount table and before it remounted gives exactly that refusal.
+
+So every shield is bound from a read-only bind of the link root, made on
+the process's own `/tmp` (`/tmp/.leerie-shield`, which no other process
+reaches) and detached once the shields are made. A bind clones its source
+mount with its flags, read-only among them, so a shield is read-only from
+the call that makes it, and the read-only pass skips it as it skips every
+mount already read-only. A tree removed after its shield is made takes the
+shield with it, and nothing is left at its path to protect. A tree removed
+between the listing of the link root and its bind gets no shield, as before
+(an entry that is gone needs none): that call is now the only place the
+build meets another tree's removal, and it is the call that would protect
+the tree. What it rejects:
+- making the namespace private or a slave: it was private already, and a
+  removal's detach is not propagation;
+- ignoring `ENOENT` in the read-only pass, or retrying it: the pass would
+  then pass over any mount that vanished, an inherited one included, with
+  no reason that it needed nothing;
+- keeping other trees out of the view: a tree and its store on one
+  writable mount puts every other tree on that mount, and hiding one
+  instead of making it read-only is still a mount on its directory,
+  detached by its removal the same way;
+- a lock every remover of a tree takes against every build: each remover
+  must join it, and a tree's removal (tens of thousands of `node_modules`
+  files) would hold up every confined start meanwhile;
+- the file-descriptor mount API (`open_tree`, `mount_setattr`,
+  `move_mount`): `move_mount` needs a `mount options=(move)` rule the
+  `leerie-container` profile does not hold, a profile every host would
+  have to reload (*What the runtime must allow*).
+
+Confinement is unchanged. Every tree and store beneath the link root that
+existed when its shield was made is read-only to the command (`chmod`,
+`utime` and `setxattr` answer `EROFS`), its own grants are writable on the
+one mount, Landlock is as it was, and what the paragraph above gives up
+stays given up. The build uses only a bind, a remount and an unmount, which
+every runtime already allows: rootless containerd and rootful Colima under
+the `leerie-container` profile (`mount options=(rw, rbind) -> /**,`,
+`remount /**,`, `umount,`), Fly and EC2 with no AppArmor. Every caller of
+the shim is covered: a worker and every measurement kind, a B* confirm
+rerun of the shown tests among them, are isolated with the link root
+(`WorkerGrants.link`) and get shields; a held-out sandbox
+(`HeldOutSandbox`, a confirm rerun that carries held-out files among them)
+overlays its grants, is passed no link root and makes none, and its other
+trees lie on the inherited state-root mount, which no removal detaches.
 
 So `/tmp` and `/dev/shm` are a confined process's own: every worker and
 every repository command reads and writes them as it would outside leerie,
