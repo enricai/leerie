@@ -8745,7 +8745,9 @@ the ref finalize pushes (review round 15 H1: read from staging's HEAD, it
 was "" once finalize's `cleanup.sh` had removed staging, so every run with
 a delivery verdict ended `unconverged`; and staging's HEAD is not what
 ships unless I1 holds staging on the branch). Every pass stamps its verdict
-with that same ref's tree. Any other verdict, or none of the shipping tree at all, makes the
+with the tree of the commit it read (*Every statement about the result is
+keyed to the commit it was made on*, below), which is that ref's tree while
+I1 holds staging on the branch. Any other verdict, or none of the shipping tree at all, makes the
 run `unconverged` with the reason "the required items were not read on
 the tree that ships". The root cause this removes (review round 14 M2):
 the decider read whichever unmet list existed — final detection's, else
@@ -8759,6 +8761,34 @@ every routed and every unverified item was read there; otherwise the
 verdict stays of its own tree and the run says so. And a final judge that
 fails in any way, not only a worker crash or timeout, is a judge that read
 nothing: its items are `unknown`, never `met`.
+
+*Every statement about the result is keyed to the commit it was made on.*
+The rule, of which the paragraph above is one case: a measurement records
+the commit it ran on, and a statement about the tree that ships comes only
+from a measurement of that tree, or from an earlier measurement together
+with the mechanical proof that the tree's difference from the one measured
+cannot reach what was measured (§8 *How a result is carried*: each carried
+file keeps the tree it was measured on, and `_change_reach` is the proof).
+Two pieces implement it, once each. *One stamp*: the commit a measurement
+ran on and that commit's tree, both taken from that commit — never re-read
+afterwards from staging's HEAD or from the run branch's ref, which name
+the same tree only because every move of staging is taken into the run
+repository before anything reads it (§8 *The final diff describes the tree
+that ships*), a guarantee a stamp should not have to lean on. *One
+comparison*: is a recorded stamp of the tree that ships — nothing when the
+tree that ships cannot be read, so each reader keeps what it does then.
+Each reader states the key it compares: today every reader of the tree that
+ships compares the content tree, which is the intended single key for a
+statement about content (an empty commit or a rebase changes the commit and
+not what was measured); a resume's reuse of a finished verdict compares the
+commit, the one it can check out (*A finished verdict is reused only on the
+commit it was measured on*). A stamp is never moved onto a verdict its
+commit did not produce. Records that never become a statement about the
+tree that ships carry their commit too, so a reader added later can check
+it: the integration judge's verdict names the commit it judged (after a
+repair round that is the repaired head's merge, not the original merge),
+and a subtask's settle-by-execution record the commit its verify commands
+ran on.
 
 *`done` rests on measurements that ran (review round 19).* Root cause:
 every regression check stepped aside when it could not measure. The

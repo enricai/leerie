@@ -43601,7 +43601,8 @@ def _shipping_tree(st: "State") -> str:
     (DESIGN §6 *The run's own repository*) — the ref the user receives,
     which outlives staging (review round 15 H1: read from staging's HEAD, it
     was "" once finalize's `cleanup.sh` had removed staging). Every delivery
-    pass stamps its verdict with it and the outcome compares against it. ""
+    pass's stamp (`_stamp`, the tree of the commit it read) is compared
+    against it (`_of_shipping`). ""
     when the ref cannot be read."""
     return _run_repo_rev(
         st, f"refs/heads/{_compute_run_branch(st.run_id)}^{{tree}}")
@@ -43631,6 +43632,26 @@ def _run_repo_rev(st: "State", rev: str) -> str:
                         "--verify", "-q", rev],
                        capture_output=True, text=True, check=False)
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _stamp(st: "State", sha: str) -> dict[str, str]:
+    """The stamp of a measurement that ran on commit `sha`: `{sha, tree}`,
+    the tree read from that commit in the run's own repository — never
+    re-read from a ref or from HEAD after the measurement (DESIGN §6 *Every
+    statement about the result is keyed to the commit it was made on*).
+    `tree` is "" when `sha` is not a commit there."""
+    return {"sha": sha or "", "tree": _commit_tree(st, sha)}
+
+
+def _of_shipping(stamped: object, shipping: str) -> bool | None:
+    """Whether the recorded stamp `stamped` is `shipping`, the tree (or
+    commit) that ships as the reader keys it (`_shipping_tree` /
+    `_shipping_commit`); None when `shipping` could not be read, so each
+    reader keeps what it does then (DESIGN §6 *Every statement about the
+    result is keyed to the commit it was made on*)."""
+    if not shipping:
+        return None
+    return bool(stamped) and stamped == shipping
 
 
 def _diff_base(st: "State") -> str | None:
@@ -43664,16 +43685,16 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
         shipping = _shipping_tree(st)
         gap = data.get("shipping_tests_gap")
         gap = gap if isinstance(gap, dict) else {}
-        if shipping and diff.get("tree_sha") == shipping:
+        if _of_shipping(diff.get("tree_sha"), shipping):
             nv = [str(x) for x in diff.get("no_verdict") or []]
             if nv:
                 out.append(f"{len(nv)} test(s) failing on the tree that ships "
                            "could not be rerun on the base, so whether the "
                            "run made them fail is unknown")
-        elif not (gap.get("tree_sha") == shipping and str(
+        elif not (_of_shipping(gap.get("tree_sha"), shipping) and str(
                 gap.get("skip_kind") or "").startswith("forbidden_")):
-            why = (gap.get("why") if shipping and gap.get("tree_sha")
-                   == shipping else None)
+            why = (gap.get("why") if _of_shipping(gap.get("tree_sha"),
+                                                  shipping) else None)
             out.append("the tests were not measured on the tree that ships"
                        + (f" ({why})" if why else
                           " (no failing-test-ID diff was taken of it)"
@@ -43696,7 +43717,7 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
                        "their base form on the tree that ships ("
                        + str(behaviour.get("error")
                              or behaviour.get("unmeasured_reason")) + ")")
-        elif shipping and behaviour.get("tree_sha") != shipping:
+        elif _of_shipping(behaviour.get("tree_sha"), shipping) is False:
             out.append("the existing tests the run changed were run in "
                        "their base form on another tree than the one that "
                        "ships")
@@ -43771,7 +43792,7 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # nothing of what ships.
         unmet, tree, which = verdict
         shipping = _shipping_tree(st)
-        if not tree or tree != shipping:
+        if not _of_shipping(tree, shipping):
             reasons.append(
                 "the required items were not read on the tree that ships: "
                 f"the last delivery verdict ({which}) is of "
@@ -63454,7 +63475,7 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=False)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
-    judged_tree = _shipping_tree(st)
+    judged_tree = _stamp(st, judged_sha)["tree"]
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -63555,7 +63576,7 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         st, leerie_dir, refresh_tokens=True)
     details: dict = {}
     judged_sha = await _branch_head_sha(str(staging))
-    judged_tree = _shipping_tree(st)
+    judged_tree = _stamp(st, judged_sha)["tree"]
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -64201,10 +64222,12 @@ async def _run_shipping_pr_review(leerie_dir: Path, st: "State", caps: dict,
             or not staging.is_dir()):
         return None
     commit, tree = _shipping_commit(st), _shipping_tree(st)
-    if not commit or not tree or _commit_tree(st, first["head"]) == tree:
+    if not commit or not tree or _of_shipping(
+            _commit_tree(st, first["head"]), tree):
         return None
     prev = st.data.get("pr_review_shipped")
-    if isinstance(prev, dict) and _commit_tree(st, prev.get("head")) == tree:
+    if isinstance(prev, dict) and _of_shipping(
+            _commit_tree(st, prev.get("head")), tree):
         return prev
     log(f"phase 5: whole-PR review again — the run branch moved from "
         f"{str(first['head'])[:12]} to {commit[:12]} since the review "
@@ -66673,8 +66696,9 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
         _set_ratchet_unverified_gap(st)
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
-    gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,
-                final_tree=_shipping_tree(st),
+    stamp = _stamp(st, sha)
+    gate.update(items=rows, unmet_final=unmet_final, final_sha=stamp["sha"],
+                final_tree=stamp["tree"],
                 final_judge={k_: judged.get(k_) for k_ in
                              ("source", "samples", "error", "attempts")
                              if k_ in judged},
@@ -75322,6 +75346,9 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     # measurement reads the committed view*).
     worktree = await _measured_tree(st, worktree, caps, log_path=log_path,
                                     label=f"settle-exec-{sid}")
+    # The commit the verify commands run on (DESIGN §6 *Every statement
+    # about the result is keyed to the commit it was made on*).
+    record["sha"] = await _branch_head_sha(worktree)
     grants = _measurement_grants(st, worktree)
     try:
         blt = resolve_blt(st.repo_root)
@@ -78654,9 +78681,12 @@ async def _run_integration_judge_gate(
             "degrading (merge preserved, check_merge_committed already ran)")
         return True
     gating, advisories = verdict
+    # `judged_sha`: the commit this verdict read — after a repair round the
+    # repaired head's merge, not `merge_commit_sha` (DESIGN §6 *Every
+    # statement about the result is keyed to the commit it was made on*).
     rec.update({"defects": [_integration_defect_label(d) for d in gating],
                 "advisories": advisories, "merge_commit_sha": merge_sha,
-                "accepted": not gating})
+                "judged_sha": judged, "accepted": not gating})
     _persist()
 
     if not gating:
@@ -78715,6 +78745,9 @@ async def _run_integration_judge_gate(
             return await _back_out(
                 f"integrator {outcome['verdict']} during repair: "
                 f"{outcome.get('diagnosis') or 'no diagnosis'}")
+        if outcome.get("judged"):
+            # The verdict below is the round's re-judge, of this commit.
+            rec["judged_sha"] = outcome["judged"]
         if outcome["verdict"] == "pass":
             rec.update({"accepted": True, "outcome": "repaired",
                         "defects": []})
@@ -78837,8 +78870,9 @@ async def _integration_repair_round(
         log(f"  integration repair {sid}: conflicted-area tests skipped "
             f"({tests['skipped']})")
     synthetic = await _synthetic_merge(staging, head, p1, p2, merge_sha)
+    judged = synthetic or head
     verdict = await _integration_judge_verdict(
-        sid, staging, synthetic or head, incoming, integrated_so_far, caps,
+        sid, staging, judged, incoming, integrated_so_far, caps,
         st, models, efforts)
     if verdict is None:
         # The re-judge crashed: the round reached no verdict on the repair.
@@ -78849,9 +78883,9 @@ async def _integration_repair_round(
     if not gating and not tests["test_failure"] \
             and not tests["stale_by_other_side"]:
         entry["verdict"] = "pass"
-        return {"verdict": "pass"}
+        return {"verdict": "pass", "judged": judged}
     entry["verdict"] = "checked"
-    return {"verdict": "checked",
+    return {"verdict": "checked", "judged": judged,
             "findings": gating + [_integration_test_defect(t)
                                   for t in tests["test_failure"]],
             "stale": tests["stale_by_other_side"]}
@@ -80200,7 +80234,7 @@ def _final_conformance_payload(st: "State",
     if not residuals and not failed_axes and not warnings:
         return None
     measured_on = str(block.get("tree_sha") or "")
-    if not measured_on or measured_on != shipping_tree:
+    if not _of_shipping(measured_on, shipping_tree):
         log("pr_writer: final conformance notes left out — measured on "
             f"tree {measured_on[:12] or '(unrecorded)'}, the run ships "
             f"{shipping_tree[:12] or '(unreadable)'}")
