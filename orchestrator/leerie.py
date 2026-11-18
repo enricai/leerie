@@ -36030,10 +36030,8 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     }
     # Only this producer's own entries are rewritten: a blocker accepted as
     # external (`_settle_accepted_external`) must survive a re-classify.
-    st.data["needs_human_verification"] = [
-        e for e in (st.data.get("needs_human_verification") or [])
-        if isinstance(e, dict) and e.get("source") != "required_item"
-    ] + _d1_needs_human_verification(items)
+    _replace_gaps(st, "required_item", _d1_needs_human_verification(items),
+                  save="none", guard=False, drop_malformed=True)
     if residual:
         log(f"  requirement coverage: {len(residual)} hole(s) left after "
             "the check rounds — proceeding with the items as returned: "
@@ -50100,6 +50098,49 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     return results
 
 
+def _replace_gaps(st: "State", source: str, new: Iterable[dict] = (), *,
+                  match: Callable[[dict], bool] | None = None,
+                  save: str = "on_change", raise_on_save: bool = False,
+                  guard: bool = True, drop_malformed: bool = False) -> None:
+    """Replace one writer's `needs_human_verification` entries: drop those
+    of `source` that `match` accepts (every one of `source` when None),
+    append `new`, then save. Every writer of that list goes through here,
+    so the PR's two lists of what the run could not verify are one list
+    with one way of being written (DESIGN §6 *The PR's end-state section is
+    rendered by code, from typed state*).
+
+    The settings are each caller's own, kept as they were:
+    - `save`: "on_change" writes the list and saves only when it changed;
+      "always" writes and saves; "none" writes, and the caller saves.
+    - `raise_on_save`: a failed save propagates rather than being dropped.
+    - `guard`: return without writing when `st.data` is not a dict; without
+      it, `st.data` is read as it is.
+    - `drop_malformed`: entries that are not dicts are dropped too.
+    `new` is read only after the guard."""
+    if guard:
+        data = getattr(st, "data", None)
+        if not isinstance(data, dict):
+            return
+    else:
+        data = st.data
+    old = data.get("needs_human_verification") or []
+    entries = [e for e in old
+               if (isinstance(e, dict) or not drop_malformed)
+               and not (isinstance(e, dict) and e.get("source") == source
+                        and (match is None or match(e)))]
+    entries += list(new)
+    if save == "on_change" and entries == old:
+        return
+    data["needs_human_verification"] = entries
+    if save == "none":
+        return
+    if raise_on_save:
+        st.save()
+        return
+    with contextlib.suppress(Exception):
+        st.save()
+
+
 REGRESSION_GAP_SOURCE = "regression_check"
 CONFIRM_BUDGET_GAP_SOURCE = "confirm_budget"
 FINAL_DIFF_GAP_SOURCE = "final_test_diff"
@@ -50116,14 +50157,6 @@ def _set_confirm_budget_gap(st: "State", site: str, what: list[str], *,
     failures are new*, step 4) — `what` those whose reruns the budget cut,
     `sized_out` those never rerun because one base/final pair of them did
     not fit what was left of the budget (step 2). One entry per site."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == CONFIRM_BUDGET_GAP_SOURCE
-                       and e.get("site") == site)]
-
     def shown(xs: list[str]) -> str:
         return ", ".join(str(w) for w in xs[:10]) + (
             f" (+{len(xs) - 10} more)" if len(xs) > 10 else "")
@@ -50139,8 +50172,9 @@ def _set_confirm_budget_gap(st: "State", site: str, what: list[str], *,
             "not rerun (sized out of the budget): "
             f"{shown(list(sized_out))} (one base/final pair did not fit "
             "what was left of confirm_budget_sec)")
+    new: list[dict] = []
     if parts:
-        entries.append({
+        new.append({
             "source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
             "detail": (f"{site}: rerun these against the base by hand — "
                        f"failing {where}, but whether {whose} made them "
@@ -50148,12 +50182,10 @@ def _set_confirm_budget_gap(st: "State", site: str, what: list[str], *,
     elif tail.strip("; "):
         # Nothing left unsettled but what `tail` names (a kept re-drive
         # group's unchecked items): still listed, never dropped with them.
-        entries.append({"source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
-                        "detail": f"{site}: {tail.strip('; ')}"})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+        new.append({"source": CONFIRM_BUDGET_GAP_SOURCE, "site": site,
+                    "detail": f"{site}: {tail.strip('; ')}"})
+    _replace_gaps(st, CONFIRM_BUDGET_GAP_SOURCE, new,
+                  match=lambda e: e.get("site") == site)
 
 
 def _set_regression_gap(st: "State", detail: str | None) -> None:
@@ -50161,18 +50193,9 @@ def _set_regression_gap(st: "State", detail: str | None) -> None:
     entry saying the orchestrator's own regression check could not run on
     the latest measured tree. One entry, the latest tree's: a later tree
     the scoped run did measure clears it."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == REGRESSION_GAP_SOURCE)]
-    if detail:
-        entries.append({"source": REGRESSION_GAP_SOURCE, "detail": detail})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+    _replace_gaps(st, REGRESSION_GAP_SOURCE,
+                  [{"source": REGRESSION_GAP_SOURCE, "detail": detail}]
+                  if detail else [])
 
 
 def _set_final_diff_gap(st: "State", detail: str | None) -> None:
@@ -50181,18 +50204,9 @@ def _set_final_diff_gap(st: "State", detail: str | None) -> None:
     that ships (DESIGN §8 *Delivery re-drive*, *The final diff describes the
     tree that ships*) — listed whether or not a required item names the test
     outcome. One entry, the latest tree's."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == FINAL_DIFF_GAP_SOURCE)]
-    if detail:
-        entries.append({"source": FINAL_DIFF_GAP_SOURCE, "detail": detail})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+    _replace_gaps(st, FINAL_DIFF_GAP_SOURCE,
+                  [{"source": FINAL_DIFF_GAP_SOURCE, "detail": detail}]
+                  if detail else [])
 
 
 async def _scoped_test_replacement(tree: str, st: "State", canonical: str,
@@ -54803,27 +54817,20 @@ def _set_record_worker_gap(st: "State", judged: Iterable[int],
     for required items whose only evidence is a command a worker ran: one
     per item, replaced for the items this pass judged and kept for the
     rest."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
     judged = set(judged)
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == RECORD_WORKER_GAP_SOURCE
-                       and e.get("item_index") in judged)]
-    for i, h in sorted(human.items()):
+
+    def entry(i: int, h: dict) -> dict:
         cmds = "; ".join(f"`{' '.join(str(c).split())[:200]}`"
                          for c in h.get("commands") or [])
-        entries.append({
+        return {
             "source": RECORD_WORKER_GAP_SOURCE, "item_index": i,
             "detail": (f"{h.get('item')} — its only evidence is a command a "
                        f"worker ran in its own working tree, which leerie "
                        f"does not re-run: {cmds}. Run it on the PR branch "
-                       f"and check.")})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+                       f"and check.")}
+    _replace_gaps(st, RECORD_WORKER_GAP_SOURCE,
+                  (entry(i, h) for i, h in sorted(human.items())),
+                  match=lambda e: e.get("item_index") in judged)
 
 
 # The "Needs human verification" source for a required item a majority of
@@ -54837,24 +54844,14 @@ def _set_judge_uninspected_gap(st: "State", judged: Iterable[int],
     """The `JUDGE_UNINSPECTED_GAP_SOURCE` entries: one per item the judge
     left uninspected, replaced for the items this pass judged and kept for
     the rest."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
     judged = set(judged)
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == JUDGE_UNINSPECTED_GAP_SOURCE
-                       and e.get("item_index") in judged)]
-    for i, text in sorted(items.items()):
-        entries.append({
-            "source": JUDGE_UNINSPECTED_GAP_SOURCE, "item_index": i,
-            "detail": (f"{str(text)[:200]} — the delivery judge did not "
-                       "inspect it on this commit, even when re-asked for "
-                       "it. Check it on the PR branch by hand.")})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+    _replace_gaps(st, JUDGE_UNINSPECTED_GAP_SOURCE, (
+        {"source": JUDGE_UNINSPECTED_GAP_SOURCE, "item_index": i,
+         "detail": (f"{str(text)[:200]} — the delivery judge did not "
+                    "inspect it on this commit, even when re-asked for "
+                    "it. Check it on the PR branch by hand.")}
+        for i, text in sorted(items.items())),
+        match=lambda e: e.get("item_index") in judged)
 
 
 def _head_identity(tree: str | Path | None) -> tuple[str, str]:
@@ -55227,11 +55224,9 @@ def _set_test_outcome_gap(st: "State", items: list[str],
     items the failing-test-ID diff could not settle (verdict `unknown`) and
     why (`reason`, from `_test_outcome_verdict`); cleared when there are
     none."""
-    entries = [e for e in (st.data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == TEST_OUTCOME_GAP_SOURCE)]
+    new: list[dict] = []
     if items:
-        entries.append({
+        new.append({
             "source": TEST_OUTCOME_GAP_SOURCE,
             # The instruction first, then the reason (it names the tests to
             # rerun), the items last: the PR caps an entry at
@@ -55241,9 +55236,8 @@ def _set_test_outcome_gap(st: "State", items: list[str],
                           "tree")[:600]
                        + " (required by: "
                        + "; ".join(x[:200] for x in items) + ")")})
-    if entries != (st.data.get("needs_human_verification") or []):
-        st.data["needs_human_verification"] = entries
-        st.save()
+    _replace_gaps(st, TEST_OUTCOME_GAP_SOURCE, new, raise_on_save=True,
+                  guard=False)
 
 
 DELIVERY_JUDGE_GAP_SOURCE = "delivery_judge_unknown"
@@ -55256,16 +55250,11 @@ def _set_delivery_unknown_gap(st: "State", source: str, items: list[str],
     naming the required items no check read on the shipping commit
     (verdict `unknown`, review round 13 claims M1) and why; cleared when
     there are none."""
-    entries = [e for e in (st.data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict) and e.get("source") == source)]
-    if items:
-        entries.append({
-            "source": source,
-            "detail": (f"Check by hand: {why} — "
-                       + "; ".join(x[:200] for x in items))})
-    if entries != (st.data.get("needs_human_verification") or []):
-        st.data["needs_human_verification"] = entries
-        st.save()
+    _replace_gaps(st, source, [{
+        "source": source,
+        "detail": (f"Check by hand: {why} — "
+                   + "; ".join(x[:200] for x in items))}] if items else [],
+        raise_on_save=True, guard=False)
 
 
 def _delivery_norm_item(item: object) -> dict:
@@ -62712,14 +62701,10 @@ def _record_round_rollback(st: "State", worker: str, label: str, reason: str,
             "commits are not in the PR" if landed else
             "its commits are STILL ON THE BRANCH, though the run decided to "
             "drop them; review them before merging")
-    data["needs_human_verification"] = [
-        e for e in (data.get("needs_human_verification") or [])
-        if not (isinstance(e, dict) and e.get("source") == ROLLBACK_GAP_SOURCE
-                and e.get("site") == site)
-    ] + [{"source": ROLLBACK_GAP_SOURCE, "site": site,
-          "detail": f"{worker} {label}: {what}. Why: {reason}"}]
-    with contextlib.suppress(Exception):
-        st.save()
+    _replace_gaps(st, ROLLBACK_GAP_SOURCE,
+                  [{"source": ROLLBACK_GAP_SOURCE, "site": site,
+                    "detail": f"{worker} {label}: {what}. Why: {reason}"}],
+                  match=lambda e: e.get("site") == site, save="always")
 
 
 async def _roll_back_round(st: "State", tree: str | Path, rev: str, *,
@@ -66370,29 +66355,21 @@ def _set_unobservable_gap(st: "State", rows: dict[int, dict]) -> None:
     """The `UNOBSERVABLE_GAP_SOURCE` entries, one per item `rows` names
     (item_index -> {item, parts}), replacing every earlier one: final
     detection types the whole item list on the tree that ships."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == UNOBSERVABLE_GAP_SOURCE)]
-    for i, r in sorted(rows.items()):
+    def entry(i: int, r: dict) -> dict:
         what = "; ".join(
             f"\"{p['part']}\" needs "
             f"{_OBSERVABILITY_NEEDS_TEXT.get(p['needs'], p['needs'])}"
             for p in r["parts"])
         c = r["parts"][0].get("cite") or {}
-        entries.append({
+        return {
             "source": UNOBSERVABLE_GAP_SOURCE, "item_index": i,
             "detail": (f"{r['item']} — not shown met: {what}, which this "
                        f"run cannot observe (the repository's test command "
                        f"runs with `{' '.join(str(c.get('quote') or '').split())[:200]}`, "
                        f"{c.get('path')}:{c.get('line_start')}). Check it "
-                       f"on the PR branch.")})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+                       f"on the PR branch.")}
+    _replace_gaps(st, UNOBSERVABLE_GAP_SOURCE,
+                  (entry(i, r) for i, r in sorted(rows.items())))
 
 
 async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
@@ -71056,12 +71033,6 @@ def _set_base_form_gap(st: "State", rec: dict) -> None:
     could not run (a language it does not place, a run that gave no
     verdict) and candidates its confirm budget left unsettled; cleared when
     there are none."""
-    data = getattr(st, "data", None)
-    if not isinstance(data, dict):
-        return
-    entries = [e for e in (data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict)
-                       and e.get("source") == BASE_FORM_GAP_SOURCE)]
     parts: list[str] = []
     for key, what in (("unmeasured", "gave no verdict"),
                       ("unsupported", "has no runner leerie reads a report "
@@ -71074,17 +71045,12 @@ def _set_base_form_gap(st: "State", rec: dict) -> None:
                          + (f" (+{len(xs) - 5} more)" if len(xs) > 5 else ""))
     if rec.get("error"):
         parts.append(f"the check raised {rec['error']}")
-    if parts:
-        entries.append({
-            "source": BASE_FORM_GAP_SOURCE,
-            "detail": ("existing tests: run each one the run changed or "
-                       "deleted, in its base form, against the PR branch — "
-                       "whether the behaviour it pinned still holds is "
-                       "unknown. " + "; ".join(parts))})
-    if entries != (data.get("needs_human_verification") or []):
-        data["needs_human_verification"] = entries
-        with contextlib.suppress(Exception):
-            st.save()
+    _replace_gaps(st, BASE_FORM_GAP_SOURCE, [{
+        "source": BASE_FORM_GAP_SOURCE,
+        "detail": ("existing tests: run each one the run changed or "
+                   "deleted, in its base form, against the PR branch — "
+                   "whether the behaviour it pinned still holds is "
+                   "unknown. " + "; ".join(parts))}] if parts else [])
 
 
 _SG_ID = r"[A-Za-z_$][\w$]*"
@@ -76635,16 +76601,15 @@ def _settle_accepted_external(st: "State", sid: str, resource: str,
     (`_settle_external_dependent`) — keeps the dependent's entries for its
     other resources and is recorded on the entry."""
     st.data.setdefault("subtask_status", {})[sid] = "accepted_external"
-    entries = [e for e in (st.data.get("needs_human_verification") or [])
-               if not (isinstance(e, dict) and e.get("source") == "blocker"
-                       and e.get("subtask") == sid
-                       and (via is None or e.get("resource") == resource))]
     entry = {"source": "blocker", "subtask": sid, "resource": resource,
              "blocker": blocker}
     if via is not None:
         entry["via"] = list(via)
-    entries.append(entry)
-    st.data["needs_human_verification"] = entries
+    _replace_gaps(st, "blocker", [entry],
+                  match=lambda e: (e.get("subtask") == sid
+                                   and (via is None
+                                        or e.get("resource") == resource)),
+                  save="none", guard=False)
     reg = st.data.get("blocked")
     if isinstance(reg, dict):
         reg.pop(sid, None)
