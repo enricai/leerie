@@ -6610,7 +6610,14 @@ directory) skips where unprivileged user namespaces are disabled.
 `tests/test_host_dir_ownership.py` pins the `.host` mount: the launcher
 creates and mounts it after the `LEERIE_*` forward, and the real rootful
 guard, executed with `chown` faked, chowns `/leerie-host` (the directory
-only) under rootful and nothing under rootless. `tests/test_cgroup_broker.py`
+only) under rootful and nothing under rootless. The launcher's real
+resolution block gives `$HOME/.leerie/.host` and refuses `LEERIE_HOST_DIR`
+at any value (4 cases), and `tests/test_old_images_reaped.py`'s
+`test_a_launch_told_another_host_dir_removes_no_held_version` replays the
+2026-11-17 reap through the real launcher: a launch given another host dir
+while an older version is held stops, every image kept (DESIGN §6 *A guard
+on a host-wide resource lives at that resource's scope, which no launch
+repoints*). `tests/test_cgroup_broker.py`
 and `tests/test_broker_wire_contract.py` cover the broker's `peak` verb and
 its parse in `_cgroup_peak`.
 

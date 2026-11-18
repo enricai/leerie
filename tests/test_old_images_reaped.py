@@ -136,7 +136,10 @@ def _rms(w: dict) -> list[str]:
 
 
 def _holds(w: dict) -> Path:
-    return w["world"] / "host" / "image-holds"
+    """Where every launch on the host holds its version: the host-wide
+    directory, which no launch repoints (DESIGN §6 *A guard on a host-wide
+    resource lives at that resource's scope, which no launch repoints*)."""
+    return w["home"] / ".leerie" / ".host" / "image-holds"
 
 
 def _run(w: dict, args: list[str], env: dict | None = None,
@@ -236,6 +239,33 @@ def test_a_version_another_launch_holds_is_left_alone(tmp_path):
     assert sorted(_store(w)) == sorted(held + [f"leerie:{CUR}"])
     assert not [c for c in _rms(w) if c.endswith(":0.0.1")], _rms(w)
     assert "kept leerie 0.0.1's images: a launch of leerie 0.0.1 is using them" in out, out
+
+
+def test_a_launch_told_another_host_dir_removes_no_held_version(tmp_path):
+    """The operator's host, 2026-11-17: launches of 0.70.2 held their
+    version where the host's launches hold, and a 0.72.0 launch given
+    another host-wide directory looked for holds only there, found none and
+    removed `leerie:0.70.2`, which no container named. Here a launch of
+    0.0.1 holds its version (the test) and this launch is given
+    `LEERIE_HOST_DIR`: it stops before any image step, every image stays,
+    and nothing is made under the directory it was given. Falsified: the
+    launcher reading `LEERIE_HOST_DIR` again (it reaped from the given
+    directory's empty `image-holds/` and removed 0.0.1's images)."""
+    w = _world(tmp_path, OWN_OLD + [f"leerie:{CUR}"])
+    bench = w["world"] / "bench-host"
+    fd = _hold(_holds(w) / "0.0.1.lock", fcntl.LOCK_SH)
+    try:
+        rc, out = _run(w, ["--no-push", "a task"],
+                       env={"LEERIE_HOST_DIR": str(bench)})
+    finally:
+        os.close(fd)
+    assert rc == 1, out
+    assert "LEERIE_HOST_DIR is not a setting" in out, out
+    assert sorted(_store(w)) == sorted(OWN_OLD + [f"leerie:{CUR}"])
+    assert not _rms(w), _calls(w)
+    assert not [c for c in _calls(w) if " image" in f" {c}"], _calls(w)
+    assert not bench.exists()
+    assert not run_argv(w)
 
 
 def test_a_launch_waits_for_a_removal_of_its_versions_images(tmp_path):

@@ -6831,25 +6831,21 @@ if [ "$IS_RESUME" = "false" ] && [ "$_skip_freshness_check" = "false" ]; then
 fi
 unset _skip_freshness_check
 
-# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
-# semaphore*; the image lock, *A host-wide image step runs once, under a
-# host lock*) defaults to ~/.leerie/.host and must stay shared: the
-# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
-# repoints it for an isolated run (a bench) that must never touch
-# ~/.leerie. Inside the container the same name means the mount point, set
-# after the LEERIE_* forward below, so this host value never leaks in.
-_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
-case "$_leerie_host_dir" in
-  "~")   _leerie_host_dir="$HOME" ;;
-  \~/*)  _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
-esac
-case "$_leerie_host_dir" in
-  /*) ;;
-  *)
-    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
-    exit 1
-    ;;
-esac
+# The host-wide dir: the guards of what every launch on the host shares —
+# the build slots (the host's memory, DESIGN §6 *A host-wide build
+# semaphore*), the toolchain-install lock (~/.cache/leerie/toolchains), the
+# image lock and the image holds (the images in the operator's containerd).
+# A guard guards only among the launches that look for it in one place, so
+# no setting repoints it (DESIGN §6 *A guard on a host-wide resource lives
+# at that resource's scope, which no launch repoints*): a run given its own
+# directory still shares the resources, and only stops seeing the other
+# runs' guards on them. Inside the container LEERIE_HOST_DIR names the
+# mount point, set after the LEERIE_* forward below.
+if [ -n "${LEERIE_HOST_DIR+x}" ]; then
+  echo "leerie: error: LEERIE_HOST_DIR is not a setting: the host-wide directory is always ~/.leerie/.host, which holds the guards of what every launch on this host shares (its memory, its toolchain cache, the images in its containerd); unset it (DESIGN §6 *A guard on a host-wide resource lives at that resource's scope, which no launch repoints*)" >&2
+  exit 1
+fi
+_leerie_host_dir="$HOME/.leerie/.host"
 # The lock every host-wide image step takes (leerie_lock): leerie's base
 # build, and the copy and pull into BuildKit's worker namespace.
 _leerie_image_lock="$_leerie_host_dir/image.lock"
@@ -11400,8 +11396,8 @@ else
   #     value would point at a host path meaningless inside the container.
   #   - LEERIE_HOME / LEERIE_REPO / LEERIE_STATE_HOST_DIR / LEERIE_SELF_CMD:
   #     launcher self-location + host paths.
-  #   - LEERIE_HOST_DIR: the host path of the host-wide dir; remapped
-  #     explicitly below (-e LEERIE_HOST_DIR=/leerie-host).
+  #   - LEERIE_HOST_DIR: refused on the host (the host-wide dir is always
+  #     ~/.leerie/.host); set explicitly below (-e LEERIE_HOST_DIR=/leerie-host).
   #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
   #   - LEERIE_NO_PUSH: resolved by the launcher, which hands a fresh run
   #     --no-push; the run's record of the choice is the orchestrator's.
