@@ -2265,8 +2265,12 @@ def test_an_unconfirmed_red_test_axis_keeps_the_repair(
     assert (staging / "calc.py").read_text() == FIXED
 
 
-def test_a_confirmation_that_raises_falls_back_to_the_red_run(
+def test_a_confirmation_that_raises_is_no_verdict_and_keeps_the_repair(
         leerie, tmp_path, monkeypatch):
+    """A red-axis confirm that raises is no verdict, as on every other path
+    (DESIGN §8, §9): the repair's commit stays and the error is recorded.
+    It used to be read as red, resetting the repair; no recorded run ever
+    took that path (S9-R9 step B, M7: 0 of the records)."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2290,9 +2294,11 @@ def test_a_confirmation_that_raises_falls_back_to_the_red_run(
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
+    assert "rolled_back" not in gate and "rollback_reason" not in gate
     assert gate["post_tests_confirm"]["error"].startswith("RuntimeError")
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert gate["post_tests_confirm"]["no_verdict"] is True
+    assert _git(staging, "rev-parse", "HEAD") != before
+    assert (staging / "calc.py").read_text() == FIXED
 
 
 @needs_landlock
