@@ -424,6 +424,27 @@ def marked_pids(mark: str) -> list[int]:
     return out
 
 
+def describe_marked(mark: str) -> str:
+    """Every live process carrying the mark, one line each: PID, parent,
+    state, kernel wait channel and argv. For a test's failure message: which
+    process a launcher still running is waiting on (its `sleep 2` poll, its
+    `_stop_run` loop's `sleep 0.1`, the client) says where it is."""
+    lines = []
+    for pid in sorted(marked_pids(mark)):
+        d = Path("/proc") / str(pid)
+        try:
+            stat = (d / "stat").read_text()
+            fields = stat[stat.rindex(")") + 2:].split()
+            wchan = (d / "wchan").read_text().strip() or "-"
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except (OSError, ValueError):
+            continue
+        cmd = " ".join(a.decode(errors="replace") for a in argv if a)
+        lines.append(f"pid={pid} ppid={fields[1]} state={fields[0]} "
+                     f"wchan={wchan} {cmd[:200]}")
+    return "\n".join(lines) or "(no marked process left)"
+
+
 def reap(mark: str) -> None:
     for pid in marked_pids(mark):
         try:
