@@ -69399,8 +69399,8 @@ def _ratchet_mark_unverified(st: "State", items: list[int], sha: str,
     no read of the new commit)."""
     if not items:
         return
-    log(f"  delivery ratchet {label}: {len(items)} previously met item(s) "
-        f"not re-verified on {sha[:12]} — unknown {items}")
+    log(f"  delivery ratchet {label}: {len(items)} item(s) not re-verified "
+        f"on {sha[:12]} — listed unverified {items}")
     rec = _ratchet_record(st)
     unv = dict(rec.get("unverified") or {})
     for i in items:
@@ -72317,6 +72317,22 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
         _resettle_test_outcome_rows(st, tree_sha)
 
 
+
+def _redrive_apply_read(st: "State", verdicts: dict[int, dict], sha: str,
+                        tree_sha: str | None) -> None:
+    """Apply a re-check of `sha` (DESIGN §8 *A re-judge that crashed read
+    nothing*): the verdicts that read it go through
+    `_redrive_apply_item_verdicts`, stamped read on `sha`; a crashed one read
+    nothing, so it is never stamped there but listed unverified on `sha`
+    (`_ratchet_mark_unverified`), which has it read again on the tree that
+    ships and blocks the re-key of `delivery_gate.final_sha` meanwhile."""
+    _redrive_apply_item_verdicts(
+        st, {i: v for i, v in verdicts.items() if not v.get("crashed")},
+        sha, tree_sha)
+    _ratchet_mark_unverified(
+        st, sorted(i for i, v in verdicts.items() if v.get("crashed")), sha,
+        "the delivery re-drive")
+
 def _final_diff_base_gap(st: "State", diff: dict | None) -> str | None:
     """The "Needs human verification" text for a failing-test-ID diff whose
     base side was never measured with its dependencies (DESIGN §9 *A failed
@@ -73538,8 +73554,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ver = await _redrive_recheck_items(
                     leerie_dir, st, caps, models, efforts, staging,
                     sorted(routed_items))
-                _redrive_apply_item_verdicts(
-                    st, ver, now, await _committed_tree_sha(str(staging)))
+                _redrive_apply_read(st, ver, now,
+                                    await _committed_tree_sha(str(staging)))
                 rechecked_sha = rec["items_rechecked_sha"] = now
                 _save()
             if routed_checks and now:
@@ -73569,7 +73585,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             if unread:
                 ver = await _redrive_recheck_items(
                     leerie_dir, st, caps, models, efforts, staging, unread)
-                _redrive_apply_item_verdicts(st, ver, final, final_tree)
+                _redrive_apply_read(st, ver, final, final_tree)
             # A kept group whose ratchet failed left items unverified: they are
             # read once more on `final`; a read that crashes again leaves them
             # unknown and listed (review round 13 claims M1).
@@ -73602,14 +73618,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     f"falsified there {met}")
                 ver = await _redrive_recheck_items(
                     leerie_dir, st, caps, models, efforts, staging, met)
-                crashed = sorted(i for i, v in ver.items() if v.get("crashed"))
-                _redrive_apply_item_verdicts(
-                    st, {i: v for i, v in ver.items() if not v.get("crashed")},
-                    final, final_tree)
                 # A judge that crashed read nothing: unknown and listed, never
                 # met, and the verdict is not re-keyed to `final` (below).
-                _ratchet_mark_unverified(st, crashed, final,
-                                         "the delivery re-drive")
+                _redrive_apply_read(st, ver, final, final_tree)
                 # A met item whose confirmed probe passed on a kept group's
                 # start and fails on its commit, under B*, was regressed by
                 # that group: it is rolled back, not shipped (DESIGN §8 *A
@@ -73634,13 +73645,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                   | {c["item_index"] for c, _s in culprits})
                     ver2 = await _redrive_recheck_items(
                         leerie_dir, st, caps, models, efforts, staging, redo)
-                    _redrive_apply_item_verdicts(
-                        st, {i: v for i, v in ver2.items()
-                             if not v.get("crashed")}, now, now_tree)
-                    _ratchet_mark_unverified(
-                        st, sorted(i for i, v in ver2.items()
-                                   if v.get("crashed")), now,
-                        "the delivery re-drive")
+                    _redrive_apply_read(st, ver2, now, now_tree)
                     rechecked_sha = rec["items_rechecked_sha"] = now
                     F, _u = await measure(shown, "redrive-flip-rollback")
                     H_known = None
