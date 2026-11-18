@@ -130,9 +130,11 @@ def test_the_kinds_differ_only_where_designed(leerie, layout, tmp_path,
     # *The setup hook writes the run layer, never the host's toolchains*).
     assert bin_ not in h.rw and data not in h.rw
     new = layout.run_dir.resolve() / leerie.RUN_LAYER_NEW_NAME
-    assert h.layer_uppers == ((data, str(new / "mise")),)
+    assert [(o.target, o.upper) for o in h.overlays if not o.home] == [
+        (data, str(new / "mise"))]
     assert data in t.rw and bin_ not in t.rw
-    assert t.layer_uppers == () and m.layer_uppers == ()
+    assert not any(o.upper for g in (t, m) for o in g.overlays
+                   if not o.home)
     # Every other grant is the same for all three — compared without the
     # reads `_beside` lists outside the state root: those are the live
     # entries of the directories on the root's path (`/tmp`, pytest's

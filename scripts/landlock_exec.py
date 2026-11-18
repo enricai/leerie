@@ -6,14 +6,13 @@ command's processes end with it*).
 Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                          [--link-root DIR]
                          [--worker-root DIR [--cli]]
-                         [--home DIR --home-bytes N [--home-layer DIR]...
-                          [--home-upper DIR]]]
+                         [OVERLAY]...]
                          [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
        landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
                         [--replace SRC=REL]... [--remove REL]...
                         [--report PATH --report-fd N] [--worker-root DIR]
-                        [--home DIR --home-bytes N [--home-layer DIR]...]
+                        [OVERLAY]...
                         [--refusal-fd N] [--taken-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
 
@@ -23,17 +22,20 @@ between two of them works (`bind_grants`). DIR holds only trees and the
 stores they install from (DESIGN §6 *The write grants on one mount are one
 mount*); every other grant is its own mount.
 
-`--home DIR --home-bytes N [--home-layer DIR]...` (with either): the
-process's own home (DESIGN §6 *Every confined process has its own home*):
-an overlay on DIR whose lower layers are each `--home-layer` (first on top)
-and DIR itself, and whose upper is a `tmpfs` of N bytes in the process's
-own mount namespace, so the kernel frees it on every exit. A grant beneath
-DIR is bound from the real directory over it. DIR is then written like a
-grant. The shim samples the home while the command runs; a home that fills
-is a refusal (`--refusal-fd`), never the command's result. `--home-upper DIR`
-(`--isolate` only): the upper is DIR on disk, its work directory
-`DIR.work` beside it, and it is kept (a tree's install writes its tree
-home layer so); a home on disk is not watched.
+OVERLAY is `--overlay DIR [--lower L]... [--upper UPPER]` or `--home DIR
+[--lower L]... --upper UPPER` (with either): an overlay on DIR whose lower layers are each
+`--lower` that exists (the first on top) and DIR itself (`mount_overlay`).
+Without `--upper` it is read-only, and none is made when no `--lower`
+exists. `--upper DIR` (`--isolate` only): the upper is DIR on disk, its
+work directory `DIR.work` beside it, kept after the process (a tree's
+install writes its tree home layer so, the setup hook the run layer), and
+DIR is then written like a grant. `--home` is the process's own home
+(DESIGN §6 *Every confined process has its own home*), at most one: a
+grant beneath DIR is bound from the real directory over it, and
+`--upper tmpfs:N` (the home's only) puts its upper on a `tmpfs` of N bytes
+in the process's own mount namespace, so the kernel frees it on every
+exit; the shim samples such a home while the command runs, and a home that
+fills is a refusal (`--refusal-fd`), never the command's result.
 
 `--refusal-fd N`: every refusal (each exit 126 the shim makes itself, never
 CMD's) also writes its reason to descriptor N, which the shim makes
@@ -741,7 +743,7 @@ CONSOLE = "/dev/console"
 _OLDROOT = "/.oldroot"
 _OVERLAY_DIR = "/tmp/.leerie-overlay"
 # Where the home's upper `tmpfs` and the real home are mounted while the
-# home's overlay is made (`private_home`); both are detached before the
+# home's overlay is made (`mount_overlay`); both are detached before the
 # command starts, so nothing reaches either but through `$HOME`.
 _HOME_UPPER = "/tmp/.leerie-home"
 _HOME_REAL = "/tmp/.leerie-home-real"
@@ -1071,59 +1073,76 @@ def overlay_grants(rw: list[str], view: str) -> list[str]:
         base = f"{_OVERLAY_DIR}/{n}"
         os.makedirs(base + "/u", mode=0o700)
         os.makedirs(base + "/w", mode=0o700)
-        _must(f"overlay {p}", _mount(
-            "overlay", p, "overlay", 0,
-            f"lowerdir={p},upperdir={base}/u,workdir={base}/w,userxattr"))
+        _overlay_on(p, [p], base + "/u", base + "/w")
         kept.append(p)
     return kept
 
 
-def private_home(home: str, layers: list[str], size: int,
-                 grants: list[str], upper: str | None = None) -> None:
-    """Mount the process's own home on `home` (DESIGN §6 *Every confined
-    process has its own home*): an overlay whose lower layers are `layers`
-    (each that exists, the first on top) and then `home` itself, and whose
-    upper and work directories are on a `tmpfs` of `size` bytes mounted in
-    this mount namespace, so the kernel frees it with the namespace on any
-    exit. Every grant in `grants` that lies beneath `home` is bound from the
-    real directory over the overlay, so it names what it names. The upper
-    `tmpfs` and the real home are then detached: the process reaches
-    neither but through `home`. Fails (`IsolationError`) rather than mount
-    a home over a mount beneath it, which the kernel refuses (`EINVAL`).
-    `upper`: an upper on disk instead, its work directory `<upper>.work`
-    beside it, kept after the process (a tree's install writes its tree
-    home layer so); no `tmpfs` is made."""
-    home = os.path.normpath(home)
-    if not os.path.isdir(home) or os.path.islink(home):
-        raise IsolationError(f"home {home}: not a directory")
-    lowers = [os.path.normpath(p) for p in layers
-              if os.path.isdir(p) and not _beneath(p, home)] + [home]
+def _overlay_on(target: str, lowers: list[str], up: str | None,
+                work: str | None) -> None:
+    """The one overlay mount: `lowers` (the first on top, the last the
+    directory's own), with an upper and its work directory or none."""
+    upper = f"upperdir={up},workdir={work}," if up is not None else ""
+    _must(f"overlay {target}", _mount(
+        "overlay", target, "overlay", 0,
+        f"lowerdir={':'.join(lowers)},{upper}userxattr"))
+
+
+def mount_overlay(target: str, lowers: list[str], upper: str | int | None,
+                  *, home: bool, grants: list[str]) -> None:
+    """Mount an overlay on `target` (DESIGN §6 *Every confined process has
+    its own home*, *The setup hook writes the run layer, never the host's
+    toolchains*): its lower layers are each of `lowers` that is a directory
+    (for the home, not beneath it; the first on top), then `target`
+    itself.
+    `upper` None: read-only, and no overlay when no lower exists. A path:
+    the upper on disk, its work directory `<upper>.work` beside it, kept
+    after the process (a tree's install writes its tree home layer, the
+    setup hook the run layer). A size (the home only): the upper and work
+    directories are on a `tmpfs` of that many bytes mounted in this mount
+    namespace, so the kernel frees it with the namespace on any exit, and
+    the upper takes `target`'s mode. `home` (DESIGN §6 *Every confined
+    process has its own home*): every grant in `grants` that lies beneath
+    `target` is bound from the real directory over the overlay, so it names
+    what it names, and the real home is then detached. Fails
+    (`IsolationError`) rather than mount over a mount beneath `target`,
+    which the kernel refuses (`EINVAL`)."""
+    what = "home" if home else "layer"
+    target = os.path.normpath(target)
+    if not os.path.isdir(target) or os.path.islink(target):
+        raise IsolationError(f"{what} {target}: not a directory")
+    # A layer beneath the home is passed over; any other overlay's is kept,
+    # and its mount refused where the kernel refuses it.
+    lowers = [os.path.normpath(p) for p in lowers if os.path.isdir(p)
+              and not (home and _beneath(p, target))] + [target]
     if any(c in p for p in lowers for c in ",:\\"):
-        raise IsolationError(f"home {home}: a path overlayfs cannot name")
+        raise IsolationError(f"{what} {target}: a path overlayfs cannot name")
     for mp, _opts in _mountinfo():
-        if mp != home and _beneath(mp, home):
+        if mp != target and _beneath(mp, target):
             raise IsolationError(
-                f"home {home}: {mp} is mounted beneath it, and an overlay's "
-                "lower layer cannot hold a mount")
-    if upper is not None:
+                f"{what} {target}: {mp} is mounted beneath it, and an "
+                "overlay's lower layer cannot hold a mount")
+    if upper is None and len(lowers) == 1:
+        return
+    if isinstance(upper, str):
         upper = os.path.normpath(upper)
         if any(c in upper for c in ",:\\") or not os.path.isdir(upper) \
                 or not os.path.isdir(upper + ".work"):
-            raise IsolationError(f"home upper {upper}: not a directory "
+            raise IsolationError(f"{what} upper {upper}: not a directory "
                                  "overlayfs can name, with its .work")
+    made = ([_HOME_UPPER] if isinstance(upper, int) else []) \
+        + ([_HOME_REAL] if home else [])
     try:
-        if upper is None:
-            os.mkdir(_HOME_UPPER, 0o700)
-        os.mkdir(_HOME_REAL, 0o700)
+        for d in made:
+            os.mkdir(d, 0o700)
     except OSError as e:
-        raise IsolationError(f"make {_HOME_UPPER}: {e}", e.errno or 0) \
-            from None
-    if upper is None:
+        raise IsolationError(f"make {d}: {e}", e.errno or 0) from None
+    if isinstance(upper, int):
         _must(f"tmpfs {_HOME_UPPER}", _mount(
             "tmpfs", _HOME_UPPER, "tmpfs", MS_NOSUID | MS_NODEV,
-            f"size={size},mode=0700"))
+            f"size={upper},mode=0700"))
         try:
-            mode = stat.S_IMODE(os.stat(home).st_mode)
+            mode = stat.S_IMODE(os.stat(target).st_mode)
             os.mkdir(f"{_HOME_UPPER}/u", mode)
             os.chmod(f"{_HOME_UPPER}/u", mode)
             os.mkdir(f"{_HOME_UPPER}/w", 0o700)
@@ -1131,65 +1150,40 @@ def private_home(home: str, layers: list[str], size: int,
             raise IsolationError(f"make the home's upper: {e}",
                                  e.errno or 0) from None
         up, work = f"{_HOME_UPPER}/u", f"{_HOME_UPPER}/w"
-    else:
+    elif upper is not None:
         up, work = upper, upper + ".work"
-    _must(f"bind {home}", _mount(home, _HOME_REAL, None, MS_BIND | MS_REC))
-    _must(f"overlay {home}", _mount(
-        "overlay", home, "overlay", 0,
-        f"lowerdir={':'.join(lowers)},upperdir={up},"
-        f"workdir={work},userxattr"))
-    for g in sorted({os.path.normpath(g) for g in grants}):
-        if g == home or not _beneath(g, home):
+    else:
+        up = work = None
+    if home:
+        _must(f"bind {target}", _mount(target, _HOME_REAL, None,
+                                       MS_BIND | MS_REC))
+    _overlay_on(target, lowers, up, work)
+    for g in sorted({os.path.normpath(g) for g in grants} if home else ()):
+        if g == target or not _beneath(g, target):
             continue
-        src = _HOME_REAL + g[len(home):]
+        src = _HOME_REAL + g[len(target):]
         if not os.path.lexists(src) or os.path.islink(src):
             continue
         _must(f"bind {g} over the home",
               _mount(src, g, None, MS_BIND | MS_REC))
     libc = _libc()
-    for d in (_HOME_REAL, *([_HOME_UPPER] if upper is None else [])):
+    for d in reversed(made):
         _must(f"detach {d}", libc.umount2(os.fsencode(d), MNT_DETACH))
         with contextlib.suppress(OSError):
             os.rmdir(d)
 
 
-def layer_mounts(layers: list[tuple[str, str]],
-                 uppers: list[tuple[str, str]]) -> list[str]:
-    """The run layer's overlays (DESIGN §6 *The setup hook writes the run
-    layer, never the host's toolchains*): on each `DIR` of `layers` whose
-    `LAYER` exists, a read-only overlay with `LAYER` above `DIR`; on each
-    `DIR` of `uppers`, an overlay over `DIR` whose upper is `UPPER` on disk
-    (its work directory `<UPPER>.work`), kept after the process. Mounted in
-    this mount namespace, after the home and before the grants are bound.
-    Returns the writable ones' targets, which the caller keeps writable.
-    Fails (`IsolationError`) rather than mount over a mount beneath `DIR`,
-    which the kernel refuses (`EINVAL`)."""
-    infos = _mountinfo()
-    writable: list[str] = []
-    for d, top, upper in ([(d, t, False) for d, t in layers]
-                          + [(d, u, True) for d, u in uppers]):
-        d, top = os.path.normpath(d), os.path.normpath(top)
-        if any(c in p for p in (d, top) for c in ",:\\"):
-            raise IsolationError(f"layer {d}: a path overlayfs cannot name")
-        if not os.path.isdir(d) or os.path.islink(d):
-            raise IsolationError(f"layer {d}: not a directory")
-        for mp, _opts in infos:
-            if mp != d and _beneath(mp, d):
-                raise IsolationError(
-                    f"layer {d}: {mp} is mounted beneath it, and an "
-                    "overlay's lower layer cannot hold a mount")
-        if not upper:
-            if not os.path.isdir(top):
-                continue
-            opts = f"lowerdir={top}:{d},userxattr"
-        else:
-            if not os.path.isdir(top) or not os.path.isdir(top + ".work"):
-                raise IsolationError(f"layer upper {top}: not a directory "
-                                     "with its .work")
-            opts = (f"lowerdir={d},upperdir={top},workdir={top}.work,"
-                    "userxattr")
-            writable.append(d)
-        _must(f"overlay {d}", _mount("overlay", d, "overlay", 0, opts))
+def mount_overlays(overlays: list[dict], grants: list[str]) -> list[str]:
+    """Each overlay of `overlays` (`--home`, `--overlay`; `mount_overlay`),
+    the home first: another's directory may lie beneath it. Mounted after
+    the root is pivoted and before the grants are bound. Returns the
+    targets with an upper, which the caller keeps writable."""
+    writable = []
+    for o in sorted(overlays, key=lambda o: not o["home"]):
+        mount_overlay(o["target"], o["lowers"], o["upper"], home=o["home"],
+                      grants=grants)
+        if o["upper"] is not None:
+            writable.append(o["target"])
     return writable
 
 
@@ -1244,18 +1238,17 @@ def _home_full() -> str | None:
     return _HOME_WATCH.finding() if _HOME_WATCH.full else None
 
 
-def _watch_home(home: str | None, size: int | None, *,
-                watch: bool = True) -> list[str]:
-    """Watch `home`, the process's own (`HomeWatch`), when there is one and
-    its upper is the shim's `tmpfs` (`watch`: an upper on disk is the
-    disk's to bound); returns it as a write grant (the overlay is the
-    process's), or nothing."""
+def _watch_home(overlays: list[dict]) -> list[str]:
+    """Watch the home, the process's own (`HomeWatch`), when its upper is
+    the shim's `tmpfs` (an upper on disk is the disk's to bound); returns
+    the targets with an upper as write grants (each overlay is the
+    process's), the home first."""
     global _HOME_WATCH
-    if home is None:
-        return []
-    if watch:
-        _HOME_WATCH = HomeWatch(home, size or 0)
-    return [home]
+    for o in overlays:
+        if o["home"] and isinstance(o["upper"], int):
+            _HOME_WATCH = HomeWatch(o["target"], o["upper"])
+    return [o["target"] for o in sorted(overlays, key=lambda o: not o["home"])
+            if o["upper"] is not None]
 
 
 def _unescape_mountinfo(field: str) -> str:
@@ -1661,12 +1654,7 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
             remove_paths: list[str] = (),
             sockets: list[str] = (),
             worker_root: str | None = None,
-            home: str | None = None, home_layers: list[str] = (),
-            home_bytes: int = 0,
-            home_upper: str | None = None,
-            layers: list[tuple[str, str]] = (),
-            layer_uppers: list[tuple[str, str]] = ()
-            ) -> tuple[int, list[str]]:
+            overlays: list[dict] = ()) -> tuple[int, list[str]]:
     """Build the namespaces and mounts for `--isolate` (or `--sandbox`,
     with `view`); returns how many mounts were made read-only and the read
     grants the worker view needs (`build_worker_view`; none without
@@ -1683,14 +1671,9 @@ def isolate(rw: list[str], ro: list[str], *, sandbox: bool = False,
     carry_rw = [p for p in rw if _beneath(p, TMP) and p != TMP]
     kept = pivot_to_owned_root(carry_ro, carry_rw, sandbox=sandbox)
     roots: list[str] = []
-    if home is not None:
-        # Before the grants are bound: one beneath the home is bound from
-        # the real directory over it, then bound or overlaid as any grant.
-        private_home(home, list(home_layers), home_bytes, rw + ro,
-                     upper=home_upper)
-        roots.append(os.path.normpath(home))
-    # After the home: a layer's directory may lie beneath it.
-    roots += layer_mounts(list(layers), list(layer_uppers))
+    # Before the grants are bound: one beneath the home is bound from the
+    # real directory over it, then bound or overlaid as any grant.
+    roots += mount_overlays(list(overlays), rw + ro)
     if sandbox:
         assert view is not None
         kept += overlay_grants(rw, view)
@@ -2030,9 +2013,8 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                 place_pairs: list[tuple[str, str]], report: str | None,
                 report_fd: int | None, worker_root: str | None = None, *,
                 over_pairs: list[tuple[str, str]] = (),
-                remove_paths: list[str] = (), home: str | None = None,
-                home_layers: list[str] = (), home_bytes: int = 0,
-                layers: list[tuple[str, str]] = ()) -> int:
+                remove_paths: list[str] = (),
+                overlays: list[dict] = ()) -> int:
     """`--sandbox`: build it, fork PID 1 of the new PID namespace, forward
     a stop signal to it, and exit as `cmd` did."""
     enter = None
@@ -2041,9 +2023,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                               place_pairs=place_pairs,
                               over_pairs=over_pairs,
                               remove_paths=remove_paths,
-                              worker_root=worker_root, home=home,
-                              home_layers=home_layers,
-                              home_bytes=home_bytes, layers=layers)
+                              worker_root=worker_root, overlays=overlays)
         if worker_root is not None:
             ro = ro + view_ro
             enter = ("view", WORKER_VIEW, worker_env_changes(worker_root))
@@ -2054,7 +2034,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
     why = _undumpable()
     if why is not None:
         return _isolation_failed(OSError(why))
-    _watch_home(home, home_bytes)
+    written = _watch_home(overlays)
     if report_fd is not None:
         os.set_inheritable(report_fd, False)
     status_r, status_w = os.pipe()
@@ -2073,8 +2053,7 @@ def run_sandbox(cmd: list[str], rw: list[str], ro: list[str], view: str,
                           | ({report_fd} if report_fd is not None else set())
                           | ({_REFUSAL_FD} if _REFUSAL_FD is not None
                              else set()))
-        rc = _confine_or_126(rw + [view] + list(PRIVATE)
-                             + ([home] if home is not None else []), ro)
+        rc = _confine_or_126(rw + [view] + list(PRIVATE) + written, ro)
         if rc is not None:
             os.write(status_w, f"E{rc}".encode())
             os._exit(0)
@@ -2171,9 +2150,7 @@ def _parse(argv: list[str]) -> dict | str:
                "report_fd": None, "egress": None, "forward": [],
                "worker_root": None, "cli": False, "refusal_fd": None,
                "taken_fd": None, "link_root": None,
-               "home": None, "home_layer": [], "home_bytes": None,
-               "home_upper": None, "layer": [], "layer_upper": [],
-               "cmd": argv[sep + 1:]}
+               "overlays": [], "cmd": argv[sep + 1:]}
     opts = argv[:sep]
     i = 0
     while i < len(opts):
@@ -2186,21 +2163,13 @@ def _parse(argv: list[str]) -> dict | str:
                      "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd",
-                     "--link-root", "--home", "--home-layer",
-                     "--home-bytes", "--home-upper", "--layer",
-                     "--layer-upper") \
+                     "--link-root", "--home", "--overlay", "--lower",
+                     "--upper") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
         v = opts[i + 1]
         if k in ("--rw", "--ro"):
             o[k[2:]].append(v)
-        elif k in ("--layer", "--layer-upper"):
-            d, eq, top = v.partition("=")
-            if not eq or not all(os.path.isabs(x) and os.path.normpath(x)
-                                 not in ("/", "//") for x in (d, top)):
-                return f"landlock_exec.py: bad {k} {v!r}"
-            o[k[2:].replace("-", "_")].append(
-                (os.path.normpath(d), os.path.normpath(top)))
         elif k in ("--place", "--replace"):
             src, eq, rel = v.partition("=")
             if not eq or not src or not rel:
@@ -2224,19 +2193,26 @@ def _parse(argv: list[str]) -> dict | str:
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --link-root {v!r}"
             o["link_root"] = os.path.normpath(v)
-        elif k in ("--home", "--home-layer", "--home-upper"):
-            if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
+        elif k in ("--home", "--overlay", "--lower", "--upper"):
+            size = v[len("tmpfs:"):] if k == "--upper" \
+                and v.startswith("tmpfs:") else None
+            if size is not None and not (size.isdigit() and int(size) > 0) \
+                    or size is None and (not os.path.isabs(v)
+                                         or os.path.normpath(v)
+                                         in ("/", "//")):
                 return f"landlock_exec.py: bad {k} {v!r}"
-            if k == "--home":
-                o["home"] = os.path.normpath(v)
-            elif k == "--home-upper":
-                o["home_upper"] = os.path.normpath(v)
+            if k in ("--home", "--overlay"):
+                o["overlays"].append({"target": os.path.normpath(v),
+                                      "lowers": [], "upper": None,
+                                      "home": k == "--home"})
+            elif not o["overlays"] or (k == "--upper" and
+                                       o["overlays"][-1]["upper"] is not None):
+                return f"landlock_exec.py: {k} {v!r} follows no overlay"
+            elif k == "--lower":
+                o["overlays"][-1]["lowers"].append(os.path.normpath(v))
             else:
-                o["home_layer"].append(os.path.normpath(v))
-        elif k == "--home-bytes":
-            if not v.isdigit() or int(v) <= 0:
-                return f"landlock_exec.py: bad --home-bytes {v!r}"
-            o["home_bytes"] = int(v)
+                o["overlays"][-1]["upper"] = (
+                    int(size) if size is not None else os.path.normpath(v))
         elif k == "--worker-root":
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --worker-root {v!r}"
@@ -2270,18 +2246,18 @@ def _parse(argv: list[str]) -> dict | str:
         return "landlock_exec.py: --report and --report-fd go together"
     if o["worker_root"] and not (o["isolate"] or o["sandbox"]):
         return "landlock_exec.py: --worker-root needs --isolate or --sandbox"
-    if o["home"] and not (o["isolate"] or o["sandbox"]):
-        return "landlock_exec.py: --home needs --isolate or --sandbox"
-    if (o["home"] is None) != (o["home_bytes"] is None) \
-            or ((o["home_layer"] or o["home_upper"]) and o["home"] is None):
-        return ("landlock_exec.py: --home and --home-bytes go together, and "
-                "--home-layer needs them")
-    if o["home_upper"] and o["sandbox"]:
-        return "landlock_exec.py: --home-upper needs --isolate"
-    if o["layer"] and not (o["isolate"] or o["sandbox"]):
-        return "landlock_exec.py: --layer needs --isolate or --sandbox"
-    if o["layer_upper"] and not o["isolate"]:
-        return "landlock_exec.py: --layer-upper needs --isolate"
+    homes = [v for v in o["overlays"] if v["home"]]
+    if o["overlays"] and not (o["isolate"] or o["sandbox"]):
+        return ("landlock_exec.py: --home and --overlay need --isolate or "
+                "--sandbox")
+    if len(homes) > 1 or any(v["upper"] is None for v in homes):
+        return "landlock_exec.py: one --home, with its --upper"
+    if any(isinstance(v["upper"], int) for v in o["overlays"]
+           if not v["home"]):
+        return "landlock_exec.py: an --upper tmpfs is the --home's only"
+    if o["sandbox"] and any(isinstance(v["upper"], str)
+                            for v in o["overlays"]):
+        return "landlock_exec.py: an --upper on disk needs --isolate"
     if o["link_root"] and not o["isolate"]:
         return "landlock_exec.py: --link-root needs --isolate"
     if o["cli"] and not (o["worker_root"] and o["isolate"]):
@@ -2314,13 +2290,11 @@ def main(argv: list[str]) -> int:
             "terminal*)")
     rw, ro, cmd = o["rw"], o["ro"], o["cmd"]
     wr = o["worker_root"]
-    home = {"home": o["home"], "home_layers": o["home_layer"],
-            "home_bytes": o["home_bytes"] or 0}
     if o["sandbox"]:
         return run_sandbox(cmd, rw, ro, o["view"], o["place"], o["report"],
                            o["report_fd"], wr, over_pairs=o["replace"],
-                           remove_paths=o["remove"], layers=o["layer"],
-                           **home)
+                           remove_paths=o["remove"],
+                           overlays=o["overlays"])
     relays: list[tuple[socket.socket, str]] = []
     enter = None
     if o["isolate"]:
@@ -2330,9 +2304,7 @@ def main(argv: list[str]) -> int:
             _n, view_ro = isolate(rw, ro, sockets=[t for _p, t in targets],
                                   worker_root=wr,
                                   link_root=o["link_root"],
-                                  home_upper=o["home_upper"],
-                                  layers=o["layer"],
-                                  layer_uppers=o["layer_upper"], **home)
+                                  overlays=o["overlays"])
             if wr is not None:
                 ro = ro + view_ro
                 enter = (("cli", WORKER_VIEW, wr) if o["cli"] else
@@ -2356,9 +2328,7 @@ def main(argv: list[str]) -> int:
             return _isolation_failed(OSError(why))
         if o["egress"]:
             os.environ.update(proxy_env(relays[-1][0].getsockname()[1]))
-        rw = rw + list(PRIVATE) + _watch_home(
-            o["home"], o["home_bytes"], watch=o["home_upper"] is None) + [
-                d for d, _u in o["layer_upper"]]
+        rw = rw + list(PRIVATE) + _watch_home(o["overlays"])
     rc = _confine_or_126(rw, ro)
     if rc is not None:
         return rc

@@ -60,6 +60,23 @@ def homes(leerie, tmp_path, monkeypatch) -> tuple[Path, Path, Path]:
     return h, layer, mise
 
 
+def _home(g):
+    """The grant's home overlay (`Overlay.home`)."""
+    return next(o for o in g.overlays if o.home)
+
+
+def _layers(g) -> tuple:
+    """The grant's read-only overlays, as `(target, lower)` pairs."""
+    return tuple((o.target, *o.lowers) for o in g.overlays
+                 if not o.home and not o.upper)
+
+
+def _uppers(g) -> tuple:
+    """The grant's other overlays with an upper, as `(target, upper)`."""
+    return tuple((o.target, o.upper) for o in g.overlays
+                 if not o.home and o.upper)
+
+
 def _publish(run_dir: Path) -> Path:
     layer = run_dir / "run-layer"
     (layer / "home").mkdir(parents=True)
@@ -76,27 +93,27 @@ def test_the_hook_writes_the_new_layer_and_names_no_host_directory(
     g = leerie._measurement_grants(_st(run), _view(run),
                                    leerie.SETUP_HOOK_KIND)
     new = run["run_dir"].resolve() / leerie.RUN_LAYER_NEW_NAME
-    assert g.home_upper == str(new / "home")
-    assert g.layer_uppers == ((str(mise.resolve()), str(new / "mise")),)
+    assert _home(g).upper == str(new / "home")
+    assert _uppers(g) == ((str(mise.resolve()), str(new / "mise")),)
     for d in (new / "home", new / "mise"):
         assert d.is_dir() and leerie._home_work(d).is_dir()
     assert str(mise.resolve()) not in g.rw
     assert str((h / ".local" / "bin").resolve()) not in g.rw
     # Its own cache travels with its data, now its overlay.
     assert dict(g.env)["MISE_CACHE_DIR"] == str(mise.resolve() / "cache")
-    assert g.layers == () and g.home_layers == (str(layer.resolve()),)
+    assert _layers(g) == () and _home(g).lowers == (str(layer.resolve()),)
 
 
 def test_no_process_reads_a_layer_until_it_is_published(leerie, run, homes):
     h, layer, mise = homes
     leerie._measurement_grants(_st(run), _view(run), leerie.SETUP_HOOK_KIND)
     m = leerie._measurement_grants(_st(run), _view(run))
-    assert m.layers == () and m.home_layers == (str(layer.resolve()),)
+    assert _layers(m) == () and _home(m).lowers == (str(layer.resolve()),)
     w = leerie._worker_grants(
         run_dir=run["run_dir"], state={}, schema_key="implementer",
         cwd=run["wts"]["wt-a"], allowed_tools=leerie.ACT_TOOLS,
         env={**run["env"], "HOME": str(h)})
-    assert w.layers == () and w.home_layers == (str(layer.resolve()),)
+    assert _layers(w) == () and _home(w).lowers == (str(layer.resolve()),)
 
 
 @pytest.mark.parametrize("kind", ["MEASURE_KIND", "INSTALL_KIND"])
@@ -106,10 +123,10 @@ def test_every_later_kind_reads_the_published_layer(leerie, run, homes,
     rl = _publish(run["run_dir"])
     g = leerie._measurement_grants(_st(run), _view(run),
                                    getattr(leerie, kind))
-    assert g.layers == ((str(mise.resolve()), str(rl / "mise")),)
+    assert _layers(g) == ((str(mise.resolve()), str(rl / "mise")),)
     # Beneath any tree home layer, above the toolchain home layer.
-    assert g.home_layers[-2:] == (str(rl / "home"), str(layer.resolve()))
-    assert g.layer_uppers == ()
+    assert _home(g).lowers[-2:] == (str(rl / "home"), str(layer.resolve()))
+    assert _uppers(g) == ()
 
 
 def test_a_worker_reads_the_published_layer(leerie, run, homes):
@@ -119,9 +136,9 @@ def test_a_worker_reads_the_published_layer(leerie, run, homes):
         run_dir=run["run_dir"], state={}, schema_key="implementer",
         cwd=run["wts"]["wt-a"], allowed_tools=leerie.ACT_TOOLS,
         env={**run["env"], "HOME": str(h)})
-    assert w.layers == ((str(mise.resolve()), str(rl / "mise")),)
-    assert w.home_layers == (str(rl / "home"), str(layer.resolve()))
-    assert w.layer_uppers == ()
+    assert _layers(w) == ((str(mise.resolve()), str(rl / "mise")),)
+    assert _home(w).lowers == (str(rl / "home"), str(layer.resolve()))
+    assert _uppers(w) == ()
 
 
 def test_the_toolchain_install_reads_none_of_it(leerie, run, homes):
@@ -129,7 +146,7 @@ def test_the_toolchain_install_reads_none_of_it(leerie, run, homes):
     _publish(run["run_dir"])
     t = leerie._measurement_grants(_st(run), _view(run),
                                    leerie.TOOLCHAIN_KIND)
-    assert t.layers == () and t.layer_uppers == () and t.home_layers == ()
+    assert _layers(t) == () and _uppers(t) == () and _home(t).lowers == ()
 
 
 def test_the_shim_is_asked_for_the_layers_only_when_isolated(
@@ -140,17 +157,20 @@ def test_the_shim_is_asked_for_the_layers_only_when_isolated(
     hk = leerie._measurement_grants(_st(run), _view(run),
                                     leerie.SETUP_HOOK_KIND)
     monkeypatch.delenv(leerie.ISOLATE_ENV, raising=False)
-    assert "--layer" not in leerie._confined_argv(m, ["true"])
-    assert "--layer-upper" not in leerie._confined_argv(hk, ["true"])
+    assert "--overlay" not in leerie._confined_argv(m, ["true"])
+    assert "--overlay" not in leerie._confined_argv(hk, ["true"])
     monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
     argv = leerie._confined_argv(m, ["true"])
-    assert argv[argv.index("--layer") + 1] == \
-        f"{mise.resolve()}={rl / 'mise'}"
-    assert argv.index("--layer") < argv.index("--")
+    i = argv.index("--overlay")
+    assert argv[i + 1:i + 4] == [str(mise.resolve()), "--lower",
+                                 str(rl / "mise")]
+    # After the home: its directory may lie beneath it.
+    assert argv.index("--home") < i < argv.index("--")
     argv = leerie._confined_argv(hk, ["true"])
     new = run["run_dir"].resolve() / leerie.RUN_LAYER_NEW_NAME
-    assert argv[argv.index("--layer-upper") + 1] == \
-        f"{mise.resolve()}={new / 'mise'}"
+    i = argv.index("--overlay")
+    assert argv[i + 1:i + 4] == [str(mise.resolve()), "--upper",
+                                 str(new / "mise")]
 
 
 def test_no_tree_may_hold_the_run_layer(leerie):
@@ -237,19 +257,35 @@ def _parse(argv):
     return landlock_exec._parse(argv)
 
 
-def test_the_shim_parses_the_layer_options():
-    o = _parse(["--isolate", "--layer", "/a=/b", "--layer-upper",
-                "/c=/d", "--", "true"])
-    assert o["layer"] == [("/a", "/b")]
-    assert o["layer_upper"] == [("/c", "/d")]
-    assert "needs --isolate or --sandbox" in _parse(
-        ["--layer", "/a=/b", "--", "true"])
-    assert "--layer-upper needs --isolate" in _parse(
-        ["--sandbox", "--view", "/v", "--layer-upper", "/a=/b", "--",
-         "true"])
-    for bad in ("/a", "a=/b", "/a=b", "/=/b"):
-        assert "bad --layer" in _parse(["--isolate", "--layer", bad, "--",
-                                        "true"])
+def test_the_shim_parses_the_overlay_options():
+    o = _parse(["--isolate", "--home", "/h", "--lower", "/l", "--upper",
+                "tmpfs:9", "--overlay", "/a", "--lower", "/b/", "--overlay",
+                "/c", "--upper", "/d", "--", "true"])
+    assert o["overlays"] == [
+        {"target": "/h", "lowers": ["/l"], "upper": 9, "home": True},
+        {"target": "/a", "lowers": ["/b"], "upper": None, "home": False},
+        {"target": "/c", "lowers": [], "upper": "/d", "home": False}]
+    assert "need --isolate or --sandbox" in _parse(
+        ["--overlay", "/a", "--lower", "/b", "--", "true"])
+    assert "an --upper on disk needs --isolate" in _parse(
+        ["--sandbox", "--view", "/v", "--overlay", "/a", "--upper", "/b",
+         "--", "true"])
+    assert "one --home, with its --upper" in _parse(
+        ["--isolate", "--home", "/h", "--", "true"])
+    assert "one --home, with its --upper" in _parse(
+        ["--isolate", "--home", "/h", "--upper", "tmpfs:9", "--home", "/i",
+         "--upper", "tmpfs:9", "--", "true"])
+    assert "the --home's only" in _parse(
+        ["--isolate", "--overlay", "/a", "--upper", "tmpfs:9", "--", "true"])
+    assert "follows no overlay" in _parse(
+        ["--isolate", "--lower", "/b", "--overlay", "/a", "--", "true"])
+    assert "follows no overlay" in _parse(
+        ["--isolate", "--overlay", "/a", "--upper", "/b", "--upper", "/c",
+         "--", "true"])
+    for k, bad in (("--overlay", "a"), ("--lower", "/"), ("--upper", "b"),
+                   ("--upper", "tmpfs:0"), ("--upper", "tmpfs:x")):
+        assert f"bad {k}" in _parse(["--isolate", "--overlay", "/a", k, bad,
+                                     "--", "true"])
 
 
 def test_the_profile_allows_the_overlay_on_the_toolchains():
