@@ -9,7 +9,7 @@ confirm then waited for a whole worker, and workers slipped in between one
 confirm's sections — 2.9x the unlocked wall time at 4 lanes, ~5x at 8.
 
 The real `_falsify_items` and `_falsifier_gates` (and the real
-`_confirm_still_failing`, `_ExecLock` and pass-through gates) drive the
+`_confirm_new_failures`, `_ExecLock` and pass-through gates) drive the
 schedule here; only the worker, the probe's runs and the facts read are
 stand-ins, each holding the lock the way the real one does (a worker shared
 with `worker=True`, a run or facts read inside `_held_out_section`).

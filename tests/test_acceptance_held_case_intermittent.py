@@ -627,8 +627,8 @@ def test_a_cut_reruns_finished_file_that_passed_refutes_it(leerie):
         clock["t"] += left
         return leerie._RerunCut(frozenset({"b"}), frozenset({"a", "b"}))
     leerie_caps = _caps(leerie, confirm_budget_sec=10)
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["a", "b", "c"], run, leerie_caps, label="t", seen_failing=True,
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["a", "b", "c"], None, run, leerie_caps, label="t", observed="asserted",
         clock=lambda: clock["t"]))
     assert v["budget_exhausted"] is True and v["reruns_run"] == 0
     assert v["confirmed"] == ["b", "c"] and v["budget_short"] == ["b", "c"]

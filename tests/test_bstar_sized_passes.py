@@ -220,7 +220,7 @@ def test_a_cut_only_candidate_with_no_pair_is_unsettled_not_no_verdict(
         raise AssertionError("the final rerun never starts")
     caps = {**leerie.DEFAULT_CAPS, "confirm_budget_sec": 10}
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x"], base, final, caps, label="q", seen_failing=True,
+        ["x"], base, final, caps, label="q", observed="pair",
         read_psi=lambda: 0.0, sleep=clk.sleep, clock=clk))
     assert v["no_verdict"] == [] and v["new"] == []
     assert v["budget_short_unsettled"] == ["x"] and v["pairs_run"] == 0
@@ -291,14 +291,15 @@ def test_the_redrive_records_a_kept_groups_unsettled_candidates(leerie):
 
 
 @pytest.mark.parametrize("fn", ["_intermittent_discovery_gate",
-                                "_acceptance_discover", "_settle"])
+                                "_acceptance_discover"])
 def test_budget_zero_waits_for_no_gate_anywhere(leerie, fn):
     """Claims review R7-C4: with `confirm_budget_sec` <= 0 the confirms
-    skipped the gate, but discovery, the held-out discovery and the
-    execution settle still waited up to `confirm_gate_wait_sec`."""
+    skipped the gate, but discovery and the held-out discovery still waited
+    up to `confirm_gate_wait_sec`. (The execution settle re-checks through
+    the B* engine itself now; its no-budget case is driven in
+    tests/test_one_differential_engine.py.)"""
     names = {"_intermittent_discovery_gate": "_intermittent_discovery",
-             "_acceptance_discover": "_acceptance_discover",
-             "_settle": "_settle_by_execution"}
+             "_acceptance_discover": "_acceptance_discover"}
     src = inspect.getsource(getattr(leerie, names[fn]))
     i = src.index("_confirm_gate(caps)")
     window = src[max(0, i - 200):i]

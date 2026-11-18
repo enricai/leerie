@@ -51,12 +51,18 @@ def _confirm_at_once(leerie, monkeypatch):
     half. B* itself is pinned with real reruns in
     tests/test_acceptance_own_start.py (a flaky set file is resource-affected,
     a consistent one confirmed) and tests/test_bstar_confirm.py."""
-    async def confirm_all(candidates, run_final, caps, *, label, **_kw):
+    real_confirm = leerie._confirm_new_failures
+
+    async def confirm_all(candidates, run_base, run_final, caps, *, label,
+                          **kw):
+        if run_base is not None:
+            return await real_confirm(candidates, run_base, run_final, caps,
+                                      label=label, **kw)
         cand = sorted(set(candidates))
         return {"candidates": cand, "confirmed": cand,
                 "resource_affected": [], "reruns_required": 0,
                 "reruns_run": 0, "budget_exhausted": False, "gate": None}
-    monkeypatch.setattr(leerie, "_confirm_still_failing", confirm_all)
+    monkeypatch.setattr(leerie, "_confirm_new_failures", confirm_all)
 
     # Held-case discovery reruns every passing defect file up to ten times
     # (DESIGN §8 *A held case that fails again*); these fixtures are
@@ -3718,10 +3724,15 @@ def test_a_first_run_timeout_then_an_ordinary_failure_does_not_roll_back(
     labels: list = []
     reruns: list = []
 
-    async def confirm_by_one_real_rerun(candidates, run_final, caps, *,
-                                        label, **_kw):
+    paired = leerie._confirm_new_failures
+
+    async def confirm_by_one_real_rerun(candidates, run_base, run_final,
+                                        caps, *, label, **kw):
         # B* with one real rerun (the autouse stub confirms with none, and
         # this defect needs the confirming rerun to happen).
+        if run_base is not None:
+            return await paired(candidates, run_base, run_final, caps,
+                                label=label, **kw)
         cand = sorted(set(candidates))
         still = await run_final(600.0)
         reruns.append((label, cand, sorted(still or [])))
@@ -3730,7 +3741,7 @@ def test_a_first_run_timeout_then_an_ordinary_failure_does_not_roll_back(
                 "resource_affected": [c for c in cand if c not in ok],
                 "reruns_required": 1, "reruns_run": 1,
                 "budget_exhausted": False, "gate": None}
-    monkeypatch.setattr(leerie, "_confirm_still_failing",
+    monkeypatch.setattr(leerie, "_confirm_new_failures",
                         confirm_by_one_real_rerun)
     # Call 1 is the start's evaluation; call 2 the repaired tree's.
     _timeout_first_after_run(leerie, monkeypatch, "acc/test_defect_2.py", 2,

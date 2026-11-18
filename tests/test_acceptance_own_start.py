@@ -635,14 +635,14 @@ def test_still_failing_needs_every_rerun(leerie):
 
     async def rerun(_t):
         return next(runs)
-    out = asyncio.run(leerie._confirm_still_failing(
-        ["a", "b"], rerun, caps, label="t", read_psi=lambda: 0.0))
+    out = asyncio.run(leerie._confirm_new_failures(
+        ["a", "b"], None, rerun, caps, label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert out["confirmed"] == ["a"] and out["resource_affected"] == ["b"]
 
     async def none(_t):
         return None
-    out = asyncio.run(leerie._confirm_still_failing(
-        ["a"], none, caps, label="t", read_psi=lambda: 0.0))
+    out = asyncio.run(leerie._confirm_new_failures(
+        ["a"], None, none, caps, label="t", read_psi=lambda: 0.0, observed="unseen"))
     # No rerun produced a report: no verdict, never the flake label.
     assert out["confirmed"] == [] and out["no_verdict"] == ["a"]
     assert out["resource_affected"] == []
@@ -655,8 +655,8 @@ def test_still_failing_needs_every_rerun(leerie):
 
     async def nosleep(_s):
         return None
-    out = asyncio.run(leerie._confirm_still_failing(
-        ["a"], count, caps, label="t", read_psi=lambda: None, sleep=nosleep))
+    out = asyncio.run(leerie._confirm_new_failures(
+        ["a"], None, count, caps, label="t", read_psi=lambda: None, sleep=nosleep, observed="unseen"))
     assert out["reruns_required"] == 5 and n["i"] == 5
 
 

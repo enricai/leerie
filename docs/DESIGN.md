@@ -14309,7 +14309,7 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   test is verbatim in the item's sentence or one of its parts (after
   NFC/whitespace normalisation);
   its named case fails under B* on a pristine installed copy of the
-  final commit (`_confirm_still_failing`, serial runner, so a load
+  final commit (B\* with no base side, serial runner, so a load
   flake never confirms), the probe placed in a held-out sandbox over that
   copy, never written into it (§6 *A held-out evaluation runs alone*); the failing assertion it quotes lies inside
   that case's reachable code and is an assertion (*The quoted assertion
@@ -21576,7 +21576,42 @@ under load. Benched (Q9), "failed twice" — today's informal rule — labelled
 (71 of 77 flaky IDs called new).
 
 The candidate is confirmed by **B\***, one reusable mechanism every "is this
-failure new / does this set still fail" verdict uses:
+failure new / does this set still fail" verdict uses. It is one engine, not
+one per caller. Every executable check is run on a side A and a side B
+through one channel, and confirmed by the same gate, pairs, budget clock,
+"a cut rerun is not a run" rule and verdict types:
+- side A is the base, a round's start or a merge parent, or none at all
+  (a held-out set, a probe, a verify command);
+- side B is the tree under test;
+- the channel is the test command over the named files, the browser suite,
+  a held-out placement, a base form written over the tree's own files, a
+  merge check's argv or a verify argv.
+
+The failing-test-ID diff, a round's diff, the base-form run, CI parity,
+the integration gate, a probe's confirm, a probe's flip, a held-out set's
+vote and a verify command's re-check are callers of it. The base-paired
+test confirms among them (the final diff, a round's diff, the base form)
+share one helper that makes, installs and removes the side-A worktree.
+Each caller states three facts the engine cannot know. Nothing else about
+a verdict differs between callers:
+- *Which question it asks* (step 4).
+  - An **attribution** check asks "did this change cause the failure?"
+    (the diffs, CI parity, the base form, the flip, the integration head
+    confirm). It decides a shortfall only on finished reruns.
+  - A **required-behaviour** check asks "does the tree do what was
+    ordered?" (the held-out vote, the falsifier probe, a verify command).
+    Its own first failing observation stands.
+  - A check whose candidates were never **seen failing** (the integration
+    overlay) never decides on a shortfall.
+- *What a case absent from side A's report means.* Side A's result is
+  three-valued: failing, passing, or absent.
+  - For "this failure is new" an absent case is not failing there, so a
+    failing test the run added is new.
+  - For "this case passed before" (the flip) an absent case did not pass:
+    a probe that does not load on the start never passed there.
+- *Whether its units are sized* (step 2): the multi-file confirms of the
+  diffs, the base form and CI parity are; a single probe, a held-out
+  set's vote and the integration groups are not.
 
 1. *Gate.* Wait until the **host's** CPU pressure (`/proc/pressure/cpu`,
    `some avg10`) is below `confirm_psi_cpu_max` (40), for at most
