@@ -71667,12 +71667,17 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
         evidence, _c = _delivery_typed_evidence(st, leerie_dir,
                                                 refresh_tokens=True)
         routing: dict = {}
+        # What the judge showed, per item: kept on the row as detection
+        # keeps `judge.unmet_parts` (DESIGN §8 *A re-check keeps what its
+        # judge showed, as detection does*). Evidence only.
+        details: dict = {}
         try:
             unmet, _n, _x = await _delivery_judge_unmet(
                 st.data.get("task", ""), items, staging, st, caps, models,
                 efforts, phase_label="redrive", exec_digest=record,
                 typed_evidence=evidence, only=judge_idx, routing=routing,
-                full_vote=_judge_majority_items(prior.values()))
+                full_vote=_judge_majority_items(prior.values()),
+                item_details=details)
             hit = {u["item_index"]: u for u in unmet
                    if u.get("item_index") in judge_idx}
             human = (set(routing.get("human_verification") or [])
@@ -71685,6 +71690,9 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                 if u is not None:
                     out[i]["evidence_by"] = {
                         out[i]["by"][0]: out[i]["evidence"][:1200]}
+                if isinstance(details.get(i), dict):
+                    out[i]["unmet_parts"] = list(
+                        details[i].get("unmet_parts") or [])
                 if u is None and i in human:
                     # A met resting only on a worker's run, or an item no
                     # sample read: unknown.
@@ -72290,7 +72298,10 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
             r = {**r, "verdict": ("unmet" if v["unmet"] else
                                   "unknown" if v.get("unknown") else "met"),
                  "by": v["by"] if v["unmet"] else [],
-                 "redrive_recheck": {"sha": sha},
+                 "redrive_recheck": {
+                     "sha": sha,
+                     **({"unmet_parts": list(v["unmet_parts"])}
+                        if isinstance(v.get("unmet_parts"), list) else {})},
                  **({"falsifier": v["falsifier"]}
                     if isinstance(v.get("falsifier"), dict) else {})}
             if isinstance(r.get("test_outcome_part"), dict):

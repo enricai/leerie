@@ -152,7 +152,9 @@ def test_an_unrouted_item_is_read_on_the_tree_the_verdict_is_keyed_to(
     assert gate["final_sha"] == final
     assert gate["final_tree"] == _git(staging, "rev-parse", "HEAD^{tree}")
     row2 = _row(gate, 2)
-    assert row2["redrive_recheck"] == {"sha": final}
+    # Its judge typed no part unmet (DESIGN §8 *A re-check keeps what its
+    # judge showed*).
+    assert row2["redrive_recheck"] == {"sha": final, "unmet_parts": []}
     assert row2["verdict"] == ("met" if item2_met_when_fixed else "unmet")
     assert ([u["item_index"] for u in gate["unmet_final"]]
             == ([] if item2_met_when_fixed else [2]))

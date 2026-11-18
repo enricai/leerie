@@ -11742,7 +11742,12 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   item's words "<quote>" fails under B* on the re-checked tree`; every
   item it ran carries its record as `falsifier`, which
   `_redrive_apply_item_verdicts` writes onto the row, so the next re-check
-  re-runs the new probe; `delivery_gate.final_progress` is restored to
+  re-runs the new probe; the judge call passes `item_details={}`, and every
+  item it judged carries that detail's `unmet_parts` (possibly empty) as
+  `unmet_parts`, which `_redrive_apply_item_verdicts` nests in the row's
+  stamp, `redrive_recheck: {sha, unmet_parts}` — evidence only, read by no
+  verdict, `by`, evidence text or outcome (DESIGN §8 *A re-check keeps what
+  its judge showed, as detection does*); `delivery_gate.final_progress` is restored to
   what it was, and a falsifier that cannot run leaves the re-check's
   verdict); the verdicts that did not crash are applied
   (`_redrive_apply_item_verdicts(st, ..., HEAD, <its tree>)`), a crashed

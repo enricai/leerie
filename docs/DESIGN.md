@@ -15405,6 +15405,22 @@ afresh on that commit (`falsifier_samples` samples, no leads); a confirmed
 sample makes it unmet again, and its probe is the one the next re-check
 re-runs.
 
+*A re-check keeps what its judge showed, as detection does.* Detection
+records, per judged item, the unmet parts its samples typed, each with only
+the citations that verify (`judge.unmet_parts`), so an item it leaves unmet
+is stated with what was found and where (§6 *The PR's end-state section is
+rendered by code, from typed state*). The re-check's judge replaced the
+verdict and kept only its prose: the row
+said `redrive_recheck: {sha}` and nothing of the parts. So an unmet the
+re-check made could be stated only as "unmet", never with what showed it.
+Measured on the recorded runs (S9-R5's prototype rendering, 83 states): 4
+of 31 judge-unmet items were unmet by a re-check judge, and none of the 4
+had a part or citation recorded (navegando-nv 399f7c8b items 139, 146 and
+150; navegando b94226a8 item 9). So the re-check keeps its judge's parts
+on the record it already writes, `redrive_recheck.unmet_parts`, in
+detection's shape, for every item its judge read. This adds evidence and
+decides nothing: no verdict, `by`, evidence text or outcome reads it.
+
 **Every item the tree that ships reports met passed detection's bar on
 it.** The re-check reaches only the items the re-drive routed. Every other
 met item was read after a kept group by the delivery ratchet's judge alone
