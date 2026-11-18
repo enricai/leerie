@@ -2709,8 +2709,8 @@ pass was skipped, crashed, or returned a fully clean result — absence
 of the field is the cue that there's nothing advisory to say. Omitted
 too when the record is not of the tree that ships:
 `_final_conformance_payload(st, shipping_tree)` returns None unless
-`_final.tree_sha` equals `shipping_tree` (`_shipping_tree(st)`, read by
-`_compose_pr_via_llm`), both non-empty, and logs
+`_of_shipping(_final.tree_sha, shipping_tree)` (`_shipping_tree(st)`, read by
+`_compose_pr_via_llm`), and logs
 `pr_writer: final conformance notes left out — measured on tree <a>, the
 run ships <b>` (DESIGN §9 final-tree pass, *Every test outcome the PR
 states was measured on the tree that ships*). Bounded
@@ -7859,6 +7859,8 @@ unchanged.
 | `_pr_review_record(st, caps, models, efforts, staging, base, head, name)` | One `pr_reviewer` call on commit `head`, returning `{base, head, model, effort, diff_cut, findings[], n_findings, n_verified, at, error?}`. Payload: `TASK`, each `_d1_report_sources` report in full, `REQUIRED ITEMS` (`_pr_review_items`), base and head, the changed files, and `git diff <base>...<head>` cut at `_PR_REVIEW_DIFF_MAX` = 600000 chars (saying so). The payload ends with `COMMANDS YOU MAY RUN`, which lists each granted command prefix, or says none is granted. It then names the canonical test command when a granted prefix covers it, and otherwise says no test runner is granted and not to try running tests. Its `cwd` is `async with _judge_checkout(st, staging, name, rev=head, share_ignored=True)` (DESIGN §8 *A worker that does not commit never runs in a tree leerie measures*), not autonomous, `PR_REVIEW_MAX_TURNS` = 150, tools from `_pr_review_tools(staging, repo_root) -> (allowed_tools, prefixes, canonical)`. That is `_widen_inspect_tools(INSPECT_TOOLS, staging)` plus `Bash(<form>:*)` for each `_full_suite_runners(_canonical_test_command(repo_root))` spelling it lacks. The whole-suite deny and notice still come from `claude_p`, because those tools reach the runner. Nothing is restored afterwards: whatever the reviewer made goes with its checkout. Each finding gets `_verify_pr_finding` against that checkout, inside the same `async with`. A `WorkerError`/timeout is recorded as `error`. |
 | `_run_shipping_pr_review(leerie_dir, st, caps, models, efforts)` | DESIGN §9 *The review the PR shows is of the tree that ships*. None, nothing run, when `pr_review` is absent or has no `head`, `base_sha`/staging is absent, `_shipping_commit`/`_shipping_tree` is "", or `_commit_tree(st, pr_review.head)` equals `_shipping_tree(st)`. Returns `pr_review_shipped` unchanged when `_commit_tree` of its `head` equals `_shipping_tree(st)` (resume). Otherwise logs `phase 5: whole-PR review again — the run branch moved from <a> to <b> since the review`, runs `_pr_review_record(..., base_sha, _shipping_commit(st), "pr-review-shipped")` and persists it as `pr_review_shipped`. Read only by `_record_pr_review_shown`. |
 | `_shipping_commit(st)` / `_commit_tree(st, commit)` / `_run_repo_rev(st, rev)` | The run branch's head commit; a commit's tree; `git rev-parse --verify -q <rev>` in `<run_dir>/repo` — each "" when it does not resolve. `_shipping_tree` is `_run_repo_rev` of the run branch's `^{tree}`. |
+| `_stamp(st, sha) -> {"sha", "tree"}` | DESIGN §6 *Every statement about the result is keyed to the commit it was made on*. The stamp of a measurement that ran on `sha`: `sha` (`""` for a falsy one) and `_commit_tree(st, sha)`. Every delivery pass stamps its verdict with it: `_run_delivery_prejudge` / `_run_delivery_recheck` (`judged_*.tree`, of the `judged_sha` read before the judge runs) and `_run_delivery_detection` (`final_sha`, `final_tree`). Never a ref or HEAD read after the measurement. |
+| `_of_shipping(stamped, shipping) -> bool \| None` | The one comparison of a recorded stamp with what ships: None when `shipping` is ""; else `stamped` is non-empty and equal to it. Each reader passes the key it compares — `_shipping_tree(st)` for every reader of the tree that ships: `_decide_outcome` (the latest delivery verdict's tree), `_unmeasured_on_shipping_tree` (`test_id_diff.tree_sha`, `shipping_tests_gap.tree_sha`, `existing_behaviour.tree_sha`), `_final_conformance_payload` (`_final.tree_sha`) and `_run_shipping_pr_review` (the tree of `pr_review.head` / `pr_review_shipped.head`). A resume's reuse of a finished verdict compares commits with staging's HEAD instead (DESIGN §8 *A finished verdict is reused only on the commit it was measured on*). |
 | `_record_pr_review_shown(st)` | In `phase_finalize` after `_record_unmet_evidence`. Removes `pr_review_shown`, then, when a review without `error` exists (`pr_review_shipped` first, else `pr_review`) and `_shipping_commit`/`_shipping_tree` resolve, checks each `verified` finding with `_pr_quote_check` against `git show <shipping commit>:<path>` in the run's own repository and writes `pr_review_shown` `{source, reviewed (its head), reviewed_tree, commit, tree, findings (those whose quote is there, `line_ok` of that file), n_quote_gone}`, logging `pr review: <n> finding(s) of `<source>` quote code the run branch's head <c> no longer has — not listed` when any is dropped. |
 | `_pr_advisory(state)` review block | From `pr_review_shown` only: heading `Whole-PR review findings (reviewed on `<commit>`, the run branch's head; each quote checked in the file there)` when `reviewed_tree == tree`, else `Whole-PR review findings (reviewed on `<reviewed>`; each quote checked again in the file at `<commit>`, the run branch's head)` (12-character shas); a line per finding `- `<path>:<start>-<end>` [<kind>] <explanation>`, the range only when `line_ok` is true; at most `_PR_ADVISORY_SHOWN`; then `- <n> more of that review's findings quote code the file at `<commit>` no longer has; not listed (state.json `<source>`)` when `n_quote_gone` > 0. |
 | `_pr_review_items(st)` | `[{item_id: "<i>", text}]` over `required_items` by position, plus `{item_id: "contract", text: JSON {defect_shape, sites}}` when the audit is applicable with sites. |
@@ -8460,8 +8462,14 @@ duplicate, moved, obsolete_by_merged_intent]}]` for repair mode.
 
 Unlike `wiring_gate`, which is written only on a clean pass,
 `state.data["integration_gate"][sid]` is written as soon as a verdict is in:
-`{defects: list[str], advisories: list[str], merge_commit_sha: str, accepted:
-bool}` (`accepted` is `not defects` on a fresh judge verdict), plus, once the
+`{defects: list[str], advisories: list[str], merge_commit_sha: str,
+judged_sha: str, accepted: bool}` (`accepted` is `not defects` on a fresh
+judge verdict; `judged_sha` the commit the verdict read — staging's HEAD or
+its `_synthetic_merge`, and after a repair round whose re-judge reached a
+verdict the commit that re-judge read (`_integration_repair_round` returns it
+as `judged` beside `pass` / `checked`), which `merge_commit_sha`, the
+original merge, is not; read by nothing yet),
+plus, once the
 repair loop runs, `repair_rounds`, `rounds` (one audit entry per round),
 `superseded`, `outcome` (`clean` / `repaired` / `backed_out`) and, as they
 apply, `fallback_reason`, `reset_to`, `residual_lines` / `residual_total`,
@@ -9990,7 +9998,9 @@ non-empty, every entry's argv non-empty); `_at_measured_ceiling(st) -> bool`
 (`blt_peak` recorded). `async _settle_by_execution(subtask, worktree, st,
 caps, *, sid) -> dict` returns and persists `settled_by_execution[sid] =
 {verdict, why, commands: [{argv, rc, attempts, passed, resource_affected,
-environment_limit, tail}], dirty, removed_untracked?}`:
+environment_limit, tail}], dirty, removed_untracked?, sha?}` (`sha`: the
+commit of the committed view the verify argvs ran in, recorded once they are
+about to run; read by nothing yet):
 
 - `none` without running when there is no argv; when an argv runs a
   command the task forbids (`_forbidden_verify_argv` over
@@ -10672,11 +10682,11 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_decide_outcome` and `_prior_delivery_residual` read `unmet_final` first.
   The final judge's retry loop treats any `Exception` as a crash (its items
   `unknown` when every attempt fails), not only `WorkerError` / timeout.
-  The verdict records `final_tree` (`_shipping_tree(st)`), and
-  `_delivery_judged_record(sha, unmet, details, tree)` records the pre-pass's
-  and the recheck's `tree` (`_shipping_tree(st)` too); the delivery
-  re-drive's re-key sets `final_tree` (`_shipping_tree(st)`) with
-  `final_sha`.
+  The verdict records `final_sha` and `final_tree` as `_stamp(st, sha)` of
+  the commit it judged, and `_delivery_judged_record(sha, unmet, details,
+  tree)` records the pre-pass's and the recheck's `tree` as
+  `_stamp(st, judged_sha)["tree"]`; the delivery re-drive's re-key sets
+  `final_tree` (`_shipping_tree(st)`) with `final_sha`.
 
 ### CI parity — `ci_checks`
 
