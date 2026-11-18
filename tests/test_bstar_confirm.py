@@ -148,7 +148,7 @@ def test_deterministic_regression_is_new_with_interleaved_pairs(leerie):
     calls = []
     b, f = _runners([set()] * 3, [{"t::x"}] * 3, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == ["t::x"] and v["resource_affected"] == []
     assert v["pairs_required"] == 3 and v["pairs_run"] == 3
     # Interleaved, base first: B F B F B F.
@@ -161,7 +161,7 @@ def test_flaky_final_is_resource_affected(leerie):
     calls = []
     b, f = _runners([set()] * 3, [{"t::x"}, set(), {"t::x"}], calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == [] and v["resource_affected"] == ["t::x"]
 
 
@@ -169,7 +169,7 @@ def test_failing_on_base_too_is_not_new(leerie):
     calls = []
     b, f = _runners([set(), {"t::x"}, set()], [{"t::x"}] * 3, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == [] and v["resource_affected"] == ["t::x"]
 
 
@@ -183,7 +183,7 @@ def test_failing_every_base_rerun_is_pre_existing_not_flaky(leerie):
                     [{"t::x", "t::y"}, {"t::x"}, {"t::x", "t::y"}], calls)
     v = asyncio.run(leerie._confirm_new_failures(
         ["t::x", "t::y"], b, f, _caps(leerie), label="t",
-        read_psi=lambda: 0.0))
+        read_psi=lambda: 0.0, observed="unseen"))
     assert v["pre_existing"] == ["t::x", "t::y"]
     assert v["resource_affected"] == [] and v["new"] == []
     assert v["no_verdict"] == []
@@ -195,12 +195,12 @@ def test_base_failing_some_reruns_stays_resource_affected(leerie):
     calls = []
     b, f = _runners([{"x", "y"}, {"x"}, {"x"}], [{"x", "y"}] * 3, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x", "y"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["x", "y"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["pre_existing"] == ["x"] and v["resource_affected"] == ["y"]
     calls = []
     b, f = _runners([{"x"}, None, {"x"}], [{"x"}] * 3, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["pre_existing"] == [] and v["resource_affected"] == ["x"]
 
 
@@ -209,7 +209,7 @@ def test_no_rerun_with_a_report_is_no_verdict(leerie):
     flake label."""
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], leerie._no_rerun, leerie._no_rerun, _caps(leerie), label="t",
-        read_psi=lambda: 0.0))
+        read_psi=lambda: 0.0, observed="unseen"))
     assert v["no_verdict"] == ["x"] and v["resource_affected"] == []
     assert v["pre_existing"] == [] and v["new"] == []
 
@@ -217,15 +217,15 @@ def test_no_rerun_with_a_report_is_no_verdict(leerie):
 def test_still_failing_splits_no_verdict(leerie):
     async def none(_t):
         return None
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], none, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, none, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["no_verdict"] == ["x"] and v["resource_affected"] == []
     runs = iter([{"x"}, set(), {"x"}])
 
     async def mixed(_t):
         return next(runs)
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], mixed, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, mixed, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["resource_affected"] == ["x"] and v["no_verdict"] == []
 
 
@@ -252,7 +252,7 @@ def test_mixed_candidates_split_per_id(leerie):
     calls = []
     b, f = _runners([set()] * 3, [{"a", "b"}, {"a"}, {"a", "b"}], calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["b", "a"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["b", "a"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == ["a"] and v["resource_affected"] == ["b"]
 
 
@@ -262,7 +262,7 @@ def test_gate_timeout_escalates_to_five_pairs(leerie):
     b, f = _runners([set()] * 5, [{"x"}] * 5, calls)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 99.0,
-        sleep=clock.sleep, clock=clock))
+        sleep=clock.sleep, clock=clock, observed="unseen"))
     assert v["gate"]["timed_out"] is True
     assert v["pairs_required"] == 5 and len(calls) == 10
     assert v["new"] == ["x"]
@@ -272,7 +272,7 @@ def test_unreadable_psi_escalates_to_five_pairs(leerie):
     calls = []
     b, f = _runners([set()] * 5, [{"x"}] * 5, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: None))
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: None, observed="unseen"))
     assert v["gate"]["readable"] is False and v["pairs_required"] == 5
     assert len(calls) == 10
 
@@ -281,7 +281,7 @@ def test_rerun_without_verdict_makes_resource_affected(leerie):
     calls = []
     b, f = _runners([set(), None, set()], [{"x"}] * 3, calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == [] and v["resource_affected"] == ["x"]
 
 
@@ -292,7 +292,7 @@ def test_raising_rerun_is_no_verdict_not_a_crash(leerie):
     async def final(timeout):
         return {"x"}
     v = asyncio.run(leerie._confirm_new_failures(
-        ["x"], boom, final, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        ["x"], boom, final, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert v["new"] == [] and v["pairs_run"] == 3
 
 
@@ -366,7 +366,7 @@ def test_budget_bounds_the_confirm(leerie):
     b, f = _runners([set()] * 3, [{"x"}] * 3, calls, clock=clock, cost=400.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock))
+        sleep=clock.sleep, clock=clock, observed="unseen"))
     assert v["budget_exhausted"] is True and v["pairs_run"] == 2
     assert v["new"] == [] and v["budget_short_unsettled"] == ["x"]
     assert v["resource_affected"] == []
@@ -387,7 +387,7 @@ def test_a_budget_shortfall_is_never_evidence_a_failure_went_away(
     b, f = _runners([set()] * 3, [{"x"}] * 3, calls, clock=clock, cost=400.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=seen_failing))
+        sleep=clock.sleep, clock=clock, observed=("pair" if seen_failing else "unseen")))
     assert v["budget_exhausted"] is True and v["pairs_run"] == 2
     assert v["new"] == new and v["budget_short"] == new
     assert v["budget_short_unsettled"] == ([] if new else ["x"])
@@ -414,7 +414,7 @@ def test_a_rerun_ending_past_the_budget_with_no_verdict_is_not_a_run(leerie):
         return None
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], base, final, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True))
+        sleep=clock.sleep, clock=clock, observed="pair"))
     assert v["pairs_run"] == 0 and v["budget_exhausted"] is True
     assert v["new"] == [] and v["budget_short"] == []
     assert v["budget_short_unsettled"] == ["x"]
@@ -431,14 +431,14 @@ def test_a_shortfall_never_overrides_disagreeing_evidence(leerie):
                     cost=700.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x", "y"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True))
+        sleep=clock.sleep, clock=clock, observed="pair"))
     assert v["pairs_run"] == 1 and v["budget_exhausted"] is True
     assert v["new"] == ["x"] and v["resource_affected"] == ["y"]
     clock = _Clock()
     b, f = _runners([None, set()], [{"x"}] * 2, [], clock=clock, cost=700.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True))
+        sleep=clock.sleep, clock=clock, observed="pair"))
     assert v["budget_exhausted"] is True and v["new"] == []
     assert v["resource_affected"] == ["x"]
 
@@ -467,7 +467,7 @@ def test_a_no_verdict_base_rerun_in_the_cut_pair_is_not_a_budget_shortfall(
         return r
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], base, final, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True))
+        sleep=clock.sleep, clock=clock, observed="pair"))
     assert v["budget_exhausted"] is True and v["pairs_run"] == 1
     assert v["new"] == [] and v["budget_short"] == []
     assert v["budget_short_unsettled"] == []
@@ -487,9 +487,9 @@ def test_still_failing_confirms_a_budget_short_vote_only_when_seen(
             return None
         clock.t += cost
         return {"x"}
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=seen_failing))
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, observed=("asserted" if seen_failing else "unseen")))
     assert v["reruns_run"] == 2 and v["budget_exhausted"] is True
     assert v["confirmed"] == confirmed and v["budget_short"] == confirmed
     assert v["resource_affected"] == ([] if confirmed else ["x"])
@@ -507,7 +507,7 @@ def test_gate_wait_is_not_charged_to_the_confirm_budget(leerie):
                     cost=400.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 99.0,
-        sleep=clock.sleep, clock=clock))
+        sleep=clock.sleep, clock=clock, observed="unseen"))
     gate = v["gate"]["waited_sec"]
     assert v["gate"]["timed_out"] is True and gate >= 300
     assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
@@ -523,9 +523,9 @@ def test_still_failing_does_not_charge_the_gate_wait_either(leerie):
         calls.append(timeout)
         clock.t += 400.0
         return {"x"}
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 99.0,
-        sleep=clock.sleep, clock=clock))
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, run_final, _caps(leerie), label="t", read_psi=lambda: 99.0,
+        sleep=clock.sleep, clock=clock, observed="unseen"))
     assert v["gate"]["timed_out"] is True and v["gate"]["waited_sec"] >= 300
     assert [round(t) for t in calls] == [1800, 1400, 1000, 600, 200]
     assert v["reruns_run"] == 5 and v["confirmed"] == ["x"]
@@ -535,7 +535,7 @@ def test_no_candidates_runs_nothing(leerie):
     calls = []
     b, f = _runners([], [], calls)
     v = asyncio.run(leerie._confirm_new_failures(
-        [], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+        [], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0, observed="unseen"))
     assert calls == [] and v["new"] == [] and v["gate"] is None
 
 
@@ -1070,42 +1070,50 @@ def test_base_checkout_failure_is_recorded_and_reads_unknown(
     assert "base checkout" in got["reason"] and stable in got["reason"]
 
 
-def test_every_measuring_confirm_says_whether_it_saw_the_failure(leerie):
+def test_every_measuring_confirm_states_the_question_it_asks(leerie):
     """Structure, paired with the consumer tests above (the held-out vote,
     the e3 final diff): every B* call that has real runners states
-    `seen_failing` — True where `confirmed`/`new` counts a failure, False
-    only for the integration overlay, whose `confirmed` routes a failure to
-    a test update rather than a code fix (DESIGN §9 *Which failures are
-    new*, step 4). A call with no runners
-    (`_no_rerun`, `_none`) runs nothing, so it needs none."""
+    `observed` (DESIGN §9 *Which failures are new*: the question each caller
+    asks) — "pair" for attribution, "asserted" for required behaviour,
+    "unseen" only for the integration overlay, whose `confirmed` routes a
+    failure to a test update rather than a code fix (step 4) — and only the
+    probe flip reads a case absent from side A as failing. A call with no
+    runners (`_no_rerun`, `_none`) runs nothing; it states "unseen"."""
     import ast
     tree = ast.parse(inspect.getsource(leerie))
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[tuple[str, str, str, str]] = []
     for fn in tree.body:
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for call in ast.walk(fn):
             if not (isinstance(call, ast.Call)
                     and isinstance(call.func, ast.Name)
-                    and call.func.id in ("_confirm_new_failures",
-                                         "_confirm_still_failing")):
-                continue
-            runners = call.args[1:]
-            if all(isinstance(a, ast.Name) and a.id in ("_no_rerun", "_none")
-                   for a in runners if not (isinstance(a, ast.Name)
-                                            and a.id == "caps")):
+                    and call.func.id == "_confirm_new_failures"):
                 continue
             kw = {k.arg: k.value for k in call.keywords}
-            assert "seen_failing" in kw, (fn.name, ast.unparse(call))
-            calls.append((fn.name, ast.unparse(call.args[1]),
-                          ast.literal_eval(kw["seen_failing"])))
-    false = [c for c in calls if not c[2]]
-    assert false == [("_integration_test_failures", "_ov", False)], calls
-    assert {c[0] for c in calls if c[2]} == {
-        "_confirm_final_test_failures", "_ci_confirm_chosen",
-        "_acceptance_run_placed", "_falsifier_gates",
-        "_redrive_new_failures", "_integration_test_failures",
-        "_base_form_regressions", "_redrive_probe_flips"}, calls
+            assert "observed" in kw, (fn.name, ast.unparse(call))
+            observed = ast.literal_eval(kw["observed"])
+            assert observed in leerie._CONFIRM_OBSERVED
+            runners = call.args[1:3]
+            if all(isinstance(a, ast.Name) and a.id in ("_no_rerun", "_none")
+                   for a in runners):
+                assert observed == "unseen", (fn.name, ast.unparse(call))
+                continue
+            absent = (ast.literal_eval(kw["absent_on_base"])
+                      if "absent_on_base" in kw else "pass")
+            calls.append((fn.name, ast.unparse(call.args[2]), observed,
+                          absent))
+    by = {o: {c[0] for c in calls if c[2] == o} for o in
+          leerie._CONFIRM_OBSERVED}
+    assert [c[:3] for c in calls if c[2] == "unseen"] == [
+        ("_integration_test_failures", "_ov", "unseen")], calls
+    assert by["pair"] == {"_confirm_against_base", "_ci_confirm_chosen",
+                          "_integration_test_failures",
+                          "_redrive_probe_flips"}, calls
+    assert by["asserted"] == {"_acceptance_run_placed", "_falsifier_gates",
+                              "_settle_by_execution"}, calls
+    assert [c[0] for c in calls if c[3] == "fail"] == [
+        "_redrive_probe_flips"], calls
 
 
 # --- review round 6 H1: a budget shortfall is unsettled, not `new` ---------
@@ -1120,7 +1128,7 @@ def test_a_discovery_find_is_never_new_on_a_shortfall(leerie):
                     cost=400.0)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x", "d"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True,
+        sleep=clock.sleep, clock=clock, observed="pair",
         intermittent=["d"]))
     assert v["pairs_run"] == 2 and v["budget_exhausted"] is True
     assert v["new"] == ["x"] and v["budget_short"] == ["x"]
@@ -1139,12 +1147,12 @@ def test_a_zero_budget_confirms_nothing_and_waits_for_nothing(leerie):
     b, f = _runners([set()], [{"x"}], calls)
     v = asyncio.run(leerie._confirm_new_failures(
         ["x", "y"], b, f, _caps(leerie, confirm_budget_sec=0), label="t",
-        read_psi=psi, seen_failing=True))
+        read_psi=psi, observed="pair"))
     assert calls == [] and v["gate"]["skipped"] == "no budget"
     assert v["new"] == [] and v["budget_short_unsettled"] == ["x", "y"]
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], f, _caps(leerie, confirm_budget_sec=0), label="t",
-        read_psi=psi, seen_failing=True, needs_rerun=["x"]))
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, f, _caps(leerie, confirm_budget_sec=0), label="t",
+        read_psi=psi, observed="asserted", needs_rerun=["x"]))
     assert calls == [] and v["budget_short_unsettled"] == ["x"]
     assert v["confirmed"] == []
 
@@ -1167,9 +1175,9 @@ def test_still_failing_needs_a_finished_rerun_for_a_weak_observation(
             return None
         clock.t += 10.0
         return {"x"}
-    v = asyncio.run(leerie._confirm_still_failing(
-        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
-        sleep=clock.sleep, clock=clock, seen_failing=True,
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], None, run_final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, observed="asserted",
         needs_rerun=needs))
     assert v["reruns_run"] == seen_runs and v["budget_exhausted"] is True
     assert v["confirmed"] == confirmed

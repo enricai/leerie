@@ -2271,7 +2271,7 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
     async def none(_t):
         return None
     v = asyncio.run(leerie._confirm_new_failures(
-        [cand], none, none, dict(caps), label="final"))
+        [cand], none, none, dict(caps), label="final", observed="unseen"))
     assert v["new"] == [] and v["no_verdict"] == [cand]
     v.update(tree_sha=tree, base_unavailable=True)
     st.data["test_id_diff"] = v
@@ -2294,7 +2294,7 @@ def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
     async def red(_t):
         return {cand}
     v = asyncio.run(leerie._confirm_new_failures(
-        [cand], red, red, dict(caps), label="final"))
+        [cand], red, red, dict(caps), label="final", observed="unseen"))
     assert v["pre_existing"] == [cand]
     v["tree_sha"] = tree
     st.data["test_id_diff"] = v

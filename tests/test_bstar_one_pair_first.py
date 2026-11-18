@@ -41,7 +41,7 @@ def _drive(leerie, recorded: dict[str, float], actual: dict[str, float]):
             return run
         return await leerie._confirm_new_failures(
             cands, runner("base"), runner("final"), pcaps, label="x",
-            seen_failing=True, prior_gate=gate, read_psi=lambda: 0.0,
+            observed="pair", prior_gate=gate, read_psi=lambda: 0.0,
             clock=lambda: clock["t"], **pairs)
 
     v = asyncio.run(leerie._confirm_sized(
@@ -111,12 +111,12 @@ def test_a_paused_confirm_resumes_where_it_stopped(leerie):
     caps = {**leerie.DEFAULT_CAPS}
     v1 = asyncio.run(leerie._confirm_new_failures(
         ["a"], runner("base"), runner("final"), caps, label="x",
-        seen_failing=True, read_psi=lambda: 0.0, max_pairs=1))
+        observed="pair", read_psi=lambda: 0.0, max_pairs=1))
     assert v1["paused"] and v1["budget_exhausted"] and v1["pairs_run"] == 1
     assert v1["new"] == ["a"] and v1["budget_short"] == ["a"]
     v2 = asyncio.run(leerie._confirm_new_failures(
         ["a"], runner("base"), runner("final"), caps, label="x",
-        seen_failing=True, prior_gate=v1["gate"], resume=v1["_resume"]))
+        observed="pair", prior_gate=v1["gate"], resume=v1["_resume"]))
     assert v2["pairs_run"] == 3 and not v2["budget_exhausted"]
     assert "paused" not in v2 and "_resume" not in v2
     assert v2["new"] == [] and v2["resource_affected"] == ["a"]

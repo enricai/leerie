@@ -6643,9 +6643,9 @@ pytest command, `claude_p` stubbed and the host PSI pinned quiet:
   `test_acceptance_no_work.py` were rewritten, including a passing-majority
   settle that now disputes); a set that fails once and then passes its B*
   reruns is `resource_affected` and no evidence, a consistent failure is
-  confirmed; `_confirm_still_failing` needs every rerun (with `seen_failing`,
-every finished one, unless the candidate is in `needs_rerun` and none
-finished) and escalates on a
+  confirmed; B\* with no base side needs every rerun (with
+`observed="asserted"`, every finished one, unless the candidate is in
+`needs_rerun` and none finished) and escalates on a
   gate timeout; HEAD at the validity base is answered without running the
   sets; a set typed broken leaves the next run's residual (all broken: no
   residual), and a residual without set indices is kept.
@@ -7508,7 +7508,7 @@ sample's probe never counts for the next.
 - `tests/test_falsifier_exec_queue.py` (3 test functions, 5 cases;
   DESIGN §6 *Evaluations queue on the lock itself*, review round 21
   execution M1): the real `_falsify_items`, `_falsifier_gates`,
-  `_confirm_still_failing` and `_ExecLock`, with the worker, the probe's
+  `_confirm_new_failures` and `_ExecLock`, with the worker, the probe's
   runs and the facts read as stand-ins holding the lock as the real ones
   do. Every item confirms (first run, B\* rerun, facts read), no worker
   starts inside a confirm, and no worker that asked after a confirm was

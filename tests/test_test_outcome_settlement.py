@@ -88,7 +88,7 @@ class TestVerdict:
 
         def diff(rb, rf, **over):
             d = asyncio.run(leerie._confirm_new_failures(
-                [CAND], rb, rf, dict(caps, **over), label="final"))
+                [CAND], rb, rf, dict(caps, **over), label="final", observed="unseen"))
             d["tree_sha"] = "T"
             return d
         no_base = {**diff(none, none), "base_unavailable": True}
