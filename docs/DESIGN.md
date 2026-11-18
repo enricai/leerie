@@ -18506,7 +18506,12 @@ confirmed under B\* against the pre-repair tree, which passed, and only a
 confirmed new failure resets; when the red run produced no per-test report
 at all (the suite could not run — a broken import or build), the axis is
 run once more, unmemoised, and a second red resets; a confirmation that
-itself fails falls back to the red run. Unconfirmed, one red
+itself raises is no verdict, as it is on every other path (§9 *Which
+failures are new*: no verdict is never a regression), so the repair is
+kept and the raise is recorded. An error in the check is the check's
+defect to fix, not evidence the repair broke the suite: no recorded run
+has raised here, and the rule follows the other paths for consistency,
+not to fix a measured case. Unconfirmed, one red
 run of one flaky test reset every round's work, the fixes included. The
 per-round ratchet does not make this rule redundant: it is the same B\*
 check per round, but it is blind exactly where the suite stops reporting

@@ -62328,13 +62328,16 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                                     log_path=(leerie_dir / "logs"
                                               / "acceptance-repair.log")))
                         except Exception as e:
-                            # The net under the per-round ratchet: when it
-                            # cannot confirm, it falls back to the red run.
-                            reason, confirm = "turned the test axis red", {
-                                "error": f"{type(e).__name__}: {e}"[:300]}
+                            # A confirm that raises is no verdict, as on
+                            # every other path (DESIGN §9): the error is
+                            # the check's, not evidence the repair broke
+                            # the suite, so the repair is kept.
+                            reason, confirm = "", {
+                                "error": f"{type(e).__name__}: {e}"[:300],
+                                "no_verdict": True}
                             log("  acceptance: confirming the red test axis "
-                                f"raised {confirm['error']} — treated as "
-                                "red")
+                                f"raised {confirm['error']} — no verdict, "
+                                "the repair is kept")
                         gate["post_tests_confirm"] = confirm
                 if (not reason and _acceptance_measured(initial)
                         and not _acceptance_measured(final)):
