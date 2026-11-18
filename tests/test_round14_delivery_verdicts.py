@@ -247,7 +247,8 @@ def test_a_recheck_of_item_1_keeps_item_0s_worker_only_entry(
     out = asyncio.run(leerie._redrive_recheck_items(
         st.run_dir, st, caps, {"delivery_judge": "sonnet"},
         {"delivery_judge": "medium"}, staging, [1]))
-    assert out == {1: {"unmet": False, "by": [], "evidence": ""}}
+    assert out == {1: {"unmet": False, "by": [], "evidence": "",
+                       "unmet_parts": []}}
     # The judge saw item 1 under its own index, and only item 1.
     assert '"item_index": 1' in asked[0]
     assert '"item_index": 0' not in asked[0]

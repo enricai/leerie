@@ -62,7 +62,9 @@ def test_a_round_reread_that_crashed_is_read_again_on_the_tree_that_ships(
     gate = st.data["delivery_gate"]
     row1 = _row(gate, 1)
     assert row1["verdict"] == "met", row1
-    assert row1["redrive_recheck"] == {"sha": final}
+    # Its judge read it and found nothing unmet (DESIGN §8 *A re-check
+    # keeps what its judge showed*).
+    assert row1["redrive_recheck"] == {"sha": final, "unmet_parts": []}
     assert [u["item_index"] for u in gate["unmet_final"]] == []
     assert not (st.data.get("delivery_ratchet") or {}).get("unverified")
     assert gate["final_sha"] == final

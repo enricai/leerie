@@ -247,7 +247,7 @@ def test_a_kept_group_that_keeps_the_met_item_leaves_it_met_on_final(
     gate = r.st.data["delivery_gate"]
     row0 = next(x for x in gate["items"] if x["item_index"] == 0)
     assert row0["verdict"] == "met"
-    assert row0["redrive_recheck"] == {"sha": final}
+    assert row0["redrive_recheck"] == {"sha": final, "unmet_parts": []}
     assert gate["unmet_final"] == []
     assert gate["final_sha"] == final
 
