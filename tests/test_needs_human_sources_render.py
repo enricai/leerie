@@ -39,7 +39,20 @@ def _written_sources() -> set[str]:
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if "needs_human_verification" not in (segment(fn) or ""):
+        # Every writer goes through `_replace_gaps` (tests/test_replace_gaps.py),
+        # whose second argument is the source it writes; a writer may name the
+        # list only through that call.
+        calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                 and isinstance(c.func, ast.Name)
+                 and c.func.id == "_replace_gaps" and len(c.args) >= 2]
+        for c in calls:
+            v = c.args[1]
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                out.add(v.value)
+            elif isinstance(v, ast.Name) and v.id in consts:
+                out.add(consts[v.id])
+        if not calls and "needs_human_verification" not in (segment(fn)
+                                                            or ""):
             continue
         for d in ast.walk(fn):
             if not isinstance(d, ast.Dict):
