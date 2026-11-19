@@ -10249,12 +10249,48 @@ outlives staging's removal by `cleanup.sh`; "" when unreadable; review
 round 15 H1) — reason `"the required items were not read on the tree
 that ships: the last delivery verdict (<which>) is of tree <12> …"` —
 or, on that tree, its unmet list is non-empty (DESIGN §6 *A delivery
-verdict counts only on the tree it was measured on*); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty; `delivery_redrive.conflict` is set (its `reason` sentence is the outcome reason, verbatim); `conformance._final.residual_defects` is non-empty (`_residual_defects_reason`: the count, whether the delivery re-drive drove them, and up to three `[kind] where: case`). Otherwise `no_work` when `any_commits` is
-False, else `done`. Callers: `_finish_no_work_run` (every planning-time
+verdict counts only on the tree it was measured on*); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty; `delivery_redrive.conflict` is set (its `reason` sentence is the outcome reason, verbatim); `conformance._final.residual_defects` is non-empty (`_residual_defects_reason`: the count, whether the delivery re-drive drove them, and up to three `[kind] where: case`); and the five further inputs of the table below (V6, V8, V12, V13, and V7 described under *The tree that ships*). Otherwise `no_work` when `any_commits` is
+False, else `done`.
+
+**The veto list (DESIGN §6 *The veto list is one list*).** Every input of
+`_decide_outcome`, in the order it appends reasons. Each is a veto: a
+non-empty reason makes the run `unconverged`; the decider has no input that
+only reports. "Compared" says whether the decider itself compares the
+record's commit with `_shipping_tree(st)` (`_of_shipping`).
+
+| # | reason | record | commit the record is of | compared | confirmation |
+|---|---|---|---|---|---|
+| V1 | `<N> subtask(s) unconverged: <ids>` | `subtask_status` values `unconverged` (`_settle_unconverged`) | the subtask's tree (`settled_by_execution[sid].sha`); none for a cascade (`not run: predecessor(s) …`), a backed-out integration or an exhausted budget | no | the subtask's verify commands, run once in its committed view (`_settle_by_execution`), or none |
+| V2 | `<N> test(s) newly failing on the final tree, confirmed against the base` — `an earlier tree (the tree that ships could not be measured)` when `stale_for_tree` is set; `(<k> on fewer than every base/final pair: the confirm budget cut the rest)` for `budget_short` | `test_id_diff.new` | `test_id_diff.tree_sha` | not by this row (V13 is) | paired B\* against the base; a `budget_short` ID counts |
+| V3 | `<N> held-out acceptance set(s) still fail` | `acceptance.gate.final` (measured, failing, `_acceptance_result_has_work`), else `acceptance.gate.residual` through `_acceptance_residual_unbroken` | `acceptance.gate.final_sha` | no (V13 reads `final_unremeasured`) | the unpaired B\* vote; a held case failing with no resource signature counts with no vote |
+| V4 | `the required items were not read on the tree that ships: …` | `_delivery_latest_verdict(delivery_gate)` | `final_tree`, `judged_after.tree` or `judged_before.tree` | yes: this row is the comparison | none: it is the absence of a verdict of that tree |
+| V5 | `<N> required item(s) still unmet` | that verdict's unmet list, when V4 did not fire | as V4 | yes | an item is unmet by the judge's strict majority over screened samples (`_delivery_screen_sample`: a met claim that does not verify is an unmet vote), a falsifier probe failing under unpaired B\*, or `untouched_paths` in code; the re-drive's re-check rewrites the list (`_redrive_apply_item_verdicts`) |
+| V6 | `<N> test(s) that passed when this task last ended done fail on this tree, and the run changed nothing` | `acceptance.settled_bar.status == "regressed"`, read only when `any_commits` is False | the base (nothing ships) | n/a | the settled bar's held-out evaluation |
+| V7 | `_base_form_reason(existing_behaviour.changed)` (`… (existing_behaviour_changed): …`) | `existing_behaviour.changed` (rows moved to `task_required` excluded) | `existing_behaviour.tree_sha` | not by this row (V13 is) | paired B\* with the base forms in place on both sides; a `budget_short` case counts |
+| V8 | `_literal_restored_reason(existing_behaviour.literal_restored)` (`… (literal_restored): …`) | `existing_behaviour.literal_restored` | `existing_behaviour.tree_sha` | no | `_base_form_literals_restored` |
+| V9 | `<N> of the repository's own merge check(s) red on the final tree: <ids>` | `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) | `ci_parity.final.sha` | no | paired B\* against the base |
+| V10 | `delivery_redrive.conflict.reason`, verbatim | `delivery_redrive.conflict` | none | no | the re-drive's own rule (the same trade recurred) |
+| V11 | `_residual_defects_reason(st)` | `conformance._final.residual_defects` | `conformance._final.tree_sha` | no | none: the final conformer's own list, not re-verified |
+| V12 | `_unclean_reason("the <worker> at <where>", lines)`, one per record | `unclean_trees` | the worker's tree | n/a | the tree's porcelain |
+| V13 | `_unmeasured_on_shipping_tree(st)`, read only when `any_commits` is True | `test_id_diff` and `shipping_tests_gap` (only when the repository has a test command or a diff exists), `acceptance.gate.final` and `final_unremeasured` (`_acceptance_unmeasured_lines`, nothing when `acceptance.skipped`), `existing_behaviour` | — | yes: this row is the comparison | — |
+
+Only when V5 holds, the decider also appends sentences about the unmet items
+themselves: the `unrouted_item` count and each one's reason, each contested
+probe (`_redrive_contest_text`) and each probe objection
+(`_redrive_objection_text`). They are not inputs: none can make the run
+`unconverged` on its own. What the run could not verify and does not veto on
+is reported, never an input: item rows `unknown` (`needs_human_verification`),
+`budget_short_unsettled` IDs (`_set_confirm_budget_gap`), held-out sets typed
+broken or variant, intermittent regressions, and the whole-PR review's
+findings.
+
+Callers: `_finish_no_work_run` (every planning-time
 no-work exit and finalize's empty-branch exit) with `any_commits=False` —
 it sets `no_work_required` only when the outcome is `no_work`, and logs the
-unconverged reasons otherwise — and `phase_finalize`'s normal path with
-`any_commits=True`. `scripts/host-finalize.sh` passes `--draft` to `gh pr
+unconverged reasons otherwise — `phase_finalize`'s normal path with
+`any_commits=True`, and `_redecide_after_operator_acceptance` (a finished
+run the operator accepted held-out cases of) with `any_commits=True`.
+`scripts/host-finalize.sh` passes `--draft` to `gh pr
 create` when `run.json`'s `outcome` is `unconverged`.
 
 ### Delivery detection — `_run_delivery_detection`

@@ -8724,7 +8724,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case), or when an existing test's base form fails on the tree that ships (`existing_behaviour_changed`, §8 *What an existing test pins on the base holds on the tree that ships*) —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case), or when an existing test's base form fails on the tree that ships (`existing_behaviour_changed`, §8 *What an existing test pins on the base holds on the tree that ships*), or when text the task asked to move into the message files is back in the production code it left (`literal_restored`, §8 *A broken base-form case whose cause is a change the run made is a question first*), or when a run that changed nothing fails tests that passed when the same task last ended `done` (§8 *Done is a fixed bar per task*), or when a worker's round was rolled back because it left its tree unclean (§8 *A worker leaves its tree clean*), or when what `done` rests on was not measured on the tree that ships (*`done` rests on measurements that ran*, below) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -8734,6 +8734,33 @@ cannot be mistaken for finished work — and the body says why: the end-state
 section (§6 *Finalization*) opens with `## Unconverged`, the decider's
 reasons followed by each unconverged subtask's own. Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
+
+*The veto list is one list, and a check joins or leaves it under one bar.*
+Each input above is a veto: any one makes the run `unconverged`, and the
+decider has no input that only reports. The inputs, each with the record it
+reads, the commit that record is of, whether the decider compares that
+commit with the tree that ships, and what confirmed the verdict, are listed
+once, in IMPLEMENTATION's *Run outcome* table, in the order the decider
+appends their reasons. What the run could not verify and does not veto on
+is reported instead (§6 *Finalization*). The rule for changing the list
+(R1): a verdict vetoes `done` only when the check that produced it is shown
+on the commit that ships and its vetoes are measured against ground truth.
+The measure is per verdict, never a check's average precision: demoting a
+check by its average drops its true members (lane S3: letting only merge
+checks veto ended 7 of 30 runs a false `done`, against 1 of 30 for the
+released list, and left 6 of one case's 9 regressions neither caught nor
+reported). So a check's veto is demoted only when, judged
+verdict by verdict on the shipped commit over recorded runs and bench
+samples, no run ground truth calls unfinished becomes `done`, and every true
+verdict of that check is also caught by another true veto in the same run.
+The mirror form governs a ruling that lifts a veto (a set typed broken, a
+case outside a set's counted bound, a base-form case a required item
+contradicts): it may lift one only when no true verdict is lifted by it.
+Being shown on the shipped commit is necessary but does not separate true
+from false where the check executes: a falsifier probe or a base form that
+over-reaches still fails on the final tree (lane S8: 24 of 36 false
+falsifier vetoes, 19 of 19 false base-form cases); their lever is the
+task's intent, decided once per behaviour, not this list.
 
 *A delivery verdict counts only on the tree it was measured on.* Each
 delivery pass records the committed tree it read beside its verdict
