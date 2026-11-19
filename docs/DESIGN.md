@@ -1948,6 +1948,55 @@ own repository (*The run's own repository* below), never the user's. Parallel wr
 collide. This is what makes "a wave of parallel implementers" safe even when
 two of them touch the same file.
 
+### A process's writes reach another only through a commit or a declared channel
+
+*Designed 2026-11-18 (rule R4, approved by the user; lane S9-R4).*
+
+**Invariant: every process leerie starts on a repository's code, or as a
+worker, runs in a world of its own. Nothing it writes reaches another
+process except through a commit or a declared channel.** The world is
+confined (I5) and isolated, and it is the process's alone: its own mount,
+IPC and network namespaces; its own `/tmp`, `/dev/shm` and devpts; its own
+home, a copy-on-write overlay of the pristine home (*Every confined process
+has its own home*); the repository as the tree it was given (a committed
+view for a measurement, its own tree for a worker); every other mount
+read-only.
+
+**The declared channels.** These are the only ways one process's writes
+reach another, each with its one writer or its sharing scope:
+1. a commit (I1, I4, I6);
+2. the run layer, written by the setup hook and published only after the
+   hook exits 0 (*The setup hook writes the run layer*);
+3. the toolchain layer and `MISE_DATA_DIR`, written by the toolchain install
+   and shared host-wide (*Every confined process has its own home*, 3);
+4. a tree's home layer, written by its install (ibid., 4);
+5. the run's stores, shared by every command leerie runs in the run (*The
+   stores a view installs from are leerie's*);
+6. a tree's stores, shared by that tree's commands, and by a worker started
+   in a tree leerie installed for;
+7. each side's worker cache set, shared by that side's workers (§8 *Nothing
+   a held-out evaluation produces reaches a fixer*);
+8. a tree's private temp directory and its measurement directory, shared by
+   that tree's commands in turn (*A confined command's scratch is short and
+   private*);
+9. a worker's notes and self-check directories, read by the workers its
+   group runs.
+
+The stores (5-7) are channels by the user's decision (2026-11-14): workers
+share the run's store, and a private store is built only for a measured
+need. A shared writable store cannot be a per-process overlay anyway: one
+overlay upper belongs to one mount at a time, and a store must lie on the
+trees' one mount, or a hard link from it fails with `EXDEV`. A new channel
+is a new entry here, with its reason. Every other write ends with its
+process.
+
+The list of top-level entries the worker view takes from the container
+(`CONTAINER_ENTRIES`) stays a hand-kept list, guarded by a test over the
+launcher's mounts; it is not derived from the container's mount table. On
+Fly and EC2, `/leerie-toolchains` is a directory of the machine, not a
+mount, and a worker root holds a read-only snapshot of it, so a mount-table
+rule would give every `mise install` there the snapshot: #397 again.
+
 ### Each worker's own configuration and temporary directories
 
 **Root cause: every worker shared one CLI configuration and one `/tmp`.**
