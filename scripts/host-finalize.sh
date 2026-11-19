@@ -38,28 +38,57 @@
 # scripts/remote/lib.sh because that one uses python3, and the launcher
 # already imports jq via the preflight; using jq keeps this file
 # python-free and matches the in-place semantics of the original block.
+#
+# Every value reaches jq through a file (`--rawfile`), never through argv. A
+# value can be a hook's output, which has no size: one recorded push_error is
+# 104,520 bytes, and a single argv string past MAX_ARG_STRLEN (131,072 bytes)
+# makes the exec of jq itself fail with E2BIG ("Argument list too long"),
+# which under `set -e` aborts finalize before its diagnostic prints. Bounding
+# the value first did not hold: the bound was `tail -c`, which uutils
+# coreutils does not keep (`_host_finalize_tail_bytes`), and that is how CI
+# hit E2BIG at this jq. A file has no such ceiling, whatever produced the
+# value. The files live next to the sidecar, never in /tmp
+# (the full-/tmp case, N30), and are removed whether jq succeeds or not.
 _host_finalize_update_run_json() {
   local sidecar="$1"
   shift
-  local tmp="$sidecar.tmp"
-  local jq_filter='.'
+  local tmp="$sidecar.tmp" vals
+  vals="$(mktemp -d "$sidecar.vals.XXXXXX")"
+  local jq_filter='.' args=() n=0 kv key val rc=0
   for kv in "$@"; do
-    local key="${kv%%=*}"
-    local val="${kv#*=}"
+    key="${kv%%=*}"
+    val="${kv#*=}"
     if [ -z "$val" ]; then
       jq_filter="${jq_filter} | .${key} = null"
     else
       jq_filter="${jq_filter} | .${key} = \$${key}"
+      printf '%s' "$val" > "$vals/$n"
+      args+=(--rawfile "$key" "$vals/$n")
+      n=$((n + 1))
     fi
   done
-  local args=()
-  for kv in "$@"; do
-    local key="${kv%%=*}"
-    local val="${kv#*=}"
-    [ -z "$val" ] || args+=(--arg "$key" "$val")
-  done
-  jq "${args[@]+"${args[@]}"}" "$jq_filter" "$sidecar" > "$tmp"
+  jq "${args[@]+"${args[@]}"}" "$jq_filter" "$sidecar" > "$tmp" || rc=$?
+  rm -rf "$vals"
+  [ "$rc" -eq 0 ] || return "$rc"
   mv "$tmp" "$sidecar"
+}
+
+# _host_finalize_tail_bytes <n> <text> — the last <n> bytes of <text>, cut by
+# bash itself: under `LC_ALL=C`, `${#s}` and `${s: -n}` count bytes. Every
+# byte bound in this file goes through here, never `tail -c`. GNU `tail -c`
+# is exact, but uutils coreutils' (`tail` on Ubuntu 26.04, CI's runner image)
+# reading a pipe sometimes returns most of its input: 30 runs of
+# `tail -c 32768` over a 200,000-byte bash `printf` pipe gave 32768 bytes 12
+# times and up to 187,193 otherwise. A shorter text comes back whole. A cut
+# can land mid-character in a UTF-8 report; jq and the terminal filter
+# substitute U+FFFD, so the worst case is one replacement character.
+_host_finalize_tail_bytes() {
+  local LC_ALL=C n="$1" s="$2"
+  if [ "${#s}" -gt "$n" ]; then
+    printf '%s' "${s: -$n}"
+  else
+    printf '%s' "$s"
+  fi
 }
 
 # Leerie's own hooks directory for a push (`_repo_git_push`): its hooks run
@@ -336,7 +365,7 @@ $out"
   # same reason; there is no run.json to point at here, but silently cutting
   # output and presenting it as complete is the part worth avoiding.
   local shown
-  shown="$(printf '%s' "$combined" | tail -c 1500)"
+  shown="$(_host_finalize_tail_bytes 1500 "$combined")"
   if [ "$shown" != "$combined" ]; then
     echo "  Hook output (last 1500 bytes):" >&2
   else
@@ -634,7 +663,7 @@ _host_finalize_refresh_pr() {
     echo "[leerie] finalize: the run's outcome changed, but run.json names no PR to update" >&2
     return 0
   fi
-  local _gd view body was new new_body
+  local _gd view new_body
   _gd="$(git -C "$USER_REPO" rev-parse --absolute-git-dir 2>/dev/null || true)"
   # gh runs from `/` and finds the repository through GIT_DIR and
   # GIT_WORK_TREE (DESIGN §6 *The host never runs a program the checkout
@@ -644,14 +673,19 @@ _host_finalize_refresh_pr() {
     printf '%s\n' "$view" | sed 's/^/    /' | _terminal_relay >&2
     return 0
   fi
-  body="$(printf '%s' "$view" | jq -r '.body // ""')"
-  was="$(jq -r '.pr_refresh.end_state_was // ""' "$run_json")"
-  new="$(jq -r '.pr_end_state // ""' "$run_json")"
   # A literal substring swap, done by jq (split/join on the exact text): the
-  # end-state section is leerie's own rendering, never interpreted.
-  new_body="$(jq -rn --arg b "$body" --arg w "$was" --arg n "$new" '
-    if ($w != "") and ($b | contains($w)) then ($b | split($w) | join($n))
-    else $b + "\n\n" + $n end')"
+  # end-state section is leerie's own rendering, never interpreted. The PR
+  # body and both renderings are read by jq from the gh output and run.json
+  # themselves, never passed through argv (see `_host_finalize_update_run_json`).
+  # Each text loses its trailing newlines, as the shell's `$( )` captures
+  # that read them before did, so the swap matches what it matched then.
+  new_body="$(printf '%s' "$view" | jq -r --slurpfile r "$run_json" '
+    def text: (. // "") | tostring | sub("\n+\\z"; "");
+    (.body | text) as $b
+    | ($r[0].pr_refresh.end_state_was | text) as $w
+    | ($r[0].pr_end_state | text) as $n
+    | if ($w != "") and ($b | contains($w)) then ($b | split($w) | join($n))
+      else $b + "\n\n" + $n end')"
   if ! printf '%s' "$new_body" | ( cd / && GIT_DIR="$_gd" GIT_WORK_TREE="$USER_REPO" gh pr edit "$url" --body-file - ) >/dev/null 2>&1; then
     echo "⚠  could not update the end state of PR $(_terminal_safe "$url"); it is left as it was (finalize tries again)" >&2
     return 0
@@ -1031,7 +1065,7 @@ $_diagnosis"
           # reached this arm.
           local _rebaser_json_trunc _rebaser_jq_rc=0
           printf '%s' "$_rebaser_json" | jq -e '.status // ""' >/dev/null 2>&1 || _rebaser_jq_rc=$?
-          _rebaser_json_trunc="$(printf '%s' "$_rebaser_json" | tail -c 2000)"
+          _rebaser_json_trunc="$(_host_finalize_tail_bytes 2000 "$_rebaser_json")"
           echo "[leerie] finalize: rebaser returned no usable status; pushing $(_terminal_safe "$run_branch") as-is" >&2
           echo "[leerie] finalize: rebaser raw payload (truncated, jq_rc=$_rebaser_jq_rc): $(_terminal_safe "$_rebaser_json_trunc")" >&2
           _host_finalize_update_run_json "$run_json" \
@@ -1117,42 +1151,25 @@ $push_hook_out"
     rm -f "$_po" "$_pe" 2>/dev/null || true
   fi
   if [ "$_prc" -ne 0 ]; then
-    # Bound what is PERSISTED, not just what is printed. `push_error` reaches
-    # `run.json` as a single `jq --arg` value, and a single argv element
-    # cannot exceed MAX_ARG_STRLEN (131,072 bytes = 32 * PAGE_SIZE). One real
-    # recorded push_error is already 104,520 bytes of jest output — 80% of
-    # that ceiling on stderr ALONE — so appending hook stdout to the same
-    # value is what makes the ceiling reachable. Past it, `jq` cannot be
-    # exec'd at all, and under the `set -euo pipefail` every caller sets that
-    # aborts host_finalize BEFORE the diagnostic below prints: the operator
-    # would lose the very output this capture exists to preserve. Same
-    # argv-E2BIG class the orchestrator hit on 2026-07-19. 32 KiB leaves ~99
-    # KiB of headroom for the jq filter, the sidecar path and the other
-    # --arg pairs; tail-anchored because the informative end of a compiler or
-    # test-runner report is its tail.
+    # Bound what is PERSISTED, not just what is printed: a hook running a
+    # test suite writes megabytes, and run.json is a small record the
+    # launcher reads whole (its run and chain tables print `push_error`).
+    # Tail-anchored, because the informative end of a compiler or
+    # test-runner report is its tail. The bound is not what lets jq record
+    # it: `_host_finalize_update_run_json` hands jq every value through a
+    # file, so a value of any size is written.
     #
-    # `tail -c` unconditionally, rather than a `${#push_all} -gt 32768` test,
-    # because `${#var}` counts CHARACTERS while both `tail -c` and the argv
-    # ceiling count BYTES — under a UTF-8 locale a 7-character Japanese
-    # string reports 7 and occupies 21. A character-based guard therefore
-    # under-measures by up to 4x, and 32,768 four-byte characters is 131,072
-    # bytes: exactly MAX_ARG_STRLEN, with the guard not firing. Piping
-    # always is byte-exact and needs no arithmetic; `tail -c` returns a
-    # shorter input unchanged, so the equality test below adds the marker
-    # only when something was really cut. Both sides have been through
-    # `$( )`, so trailing-newline stripping is symmetric and cannot make a
-    # whole-input case look truncated.
-    #
-    # A byte cut can land mid-character in a UTF-8 report. That is fine and
-    # was verified rather than assumed: `jq --arg` substitutes U+FFFD for
-    # the orphaned byte and still writes valid JSON at rc 0, so the worst
-    # case is one replacement character at the cut point — not the aborted
-    # write this bound exists to prevent.
+    # Counted in BYTES (`_host_finalize_tail_bytes`), never by a
+    # `${#push_all}` test in the caller's locale: under UTF-8 that counts
+    # CHARACTERS, and a 7-character Japanese string reports 7 and occupies
+    # 21. A shorter text comes back whole, so the equality test below adds
+    # the marker only when something was really cut. Both sides have been
+    # through `$( )`, so trailing-newline stripping is symmetric and cannot
+    # make a whole-input case look truncated.
     local push_persist
-    push_persist="$(printf '%s' "$push_all" | tail -c 32768)"
+    push_persist="$(_host_finalize_tail_bytes 32768 "$push_all")"
     if [ "$push_persist" != "$push_all" ]; then
-      push_persist="…(truncated to the last 32 KiB; a single jq --arg value
-cannot exceed MAX_ARG_STRLEN)…
+      push_persist="…(truncated to the last 32 KiB)…
 $push_persist"
     fi
     _host_finalize_update_run_json "$run_json" \
@@ -1175,7 +1192,7 @@ $push_persist"
     local push_display="$push_all"
     if [ "${#push_all}" -gt 4000 ]; then
       push_display="…(truncated; more in run.json \`push_error\`)…
-$(printf '%s' "$push_all" | tail -c 4000)"
+$(_host_finalize_tail_bytes 4000 "$push_all")"
     fi
     echo "  Push output was (stderr, plus any pre-push hook stdout):" >&2
     # `sed` rather than `printf '    %s\n'`: that form indents only the

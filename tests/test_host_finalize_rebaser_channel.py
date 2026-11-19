@@ -203,7 +203,9 @@ def test_capture_does_not_merge_the_log_stream_into_the_verdict() -> None:
 def test_fallback_arm_truncates_from_the_tail() -> None:
     """`head -c 2000` preserved log noise and dropped the JSON it exists to keep."""
     src = _code_only(HOST_FINALIZE_SH.read_text())
-    assert 'tail -c 2000' in src, (
+    # Cut by bash, never `tail -c` (uutils' `tail -c` does not keep the
+    # bound; tests/test_finalize_values_never_in_argv.py).
+    assert '_host_finalize_tail_bytes 2000 "$_rebaser_json"' in src, (
         "the `*)` arm must tail-truncate the raw payload — a malformed verdict "
         "shows its corruption at the end"
     )
