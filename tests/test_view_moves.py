@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -221,6 +222,78 @@ def test_a_failed_install_is_not_recorded(leerie, env, monkeypatch):
     _commit(leerie, staging, {"src/a.txt": "2"})
     v1 = _measure(leerie, st, staging, caps)
     assert os.path.realpath(v1) not in leerie._VIEW_INSTALLS
+
+
+# An install as uv's is: what it installs is a hard link of its own cache's
+# copy, and its cache is one of the tree's own stores (`UV_CACHE_DIR`),
+# which a moved view starts empty.
+LINKED = (
+    "import hashlib, os, pathlib\n"
+    "want = open('package.json').read()\n"
+    "cache = pathlib.Path(os.environ['UV_CACHE_DIR'],\n"
+    "                     hashlib.sha256(want.encode()).hexdigest())\n"
+    "if not cache.exists():\n"
+    "    cache.parent.mkdir(parents=True, exist_ok=True)\n"
+    "    cache.write_text(want)\n"
+    "p = pathlib.Path('node_modules/dep/index.js')\n"
+    "if not p.exists() or p.read_text() != want:\n"
+    "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+    "    if p.exists():\n"
+    "        p.unlink()\n"
+    "    os.link(cache, p)\n")
+
+
+def _stores_gone(leerie, st) -> None:
+    """Wait for the removal leerie runs off the event loop of what a moved
+    view's earlier stores held (`<run>/measure/.gone`)."""
+    gone = st.run_dir / leerie.MEASURE_DIRNAME / ".gone"
+    for _ in range(300):
+        if not gone.exists():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"{gone} still there")
+
+
+def test_a_view_moved_once_moves_again_when_its_install_links_a_store(
+        leerie, env, hold, monkeypatch):
+    """The install's output is a link of a file in the tree's own stores.
+    A move starts those stores empty and removes the old ones; that removal
+    drops a link of the output, which moves its change time. The install's
+    snapshot is taken after it, so the next tip with the same inputs moves
+    the view again, and keeps the install."""
+    st, staging, caps, _count = env
+    # The removal outlasts the install, as a real store's does (click's uv
+    # cache: the install, a no-op, ends first).
+    real_rm = leerie._rmtree_owned
+
+    def _slow_rm(path, *a, **k):
+        if Path(path).name == ".gone":
+            time.sleep(2)
+        return real_rm(path, *a, **k)
+    monkeypatch.setattr(leerie, "_rmtree_owned", _slow_rm)
+    st.data["provision"]["recipe"] = [
+        {"kind": "install", "command": [sys.executable, "-c", LINKED],
+         "working_dir": "."}]
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    dep = v1 / "node_modules" / "dep" / "index.js"
+    assert os.stat(dep).st_nlink == 2          # linked from its store
+    held = hold(dep)
+    _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert _is_held(held, v2 / "node_modules/dep/index.js")   # moved once
+    _stores_gone(leerie, st)
+    c = _commit(leerie, staging, {"src/a.txt": "4"})
+    v3 = _measure(leerie, st, staging, caps)
+    assert _git(v3, "rev-parse", "HEAD") == c
+    assert _is_held(held, v3 / "node_modules/dep/index.js")   # and again
+    # A changed input still makes a fresh view.
+    _stores_gone(leerie, st)
+    _commit(leerie, staging, {"package.json": '{"name": "z"}\n'})
+    v4 = _measure(leerie, st, staging, caps)
+    assert not _is_held(held, v4 / "node_modules/dep/index.js")
+    assert (v4 / "node_modules/dep/index.js").read_text() == \
+        '{"name": "z"}\n'
 
 
 # An install as some package managers' is: it adds what its manifest names

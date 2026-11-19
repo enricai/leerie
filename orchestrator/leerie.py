@@ -27337,6 +27337,15 @@ def _measure_id_dir(run_dir: Path, tree: Path,
     return None
 
 
+# tree realpath -> the thread removing the stores an earlier tree at its
+# path left (`_measure_dir_at`). A store's file can be a hard link of what
+# the tree's install made (uv links its cache into the environment), and
+# removing a link moves the linked file's change time: an install's
+# snapshot waits for it (`_ensure_worktree_deps`; DESIGN §8 *A view moves
+# to the next tip when the install's inputs are unchanged*).
+_STORES_REMOVING: dict[str, threading.Thread] = {}
+
+
 def _measure_dir_at(run_dir: Path, tree: Path,
                     dirs: tuple[Path, Path, Path] | None) -> Path:
     root = run_dir / MEASURE_DIRNAME
@@ -27369,8 +27378,10 @@ def _measure_dir_at(run_dir: Path, tree: Path,
                 gone = root / ".gone"
                 _mkdir_private(gone, run_dir)
                 os.rename(stale, gone / f"stores-{tree.name}-{tid}")
-                threading.Thread(target=_rmtree_owned, args=(gone,),
-                                 daemon=True).start()
+                rm = threading.Thread(target=_rmtree_owned, args=(gone,),
+                                      daemon=True)
+                rm.start()
+                _STORES_REMOVING[os.path.realpath(tree)] = rm
     else:
         tid = hashlib.sha256(str(tree).encode()).hexdigest()[:16]
     own = root / f"{tree.name}-{tid}"
@@ -48312,6 +48323,13 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
 
     async def _snap() -> None:
         _INSTALL_OUTPUTS.pop(key, None)
+        # The tree's earlier stores, removed off the event loop, may hold
+        # links of the install's output: removing one moves the output's
+        # change time, which the snapshot reads. It is taken once they are
+        # gone, so a later move does not read their removal as a change.
+        rm = _STORES_REMOVING.pop(key, None)
+        if rm is not None:
+            await asyncio.to_thread(rm.join)
         got = (await asyncio.to_thread(_install_snapshot, tree, made)
                if made is not None and ok else None)
         if got is not None:

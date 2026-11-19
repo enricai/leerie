@@ -5112,7 +5112,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   fails leaves a fresh id per call) from the run directory down; else
   `sha256(<tree realpath>)[:16]`. When
   a new id is written (a new tree at that path), `<run>/worktrees/.stores/tree-stores/<tree>/`
-  is moved aside to `.gone/` too. A
+  is moved aside to `.gone/` too, its removal's daemon thread recorded in
+  `_STORES_REMOVING[realpath(<tree>)]`. A
   sidecar `<run>/measure/<tree-name>-<id>.tree` (JSON `{tree, id_file,
   tmp}`) records the owner and its private temp directory;
   `_sweep_measure_dirs(root)` (every call) moves aside to
@@ -9443,7 +9444,11 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     entry seen opening nothing makes the reads unknown for the rest of the run of the recipe); and, before the
     first `build` entry after an install and after the loop, stores `_install_snapshot(tree, outputs) -> InstallSnapshot |
     None` (`(outputs, zlib(NUL-joined listing), digest)`) in
-    `_INSTALL_OUTPUTS[<view>]` while every install so far succeeded; on a
+    `_INSTALL_OUTPUTS[<view>]` while every install so far succeeded — first
+    joining (`asyncio.to_thread(join)`) the thread `_STORES_REMOVING.pop(
+    <view>)` names, the removal of the tree's earlier stores that
+    `_measure_dir_at` starts when it writes a new id (a store's file can be
+    a hard link of the install's output); on a
     successful run whose reads are known `_record_view_install(st,
     view_key, reads)` stores `(_install_key(<run repo of the tree the view
     shows>, <its tip>, <recipe>, reads), snapshot, reads)` in
