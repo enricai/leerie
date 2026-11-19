@@ -9388,7 +9388,8 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     otherwise, when the tip moved, the view moved there with its install
     kept (DESIGN §8 *A view moves to the next tip when the install's inputs
     are unchanged*) if `_VIEW_INSTALLS[<view>]` holds an install key equal
-    to `_install_key(<run repo>, <new tip>, <recipe>)` and `_move_view` succeeds — its
+    to `_install_key(<run repo>, <new tip>, <recipe>, <its reads>)` and
+    `_move_view` succeeds — its
     `_DEPS_INSTALLED`/`_DEPS_FAILED` entries dropped and
     `_DEPS_KEPT[<view>]` set to the install's outputs — else the old one
     removed (`git worktree remove --force`, `_rmtree_owned`), its
@@ -9416,25 +9417,37 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     log_prefix=label)` applied (the recipe's `install` and `build` entries,
     once per view and tip), or `tree` when `_committed_view` is None.
     The move, all process-level and keyed by the view's realpath:
-    `_install_key(repo, tip, recipe) -> str | None` is a
-    sha256 over each `install` entry's `[command, working_dir, env]`
-    (JSON, sorted keys) and, from `git ls-tree -r -z --full-tree <tip>` in
-    the run repository, the path and `<mode> <type> <sha>` of every tracked
-    file whose basename is in `_INSTALL_INPUT_NAMES` (manifests, lockfiles,
-    package-manager configuration), that lies under a directory in
-    `_INSTALL_INPUT_DIRS` (`patches`); None when git fails.
+    `_install_key(repo, tip, recipe, reads: InstallReads) -> str | None` is
+    a sha256 over each `install` entry's `[command, working_dir, env]`
+    (JSON, sorted keys) and, from `git ls-tree -r -t -z --full-tree <tip>`
+    in the run repository, the path and `<mode> <type> <sha>` (`-` when
+    absent) of each file in `reads[0]`, and the sorted `<name> <mode>` of
+    the tracked entries directly in each directory in `reads[1]` or holding
+    a file in `reads[0]`; None when git fails. `InstallReads` is
+    `(files, directories)`, tree-relative (`""` the tree), each a
+    `frozenset[str]`. `_watch_reads(tree) -> _ReadWatch | None`: an inotify
+    instance (`inotify_init1(O_NONBLOCK|O_CLOEXEC)`, through `ctypes`)
+    watching, for `IN_OPEN` with `IN_ONLYDIR|IN_DONT_FOLLOW`, the tree and
+    every directory `git ls-tree -r -d --full-tree HEAD` lists there; None
+    off Linux, when git fails or a watch cannot be added.
+    `_drain_reads(w) -> bool` reads its queued events into `w.files` /
+    `w.opened` (`IN_ISDIR`), False on `IN_Q_OVERFLOW` or a read error.
     In a view (`realpath(tree)` among `_VIEWS`' paths),
     `_ensure_worktree_deps` collects the install's outputs — `set(
     _DEPS_KEPT.pop(<view>))` plus, around each `install` entry, the paths
     `_ignored_paths(tree)` (`_untracked_cmd(which="ignored",
     directory=True)`, None when git fails) lists after it and not before —
-    and, before the first `build` entry after an install and after the
-    loop, stores `_install_snapshot(tree, outputs) -> InstallSnapshot |
+    and, around each `install` entry, what it opened (`_watch_reads`, its
+    descriptor drained by `loop.add_reader` while the entry runs and once
+    after; a watch not made, a lost event, an `_IN_Q_OVERFLOW`, or an
+    entry seen opening nothing makes the reads unknown for the rest of the run of the recipe); and, before the
+    first `build` entry after an install and after the loop, stores `_install_snapshot(tree, outputs) -> InstallSnapshot |
     None` (`(outputs, zlib(NUL-joined listing), digest)`) in
     `_INSTALL_OUTPUTS[<view>]` while every install so far succeeded; on a
-    successful run `_record_view_install(st, view_key)` stores
-    `(_install_key(<run repo of the tree the view shows>, <its tip>, …),
-    snapshot)` in `_VIEW_INSTALLS[<view>]`. A run of the recipe drops both
+    successful run whose reads are known `_record_view_install(st,
+    view_key, reads)` stores `(_install_key(<run repo of the tree the view
+    shows>, <its tip>, <recipe>, reads), snapshot, reads)` in
+    `_VIEW_INSTALLS[<view>]`. A run of the recipe drops both
     entries first. `_output_entries(tree, outputs, known=None)`: every
     entry at or under the outputs, links never followed, as `(path,
     _output_state(lstat))` — a file's or link's `mode:ino:size:ctime_ns`,

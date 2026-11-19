@@ -48301,6 +48301,11 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     is_view = key in {os.path.realpath(v) for _tip, v in _VIEWS.values()}
     kept = _DEPS_KEPT.pop(key, ())
     made: set[str] | None = set(kept) if is_view else None
+    # In a view, what its `install` entries open there (`_watch_reads`):
+    # the install key is read from it. None once an open may have been
+    # missed.
+    files: set[str] | None = set() if is_view else None
+    opened: set[str] = set()
     _INSTALL_OUTPUTS.pop(key, None)
     _VIEW_INSTALLS.pop(key, None)
     snap_due = False
@@ -48358,14 +48363,41 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                         else MEASURE_KIND)
                 if kind not in entry_grants:
                     entry_grants[kind] = _measurement_grants(st, tree, kind)
-                rc, _tail = await _run_streaming(
-                    argv, grants=entry_grants[kind], cwd=str(wd),
-                    env=entry_env,
-                    timeout=_recipe_timeout_s(
-                        e, caps.get("worker_timeout_sec")),
-                    log_path=log_path,
-                    label=f"{label_prefix}-install: {' '.join(e['command'])}",
-                    verbosity=verbosity)
+                watch = (await asyncio.to_thread(_watch_reads, tree)
+                         if kind == INSTALL_KIND and files is not None
+                         else None)
+                if watch is None and kind == INSTALL_KIND:
+                    files = None
+                lost: list[bool] = []
+                if watch is not None:
+                    asyncio.get_running_loop().add_reader(
+                        watch.fd, lambda w=watch, lost=lost:
+                        _drain_reads(w) or lost.append(True))
+                try:
+                    rc, _tail = await _run_streaming(
+                        argv, grants=entry_grants[kind], cwd=str(wd),
+                        env=entry_env,
+                        timeout=_recipe_timeout_s(
+                            e, caps.get("worker_timeout_sec")),
+                        log_path=log_path,
+                        label=(f"{label_prefix}-install: "
+                               f"{' '.join(e['command'])}"),
+                        verbosity=verbosity)
+                finally:
+                    if watch is not None:
+                        asyncio.get_running_loop().remove_reader(watch.fd)
+                        # An install opens at least its own manifest: an
+                        # entry seen opening nothing was not seen at all (a
+                        # tree reached by another name), never "read
+                        # nothing".
+                        whole = (_drain_reads(watch) and not lost
+                                 and bool(watch.files or watch.opened))
+                        os.close(watch.fd)
+                        if whole and files is not None:
+                            files |= watch.files
+                            opened |= watch.opened
+                        else:
+                            files = None
                 if rc != 0 and e.get("kind") == "install":
                     ok = False
                 if e.get("kind") == "install" and made is not None:
@@ -48386,8 +48418,9 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             await _snap()
     # What a view's next tip may reuse: this install's key and what it
     # made, recorded only for an install that succeeded here.
-    if ok and key in _INSTALL_OUTPUTS:
-        await _record_view_install(st, key)
+    if ok and key in _INSTALL_OUTPUTS and files is not None:
+        await _record_view_install(
+            st, key, (frozenset(files), frozenset(opened)))
     if ok:
         _DEPS_FAILED.pop(key, None)
     else:
@@ -49267,10 +49300,10 @@ _VIEWS: dict[str, tuple[str, Path]] = {}
 # paths its `install` entries made, the listing of every entry under them
 # (zlib, NUL-separated) and a digest of each entry's state.
 InstallSnapshot = tuple[tuple[str, ...], bytes, str]
-# view realpath -> (install key, its install's snapshot): what the view's
-# install was made from and what it made (DESIGN §8 *A view moves to the
-# next tip when the install's inputs are unchanged*).
-_VIEW_INSTALLS: dict[str, tuple[str, InstallSnapshot]] = {}
+# view realpath -> (install key, its install's snapshot, what it read):
+# what the view's install was made from and what it made (DESIGN §8 *A view
+# moves to the next tip when the install's inputs are unchanged*).
+_VIEW_INSTALLS: dict[str, tuple[str, InstallSnapshot, "InstallReads"]] = {}
 # view realpath -> the outputs of the install it was moved with, to a new
 # tip: the recipe runs there again in full, and the install finds them in
 # place.
@@ -49279,48 +49312,122 @@ _DEPS_KEPT: dict[str, tuple[str, ...]] = {}
 # time leerie ran them there and they succeeded (a build's outputs are not
 # among them).
 _INSTALL_OUTPUTS: dict[str, InstallSnapshot] = {}
-# The install inputs by name: manifests, lockfiles and package-manager
-# configuration, wherever they are in the tree.
-_INSTALL_INPUT_NAMES = frozenset({
-    "package.json", "package-lock.json", "npm-shrinkwrap.json",
-    "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", ".yarnrc",
-    ".yarnrc.yml", ".npmrc", ".pnpmfile.cjs", "bun.lockb", "bun.lock",
-    ".nvmrc", ".node-version", "requirements.txt", "requirements-dev.txt",
-    "pyproject.toml", "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock",
-    "setup.py", "setup.cfg", ".python-version", "Gemfile", "Gemfile.lock",
-    ".ruby-version", "Cargo.toml", "Cargo.lock", "rust-toolchain",
-    "rust-toolchain.toml", "go.mod", "go.sum", "composer.json",
-    "composer.lock", ".tool-versions", "mise.toml"})
-_INSTALL_INPUT_DIRS = frozenset({"patches"})
+# What an install read in a view (DESIGN §8 *A view moves to the next tip
+# when the install's inputs are unchanged*): the tracked files and the
+# tracked directories its `install` entries opened there.
+InstallReads = tuple[frozenset[str], frozenset[str]]
+# inotify (Linux, <sys/inotify.h>): an open, the queue's overflow, a
+# directory; watch only a directory, never through a link.
+_IN_OPEN = 0x00000020
+_IN_Q_OVERFLOW = 0x00004000
+_IN_ISDIR = 0x40000000
+_IN_ONLYDIR = 0x01000000
+_IN_DONT_FOLLOW = 0x02000000
 
 
-def _install_key(repo: Path, tip: str, recipe: list) -> str | None:
+class _ReadWatch(NamedTuple):
+    """An inotify instance watching every tracked directory of a tree: its
+    descriptor, each watch's directory (relative, "" for the tree), and
+    what was opened under them so far."""
+    fd: int
+    dirs: dict[int, str]
+    files: set[str]
+    opened: set[str]
+
+
+def _watch_reads(tree: str | Path) -> _ReadWatch | None:
+    """Watch every directory tracked at `tree`'s HEAD, and the tree itself,
+    for opens (`_drain_reads` collects them). None when git cannot list
+    them or one cannot be watched: no read can then be told missing."""
+    r = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r", "-d",
+                        "-z", "--name-only", "--full-tree", "HEAD"],
+                       capture_output=True, check=False, timeout=120)
+    if r.returncode != 0 or not sys.platform.startswith("linux"):
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    except (OSError, AttributeError):
+        return None
+    if fd < 0:
+        return None
+    w = _ReadWatch(fd, {}, set(), set())
+    for rel in ["", *(os.fsdecode(p) for p in r.stdout.split(b"\0") if p)]:
+        wd = libc.inotify_add_watch(
+            fd, os.fsencode(os.path.join(str(tree), rel)),
+            _IN_OPEN | _IN_ONLYDIR | _IN_DONT_FOLLOW)
+        if wd < 0:
+            os.close(fd)
+            return None
+        w.dirs[wd] = rel
+    return w
+
+
+def _drain_reads(w: _ReadWatch) -> bool:
+    """Move every queued open into `w.files`/`w.opened`; False once the
+    queue overflowed (an open was lost) or cannot be read."""
+    while True:
+        try:
+            buf = os.read(w.fd, 1 << 16)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not buf:
+            return True
+        i = 0
+        while i + 16 <= len(buf):
+            wd = int.from_bytes(buf[i:i + 4], sys.byteorder, signed=True)
+            mask = int.from_bytes(buf[i + 4:i + 8], sys.byteorder)
+            n = int.from_bytes(buf[i + 12:i + 16], sys.byteorder)
+            name = os.fsdecode(buf[i + 16:i + 16 + n].rstrip(b"\0"))
+            i += 16 + n
+            if mask & _IN_Q_OVERFLOW:
+                return False
+            d = w.dirs.get(wd)
+            if d is None or not mask & _IN_OPEN:
+                continue
+            rel = f"{d}/{name}" if d and name else (name or d)
+            (w.opened if mask & _IN_ISDIR else w.files).add(rel)
+
+
+def _install_key(repo: Path, tip: str, recipe: list,
+                 reads: InstallReads) -> str | None:
     """The install key of `tip` (DESIGN §8 *A view moves to the next tip
     when the install's inputs are unchanged*): the recipe's `install`
-    entries (command, working directory, environment) and the git blob of
-    every install input at `tip` — a tracked file named in
-    `_INSTALL_INPUT_NAMES` or under a `_INSTALL_INPUT_DIRS` directory — read
-    from the run repository. None when git cannot list the tip."""
-    r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-z",
+    entries (command, working directory, environment) and, read from the
+    run repository at `tip`, the entry of each file in `reads` (absent:
+    `-`) and the tracked names, with their modes, in each directory in
+    `reads` or holding a file in it. None when git cannot list the tip."""
+    r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-t", "-z",
                         "--full-tree", tip], capture_output=True,
                        check=False, timeout=60)
     if r.returncode != 0:
         return None
+    meta_of: dict[str, bytes] = {}
+    names_in: dict[str, list[bytes]] = {}
+    for rec in r.stdout.split(b"\0"):
+        if not rec:
+            continue
+        meta, _tab, raw = rec.partition(b"\t")
+        path = os.fsdecode(raw)
+        meta_of[path] = meta
+        parent, _sep, name = path.rpartition("/")
+        names_in.setdefault(parent, []).append(
+            os.fsencode(name) + b" " + meta.split(b" ", 1)[0])
     h = hashlib.sha256()
     for e in recipe:
         if e.get("kind") == "install" and e.get("command"):
             h.update(json.dumps([e["command"], e.get("working_dir") or ".",
                                  e.get("env") or {}], sort_keys=True
                                 ).encode() + b"\0")
-    for rec in sorted(r.stdout.split(b"\0")):
-        if not rec:
-            continue
-        meta, _tab, raw = rec.partition(b"\t")
-        path = os.fsdecode(raw)
-        parts = path.split("/")
-        if (parts[-1] in _INSTALL_INPUT_NAMES
-                or any(d in _INSTALL_INPUT_DIRS for d in parts[:-1])):
-            h.update(raw + b" " + meta + b"\0")
+    files, opened = reads
+    for path in sorted(files):
+        h.update(b"f " + os.fsencode(path) + b"\0"
+                 + meta_of.get(path, b"-") + b"\0")
+    for d in sorted(set(opened) | {f.rpartition("/")[0] for f in files}):
+        h.update(b"d " + os.fsencode(d) + b"\0"
+                 + b"\0".join(sorted(names_in.get(d, []))) + b"\0\0")
     return h.hexdigest()
 
 
@@ -49475,9 +49582,11 @@ def _view_repo(st: "State", tree: str | Path) -> Path | None:
     return None
 
 
-async def _record_view_install(st: "State", view_key: str) -> None:
+async def _record_view_install(st: "State", view_key: str,
+                               reads: InstallReads) -> None:
     """Record, for the committed view at `view_key`, the install key of its
-    tip with the snapshot of the install just made there (`_VIEW_INSTALLS`;
+    tip from what the install just made there read (`reads`), with the
+    reads and that install's snapshot (`_VIEW_INSTALLS`;
     DESIGN §8 *A view moves to the next tip when the install's inputs are
     unchanged*). Nothing for a tree that is no view. The run repository is
     found from the worker tree the view shows, never from the view."""
@@ -49486,11 +49595,12 @@ async def _record_view_install(st: "State", view_key: str) -> None:
             continue
         recipe = (st.data.get("provision") or {}).get("recipe") or []
         reg = await asyncio.to_thread(_view_repo, st, tree_key)
-        ikey = (await asyncio.to_thread(_install_key, reg, tip, recipe)
+        ikey = (await asyncio.to_thread(_install_key, reg, tip, recipe,
+                                        reads)
                 if reg is not None else None)
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
-            _VIEW_INSTALLS[view_key] = (ikey, snap)
+            _VIEW_INSTALLS[view_key] = (ikey, snap, reads)
         return
 
 
@@ -49570,7 +49680,8 @@ async def _committed_view(st: "State", tree: str | Path) -> Path | None:
     made = _VIEW_INSTALLS.get(os.path.realpath(wt))
     if have and have[1].is_dir() and made is not None:
         recipe = (st.data.get("provision") or {}).get("recipe") or []
-        now_key = await asyncio.to_thread(_install_key, reg, tip, recipe)
+        now_key = await asyncio.to_thread(_install_key, reg, tip, recipe,
+                                          made[2])
         if now_key is not None and now_key == made[0] and \
                 await asyncio.to_thread(_move_view, reg, wt, tip, made[1]):
             _VIEWS[key] = (tip, wt)
