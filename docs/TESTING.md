@@ -7107,7 +7107,7 @@ sample's probe never counts for the next.
   `shutil.rmtree` only inside `_rm_owned`; every `rm -rf` in
   `scripts/*.sh` is inside `leerie_rm_owned` or of a `mktemp` directory the
   same script made.
-- `tests/test_view_moves.py` (11 tests, DESIGN §8 *A view moves to the next
+- `tests/test_view_moves.py` (12 tests, DESIGN §8 *A view moves to the next
   tip when the install's inputs are unchanged*; review round 18 L1), real
   git, the real scripts and `_measured_tree` with an incremental stand-in
   install: a new tip with the same inputs moves the view — the install's
@@ -7127,7 +7127,12 @@ sample's probe never counts for the next.
   install read: it changes with a file read, a file appearing where one was
   read, beside one or in a directory read, the install entries and their
   environment, and with nothing else, and the install's recorded reads hold
-  `package.json` and not the file only the build read.
+  `package.json` and not the file only the build read; an install whose
+  output is a hard link of the tree's own store (as uv's) moves the view
+  again at a third tip, its earlier stores' removal (slowed, as a real
+  store's outlasts a no-op install) waited for before the snapshot — at
+  ba1330af the third tip got a fresh view — and a changed input after it
+  still makes a fresh one.
 - `tests/test_tree_repos.py` (11 tests, DESIGN §6 *A repository per
   committing tree (I6)*): staging and a subtask tree are worktrees of their
   own bare repositories (the run repository's objects through the

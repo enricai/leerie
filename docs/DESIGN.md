@@ -15811,7 +15811,14 @@ it:
   done, before any build runs, leerie records every entry under those paths
   with its state: a file's or link's inode, size, mode and change time — a
   time its owner cannot set back, moved by every write, rename, chmod or
-  link — and a directory's inode and mode;
+  link — and a directory's inode and mode. It records them once the
+  removal of the tree's earlier stores has finished, which leerie runs
+  off the event loop when a moved view starts empty stores. A store's file
+  can be a hard link of the install's output (uv links its cache into the
+  environment), and removing a link moves the linked file's change time.
+  Recorded before that removal ends, the snapshot read the removal as a
+  change at the next tip, so a view moved once was never moved again
+  (measured on click, uv; *designed 2026-11-19*, lane S9-R8);
 - when the key at the new tip is the key recorded, the view's `.git` is
   pointed back at its own administrative directory, found from the run
   repository's side; its measurement id there is removed, so to every
