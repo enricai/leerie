@@ -3084,14 +3084,24 @@ the classifier fails 4 tests, and the control keeps passing.
 ### Three further traps in the same change
 
 Three further traps, each caught by a test rather than by review. (1)
-`push_error` reaches `run.json` as a single `jq --arg` value, bounded by
-`MAX_ARG_STRLEN` (131,072 bytes) — one real recorded `push_error` is
-already **104,520 bytes on stderr alone**, so folding hook stdout in is
-what makes the ceiling reachable; past it `jq` cannot be exec'd and
-`set -e` aborts `host_finalize` before the diagnostic prints. The
-persisted copy is tail-bounded at 32 KiB (printed copy: 4000 bytes);
+`push_error` is a hook's output, and one real recorded `push_error` is
+already **104,520 bytes on stderr alone**. Passed to `jq` as one argv
+string, a value past `MAX_ARG_STRLEN` (131,072 bytes) means `jq` cannot be
+exec'd, and `set -e` aborts `host_finalize` before the diagnostic prints.
+The persisted copy is tail-bounded at 32 KiB (printed copy: 4000 bytes);
 `test_oversized_push_output_still_writes_the_sidecar` drives ~200 KB
-through it. (2) Husky v9 prints its banner on **stdout** (line 20 of
+through it. That bound did not keep the argv short: uutils coreutils' `tail
+-c` (Ubuntu 26.04, CI's runner image) sometimes returns most of a piped
+input, and CI hit E2BIG at that `jq` (run 44408751581). Every value now
+reaches `jq` through a file (`--rawfile`, `--slurpfile`), never argv.
+Every byte bound is now cut by bash (`_host_finalize_tail_bytes`), never
+`tail -c`; the same inexact `tail` failed
+`test_persist_bound_is_measured_in_bytes_not_characters` on #416's CI (3.10
+and 3.12). `tests/test_finalize_values_never_in_argv.py` pins both
+independently of the host's `tail`. It uses a 200 KB value, a `tail` that
+returns its whole input on the real push path (the bounds still hold, and
+`tail` never runs), and a PR body past `MAX_ARG_STRLEN` through the
+end-state refresh. (2) Husky v9 prints its banner on **stdout** (line 20 of
 `.husky/_/h` is a bare `echo` with no `>&2`), so the "which hook" naming
 grep, reading stderr only, could never match the commonest hook runner in
 existence; it now reads stderr plus the hook's stdout. (3) That grep must
