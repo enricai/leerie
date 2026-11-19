@@ -627,8 +627,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
     implementation work starts, and the PR lists it under *Not verified
     by this run*. The delivery gate then reads it on the tree that ships
     like any other item. If it is met, it is met. If it is unmet, the
-    outcome is the existing `unconverged`, and the re-drive reason is
-    `no_owner`.
+    re-drive drives it like any item no subtask claims, by every subtask
+    it may drive (§8 *Delivery re-drive* rule 2), and if it stays unmet
+    the outcome is the existing `unconverged`.
 
   Measured by replaying the rule over every barnacle, web and navegando
   run still on disk (20 runs with required items, all from after
@@ -14957,7 +14958,17 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    that keeps both, on opus when sonnet could not*).
 2. *Who owns it.* The planner types, per subtask, the required items it
    delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
-   An unmet deliverable item re-drives **every** claimer. A process item
+   An unmet deliverable item re-drives **every** claimer. An item no
+   subtask claims, or none the re-drive may drive, goes to the subtasks
+   the round's defect notes go to, else to every subtask the re-drive may
+   drive. This is the designed
+   fallback, not a missing owner. Measured over the 70 recorded runs with
+   re-drive rounds: every drive of an item no member claimed was of an item
+   no subtask claims at all. Of those 121 drives, 16 (13.2%, 16 items in
+   12 runs) kept a commit after which the item read met and no claimer
+   group of the round also kept one. That is above the 10% bar fixed in
+   advance for reporting such an item instead of driving it (lane S9-R6,
+   B3; its `B134/RESULTS.md`). A process item
    (a constraint over the whole change: root causes only, no regressions)
    is no one subtask's deliverable, so its claimers are not its owners;
    but a confirmed probe that it fails is a concrete defect in specific
@@ -15610,11 +15621,17 @@ is the subtask whose work the item is, and the confirmed finding is the
 evidence it lacked. A claimer settled `blocked` (its blocker is typed
 outside the tree, §13 *A blocked implementer says why, as a type*), one
 the operator accepted, or one settled `accepted_external` is not driven.
-An item no group drives — no subtask the re-drive may drive can take it,
-or every group holding it was out of its members' re-drive rounds, or the
-re-drive's time budget ran out first — is recorded as a typed
+An item no group drives is recorded as a typed
 `unrouted_item` (`{item_index, item, reason: no_owner | budget |
-unreproducible | no_code_target | after_last_round}`). So is an item rule 4 does not drive, with reason
+unreproducible | no_code_target | after_last_round}`). Its reason says
+why: every group holding it was out of its members' re-drive rounds, or
+the time budget ran out first (`budget`), or it was confirmed after the
+last round (`after_last_round`). An item no subtask claims is not
+`no_owner`: rule 2 drives it by every subtask. `no_owner` is recorded
+only when the loop stopped before a group was handed the item (a
+conflict, a failed rollback, the round ceiling, a head it could not read),
+or when no
+subtask the re-drive may drive is left at all. So is an item rule 4 does not drive, with reason
 `unreproducible` and the item words its probe tested (`probed`); the
 outcome's reasons say for it that a confirmed falsifier probe of those
 words fails under B\* and that the probe is held-out content no fixer
