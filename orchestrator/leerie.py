@@ -25606,9 +25606,9 @@ def _require_heldout_sandbox(run_dir: Path) -> None:
     # real home.
     home = _confined_home()
     home_mark = f".leerie-probe-{nonce}"
-    grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",), home=home,
-                          home_layers=tuple(
-                              p for p in (_toolchain_home(),) if p and home))
+    grants = WorkerGrants(rw=("/dev/null", str(view)), ro=("/",),
+                          overlays=_grant_overlays(home, tuple(
+                              p for p in (_toolchain_home(),) if p)))
     r: subprocess.CompletedProcess | None = None
     raw = b""
     placed_on_disk = False
@@ -25802,6 +25802,19 @@ class HeldOutSandbox(NamedTuple):
     remove: tuple[str, ...] = ()
 
 
+class Overlay(NamedTuple):
+    """An overlay the shim mounts on `target` (`--home`/`--overlay`,
+    `mount_overlay`): `lowers` above it, the first on top; `upper` the
+    directory on disk it writes (its `<upper>.work` beside it), kept after
+    the process, or "": read-only, and for the home (`home`, the process's
+    own, DESIGN §6 *Every confined process has its own home*) a `tmpfs` of
+    `HOME_UPPER_BYTES` the kernel frees with the process."""
+    target: str
+    lowers: tuple[str, ...] = ()
+    upper: str = ""
+    home: bool = False
+
+
 class WorkerGrants(NamedTuple):
     """What a worker's processes may write (`rw`, read too) and read
     (`ro`), as absolute paths. `env`: the `(name, value)` pairs that point
@@ -25822,24 +25835,13 @@ class WorkerGrants(NamedTuple):
     env: tuple[tuple[str, str], ...] = ()
     egress: bool = False
     link: str = ""
-    # The home the shim gives the process a copy of when it isolates it,
-    # and the layers beneath its upper, first on top (`_confined_home`;
-    # DESIGN §6 *Every confined process has its own home*); empty, none.
-    home: str = ""
-    home_layers: tuple[str, ...] = ()
-    # The home's upper on disk instead of a `tmpfs`, kept after the process:
-    # a tree's install writes its tree home layer so (`_tree_home_layer`).
-    home_upper: str = ""
     # Variables removed from the process's environment after `env` is
     # laid over it (`_grant_env`): the store variables, for the toolchain
     # kind.
     drop: tuple[str, ...] = ()
-    # The run layer (DESIGN §6 *The setup hook writes the run layer, never
-    # the host's toolchains*): `(DIR, LAYER)` pairs the shim overlays
-    # read-only, LAYER above DIR (`layers`), and `(DIR, UPPER)` pairs it
-    # overlays with an upper on disk, writable (`layer_uppers`, the hook's).
-    layers: tuple[tuple[str, str], ...] = ()
-    layer_uppers: tuple[tuple[str, str], ...] = ()
+    # The overlays the shim mounts when it isolates the process: the home
+    # (`_confined_home`) and the run layer's (`_grant_overlays`).
+    overlays: tuple[Overlay, ...] = ()
 
 
 # DESIGN §6 *Every confined process has its own home*: the size of the
@@ -26512,8 +26514,8 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
-        egress=True, link=str(run_dir / TREES_DIRNAME), home=own_home,
-        home_layers=layers, layers=run_mise)
+        egress=True, link=str(run_dir / TREES_DIRNAME),
+        overlays=_grant_overlays(own_home, layers, layers=run_mise))
 
 
 # DESIGN §6 *The orchestrator's root is leerie's; a repository's root is
@@ -26601,28 +26603,26 @@ def _shim_refusals(what: str) -> Iterator[int]:
         refusals.check()
 
 
-def _home_argv(grants: WorkerGrants) -> list[str]:
-    """The shim's options for the process's own home (DESIGN §6 *Every
-    confined process has its own home*), or none when the grant names no
-    home."""
-    if not grants.home:
-        return []
-    argv = ["--home", grants.home, "--home-bytes", str(HOME_UPPER_BYTES)]
-    for layer in grants.home_layers:
-        argv += ["--home-layer", layer]
-    if grants.home_upper:
-        argv += ["--home-upper", grants.home_upper]
-    return argv
+def _grant_overlays(home: str, lowers: tuple[str, ...], upper: str = "",
+                    layers: tuple[tuple[str, str], ...] = (),
+                    layer_uppers: tuple[tuple[str, str], ...] = ()
+                    ) -> tuple[Overlay, ...]:
+    """A grant's overlays: the home first (none when `home` is empty), then
+    each read-only `(DIR, LAYER)` and each writable `(DIR, UPPER)`."""
+    return (((Overlay(home, lowers, upper, home=True),) if home else ())
+            + tuple(Overlay(d, (layer,)) for d, layer in layers)
+            + tuple(Overlay(d, upper=u) for d, u in layer_uppers))
 
 
-def _layer_argv(grants: WorkerGrants) -> list[str]:
-    """The shim's options for the run layer's overlays (DESIGN §6 *The setup
-    hook writes the run layer, never the host's toolchains*)."""
+def _overlay_argv(grants: WorkerGrants) -> list[str]:
+    """The shim's options for the grant's overlays (`Overlay`)."""
     argv: list[str] = []
-    for d, layer in grants.layers:
-        argv += ["--layer", f"{d}={layer}"]
-    for d, upper in grants.layer_uppers:
-        argv += ["--layer-upper", f"{d}={upper}"]
+    for o in grants.overlays:
+        argv += ["--home" if o.home else "--overlay", o.target]
+        for lower in o.lowers:
+            argv += ["--lower", lower]
+        if o.upper or o.home:
+            argv += ["--upper", o.upper or f"tmpfs:{HOME_UPPER_BYTES}"]
     return argv
 
 
@@ -26674,7 +26674,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
                      str(report_fd)]
         if wr is not None:
             argv += ["--worker-root", wr]
-        argv += _home_argv(grants) + _layer_argv(grants)
+        argv += _overlay_argv(grants)
     elif _isolated():
         argv.append("--isolate")
         if grants.egress:
@@ -26689,7 +26689,7 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
             argv += ["--worker-root", wr] + (["--cli"] if cli else [])
         if grants.link:
             argv += ["--link-root", grants.link]
-        argv += _home_argv(grants) + _layer_argv(grants)
+        argv += _overlay_argv(grants)
     for p in grants.rw:
         argv += ["--rw", p]
     for p in grants.ro:
@@ -27536,7 +27536,7 @@ def _measurement_grants(st: "State", tree: str | Path,
             else:
                 # The hook writes the host's toolchains never: its writes
                 # there land in the run layer it makes, an overlay the
-                # shim mounts and grants (`--layer-upper`).
+                # shim mounts and grants (`--overlay ... --upper`).
                 upper = new_layer / RUN_LAYER_MISE
                 _mkdir_private(upper, run_dir)
                 _mkdir_private(_home_work(upper), run_dir)
@@ -27606,9 +27606,9 @@ def _measurement_grants(st: "State", tree: str | Path,
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
         tuple(env.items()), egress=kind != MEASURE_KIND,
-        link=str(run_dir.resolve() / TREES_DIRNAME), home=own_home,
-        home_layers=layers, drop=drop, home_upper=upper, layers=run_mise,
-        layer_uppers=layer_uppers)
+        link=str(run_dir.resolve() / TREES_DIRNAME), drop=drop,
+        overlays=_grant_overlays(own_home, layers, upper, run_mise,
+                                 layer_uppers))
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:

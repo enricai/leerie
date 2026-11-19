@@ -137,11 +137,12 @@ def test_worker_and_install_name_the_same_tree_stores(
     # layer, which the worker's own home has on top once it exists.
     assert "PYTHONUSERBASE" not in wenv
     layer = stores / leerie.TREE_HOME_NAME
-    assert g.home_layers[:1] != (str(layer),)
+    assert all(o.lowers[:1] != (str(layer),) for o in g.overlays)
     layer.mkdir(parents=True, exist_ok=True)
     g2 = _grants(leerie, run, lane, schema_key, getattr(leerie, tools))
-    if g2.home:
-        assert g2.home_layers[0] == str(layer)
+    for o in g2.overlays:
+        if o.home:
+            assert o.lowers[0] == str(layer)
 
 
 def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(

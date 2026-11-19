@@ -137,7 +137,8 @@ def test_the_kinds_that_write_mise_data_share_its_cache(
     # *The setup hook writes the run layer, never the host's toolchains*).
     assert not cache.is_relative_to(env["TMPDIR"])
     written = (g.rw if kind == "TOOLCHAIN_KIND"
-               else tuple(d for d, _u in g.layer_uppers))
+               else tuple(o.target for o in g.overlays
+                          if o.upper and not o.home))
     assert any(cache.is_relative_to(p) for p in written), g
 
 

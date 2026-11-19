@@ -5602,7 +5602,7 @@ install its tree's.**
    grants are bound, the shim mounts an overlay on `$HOME`: lower layers the
    toolchain home layer, then the pristine home; upper and work directories
    on a `tmpfs` of its own, mounted in that namespace (`--home`,
-   `--home-layer`). Every tool sees one ordinary `$HOME`, through `$HOME`
+   `--lower`, `--upper tmpfs:N`). Every tool sees one ordinary `$HOME`, through `$HOME`
    and through the password database alike: reads fall through to the
    layers, writes land in the upper. A grant that lies beneath the home (a
    host's state root) is bound from the real
@@ -5752,7 +5752,7 @@ onto itself:
 | under the `leerie-container` profile before this change | `EACCES` | — |
 
 What it costs, measured on real launches (rootless, image `leerie:hc-home`,
-host load average about 45): making the home (`private_home`) took 6–10 ms
+host load average about 45): making the home (then `private_home`, now `mount_overlay`) took 6–10 ms
 per confined process; end to end, from the shim's start to its exit, 60
 paired spawns of `/bin/true` with and without a home differed by a median
 of 92 ms, the rest being the namespace's teardown of the overlay and its
@@ -5822,9 +5822,9 @@ no other run's, reads what it wrote at the path it wrote it.**
    uppers on disk: `home/`, over the home, and `mise/`, over
    `MISE_DATA_DIR`, each with its overlay work directory beside it. The
    hook's home is an overlay whose upper is `home/` (the shape a tree's
-   install already has, `--home-upper`), and the shim mounts a second
+   install already has, `--home DIR --upper U`), and the shim mounts a second
    overlay on `MISE_DATA_DIR` whose lower is the host's directory and whose
-   upper is `mise/` (`--layer-upper`). Writes land in the run layer; reads
+   upper is `mise/` (`--overlay DIR --upper U`). Writes land in the run layer; reads
    fall through to the host's toolchains and the pristine home. The hook's
    grant names `MISE_DATA_DIR` and its home for writing, both overlays it
    alone holds; it names no host directory and no `~/.local/bin`. A hook's

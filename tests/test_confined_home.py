@@ -59,6 +59,11 @@ def homes(leerie, tmp_path, monkeypatch) -> tuple[Path, Path]:
     return h, layer
 
 
+def _home(g):
+    """The grant's home overlay (`Overlay.home`), or None."""
+    return next((o for o in g.overlays if o.home), None)
+
+
 KINDS = ["MEASURE_KIND", "INSTALL_KIND", "SETUP_HOOK_KIND", "TOOLCHAIN_KIND"]
 
 
@@ -78,8 +83,8 @@ def test_every_other_kind_reads_the_layer_beneath_its_own_home(
     h, layer = homes
     g = leerie._measurement_grants(_st(run), _view(run),
                                    getattr(leerie, kind))
-    assert g.home == str(h.resolve())
-    assert g.home_layers == (str(layer.resolve()),)
+    assert _home(g).target == str(h.resolve())
+    assert _home(g).lowers == (str(layer.resolve()),)
     assert g.drop == ()
     assert "HOME" not in dict(g.env)
     assert str(layer.resolve()) not in g.rw
@@ -93,7 +98,7 @@ def test_the_toolchain_install_writes_the_layer_and_sees_no_store(
     assert dict(g.env)["HOME"] == str(layer.resolve())
     assert str(layer.resolve()) in g.rw
     # It reads no layer it writes.
-    assert g.home_layers == ()
+    assert _home(g).lowers == ()
     assert set(leerie._STORE_VARS) <= set(g.drop)
     base = {**{v: "/store" for v in leerie._STORE_VARS},
             "pnpm_config_store_dir": "/store", "KEEP": "1"}
@@ -109,8 +114,8 @@ def test_a_worker_names_its_home_and_the_layer(leerie, run, homes):
         run_dir=run["run_dir"], state={}, schema_key="implementer",
         cwd=run["wts"]["wt-a"], allowed_tools=leerie.ACT_TOOLS,
         env={**run["env"], "HOME": str(h)})
-    assert g.home == str(h.resolve())
-    assert g.home_layers == (str(layer.resolve()),)
+    assert _home(g).target == str(h.resolve())
+    assert _home(g).lowers == (str(layer.resolve()),)
 
 
 def test_a_home_beneath_tmp_is_none(leerie, tmp_path):
@@ -133,9 +138,8 @@ def test_the_shim_is_asked_for_the_home_only_when_isolated(
     argv = leerie._confined_argv(g, ["true"])
     i = argv.index("--home")
     assert argv[i + 1] == str(h.resolve())
-    assert argv[argv.index("--home-bytes") + 1] == str(
-        leerie.HOME_UPPER_BYTES)
-    assert argv[argv.index("--home-layer") + 1] == str(layer.resolve())
+    assert argv[i + 2:i + 6] == ["--lower", str(layer.resolve()), "--upper",
+                                 f"tmpfs:{leerie.HOME_UPPER_BYTES}"]
     assert argv.index("--home") < argv.index("--")
 
 
@@ -161,21 +165,22 @@ def test_a_trees_install_writes_its_layer_and_the_rest_read_it(
                  / view.name / leerie.TREE_HOME_NAME)
     m = leerie._measurement_grants(_st(run), view, leerie.MEASURE_KIND)
     # No layer until the install has made it.
-    assert m.home_upper == "" and m.home_layers == (str(layer.resolve()),)
+    assert _home(m).upper == "" and _home(m).lowers == (
+        str(layer.resolve()),)
     i = leerie._measurement_grants(_st(run), view, leerie.INSTALL_KIND)
-    assert i.home_upper == str(tree_home)
+    assert _home(i).upper == str(tree_home)
     assert tree_home.is_dir() and leerie._home_work(tree_home).is_dir()
-    assert i.home_layers == (str(layer.resolve()),)
+    assert _home(i).lowers == (str(layer.resolve()),)
     m = leerie._measurement_grants(_st(run), view, leerie.MEASURE_KIND)
-    assert m.home_upper == ""
-    assert m.home_layers == (str(tree_home), str(layer.resolve()))
+    assert _home(m).upper == ""
+    assert _home(m).lowers == (str(tree_home), str(layer.resolve()))
     t = leerie._measurement_grants(_st(run), view, leerie.TOOLCHAIN_KIND)
-    assert t.home_upper == "" and t.home_layers == ()
+    assert _home(t).upper == "" and _home(t).lowers == ()
     # Another tree reads none of it.
     other = run["wts"]["wt-a"]
     o = leerie._measurement_grants(_st(run), other, leerie.MEASURE_KIND)
-    assert str(tree_home) not in o.home_layers
-    assert leerie._home_argv(i)[-2:] == ["--home-upper", str(tree_home)]
+    assert str(tree_home) not in _home(o).lowers
+    assert leerie._overlay_argv(i)[-2:] == ["--upper", str(tree_home)]
 
 
 def test_the_toolchain_install_keeps_its_home_writes_in_the_layer(

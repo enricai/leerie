@@ -4721,26 +4721,35 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   and the real `main()` driven down each dispatch path (fresh, `resume
   <id>`, `--phase judge`, `--phase heal`) calls it before its first
   confined spawn, which carries `--isolate`.
-- `WorkerGrants(rw, ro, env=(), egress=False, link="", home="",
-  home_layers=(), drop=(), home_upper="", layers=(), layer_uppers=())`
-  (NamedTuple of
+- `WorkerGrants(rw, ro, env=(), egress=False, link="", drop=(),
+  overlays=())` (NamedTuple of
   absolute paths; the `shared_tmp` field is deleted — every confined
-  process has its own `/tmp`). `home`, `home_layers`: the home the shim
-  gives the process its own copy of, and the layers beneath its upper,
-  first on top (DESIGN §6 *Every confined process has its own home*):
+  process has its own `/tmp`). `overlays`: a tuple of `Overlay(target,
+  lowers=(), upper="", home=False)` (NamedTuple), each an overlay the shim
+  mounts on `target` when it isolates the process: `lowers` above it,
+  first on top; `upper` a directory on disk it writes (its `_home_work`
+  beside it), or `""` — read-only, and for the `home` overlay (the
+  process's own home, at most one, DESIGN §6 *Every confined process has
+  its own home*) a `tmpfs` of `HOME_UPPER_BYTES`.
+  `_grant_overlays(home, lowers, upper="", layers=(), layer_uppers=()) ->
+  tuple[Overlay, ...]` builds them: `Overlay(home, lowers, upper,
+  home=True)` first when `home` is non-empty, then `Overlay(DIR, (LAYER,))`
+  per `layers` pair and `Overlay(DIR, upper=UPPER)` per `layer_uppers`
+  pair. Below, "the home's lowers" and "the home's upper" are that first
+  overlay's, and `layers`/`layer_uppers` the pairs passed. The home is
   `_confined_home(env=None) -> str` is the realpath of `env["HOME"]` (else
   `os.environ`'s, else `Path.home()`), or `""` when it holds `SHARED_TMP`
   or lies beneath it; `_toolchain_home() -> str` is the realpath of
   `$LEERIE_TOOLCHAIN_HOME` (`TOOLCHAIN_HOME_ENV`; the image sets
   `/leerie-toolchains/home`), or `""` when unset or relative.
-  `_worker_grants` and `_measurement_grants` set `home=_confined_home(…)`
-  and `home_layers=(_toolchain_home(),)` when both are non-empty; the
-  toolchain kind sets `home_layers=()`, `env["HOME"]=_toolchain_home()`
+  `_worker_grants` and `_measurement_grants` give the home
+  `_confined_home(…)` with lowers `(_toolchain_home(),)` when both are
+  non-empty; the toolchain kind gives it no lowers, `env["HOME"]=_toolchain_home()`
   and `drop` = every `_STORE_VARS` key plus `pnpm_config_<k>` for each
   `_PNPM_SETTINGS` key. In a run tree (`<run-dir>/worktrees/<tree>`,
   every kind but the toolchain kind, with a home): the install kind makes
-  `_tree_home_layer` and `_home_work` of it (0700) when the kind is in `TREE_HOME_WRITERS` (`{INSTALL_KIND}`) and sets `home_upper` to
-  the layer; every other kind puts the layer first in `home_layers` when
+  `_tree_home_layer` and `_home_work` of it (0700) when the kind is in `TREE_HOME_WRITERS` (`{INSTALL_KIND}`) and sets the home's upper to
+  the layer; every other kind puts the layer first in the home's lowers when
   it is a directory. `_worker_grants` does the same for a worker whose
   `_installed_tree_stores(cwd)` is not None (DESIGN §6 *Every confined
   process has its own home*, 4). The run layer (DESIGN §6 *The setup hook
@@ -4754,20 +4763,16 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   is a directory (the home part only with a non-empty `own_home`), and both
   empty unless `<run-dir>/run-layer` is a directory. Every grant
   `_worker_grants` and `_measurement_grants` build but the toolchain and
-  setup-hook kinds' puts the home part in `home_layers` after any tree home
-  layer and before the toolchain home layer, and sets `layers` to the
-  `MISE_DATA_DIR` part: a read-only overlay, the run layer's `mise` above
-  the host's directory. The setup-hook kind sets `home_upper` to
+  setup-hook kinds' puts the home part in the home's lowers after any tree home
+  layer and before the toolchain home layer, and passes the
+  `MISE_DATA_DIR` part as `layers`: a read-only overlay, the run layer's `mise` above
+  the host's directory. The setup-hook kind sets the home's upper to
   `<run-dir>/run-layer.new/home` (with a home) and
   `layer_uppers=((_mise_data_dir(), <run-dir>/run-layer.new/mise),)` (when
   `MISE_DATA_DIR` is not beneath the state root; it is made first), each
   upper made 0700 with its `_home_work` by `_mkdir_private`, and names
   neither `MISE_DATA_DIR` nor `~/.local/bin` in `rw`: the shim adds each
-  overlay it makes writable. `_layer_argv(grants) -> list[str]` is
-  `["--layer", f"{d}={l}"]` per `layers` entry and `["--layer-upper",
-  f"{d}={u}"]` per `layer_uppers` entry; `_confined_argv` appends it after
-  `_home_argv` in both the sandbox and the isolated branch (never when
-  neither). `_run_view(run_dir, path) -> Path`: the path a confined
+  overlay it makes writable. `_run_view(run_dir, path) -> Path`: the path a confined
   process of the run sees at `path` when it lies beneath `_confined_home()`
   or `_mise_data_dir()` and the run layer exists — its run-layer
   counterpart when that layer's component walk finds an entry at it, or
@@ -4778,10 +4783,11 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   regular file, as `shutil.which`. `_grant_env(base, grants) -> dict` is `{**base,
   **dict(grants.env)}` less every `grants.drop` key: the environment of
   every confined command (`_run_streaming`, `_run_mise_install`'s version
-  read, `_ts_script_run`). `HOME_UPPER_BYTES = 1 << 30`. `_home_argv(grants)
-  -> list[str]`: `[]` when `grants.home` is empty, else `["--home", home,
-  "--home-bytes", str(HOME_UPPER_BYTES)]` plus `["--home-layer", L]` per
-  layer and `["--home-upper", U]` when `home_upper`; `_confined_argv` appends it after the sandbox options, and after
+  read, `_ts_script_run`). `HOME_UPPER_BYTES = 1 << 30`. `_overlay_argv(grants)
+  -> list[str]`: per overlay, in order, `["--home" if home else "--overlay",
+  target]`, `["--lower", L]` per lower, then `["--upper", upper]`, or
+  `["--upper", f"tmpfs:{HOME_UPPER_BYTES}"]` for a home whose `upper` is
+  `""`; `_confined_argv` appends it after the sandbox options, and after
   the isolation ones when `_isolated()` (never when neither: the home stays
   read). `link`: `str(<run-dir>/worktrees)`
   (`TREES_DIRNAME`) from `_worker_grants` and `_measurement_grants`, the
@@ -5052,8 +5058,8 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   `_WORKER_DEVICES`, the tree, `_measure_dir(st, tree)`, the run's
   stores `<run>/worktrees/.stores/stores/` (`RUN_STORES_DIRNAME`, made 0700), the tree's
   private temp directory `_private_tmp(<measure-dir>)`; setup-hook kind
-  adds nothing (its writes are its run layer's overlays, `layer_uppers` and
-  `home_upper` above), toolchain kind `MISE_DATA_DIR` and the toolchain home
+  adds nothing (its writes are its run layer's overlays, the
+  uppers above), toolchain kind `MISE_DATA_DIR` and the toolchain home
   layer `_toolchain_home()` (`$LEERIE_TOOLCHAIN_HOME`, `TOOLCHAIN_HOME_ENV`,
   realpath; none when unset) — a toolchain path beneath the state root is
   never granted. `ro`:
@@ -5581,44 +5587,46 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   directory removed before anything else is mounted. Every other grant is bound onto
   itself apart. Returns `(grants, roots)`: the grants, and `[link_root]`
   when it was bound. `isolate(..., link_root=)` passes it through.
-- `private_home(home, layers, size, grants) -> None` (`--home DIR
-  --home-bytes N [--home-layer DIR]...`, with `--isolate` or `--sandbox`;
-  DESIGN §6 *Every confined process has its own home*) — called by
-  `isolate(..., home=, home_layers=, home_bytes=)` right after
-  `pivot_to_owned_root`, before the grants are bound or overlaid; `home` is
-  then in `roots` (its own mount kept writable, what is beneath it judged
-  apart). Refuses (`IsolationError`) a `home` that is not a directory, a
-  layer or home path holding `,`, `:` or a backslash, and a mount beneath
-  `home` (`/proc/self/mountinfo`). Mounts a `tmpfs` (`size=N,mode=0700`,
-  `nosuid,nodev`) on `_HOME_UPPER` (`/tmp/.leerie-home`), makes `u/` (the
-  home's mode) and `w/` in it, binds `home` recursively at `_HOME_REAL`
-  (`/tmp/.leerie-home-real`), mounts `overlay` on `home` with
-  `lowerdir=<each existing layer not beneath home>:<home>`,
-  `upperdir=_HOME_UPPER/u`, `workdir=_HOME_UPPER/w`, `userxattr`; binds
-  every `rw`/`ro` grant strictly beneath `home` from `_HOME_REAL/<rel>`
-  over the overlay (`MS_BIND | MS_REC`; a missing source or a link
-  skipped); then detaches `_HOME_REAL` and `_HOME_UPPER` (`MNT_DETACH`)
-  and removes both directories. With `--home-upper DIR` (`--isolate`
-  only; `upper=` here) no `tmpfs` is made: `upperdir=DIR`,
-  `workdir=DIR.work` (both must be directories and nameable, else
-  `IsolationError`), and only `_HOME_REAL` is detached; such a home is not
-  watched (`_watch_home(..., watch=False)`).
-- `layer_mounts(layers, uppers) -> list[str]` (`--layer DIR=LAYER`, with
-  `--isolate` or `--sandbox`; `--layer-upper DIR=UPPER`, with `--isolate`
-  only; DESIGN §6 *The setup hook writes the run layer, never the host's
-  toolchains*) — called by `isolate(..., layers=, layer_uppers=)` right
-  after `private_home`, before the grants are bound. Refuses
-  (`IsolationError`) a `DIR` that is not a directory, a path holding `,`,
-  `:` or a backslash, and a mount beneath `DIR`. For each `--layer` whose
-  `LAYER` is a directory: `overlay` on `DIR` with
-  `lowerdir=<LAYER>:<DIR>`, `userxattr`, and no upper (read-only). For
-  each `--layer-upper`: `overlay` on `DIR` with `lowerdir=<DIR>,
-  upperdir=<UPPER>,workdir=<UPPER>.work,userxattr` (`UPPER` and its
-  `.work` must be directories). Returns the `--layer-upper` targets, which
-  `isolate` keeps writable (its `roots`) and `main()` adds to the Landlock
-  write grants. The AppArmor profile allows `mount fstype=overlay overlay
-  -> /leerie-toolchains/mise/`. `main()` and `run_sandbox` add `home` to
-  the Landlock write grants (`_watch_home`) and set `_HOME_WATCH =
+- `mount_overlay(target, lowers, upper, *, home, grants) -> None`
+  (`--overlay DIR [--lower L]... [--upper U]` and `--home DIR [--lower
+  L]... --upper U|tmpfs:N`, with `--isolate` or `--sandbox`; DESIGN §6
+  *Every confined process has its own home*, *The setup hook writes the run layer, never the host's
+  toolchains*) — called by `mount_overlays(overlays, grants) -> list[str]`,
+  which `isolate(..., overlays=)` calls right after `pivot_to_owned_root`,
+  before the grants are bound or overlaid, the home first (another's
+  directory may lie beneath it); it returns the targets with an upper,
+  which `isolate` keeps writable (its `roots`, what is beneath them judged
+  apart). `_parse` gives `overlays` as dicts `{target, lowers, upper,
+  home}` (`upper` None, a path, or the `tmpfs:N` size as an int) and
+  refuses (usage, exit 2) a `--lower`/`--upper` before any overlay or a
+  second `--upper` for one, a path that is not absolute or is `/`, a
+  `tmpfs:N` with N not a positive integer, more than one `--home` or a
+  home without `--upper`, `tmpfs:N` on an `--overlay`, an `--upper` on disk
+  with `--sandbox`, and either option without `--isolate` or `--sandbox`.
+  `mount_overlay` (its refusals `IsolationError`, each message beginning
+  `home <target>` or `layer <target>`): refuses a `target` that is not a
+  directory; its lowers are each `lowers` entry that is a directory (for the
+  home, and not beneath `target`), then `target`; refuses a lower holding `,`, `:` or a
+  backslash, and a mount beneath `target` (`/proc/self/mountinfo`); mounts
+  nothing when `upper` is None and no lower is left. An
+  `upper` path must be nameable and a directory with `<upper>.work` beside
+  it (else `<home|layer> upper <U>: not a directory overlayfs can name,
+  with its .work`). A `tmpfs:N` upper (the home's only) is a `tmpfs`
+  (`size=N,mode=0700`, `nosuid,nodev`) on `_HOME_UPPER`
+  (`/tmp/.leerie-home`) with `u/` (the target's mode) and `w/` in it. For
+  the home it binds `target` recursively at `_HOME_REAL`
+  (`/tmp/.leerie-home-real`) first. Then `_overlay_on(target, lowers, up,
+  work)`, the one overlay mount (`overlay_grants` makes the sandbox's
+  through it too): `overlay` on `target` with `lowerdir=<lowers joined by
+  :>`, `upperdir=`/`workdir=` when there is an upper, `userxattr`. For
+  the home it then binds every `rw`/`ro` grant strictly beneath `target`
+  from `_HOME_REAL/<rel>` over the overlay (`MS_BIND | MS_REC`; a missing
+  source or a link skipped), and detaches (`MNT_DETACH`) and removes
+  `_HOME_REAL`, and `_HOME_UPPER` when it made it. The AppArmor profile
+  allows `mount fstype=overlay overlay -> /leerie-toolchains/mise/`.
+  `main()` and `run_sandbox` add each target with an upper to
+  the Landlock write grants (`_watch_home(overlays)`, the home first) and,
+  when the home's upper is `tmpfs:N`, set `_HOME_WATCH =
   HomeWatch(home, N)`: `_wait_signal(watched)` (every wait in `run`,
   `run_as_init` and `run_sandbox`) samples it and waits with
   `sigtimedwait(…, HOME_SAMPLE_SEC = 0.2)`; a sample with `f_bavail *
@@ -5836,7 +5844,7 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `--forward <its port>=<_egress_server().forward(its port)>`; with
   `worker_root` True and `_worker_root()` a path, `--worker-root <path>`
   (after the sandbox options, or after the isolation ones when isolated;
-  plus `--cli` when `cli`); `_home_argv(grants)` (sandboxed or isolated);
+  plus `--cli` when `cli`); `_overlay_argv(grants)` (sandboxed or isolated);
   then `--rw`/`--ro` from `grants` and `-- cmd`.
   `_invoke` passes `cli=True` (it starts a worker's CLI), and so does
   `scripts/worker-guard.py`'s `guard_confine`; `_require_heldout_sandbox`'s
