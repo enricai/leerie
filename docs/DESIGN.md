@@ -8818,6 +8818,27 @@ repair round that is the repaired head's merge, not the original merge),
 and a subtask's settle-by-execution record the commit its verify commands
 ran on.
 
+*A verdict of another tree states no failure of the tree that ships.* A
+failing verdict whose stamp is not the tree that ships still vetoes `done`:
+a failure was seen, and nothing has measured it gone. But the outcome's
+reason never says it of the tree that ships ("on the final tree"); it says
+which tree it is of, in that input's place: "<the failure>, on tree <t>,
+not the tree that ships (<s>): not measured there". One policy for every
+stamped input of the outcome: the failing-test-ID diff, the held-out sets
+(their commit's tree), an existing test's base form and the text it
+restored, the merge checks (their commit's tree) and the final
+conformance's residual defects. The delivery verdict already reads "not
+read on the tree that ships". When the tree that ships cannot be read,
+or the record carries no stamp, each input keeps its own words: neither
+shows another tree. A required item's test-outcome row is unchanged: a
+`new` that a stale diff carries still makes it unmet (§8, the diff "is
+marked stale"). Before, the failing-test-ID diff's reason rested on a
+marker its refresh writes (`stale_for_tree`) rather than on its stamp; the
+merge checks said "on the final tree" of whatever commit they had run on;
+and the held-out count and the residual defects never said which tree they
+were of. A verdict of another tree that holds no failure (a green merge
+check, a passing set) is not changed by this rule.
+
 *`done` rests on measurements that ran (review round 19).* Root cause:
 every regression check stepped aside when it could not measure. The
 failing-test-ID diff returned "nothing to diff" when the test axis gave no

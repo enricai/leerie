@@ -10282,21 +10282,23 @@ False, else `done`.
 `_decide_outcome`, in the order it appends reasons. Each is a veto: a
 non-empty reason makes the run `unconverged`; the decider has no input that
 only reports. "Compared" says whether the decider itself compares the
-record's commit with `_shipping_tree(st)` (`_of_shipping`).
+record's commit with `_shipping_tree(st)` (`_of_shipping`); "for the
+wording only" means the comparison changes the reason's text (*A failing
+verdict of another tree*, below), never whether it vetoes.
 
 | # | reason | record | commit the record is of | compared | confirmation |
 |---|---|---|---|---|---|
 | V1 | `<N> subtask(s) unconverged: <ids>` | `subtask_status` values `unconverged` (`_settle_unconverged`) | the subtask's tree (`settled_by_execution[sid].sha`); none for a cascade (`not run: predecessor(s) …`), a backed-out integration or an exhausted budget | no | the subtask's verify commands, run once in its committed view (`_settle_by_execution`), or none |
-| V2 | `<N> test(s) newly failing on the final tree, confirmed against the base` — `an earlier tree (the tree that ships could not be measured)` when `stale_for_tree` is set; `(<k> on fewer than every base/final pair: the confirm budget cut the rest)` for `budget_short` | `test_id_diff.new` | `test_id_diff.tree_sha` | not by this row (V13 is) | paired B\* against the base; a `budget_short` ID counts |
-| V3 | `<N> held-out acceptance set(s) still fail` | `acceptance.gate.final` (measured, failing, `_acceptance_result_has_work`), else `acceptance.gate.residual` through `_acceptance_residual_unbroken` | `acceptance.gate.final_sha` | no (V13 reads `final_unremeasured`) | the unpaired B\* vote; a held case failing with no resource signature counts with no vote |
+| V2 | `<N> test(s) newly failing on the final tree, confirmed against the base` — `an earlier tree (the tree that ships could not be measured)` when `stale_for_tree` is set; `(<k> on fewer than every base/final pair: the confirm budget cut the rest)` for `budget_short` | `test_id_diff.new` | `test_id_diff.tree_sha` | for the wording only (below); the veto, not by this row (V13 is) | paired B\* against the base; a `budget_short` ID counts |
+| V3 | `<N> held-out acceptance set(s) still fail` | `acceptance.gate.final` (measured, failing, `_acceptance_result_has_work`), else `acceptance.gate.residual` through `_acceptance_residual_unbroken` | `acceptance.gate.final_sha` | for the wording only (below) (V13 reads `final_unremeasured`) | the unpaired B\* vote; a held case failing with no resource signature counts with no vote |
 | V4 | `the required items were not read on the tree that ships: …` | `_delivery_latest_verdict(delivery_gate)` | `final_tree`, `judged_after.tree` or `judged_before.tree` | yes: this row is the comparison | none: it is the absence of a verdict of that tree |
 | V5 | `<N> required item(s) still unmet` | that verdict's unmet list, when V4 did not fire | as V4 | yes | an item is unmet by the judge's strict majority over screened samples (`_delivery_screen_sample`: a met claim that does not verify is an unmet vote), a falsifier probe failing under unpaired B\*, or `untouched_paths` in code; the re-drive's re-check rewrites the list (`_redrive_apply_item_verdicts`) |
 | V6 | `<N> test(s) that passed when this task last ended done fail on this tree, and the run changed nothing` | `acceptance.settled_bar.status == "regressed"`, read only when `any_commits` is False | the base (nothing ships) | n/a | the settled bar's held-out evaluation |
-| V7 | `_base_form_reason(existing_behaviour.changed)` (`… (existing_behaviour_changed): …`) | `existing_behaviour.changed` (rows moved to `task_required` excluded) | `existing_behaviour.tree_sha` | not by this row (V13 is) | paired B\* with the base forms in place on both sides; a `budget_short` case counts |
-| V8 | `_literal_restored_reason(existing_behaviour.literal_restored)` (`… (literal_restored): …`) | `existing_behaviour.literal_restored` | `existing_behaviour.tree_sha` | no | `_base_form_literals_restored` |
-| V9 | `<N> of the repository's own merge check(s) red on the final tree: <ids>` | `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) | `ci_parity.final.sha` | no | paired B\* against the base |
+| V7 | `_base_form_reason(existing_behaviour.changed)` (`… (existing_behaviour_changed): …`) | `existing_behaviour.changed` (rows moved to `task_required` excluded) | `existing_behaviour.tree_sha` | for the wording only (below); the veto, not by this row (V13 is) | paired B\* with the base forms in place on both sides; a `budget_short` case counts |
+| V8 | `_literal_restored_reason(existing_behaviour.literal_restored)` (`… (literal_restored): …`) | `existing_behaviour.literal_restored` | `existing_behaviour.tree_sha` | for the wording only (below) | `_base_form_literals_restored` |
+| V9 | `<N> of the repository's own merge check(s) red on the final tree: <ids>` | `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) | `ci_parity.final.sha` | for the wording only (below) | paired B\* against the base |
 | V10 | `delivery_redrive.conflict.reason`, verbatim | `delivery_redrive.conflict` | none | no | the re-drive's own rule (the same trade recurred) |
-| V11 | `_residual_defects_reason(st)` | `conformance._final.residual_defects` | `conformance._final.tree_sha` | no | none: the final conformer's own list, not re-verified |
+| V11 | `_residual_defects_reason(st)` | `conformance._final.residual_defects` | `conformance._final.tree_sha` | for the wording only (below) | none: the final conformer's own list, not re-verified |
 | V12 | `_unclean_reason("the <worker> at <where>", lines)`, one per record | `unclean_trees` | the worker's tree | n/a | the tree's porcelain |
 | V13 | `_unmeasured_on_shipping_tree(st)`, read only when `any_commits` is True | `test_id_diff` and `shipping_tests_gap` (only when the repository has a test command or a diff exists), `acceptance.gate.final` and `final_unremeasured` (`_acceptance_unmeasured_lines`, nothing when `acceptance.skipped`), `existing_behaviour` | — | yes: this row is the comparison | — |
 
@@ -10318,6 +10320,23 @@ unconverged reasons otherwise — `phase_finalize`'s normal path with
 run the operator accepted held-out cases of) with `any_commits=True`.
 `scripts/host-finalize.sh` passes `--draft` to `gh pr
 create` when `run.json`'s `outcome` is `unconverged`.
+
+**A failing verdict of another tree** (DESIGN §6 *A verdict of another tree
+states no failure of the tree that ships*). Each stamped failing input
+above still vetoes, but when `_of_shipping(<its tree>, _shipping_tree(st))`
+is False its reason is `_stale_verdict_reason(verdict, tree, shipping)` →
+`"<verdict>, on tree <12>, not the tree that ships (<12>): not measured
+there"`, in the same place. The stamps: `test_id_diff.tree_sha` (verdict `"<N> test(s) newly
+failing, confirmed against the base"`); `_commit_tree(st,
+acceptance.gate.final_sha)` (`"<N> held-out acceptance set(s) failing"`);
+`existing_behaviour.tree_sha` for the base-form and restored-literal
+reasons (their own text); `_commit_tree(st, ci_parity.final.sha)` (`"<N> of
+the repository's own merge check(s) red: <ids>"`); and
+`conformance._final.tree_sha` (`_residual_defects_reason`'s text). When the
+tree that ships is unreadable (`_of_shipping` None), the record has no
+stamp, or the stamp is of the tree that ships, each reason is the text
+above. The outcome is never changed by this
+(`tests/test_stale_verdict_states_no_failure.py`).
 
 ### Delivery detection — `_run_delivery_detection`
 

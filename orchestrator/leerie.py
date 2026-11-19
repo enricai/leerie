@@ -43739,6 +43739,15 @@ def _unmeasured_on_shipping_tree(st: State) -> list[str]:
     return out
 
 
+def _stale_verdict_reason(verdict: str, tree: object, shipping: str) -> str:
+    """The outcome reason for a failing `verdict` recorded on `tree`, which
+    is not the tree that ships (DESIGN §6 *A verdict of another tree states
+    no failure of the tree that ships*): it still vetoes, and says which
+    tree the failure is of."""
+    return (f"{verdict}, on tree {str(tree)[:12]}, not the tree that ships "
+            f"({shipping[:12]}): not measured there")
+
+
 def _decide_outcome(st: State, *, any_commits: bool) -> str:
     """The run's single verdict — `done`, `no_work` or `unconverged` —
     written to `st.data["outcome"]` (and run.json) here and nowhere else
@@ -43747,6 +43756,15 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     undone is never reported as "no work required". Benched as the P7
     outcome simulation (90 historical runs)."""
     reasons: list[str] = []
+
+    def _keyed(tree: object, current: str, verdict: str) -> str:
+        # One stale policy: a failure recorded on another tree than the one
+        # that ships is said as of that tree. A record with no stamp, or a
+        # tree that ships that cannot be read, shows no other tree: as today.
+        shipping = _shipping_tree(st)
+        return (_stale_verdict_reason(verdict, tree, shipping)
+                if tree and _of_shipping(tree, shipping) is False
+                else current)
     statuses = st.data.get("subtask_status")
     if isinstance(statuses, dict):
         unconverged = sorted(s for s, v in statuses.items()
@@ -43758,18 +43776,20 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     if isinstance(diff, dict) and diff.get("new"):
         short = [x for x in diff.get("budget_short") or []
                  if x in diff["new"]]
+        cut = (f" ({len(short)} on fewer than every base/final pair: the "
+               "confirm budget cut the rest)" if short else "")
         # `stale_for_tree` is written by every refresh that could not
         # measure the tree that ships — the re-drive's tail and phase 5's
         # own — so the reason names that tree, not one stage.
-        reasons.append(f"{len(diff['new'])} test(s) newly failing on "
-                       + ("an earlier tree (the tree that ships could not "
-                          "be measured), "
-                          if diff.get("stale_for_tree")
-                          else "the final tree, ")
-                       + "confirmed against the base"
-                       + (f" ({len(short)} on fewer than every base/final "
-                          "pair: the confirm budget cut the rest)"
-                          if short else ""))
+        reasons.append(_keyed(
+            diff.get("tree_sha"),
+            f"{len(diff['new'])} test(s) newly failing on "
+            + ("an earlier tree (the tree that ships could not be "
+               "measured), " if diff.get("stale_for_tree")
+               else "the final tree, ")
+            + "confirmed against the base" + cut,
+            f"{len(diff['new'])} test(s) newly failing, confirmed against "
+            "the base" + cut))
     acc = st.data.get("acceptance") or {}
     gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
     if isinstance(gate, dict):
@@ -43792,7 +43812,10 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         if not failing and isinstance(residual, dict):
             failing = int(residual.get("failing_sets") or 0)
         if failing:
-            reasons.append(f"{failing} held-out acceptance set(s) still fail")
+            reasons.append(_keyed(
+                _commit_tree(st, gate.get("final_sha")),
+                f"{failing} held-out acceptance set(s) still fail",
+                f"{failing} held-out acceptance set(s) failing"))
     delivery = st.data.get("delivery_gate")
     verdict = _delivery_latest_verdict(delivery)
     if verdict is not None:
@@ -43883,19 +43906,26 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         # *What an existing test pins on the base holds on the tree that
         # ships*). Of the tree that ships, or `_unmeasured_on_shipping_tree`
         # says it was not measured.
-        reasons.append(_base_form_reason(
-            [r for r in behaviour["changed"] if isinstance(r, dict)]))
+        text = _base_form_reason(
+            [r for r in behaviour["changed"] if isinstance(r, dict)])
+        reasons.append(_keyed(behaviour.get("tree_sha"), text, text))
     if isinstance(behaviour, dict) and behaviour.get("literal_restored"):
         # Text the task asked to move into the message files, back in the
         # production code it left (DESIGN §8 *A broken base-form case whose
         # cause is a change the run made is a question first*).
-        reasons.append(_literal_restored_reason(
-            [r for r in behaviour["literal_restored"] if isinstance(r, dict)]))
+        text = _literal_restored_reason(
+            [r for r in behaviour["literal_restored"] if isinstance(r, dict)])
+        reasons.append(_keyed(behaviour.get("tree_sha"), text, text))
     ci_unmet = _ci_parity_unmet(st)
     if ci_unmet:
-        reasons.append(f"{len(ci_unmet)} of the repository's own merge "
-                       "check(s) red on the final tree: "
-                       + ", ".join(str(u.get("id")) for u in ci_unmet))
+        ids = ", ".join(str(u.get("id")) for u in ci_unmet)
+        reasons.append(_keyed(
+            _commit_tree(st, (st.data.get("ci_parity") or {}).get(
+                "final", {}).get("sha")),
+            f"{len(ci_unmet)} of the repository's own merge check(s) red "
+            f"on the final tree: {ids}",
+            f"{len(ci_unmet)} of the repository's own merge check(s) red: "
+            + ids))
     redrive = st.data.get("delivery_redrive")
     conflict = (redrive.get("conflict") if isinstance(redrive, dict)
                 else None)
@@ -43903,7 +43933,10 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         reasons.append(str(conflict["reason"]))
     residual_defects = _residual_defects_reason(st)
     if residual_defects:
-        reasons.append(residual_defects)
+        final_rec = (st.data.get("conformance") or {}).get("_final")
+        reasons.append(_keyed(
+            final_rec.get("tree_sha") if isinstance(final_rec, dict)
+            else None, residual_defects, residual_defects))
     unclean = st.data.get("unclean_trees")
     for rec in (unclean.values() if isinstance(unclean, dict) else ()):
         if isinstance(rec, dict):
