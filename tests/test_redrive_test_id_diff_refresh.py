@@ -134,7 +134,8 @@ def test_a_diff_that_cannot_be_measured_again_is_marked_stale(
     row = st.data["delivery_gate"]["items"][0]
     assert row["verdict"] == "unmet" and redriven["x"] in row["reason"]
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
-    assert "an earlier tree" in st.data["outcome_reasons"][0]
+    assert f"on tree {redriven['t0'][:12]}, not the tree that ships" \
+        in st.data["outcome_reasons"][0]
     # Detection's diff said "no regressions" instead: on the shipping tree
     # that reads unknown, never met.
     st.data["test_id_diff"] = {**st.data["test_id_diff"], "new": []}
