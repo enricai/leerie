@@ -26,7 +26,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from tests.conftest import REAL_HOME, XDG_BASE_DIRS
+from tests.conftest import (
+    REAL_HOME, XDG_BASE_DIRS, leerie_container_drop)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
@@ -206,15 +207,18 @@ def test_the_real_container_runs_the_pinned_node(tmp_path):
     # The sandbox's mounts need the profile the launcher passes.
     if Path("/etc/apparmor.d/leerie-container").is_file():
         sec += ["--security-opt", "apparmor=leerie-container"]
-    tmpfs = "rw,exec,size=2g,uid=1000,gid=1000"
+    # The toolchain cache as the launcher mounts it: one directory at
+    # /leerie-toolchains, its `mise/` and `home/` both the leerie user's.
+    drop, owner = leerie_container_drop()
+    tmpfs = f"rw,exec,size=2g,{owner}"
     r = subprocess.run(
         ["nerdctl", "run", "--rm", *sec, "--user", "0",
          "--entrypoint", "bash",
          "-v", f"{REPO_ROOT}:/src:ro", "-v", f"{tmp_path}:/out:ro",
          "--tmpfs", f"/leerie-state:{tmpfs}",
-         "--tmpfs", f"/leerie-toolchains/mise:{tmpfs}",
+         "--tmpfs", f"/leerie-toolchains:{tmpfs}",
          image, "-c",
-         f"{prep} && exec runuser -u leerie -- env HOME=/home/leerie "
+         f"{prep} && {drop} env HOME=/home/leerie "
          f"PATH='{path}' /usr/bin/python3 /out/driver.py "
          "/src/orchestrator/leerie.py /leerie-state/w"],
         capture_output=True, text=True, timeout=1500, env=_users_env())
