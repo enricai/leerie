@@ -1502,8 +1502,10 @@ def _placed(fn):
 def gate_env(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
-    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head)
-    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head)
+    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head,
+                                      writer="falsifier")
+    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head,
+                                         writer=None)
     seen_facts = []
 
     def fake_facts(tree, probe, case, **_kw):
@@ -2682,7 +2684,7 @@ def test_the_facts_read_places_the_probe(leerie, tmp_path, monkeypatch):
     st = _st(leerie, tmp_path, repo, head)
     gate_env = types.SimpleNamespace(
         st=st, confirm=leerie._falsifier_checkout(st, "falsifier-confirm",
-                                                  head))
+                                                  head, writer=None))
     src = gate_env.st.run_dir / "probe-src.test.ts"
     src.write_text("describe('m', () => {\n  it('keeps the sum', () => {\n"
                    "    expect(add(2, 3)).toBe(5);\n  });\n});\n")

@@ -6819,9 +6819,11 @@ def _git_hooks_on(env: Mapping[str, str]) -> dict[str, str]:
 # view installs from are leerie's*): variable -> directory name. Every one is
 # the run's own: leerie's commands get `<run-dir>/worktrees/.stores/stores/<name>`
 # (`_leerie_stores`, set on the orchestrator's environment in `main()` once
-# the run directory exists), written by every command leerie runs in the
-# run; the run's workers share `<run-dir>/worktrees/.stores/cache/<name>`
-# (`_worker_cache_env`). No store is shared across runs or repositories.
+# the run directory exists), written by every command leerie runs in a tree
+# no worker writes; the run's workers share their side's `<run-dir>/
+# worktrees/.stores/cache/<name>` or `cache-held-out/<name>`
+# (`_worker_cache_env`), and so does every command leerie runs in a tree a
+# worker writes (`_tree_store_env`). No store is shared across runs or repositories.
 # Every installer the provision recipe can name is covered: pnpm, npm, yarn
 # (classic and berry), bun, corepack, pip, uv, poetry, go, bundler,
 # composer, dotnet. What an install keeps beneath `~` (pip's `--user`
@@ -6878,11 +6880,14 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
 # they run and the next command reads (uv's install of the project, Go's
 # build cache, NuGet's restore, pnpm's metadata cache), bundler's path
 # (whose default is the toolchain's gem directory) and the browsers a
-# browser suite downloads. Two trees at two commits never share them, and a
-# view whose tip moves starts them empty. What an install keeps beneath `~`
+# browser suite downloads. Two trees no worker writes never share them, and
+# a view whose tip moves starts them empty. What an install keeps beneath `~`
 # is the tree home layer's (`_tree_home_layer`), not a store's. Set, for every command leerie
-# runs in a tree under `<run-dir>/worktrees/`, to
-# `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>` (`_tree_store_env`).
+# runs in a tree under `<run-dir>/worktrees/` that no worker writes, to
+# `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>` (`_tree_store_env`);
+# in a tree a worker writes, to that side's worker cache set, as every other
+# store is there (DESIGN §6 *A tree's stores are the tree's, whoever writes
+# it*).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
     "UV_CACHE_DIR", "BUNDLE_PATH", "NUGET_PACKAGES", "GOCACHE",
     "npm_config_cache_dir",
@@ -6895,29 +6900,53 @@ _TREE_STORE_VARS: frozenset[str] = frozenset({
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
     """`(tree, stores)` for the run tree `cwd` lies in
     (`<run-dir>/worktrees/<tree>`): its own stores are `<run-dir>/
-    tree-stores/<tree>/`. None for a `cwd` outside every run tree."""
+    worktrees/.stores/tree-stores/<tree>/`. None for a `cwd` outside every
+    run tree. A run's tree is found first, the outermost directory under a
+    run's `worktrees` (one beside the run's own repository, `<run-dir>/
+    repo`, or a clone leerie recorded, `_CLONE_CACHES`), never by its
+    `.git` and never by anything beneath it: a confined worker writes its
+    tree, so it may remove its `.git` or plant a `.git`, a `worktrees`, a
+    `tree-repos` or a `repo` deeper down, all of them inside the tree
+    leerie finds first, since every run has its repository (DESIGN §6 *A
+    tree's stores are the tree's, whoever writes it*). When no such
+    directory qualifies (outside a run, as a test's checkout), the nearest
+    directory under a `worktrees` that holds `.git`; with no `<run-dir>/
+    repo` to anchor on, a planted `repo` beside a planted `worktrees` could
+    qualify first."""
     if cwd is None:
         return None
     p = Path(os.path.abspath(cwd))
-    for d in (p, *p.parents):
-        if d.parent.name == "worktrees" and (d / ".git").exists():
-            return d, _stores_home(d.parent.parent) / TREE_STORES_DIRNAME \
-                / d.name
+    ups = [d for d in (p, *p.parents) if d.parent.name == "worktrees"
+           and d.name not in (STORES_HOME_NAME, SELFCHECK_COPIES_NAME)]
+    for d in (*[d for d in reversed(ups)
+                if os.path.realpath(d) in _CLONE_CACHES
+                or _is_git_dir(d.parent.parent / RUN_REPO_NAME)],
+              *[d for d in ups if (d / ".git").exists()]):
+        return d, _stores_home(d.parent.parent) / TREE_STORES_DIRNAME / d.name
     return None
 
 
 def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
                     ) -> None:
-    """Point `env`'s `_TREE_STORE_VARS` at the tree `cwd` lies in, when that
-    tree is one of a run's (`_tree_stores_dir`): `<run-dir>/
-    tree-stores/<tree>/<name>`, made here 0700 (`_mkdir_private`), like
-    every directory leerie makes for a measurement. A `cwd` outside every run tree leaves `env` as it is. The one choice of
-    a tree's stores: leerie's commands there and a worker started in a tree
-    leerie installed for (`_installed_tree_stores`) both get it (DESIGN §6
-    *A worker started in a tree leerie installed for runs on that tree's
-    stores*)."""
+    """THE choice of a run tree's stores, made by the tree for every process
+    in it (DESIGN §6 *A tree's stores are the tree's, whoever writes it*).
+    In a tree a worker writes (`_tree_cache`), every `_STORE_VARS` variable
+    of `env` at that side's worker cache set, as the worker's own spawn has
+    them (`_cache_vars`). In any other run tree (`_tree_stores_dir`), its
+    `_TREE_STORE_VARS` at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
+    <name>`, made here
+    0700 (`_mkdir_private`), like every directory leerie makes for a
+    measurement, and the rest left as they are (the run's, `_leerie_stores`).
+    A `cwd` outside every run tree leaves `env` as it is. Leerie's commands
+    there (`_run_streaming`) and a worker started there (`_invoke`) both get
+    it."""
     found = _tree_stores_dir(cwd)
     if found is None:
+        return
+    cache = _tree_cache(cwd)
+    if cache is not None:
+        env.update({k: v for k, v in _cache_vars(cache).items()
+                    if k != "XDG_CACHE_HOME"})
         return
     root = found[1]
     for var in _TREE_STORE_VARS:
@@ -6926,6 +6955,36 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
             _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
     _with_pnpm_spellings(env)
+
+
+# The worker cache set of each ref-less clone leerie made for a worker that
+# writes it (`_acceptance_writer_checkout`'s `writer`), by its realpath: in
+# this process only, as the clones are, and dropped when leerie removes one
+# (`_remove_acceptance_checkout`). Leerie's own record, never the tree's.
+_CLONE_CACHES: dict[str, Path] = {}
+
+
+def _tree_cache(cwd: str | Path | None) -> Path | None:
+    """The worker cache set every process in the run tree `cwd` lies in runs
+    on, when a worker writes that tree (DESIGN §6 *A tree's stores are the
+    tree's, whoever writes it*): the one recorded for a clone leerie made
+    for a worker (`_CLONE_CACHES`), else the fixers' for a tree of its own
+    repository (`<run-dir>/tree-repos/<tree>`: only their committing
+    workers' trees have one, DESIGN §6 *A repository per committing tree
+    (I6)*). None for a tree no worker writes, and outside every run tree."""
+    found = _tree_stores_dir(cwd)
+    if found is None:
+        return None
+    tree = found[0]
+    recorded = _CLONE_CACHES.get(os.path.realpath(tree))
+    if recorded is not None:
+        return recorded
+    run_dir = tree.parent.parent
+    # The directory, not what is in it: its committing worker writes the
+    # repository's contents, never the entry in `tree-repos/`.
+    if (run_dir / TREE_REPOS_NAME / tree.name).is_dir():
+        return _stores_home(run_dir) / WORKER_CACHE_DIR
+    return None
 
 
 def _tree_stores_for(env: Mapping[str, str], cwd: str | Path | None
@@ -6941,9 +7000,10 @@ def _installed_tree_stores(cwd: str | Path | None) -> Path | None:
     in that tree in this process (`_DEPS_INSTALLED`, the record that keeps
     it from installing a tree twice), else None: a worker started there
     must see that install (DESIGN §6 *A worker started in a tree leerie
-    installed for runs on that tree's stores*). A tree leerie never
-    installs for — a subtask's, staging — keeps its workers on their side's
-    cache, where their own installs land."""
+    installed for runs on that tree's stores*). In a tree a worker writes
+    the worker's variables stay at its side's cache, where leerie's install
+    there wrote too (`_tree_cache`); the grant still names these stores,
+    whose `home` is the tree home layer that install wrote."""
     found = _tree_stores_dir(cwd)
     if found is None or os.path.realpath(found[0]) not in _DEPS_INSTALLED:
         return None
@@ -7001,8 +7061,9 @@ def _leerie_stores(env: MutableMapping[str, str], run_dir: Path) -> None:
     """Point every `_STORE_VARS` variable of `env` at the run's own store,
     `<run-dir>/worktrees/.stores/stores/<name>` (`_stores_home`,
     `RUN_STORES_DIRNAME`), made here. Every command
-    leerie runs in the run reads and writes them, and nothing outside the
-    run does: no store is shared across runs or repositories (DESIGN §6
+    leerie runs in a tree no worker writes reads and writes them (in one a
+    worker writes, `_tree_store_env` replaces every one by that side's
+    cache), and nothing outside the run does: no store is shared across runs or repositories (DESIGN §6
     *The stores a view installs from are leerie's*). A worker's environment
     replaces every one (`_worker_cache_env`), and no worker's grant names
     them."""
@@ -7024,13 +7085,16 @@ def _worker_cache_env(env: Mapping[str, str], run_dir: Path,
     `<run-dir>/worktrees/.stores/cache/`): `<cache>/<name>` and
     `XDG_CACHE_HOME` at `<cache>/xdg`. One
     set per side of the run, not per worker (`_worker_cache_dir`): what a
-    worker leaves in a cache can mislead only another worker of its side,
-    never a measurement, and nothing a held-out-side worker's processes
+    worker leaves in a cache can mislead only its side's workers and
+    leerie's commands in its side's trees, never a measurement in a view,
+    and nothing a held-out-side worker's processes
     leave reaches a fixer (DESIGN §8 *Nothing a held-out evaluation produces
     reaches a fixer*); a cold set costs a worker a download (measured on
     funeralworks: Playwright's chromium 20 s and 656 MB). None of them is
     the run's store leerie's commands use (DESIGN §6 *The stores a view
-    installs from are leerie's*)."""
+    installs from are leerie's*); leerie's commands in a tree a worker of
+    the side writes use the side's (DESIGN §6 *A tree's stores are the
+    tree's, whoever writes it*)."""
     if cache is None:
         cache = _stores_home(run_dir) / WORKER_CACHE_DIR
     out = {**env, **_cache_vars(cache)}
@@ -11945,9 +12009,11 @@ async def _run_streaming(
                                        refusal_fd=refusals.fd,
                                        taken_fd=(taken.fd if taken is not None
                                                  else None))
-            # A command in a run's tree reads that tree's own stores
-            # (`_TREE_STORE_VARS`; DESIGN §6 *Which stores an install may
-            # share*).
+            # A command in a run's tree runs on that tree's store set: its
+            # own stores for `_TREE_STORE_VARS`, or in a tree a worker
+            # writes that side's cache for every store variable (DESIGN §6
+            # *Which stores an install may share*, *A tree's stores are the
+            # tree's, whoever writes it*).
             env = _tree_stores_for(env if env is not None else os.environ, cwd)
             gate_r: int | None = None
             gate_w: int | None = None
@@ -26099,7 +26165,10 @@ def _granted_cache_dir(grants: "WorkerGrants | None",
                        run_dir: str | Path) -> Path:
     """The cache set `grants` writes: the held-out side's when the grant
     names it, else the fixers' side's. The worker's environment is pointed
-    at this one (`_invoke`), so the variables follow the grant."""
+    at this one (`_invoke`), so the variables follow the grant; in a tree a
+    worker writes, `_tree_store_env` then points them at that tree's side,
+    the same cache for a worker of that side (DESIGN §6 *A tree's stores
+    are the tree's, whoever writes it*)."""
     held = _stores_home(run_dir) / HELD_OUT_CACHE_DIR
     if grants is not None and any(
             os.path.realpath(p) == os.path.realpath(held)
@@ -26517,7 +26586,10 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
         rw.append(str(copies))
     # The stores of a tree leerie installed for, as the tree itself is
     # granted: the worker sees that install (DESIGN §6 *A worker started in
-    # a tree leerie installed for runs on that tree's stores*).
+    # a tree leerie installed for runs on that tree's stores*). In a tree a
+    # worker writes they hold only the tree home layer; the install itself
+    # is in the side's cache the worker already has (DESIGN §6 *A tree's
+    # stores are the tree's, whoever writes it*).
     tree_stores = _installed_tree_stores(cwd_r)
     if tree_stores is not None:
         _mkdir_private(tree_stores, run_dir)
@@ -26758,8 +26830,8 @@ MEASURE_DIRNAME = "measure"
 # Where `_tree_store_env` puts a run tree's own installer stores.
 TREE_STORES_DIRNAME = "tree-stores"
 # The run's own package stores (`_leerie_stores`): every command leerie runs
-# in the run reads and writes them (DESIGN §6 *The stores a view installs
-# from are leerie's*).
+# in a tree no worker writes reads and writes them (DESIGN §6 *The stores a
+# view installs from are leerie's*).
 RUN_STORES_DIRNAME = "stores"
 # Every store a run's tree installs from lives beside the trees, in
 # `<run-dir>/worktrees/.stores/` (DESIGN §6 *The write grants on one mount
@@ -27483,7 +27555,9 @@ def _measurement_grants(st: "State", tree: str | Path,
     """THE grant of a command leerie runs on a repository's code (DESIGN §6
     *Leerie's runs of the repository's commands are confined too*): write
     the tree, its measurement directory (`_measure_dir`), the run's own
-    stores (`<run-dir>/worktrees/.stores/stores/`, `_leerie_stores`) and the tree's own
+    stores (`<run-dir>/worktrees/.stores/stores/`, `_leerie_stores`; in a
+    tree a worker writes, that side's worker cache set instead,
+    `_tree_cache`) and the tree's own
     (`<run-dir>/worktrees/.stores/tree-stores/<tree>/`, `_tree_store_env`; DESIGN §6 *The
     stores a view installs from are leerie's*, *Which stores an install may
     share*); read its git metadata (`_measured_git_reads`), the run's mise
@@ -27520,9 +27594,11 @@ def _measurement_grants(st: "State", tree: str | Path,
                 "*Leerie's runs of the repository's commands are confined "
                 "too*). Report this.")
     own = _measure_dir_at(run_dir, t, dirs)
-    # The run's own stores, which every command leerie runs in the run
-    # writes and no other run reads.
-    stores = _stores_home(run_dir) / RUN_STORES_DIRNAME
+    # The run's own stores, which every command leerie runs in a tree no
+    # worker writes writes and no other run reads; in a tree a worker
+    # writes, that side's cache set, which `_tree_store_env` names there
+    # (DESIGN §6 *A tree's stores are the tree's, whoever writes it*).
+    stores = _tree_cache(t) or _stores_home(run_dir) / RUN_STORES_DIRNAME
     _mkdir_private(stores, run_dir)
     rw: list[str] = list(_WORKER_DEVICES) + [str(t), str(own), str(stores)]
     tree_home: Path | None = None
@@ -27898,11 +27974,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # stores a view installs from are leerie's*).
     worker_env = _worker_cache_env(
         worker_env, leerie_dir, _granted_cache_dir(grants, leerie_dir))
-    # In a tree leerie installed for, its per-tree stores are the tree's,
-    # chosen by the one function leerie's own commands there use (DESIGN §6
-    # *A worker started in a tree leerie installed for runs on that tree's
-    # stores*; review round 23 exec M1).
-    if _granted_tree_stores(grants, cwd):
+    # In a tree a worker writes, and in a tree leerie installed for, its
+    # stores are the tree's, chosen by the one function leerie's own
+    # commands there use (DESIGN §6 *A tree's stores are the tree's,
+    # whoever writes it*, *A worker started in a tree leerie installed for
+    # runs on that tree's stores*; review round 23 exec M1).
+    if _tree_cache(cwd) is not None or _granted_tree_stores(grants, cwd):
         _tree_store_env(worker_env, cwd)
     # Every command and hook of a confined worker runs in a domain nested in
     # its CLI's, so none can write into the stream this reads (DESIGN §6 *A
@@ -48363,9 +48440,11 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
     # The repository's own install, as the repository runs it — its
-    # manager's defaults, its `postinstall` — against the run's own stores,
-    # which it writes and no other run reads (DESIGN §6 *The stores a view
-    # installs from are leerie's*).
+    # manager's defaults, its `postinstall` — against the tree's stores: the
+    # run's own, or in a tree a worker writes that side's cache, which it
+    # writes and no other run reads (DESIGN §6 *The stores a view installs
+    # from are leerie's*, *A tree's stores are the tree's, whoever writes
+    # it*).
     # In a committed view, the install's own outputs: the ignored paths its
     # `install` entries make — in a view moved with its install kept, the
     # ones that install made, still there (`_DEPS_KEPT`) — and their state
@@ -58843,7 +58922,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     # A crashed attempt's validity tree goes with its checkout, whether or
     # not this attempt opens one.
     _remove_acceptance_checkout(st, _helper_worktree_path(st, f"{name}-view"))
-    made = await asyncio.to_thread(_acceptance_writer_checkout, st, wt, base)
+    made = await asyncio.to_thread(_acceptance_writer_checkout, st, wt, base,
+                                   writer="acceptance_writer")
     if made.startswith("failed"):
         out["reason"] = made
         return out
@@ -59333,13 +59413,29 @@ def _make_clone_git_dir(src: Path, wt: Path, rev: str) -> bool:
     return True
 
 
-def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
+def _acceptance_writer_checkout(st: "State", wt: Path, base: str, *,
+                                writer: str | None) -> str:
     """Create the writer's checkout of `base` at `wt` — "clone", "worktree",
     or "failed: <why>". A ref-less clone of the run's own repository
     (`_ref_less_clone`), so the only commit the writer can reach is the own
     start and its history: no branch, tag or earlier run's branch (DESIGN §8
     *The validity tree is the run's own start*). Fails open to a detached
-    worktree of the run's repository (its refs visible), logged."""
+    worktree of the run's repository (its refs visible), logged. `writer`
+    (keyword-only, no default: no caller can leave it out) is the kind of
+    worker that will write the checkout, whose side's cache set every
+    process in it then runs on (`_CLONE_CACHES`, `_tree_cache`), or None
+    for a checkout only leerie uses (DESIGN §6 *A tree's stores are the
+    tree's, whoever writes it*)."""
+    _CLONE_CACHES.pop(os.path.realpath(wt), None)
+    kind = _writer_checkout(st, wt, base)
+    if writer is not None and not kind.startswith("failed"):
+        _CLONE_CACHES[os.path.realpath(wt)] = _worker_cache_dir(st.run_dir,
+                                                                writer)
+    return kind
+
+
+def _writer_checkout(st: "State", wt: Path, base: str) -> str:
+    """`_acceptance_writer_checkout`'s checkout, without its record."""
     # The own start was read in the user's checkout; the run's repository
     # (DESIGN §6 *The run's own repository*) fetches it if it lacks it.
     _run_repo_commit(st, base, "refs/leerie/own-start")
@@ -59435,6 +59531,7 @@ def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
     _rmtree_owned(wt)
     _rmtree_owned(_clone_git_dir(wt))
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
+    _CLONE_CACHES.pop(os.path.realpath(wt), None)
 
 
 async def phase_acceptance_write(task: str, st: "State", caps: dict,
@@ -61044,7 +61141,8 @@ async def _acceptance_surrogate_fix(st: "State", caps: dict, models: dict,
                                     ) -> dict | None:
     """`_acceptance_surrogate`'s work in its checkout `wt`."""
     log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
-    if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own)
+    if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own,
+                                writer="surrogate_fixer")
             ).startswith("failed"):
         return None
     task = st.data.get("task") or ""
@@ -65518,7 +65616,9 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             _confined_argv(grants, argv, refusal_fd=refusal_fd),
             cwd=str(tree), stdin=subprocess.DEVNULL, capture_output=True,
             text=text, timeout=timeout, check=False, pass_fds=(refusal_fd,),
-            env=_grant_env(_ts_script_env(), grants))
+            # The tree's stores, as every command leerie runs there
+            # (`_tree_store_env`).
+            env=_grant_env(_tree_stores_for(_ts_script_env(), tree), grants))
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.
@@ -65833,12 +65933,14 @@ def _falsifier_needs_reask(result: dict | None, activity: dict) -> bool:
             and not (activity.get("created") and activity.get("ran")))
 
 
-def _falsifier_checkout(st: "State", name: str, sha: str) -> Path | None:
+def _falsifier_checkout(st: "State", name: str, sha: str, *,
+                        writer: str | None) -> Path | None:
     """A ref-less checkout of `sha` (the writers' own kind, so no later fix
-    on another branch is reachable), or None."""
+    on another branch is reachable), or None. `writer` as
+    `_acceptance_writer_checkout`'s."""
     wt = _helper_worktree_path(st, name)
     _remove_acceptance_checkout(st, wt)
-    kind = _acceptance_writer_checkout(st, wt, sha)
+    kind = _acceptance_writer_checkout(st, wt, sha, writer=writer)
     if kind.startswith("failed"):
         log(f"  delivery detection: no {name} checkout ({kind})")
         return None
@@ -66440,7 +66542,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     trees: list[Path] = []
     confirm_tree = await asyncio.to_thread(
-        _falsifier_checkout, st, "falsifier-confirm", sha)
+        _falsifier_checkout, st, "falsifier-confirm", sha, writer=None)
     try:
         if confirm_tree is None:
             return {"enabled": False, "skipped": "no checkout of the final "
@@ -66480,7 +66582,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         lanes: asyncio.Queue = asyncio.Queue()
         for n in range(n_lanes):
             lane = await asyncio.to_thread(
-                _falsifier_checkout, st, f"falsifier-lane{n}", sha)
+                _falsifier_checkout, st, f"falsifier-lane{n}", sha,
+                writer="falsifier")
             if lane is None:
                 continue
             trees.append(lane)
@@ -72373,7 +72476,7 @@ async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
     try:
         for side, sha in (("post", post_sha), ("pre", pre_sha)):
             wt = await asyncio.to_thread(_falsifier_checkout, st,
-                                         f"flip-{side}", sha)
+                                         f"flip-{side}", sha, writer=None)
             if wt is None:
                 return out
             trees[side] = wt
@@ -73554,11 +73657,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                                  for p_ in probe_sets):
                         # A probe confirmed through the browser suite runs
                         # through it in the fixer's self-check, over a copy of
-                        # staging that shares its ignored paths and its tree
-                        # stores: the suite's prerequisites (a code generator,
-                        # the runner's browser) set staging up, as they set up
-                        # the checkout it was confirmed in (DESIGN §8 *A probe
-                        # is re-run through the channel that confirmed it*).
+                        # staging that shares its ignored paths and its stores,
+                        # the fixers' cache set: the suite's prerequisites (a
+                        # code generator, the runner's browser) set staging up,
+                        # as they set up the checkout it was confirmed in
+                        # (DESIGN §8 *A probe is re-run through the channel
+                        # that confirmed it*). Preparation, not a measurement
+                        # (DESIGN §6 *A tree's stores are the tree's, whoever
+                        # writes it*).
                         await _ci_prepare(staging, [_browser_suite_rec(suite)],
                                           st, caps, "redrive", done=suite_prepared)
                     if shown or probe_sets:
@@ -83437,8 +83543,8 @@ def main() -> int | None:
     _record_run_id_for_launcher(st.run_id)
     for sub in ("", "subtasks", NOTES_DIRNAME, "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
-    # Before any install: every command leerie runs installs into the run's
-    # own stores, which no other run reads (DESIGN §6 *The stores a view
+    # Before any install: every command leerie runs in a tree no worker
+    # writes installs into the run's own stores, which no other run reads (DESIGN §6 *The stores a view
     # installs from are leerie's*).
     _leerie_stores(os.environ, st.run_dir)
     # mise refuses every configuration file it was not told to trust — a

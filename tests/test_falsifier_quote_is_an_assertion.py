@@ -206,8 +206,10 @@ PY_SETUP_THROWS = ("from calc import add\n\n\n"
 def _py_gates(leerie, tmp_path, monkeypatch, quote: str, src: str) -> dict:
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
-    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head)
-    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head)
+    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head,
+                                      writer="falsifier")
+    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head,
+                                         writer=None)
     monkeypatch.setattr(leerie, "_probe_case_facts_placed", _placed(
         lambda tree, probe, case, **_kw: _facts_for(Path(probe).read_text())))
     p = lane / PY_PROBE_REL
@@ -306,8 +308,10 @@ def _vitest_gates(leerie, tmp_path, monkeypatch, probe: str,
     head = _git(repo, "rev-parse", "HEAD")
     monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
     st = _st(leerie, tmp_path, repo, head)
-    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head)
-    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head)
+    lane = leerie._falsifier_checkout(st, "falsifier-lane0", head,
+                                      writer="falsifier")
+    confirm = leerie._falsifier_checkout(st, "falsifier-confirm", head,
+                                         writer=None)
     p = lane / I8_REL
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(probe)

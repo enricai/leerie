@@ -11,9 +11,12 @@ two functions that never agreed on a tree.
 
 The rule: for a tree leerie installed for, the environment `_invoke` gives a
 worker there and the one `_run_streaming` gives leerie's commands there name
-the same per-tree store for every `_TREE_STORE_VARS` variable, the grant
-names the stores as it names the tree, and the worker's home has the tree
-home layer on top (DESIGN §6 *Every confined process has its own home*, 4:
+the same store for every store variable — in a tree no worker writes, the
+tree's own for every `_TREE_STORE_VARS` variable; in a tree a worker writes
+(a falsifier lane, the writer's and the surrogate's checkouts), the
+worker's side cache for every one (DESIGN §6 *A tree's stores are the
+tree's, whoever writes it*) —, the grant names the tree's stores as it
+names the tree, and the worker's home has the tree home layer on top (DESIGN §6 *Every confined process has its own home*, 4:
 no variable moves a user base since). Then, executed where isolation works:
 a worker's confined process runs by name a script an install put in
 `~/.local/bin`, and a real
@@ -95,51 +98,86 @@ def _spawn(leerie, run, tree: Path, grants) -> None:
     asyncio.run(go())
 
 
-def _lane(run) -> Path:
-    return run["wts"]["wt-a"]
+def _lane(leerie, run, writer: str = "falsifier") -> Path:
+    """A falsifier lane as `_falsify_items` makes one: a ref-less clone
+    made for the worker that writes it."""
+    from tests.test_tree_decides_its_stores import _clone
+    return _clone(leerie, run, "falsifier-lane0", writer)
 
 
 # --- the rule ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("schema_key,tools,access", [
-    ("falsifier", "ACT_TOOLS", "rw"),
-    ("acceptance_writer", "ACT_TOOLS", "rw"),
-    ("surrogate_fixer", "ACT_TOOLS", "rw"),
-    ("set_auditor", "SATISFIED_PROBE_TOOLS", "ro"),
-])
-def test_worker_and_install_name_the_same_tree_stores(
-        leerie, run, stores_env, installed, monkeypatch, schema_key, tools,
-        access):
-    lane = _lane(run)
-    installed(lane)
-    stores = run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / lane.name
-    g = _grants(leerie, run, lane, schema_key, getattr(leerie, tools))
+def test_a_reader_and_the_install_name_the_same_tree_stores(
+        leerie, run, stores_env, installed, monkeypatch):
+    """A tree no worker writes (the set audit's, the planning worktree):
+    leerie's install there writes the tree's own per-tree stores, and the
+    worker that reads it has its per-tree variables there, read."""
+    from tests.test_worker_confinement import RUN_ID
+    tree = run["wts"][f"{RUN_ID}-view-staging"]
+    installed(tree)
+    stores = (run["run_dir"] / "worktrees" / ".stores" / "tree-stores"
+              / tree.name)
+    g = _grants(leerie, run, tree, "set_auditor",
+                leerie.SATISFIED_PROBE_TOOLS)
     real = os.path.realpath(stores)
-    assert real in {os.path.realpath(p) for p in getattr(g, access)}
-    other = "ro" if access == "rw" else "rw"
-    assert real not in {os.path.realpath(p) for p in getattr(g, other)}
-
-    wenv = _worker_env(leerie, run, lane, g)
-    install_env = leerie._tree_stores_for(os.environ, lane)
+    assert real in {os.path.realpath(p) for p in g.ro}
+    assert real not in {os.path.realpath(p) for p in g.rw}
+    wenv = _worker_env(leerie, run, tree, g)
+    install_env = leerie._tree_stores_for(os.environ, tree)
     cache = leerie._granted_cache_dir(g, run["run_dir"])
     for var in leerie._TREE_STORE_VARS:
         # The install's value, and not the worker cache's: the two sources
         # disagree by construction.
         assert wenv[var] == install_env[var], var
         assert Path(wenv[var]).is_relative_to(stores), var
-        assert not Path(wenv[var]).is_relative_to(cache), var
     # Every other store stays the worker's side cache, never leerie's.
     for var in (set(leerie._STORE_VARS) - leerie._TREE_STORE_VARS):
         assert Path(wenv[var]).is_relative_to(cache), var
-    # No variable moves a user base (DESIGN §6 *Every confined process has
-    # its own home*, 4): what the install kept beneath `~` is the tree home
-    # layer, which the worker's own home has on top once it exists.
-    assert "PYTHONUSERBASE" not in wenv
+    _home_layer_on_top(leerie, run, tree, "set_auditor",
+                       leerie.SATISFIED_PROBE_TOOLS, stores)
+
+
+@pytest.mark.parametrize("schema_key,cache", [
+    ("falsifier", "HELD_OUT_CACHE_DIR"),
+    ("acceptance_writer", "HELD_OUT_CACHE_DIR"),
+    ("surrogate_fixer", "WORKER_CACHE_DIR"),
+])
+def test_a_writer_and_the_install_name_the_same_stores(
+        leerie, run, stores_env, installed, monkeypatch, schema_key, cache):
+    """A tree a worker writes: the worker and leerie's install there both
+    run on that worker's side cache, every store variable included; the
+    worker writes the tree's own stores, whose `home` is the tree home
+    layer (DESIGN §6 *A tree's stores are the tree's, whoever writes it*)."""
+    lane = _lane(leerie, run, schema_key)
+    installed(lane)
+    stores = (run["run_dir"] / "worktrees" / ".stores" / "tree-stores"
+              / lane.name)
+    g = _grants(leerie, run, lane, schema_key, leerie.ACT_TOOLS)
+    real = os.path.realpath(stores)
+    assert real in {os.path.realpath(p) for p in g.rw}
+    side = run["run_dir"] / "worktrees" / ".stores" / getattr(leerie, cache)
+    assert leerie._granted_cache_dir(g, run["run_dir"]) == side
+    wenv = _worker_env(leerie, run, lane, g)
+    install_env = leerie._tree_stores_for(os.environ, lane)
+    for var in leerie._STORE_VARS:
+        assert wenv[var] == install_env[var], var
+        assert Path(wenv[var]).is_relative_to(side), var
+    _home_layer_on_top(leerie, run, lane, schema_key, leerie.ACT_TOOLS,
+                       stores)
+
+
+def _home_layer_on_top(leerie, run, tree: Path, schema_key: str, tools: str,
+                       stores: Path) -> None:
+    """No variable moves a user base (DESIGN §6 *Every confined process has
+    its own home*, 4): what the install kept beneath `~` is the tree home
+    layer, which the worker's own home has on top once it exists."""
+    g = _grants(leerie, run, tree, schema_key, tools)
+    assert "PYTHONUSERBASE" not in _worker_env(leerie, run, tree, g)
     layer = stores / leerie.TREE_HOME_NAME
     assert all(o.lowers[:1] != (str(layer),) for o in g.overlays)
     layer.mkdir(parents=True, exist_ok=True)
-    g2 = _grants(leerie, run, lane, schema_key, getattr(leerie, tools))
+    g2 = _grants(leerie, run, tree, schema_key, tools)
     for o in g2.overlays:
         if o.home:
             assert o.lowers[0] == str(layer)
@@ -149,7 +187,7 @@ def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
         leerie, run, stores_env, monkeypatch):
     """A subtask's tree, which leerie measures only through its committed
     view: the worker's own installs land in its side's cache."""
-    lane = _lane(run)
+    lane = run["wts"]["wt-a"]
     assert os.path.realpath(lane) not in leerie._DEPS_INSTALLED
     g = _grants(leerie, run, lane, "implementer", leerie.ACT_TOOLS)
     stores = os.path.realpath(run["run_dir"] / "worktrees" / ".stores" / "tree-stores" / lane.name)
@@ -172,7 +210,7 @@ def test_a_worker_runs_a_script_leeries_install_put_in_the_tree(
     falsifier's own confined process, with the environment `_invoke` gives
     it, runs it by name in that tree, and the real home holds nothing."""
     monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
-    lane = _lane(run)
+    lane = _lane(leerie, run)
     st = _St(run["user"], run["run_dir"])
     log = run["run_dir"] / "logs" / "tree-install.log"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +264,7 @@ def test_a_falsifier_runs_the_pytest_leeries_pip_install_put_in_its_lane(
     # The test runner's own import path is no part of a run's environment:
     # pip would count what it finds there as installed.
     monkeypatch.delenv("PYTHONPATH", raising=False)
-    lane = _lane(run)
+    lane = _lane(leerie, run)
     st = _St(run["user"], run["run_dir"])
     st.data["provision"] = {"recipe": [
         {"kind": "install",

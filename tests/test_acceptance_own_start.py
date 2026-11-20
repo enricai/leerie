@@ -435,7 +435,8 @@ def test_a_failed_clone_falls_back_to_a_worktree(leerie, tmp_path,
         return real(argv, *a, **k)
     monkeypatch.setattr(leerie.subprocess, "run", run)
     wt = leerie._helper_worktree_path(st, "acceptance-9")
-    assert leerie._acceptance_writer_checkout(st, wt, own) == "worktree"
+    assert leerie._acceptance_writer_checkout(
+        st, wt, own, writer="acceptance_writer") == "worktree"
     assert "detached worktree" in capsys.readouterr().out
     assert _git(wt, "rev-parse", "HEAD") == own
     leerie._remove_acceptance_checkout(st, wt)
