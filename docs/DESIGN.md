@@ -16685,7 +16685,7 @@ ignore file — read through the run's settings (above). One function
 builds every listing of untracked files (`_untracked_cmd`; in shell
 `leerie_untracked`): I1's checker, I2's bracket, the one restore and its
 write bits, the self-check's copy and the ignored paths it shares, the
-acceptance writer's collection, the surrogate's change check and the
+acceptance writer's collection, the commit of the surrogate's fix and the
 checkout sentinel. No other `ls-files --others` exists in leerie, and no
 `git status` that lists untracked files (`tests/test_one_ignore_rule.py`,
 derived from the source). The root cause: two definitions. Round 16
@@ -17047,7 +17047,8 @@ line — the case names are given to the implementer in a held-back round
 anyway. The acceptance evaluation, the set audit, the surrogate witness
 and the falsifier (its `.leerie-falsifier/` leads and the confirm
 checkout) all work in disposable checkouts that are removed and never
-committed from.
+committed from onto a branch: the surrogate's fix is committed by leerie
+on no branch, only for the witness's tree.
 
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"
@@ -19191,12 +19192,18 @@ trigger ever drops a case, a set or a residual on its own:
 - **The surrogate witness**, only when neither of the above fired: one
   independent `surrogate_fixer` per gate fixes the report in a ref-less
   clone of the own start (the writer's checkout) without ever seeing a set
-  — its `Read` denies cover them as they cover the fixers — and each
-  remaining failing set is run on its tree, confirmed under B*. A set that
+  — its `Read` denies cover them as they cover the fixers. Leerie commits
+  what it left there — a commit of leerie's own, on no branch, of the
+  files it changed or removed and the new files the ignore rule keeps — and removes
+  the clone; each remaining failing set is run, confirmed under B*, in a
+  tree of that commit installed from its committed manifests (*Every
+  measurement reads the committed view*). An install or build output the
+  surrogate left ignored is not its fix; a manifest or lockfile it changed is, and
+  the witness's tree installs from it. A set that
   still fails on an independent fix is a trigger and nothing more: the
   surrogate is one fix, not the contract, so a failure there never drops a
   case, never types a set broken and never stops the residual. The set is
-  then audited on the surrogate's tree, and its typed cases (if any) go
+  then audited in that tree, and its typed cases (if any) go
   into the note. Q6/R7 ran the witness on 11 failing sets: all 6
   broken ones failed on the independent fix (both held-out sets the other
   triggers missed among them), and so did 4 of the 5 sets that were

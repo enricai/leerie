@@ -12444,11 +12444,19 @@ def _bring_commit(tree: str | Path, sha: str) -> None:
     run_repo = _run_repo_for_tree(tree)
     if run_repo is None:
         return
+    if _git_sync(["--git-dir", str(run_repo), "cat-file", "-e",
+                  f"{sha}^{{commit}}"], timeout=30).returncode == 0:
+        return
+    _bring_commit_from(run_repo, _tree_repo_of(tree), sha)
+
+
+def _bring_commit_from(run_repo: Path, tr: Path | None, sha: str) -> None:
+    """`_bring_commit` from the git directory `tr` (a tree repository, a
+    ref-less clone's leerie-owned git directory) into `run_repo`."""
     at = ["--git-dir", str(run_repo)]
     if _git_sync([*at, "cat-file", "-e", f"{sha}^{{commit}}"],
                  timeout=30).returncode == 0:
         return
-    tr = _tree_repo_of(tree)
     if tr is None:
         raise RunRepoError(f"{sha} is in no repository leerie can take from")
     f = _git_sync([*at, "fetch", "--quiet", "--no-tags",
@@ -59328,6 +59336,78 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
     return "worktree"
 
 
+def _commit_checkout_change(st: "State", wt: Path, parent: str,
+                            message: str) -> str | None:
+    """A commit of leerie's, on no branch, of what a worker left in its
+    ref-less clone `wt` of `parent` (`_ref_less_clone`): the tracked files
+    it changed or removed and the untracked files the one ignore rule keeps
+    (`_untracked_cmd`), both read against the clone's index, which is
+    leerie's (`_make_clone_git_dir`: `parent`'s tree, its stat data taken
+    before any worker ran — so only a file whose stat changed is read
+    again), never the clone's own `.git`. The commit is fetched into the run
+    repository and kept there under `refs/leerie/kept/<sha>`
+    (`_bring_commit_from`), so a view of it can be made there (DESIGN §8
+    *Every measurement reads the committed view*). "" when its tree is
+    `parent`'s — nothing changed — and None when git cannot say or `wt` is
+    no ref-less clone (a committing worker never works in a worktree of the
+    run repository: `_tree_git_dirs` stops the run first)."""
+    loc = _run_tree_location(wt)
+    if not (isinstance(loc, tuple) and loc[0] == loc[1]
+            and loc[1].parent.name == CLONE_GITS_NAME):
+        return None
+
+    def _git(*args: str, stdin: bytes | None = None
+             ) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *prefix, *args], input=stdin,
+                              capture_output=True, check=False, env=env,
+                              timeout=300)
+    try:
+        prefix, env = _git_view(wt)
+        env = {**(env or os.environ), **_SYNTHETIC_GIT_ENV}
+        was = _git("rev-parse", "--verify", "-q", f"{parent}^{{tree}}")
+        held = _git("write-tree")
+        if was.returncode != 0:
+            return None
+        # Only leerie writes this index; it is read again from `parent` if
+        # it ever holds anything else.
+        if held.returncode != 0 or held.stdout.strip() != was.stdout.strip():
+            if _git("read-tree", parent).returncode != 0:
+                return None
+        _git("update-index", "-q", "--refresh")
+        # Never a status inside a submodule's checkout, whose config and
+        # filters its worker wrote.
+        changed = _git("diff-files", "-z", "--name-only",
+                       "--ignore-submodules=dirty")
+        uargs, _uenv = _untracked_cmd(wt)
+        new = subprocess.run(["git", *uargs], capture_output=True,
+                             check=False, env=env, timeout=300)
+        if changed.returncode != 0 or new.returncode != 0:
+            return None
+        paths = [p for p in changed.stdout.split(b"\0") if p]
+        paths += [p for p in new.stdout.split(b"\0") if p]
+        if paths and _git("update-index", "--add", "--remove", "--replace",
+                          "-z", "--stdin",
+                          stdin=b"\0".join(paths) + b"\0").returncode != 0:
+            return None
+        tree = _git("write-tree")
+        if tree.returncode != 0:
+            return None
+        if tree.stdout.strip() == was.stdout.strip():
+            return ""
+        # Leerie's commit, never signed: a signing setting carried in from
+        # the user's config would fail it where no key is.
+        made = _git("-c", "commit.gpgSign=false", "commit-tree",
+                    tree.stdout.decode().strip(), "-p", parent,
+                    "-m", message)
+        if made.returncode != 0:
+            return None
+        sha = made.stdout.decode().strip()
+        _bring_commit_from(_run_repo(st), loc[1], sha)
+        return sha
+    except (OSError, ValueError, subprocess.SubprocessError, RunRepoError):
+        return None
+
+
 def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
     """Remove a writer checkout, whichever kind it is, and a ref-less
     clone's leerie-owned git directory with it."""
@@ -60925,13 +61005,26 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
                                 efforts: dict, own: str) -> dict | None:
     """One test-blind `surrogate_fixer` at the run's own start (Q6/R7): a
     ref-less clone like the writer's, the report copied in, a full fix of
-    the report's contract left uncommitted in the tree. It never sees a set
-    (its `Read` denies cover them). `{dir, env}` or None when it could not
-    run or changed nothing — then it witnesses nothing. In a Prisma/PostgreSQL
-    repo its session has a database of its own (`claude_p(db=True)`)."""
+    the report's contract left uncommitted in the tree, which leerie then
+    commits on no branch (`_commit_checkout_change`) and removes. It never
+    sees a set (its `Read` denies cover them). `{rev}`, the fix's commit,
+    or `{abstained}` / None when it could not run or changed nothing — then
+    it witnesses nothing. In a Prisma/PostgreSQL repo its session has a
+    database of its own (`claude_p(db=True)`)."""
     wt = _helper_worktree_path(st, "acceptance-surrogate")
-    log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
     _remove_acceptance_checkout(st, wt)
+    try:
+        return await _acceptance_surrogate_fix(st, caps, models, efforts,
+                                               own, wt)
+    finally:
+        _remove_acceptance_checkout(st, wt)
+
+
+async def _acceptance_surrogate_fix(st: "State", caps: dict, models: dict,
+                                    efforts: dict, own: str, wt: Path
+                                    ) -> dict | None:
+    """`_acceptance_surrogate`'s work in its checkout `wt`."""
+    log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
     if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own)
             ).startswith("failed"):
         return None
@@ -60941,7 +61034,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
             str(wt), st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
             label_prefix="acceptance-surrogate", log_prefix="acceptance"):
-        return {"dir": wt, "abstained": "dependency install failed"}
+        return {"abstained": "dependency install failed"}
     scope = st.data.get("defect_scope") or {}
     gt = scope.get("ground_truth") or {}
     user = "\n".join([
@@ -60966,17 +61059,19 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
             effort=efforts.get("surrogate_fixer"),
             sid="acceptance-surrogate", db=True)
     except (WorkerError, subprocess.TimeoutExpired) as e:
-        return {"dir": wt, "abstained": _brief_worker_exc(e)}
+        return {"abstained": _brief_worker_exc(e)}
     # Only the report copies made above go; never a tracked file.
     _unplace(copied, wt)
-    changed = subprocess.run(["git", *_tree_git_args(wt), "status",
-                              "--porcelain", "--untracked-files=no"],
-                             capture_output=True, text=True, check=False)
-    made = _untracked_listing(wt)
-    if (changed.returncode != 0 or made is None
-            or not (changed.stdout.strip() or made)):
-        return {"dir": wt, "abstained": "the independent fix changed nothing"}
-    return {"dir": wt}
+    # What it measures is what was committed: a file it left ignored (a
+    # build output, an install) is not the fix, and the witness's tree
+    # makes its own from the committed sources and manifests.
+    rev = await asyncio.to_thread(_commit_checkout_change, st, wt, own,
+                                  "leerie: the surrogate's fix")
+    if rev is None:
+        return {"abstained": "the independent fix could not be committed"}
+    if not rev:
+        return {"abstained": "the independent fix changed nothing"}
+    return {"rev": rev}
 
 
 async def _acceptance_rewrite_set(k: int, task: str, st: "State", caps: dict,
@@ -61053,6 +61148,10 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
     task = st.data.get("task") or ""
     rev = final_sha or "HEAD"
     sur: dict = {}
+    # The witness's tree: a view of the surrogate's commit, installed from
+    # its committed manifests (DESIGN §8 *Every measurement reads the
+    # committed view*), made once per gate and closed with it.
+    sur_view = contextlib.AsyncExitStack()
     todo = [i for i in sorted(results)
             if i in by_index and not results[i].get("passed")
             and not results[i].get("unmeasured")
@@ -61106,16 +61205,26 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                     sur.update(await _acceptance_surrogate(
                         st, caps, models, efforts, own) or {"abstained":
                                                             "not set up"})
+                    if sur.get("rev"):
+                        view = await sur_view.enter_async_context(
+                            _acceptance_tree(st, caps, sur["rev"],
+                                             "acceptance-surrogate-view",
+                                             "surrogate-view"))
+                        if view is None:
+                            sur["abstained"] = ("the independent fix's tree "
+                                                "could not be set up")
+                        else:
+                            sur["view"] = view
                     if sur.get("abstained"):
                         log(f"  acceptance: surrogate witness abstained "
                             f"({sur['abstained']})")
-                if sur.get("dir") and not sur.get("abstained"):
+                if sur.get("view"):
                     witness = await _acceptance_run_placed(
-                        st, caps, Path(sur["dir"]), [s_],
+                        st, caps, sur["view"], [s_],
                         f"surrogate-{idx}", confirm=True)
                     if witness and witness[0]["failing_files"]:
                         sur_audit = await _acceptance_audit_in(
-                            st, caps, models, efforts, Path(sur["dir"]), s_,
+                            st, caps, models, efforts, sur["view"], s_,
                             label=f"surrogate-audit-{idx}", harness_rev=own,
                             tree_note="an independent fix of the report, "
                             "made without seeing this set")
@@ -61183,8 +61292,7 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             results[idx] = res
             _save()
     finally:
-        if sur.get("dir"):
-            _remove_acceptance_checkout(st, Path(sur["dir"]))
+        await sur_view.aclose()
     return [results.get(r["index"], r) for r in final]
 
 
