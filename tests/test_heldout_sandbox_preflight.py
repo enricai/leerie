@@ -71,7 +71,18 @@ def _fake_run(leerie, monkeypatch, *, rc: int = 0, stderr: str = "",
 def _good(leerie) -> dict:
     return {"ipc_ns": "ipc:[1]", "interfaces": ["lo"], "tmp_private": True,
             "shm_private": True, "erofs": True, "add_key": True,
-            "placed": True}
+            "placed": True, "home_written": True}
+
+
+def _own_home(leerie, monkeypatch, tmp_path) -> None:
+    """A confined home, as every real run has (`/home/leerie`). Left to the
+    environment, `_confined_home()` is "" whenever conftest's HOME lies
+    beneath /tmp (CI's TMPDIR), and the gate's home check never runs; with
+    TMPDIR elsewhere it runs. Pinned, the report is judged the same way on
+    every host."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(leerie, "_confined_home", lambda env=None: str(home))
 
 
 @pytest.mark.parametrize("line,fix", [
@@ -109,9 +120,11 @@ def test_fly_is_told_it_does_not_start(leerie, monkeypatch, tmp_path,
     ("erofs", "EACCES", "not EROFS"),
     ("add_key", "added", "add_key is allowed"),
     ("placed", False, "placed file is not in the view"),
+    ("home_written", False, "its home is not writable"),
 ])
 def test_a_sandbox_missing_a_property_stops_the_run(
         leerie, monkeypatch, tmp_path, capsys, field, value, named):
+    _own_home(leerie, monkeypatch, tmp_path)
     rep = _good(leerie)
     rep[field] = (os.readlink("/proc/self/ns/ipc") if value == "SAME"
                   else value)
@@ -125,6 +138,7 @@ def test_a_sandbox_missing_a_property_stops_the_run(
 
 def test_a_good_sandbox_turns_isolation_on_and_cleans_up(
         leerie, monkeypatch, tmp_path):
+    _own_home(leerie, monkeypatch, tmp_path)
     seen: list = []
     _fake_run(leerie, monkeypatch, report=_good(leerie), seen=seen)
     # The network probe runs after the sandbox's, before isolation is on
