@@ -21,6 +21,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -69,11 +70,26 @@ def _held(pid: int, inodes: set[int]) -> set[int]:
     return held
 
 
-def test_the_relay_closes_the_refusal_and_taken_descriptors(tmp_path):
+@pytest.fixture
+def relay_target_dir(leerie) -> Iterator[Path]:
+    """Where a relay's target socket lives: the egress proxy's own
+    placement, `_new_private_tmp`'s `/tmp/l/<prefix><random>/` (DESIGN §6
+    *No leerie service is reachable by a path from a process it does not
+    serve*), short whatever the state root or the test's base directory
+    (DESIGN §6 *A confined command's scratch is short and private*). A
+    socket under `tmp_path` passed `sun_path`'s 107 bytes once `--basetemp`
+    was long, a path no relay is ever given. Removed at teardown."""
+    d = leerie._new_private_tmp("relay-test-")
+    yield d
+    leerie._rmtree_owned(d)
+    leerie._PRIVATE_TMPS.pop(str(d), None)
+
+
+def test_the_relay_closes_the_refusal_and_taken_descriptors(relay_target_dir):
     """The real `serve_relays`, in a process of its own given both
     descriptors as the shim holds them: once it relays a connection, it
     holds neither."""
-    target = tmp_path / "t.sock"
+    target = relay_target_dir / "t.sock"
     up = socket.socket(socket.AF_UNIX)
     up.bind(str(target))
     up.listen(1)
@@ -150,7 +166,7 @@ def test_the_shim_is_non_dumpable_before_it_forks_the_relay(monkeypatch):
 
 
 @needs_isolation
-def test_the_running_relay_is_non_dumpable(tmp_path):
+def test_the_running_relay_is_non_dumpable(tmp_path, relay_target_dir):
     """The real shim, `--isolate --egress`, with a refusal descriptor
     (`--taken-fd` is `--sandbox`'s alone): while the
     command runs, its parent (this process, which owns the shim's user
@@ -160,7 +176,7 @@ def test_the_running_relay_is_non_dumpable(tmp_path):
     if str(tmp_path.resolve()).startswith("/tmp/"):
         pytest.skip("grants beneath /tmp are carried, not bound: run with "
                     "--basetemp outside /tmp")
-    egress = tmp_path / "egress.sock"
+    egress = relay_target_dir / "egress.sock"
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(str(egress))
     srv.listen(1)
