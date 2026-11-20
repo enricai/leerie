@@ -6679,12 +6679,15 @@ The mechanism:
   review round 39 (isolation, R1) it said so through the refusal
   descriptor, and the committed tree turned into exit 78 on every
   `resume`, because the evaluation runs again over the same tree. Now:
-  - every caller that places a file checks its path first by the shim's
-    own rule, `_lexists_beneath`: a file at the path, or a link or a
-    non-directory on any component on its way, makes the path taken (the
-    acceptance gate records it `path_in_use`, the set unmeasured; the set
-    audit, the parse check and the falsifier's confirm skip it), and the
-    file is never handed to the shim;
+  - every caller that places a file over a tree a worker committed checks
+    its path first by the shim's own rule, `_lexists_beneath`: a file at
+    the path, or a link or a non-directory on any component on its way,
+    makes the path taken (the acceptance gate records it `path_in_use`,
+    the set unmeasured; the set audit, the parse check and the falsifier's
+    confirm skip it), and the file is never handed to the shim; the
+    writer's validation, placing a set over the tree leerie made at the
+    own start, checks none, and reads the shim's report as a run it could
+    not make;
   - the shim itself reports a path it finds taken (`EEXIST`, `ENOTDIR`,
     `ELOOP`) on a descriptor of its own, `--taken-fd`, never on the
     refusal descriptor, and does not run the command; leerie raises
@@ -18295,7 +18298,24 @@ bar per task, not re-sampled each run*.) The writer's checkout is a clone whose 
 reachable commit is the own start — no branch, tag or run branch — so
 neither a later commit nor an earlier run's fix can steer the tests, and
 everything the writer runs runs on that base tree (fail-open to a plain
-worktree, logged, when the clone cannot be made).
+worktree, logged, when the clone cannot be made). It is where the writer
+works, never where its set is measured: the set's files (its declared
+tests and their support files) are read out of it, and Python validates
+them in a tree leerie makes at the own start and installs itself, each run
+placing them — and nothing else the writer left — in its sandbox as
+evaluation does (*Every measurement reads the committed view*). A file
+validation drops is no longer placed: the rest is validated again without
+it, so a valid set was validated beside exactly what it carries — and a
+defect file that failed only beside the dropped one now passes, as it will
+everywhere the set runs, and counts among the defect files that pass on base
+(the writer's retry, and the no-work verdict, read them). A declared file that cannot be read out (a link, a file past the size
+limit) is dropped; a support file that cannot be is never placed, and a run
+without it decides nothing about the set but which declared files drop: a
+pass that ends any other way discards the set for it, and only a pass that
+drops files and otherwise holds goes on — the set kept if those drops leave
+the file behind. Once a
+defect file went unread or a support file was missing, no defect file
+passing on base is taken for the defect being fixed.
 
 **Written whenever the defect-scope audit ran.** The sets used to be
 written only when the audit said `applicable`. Measured over 152
@@ -19208,8 +19228,9 @@ residual (below). Only the audit types a set broken; M1/M2 and the
 surrogate are triggers only.
 
 **The writer gets one more try when nothing fails at the own start.**
-When every declared defect file ran and passed on the own start — the set
-cannot discriminate as written — the writer is asked once more in the
+When no defect file fails on the own start — every one that ran passed,
+none went unread and no file it was run beside was missing; the set cannot
+discriminate as written — the writer is asked once more in the
 same checkout, its files still there, with the runner's per-case result
 for its defect files: rewrite them to fail for the reported reason if the
 defect still reproduces here, or say in `notes` that it does not and
