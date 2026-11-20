@@ -28,7 +28,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REAL_HOME, XDG_BASE_DIRS  # noqa: F401
+from tests.conftest import (  # noqa: F401
+    REAL_HOME, XDG_BASE_DIRS, leerie_container_drop)
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
     _St, pytestmark, run)
 
@@ -395,15 +396,7 @@ def test_the_real_container_gives_each_process_its_own_home(tmp_path):
                              "leerie-container")
     if Path("/etc/apparmor.d/leerie-container").is_file():
         sec += ["--security-opt", f"apparmor={profile}"]
-    # The entry's own drop: rootless maps outer root onto leerie (the home
-    # stays root-owned), rootful switches uid after chowning the home.
-    drop = ('unshare --user --map-user="$(id -u leerie)" '
-            '--map-group="$(id -g leerie)"' if rootless.is_file() else
-            "chown -R leerie: /home/leerie /leerie-toolchains && "
-            "runuser -u leerie --")
-    # Owned as the home is: by root under rootless (outer root is the inner
-    # leerie), by leerie's uid under rootful.
-    owner = ("uid=0,gid=0" if rootless.is_file() else "uid=1000,gid=1000")
+    drop, owner = leerie_container_drop()
     tmpfs = f"rw,exec,size=1g,{owner}"
     r = subprocess.run(
         ["nerdctl", "run", "--rm", *sec, "--user", "0",
@@ -411,7 +404,6 @@ def test_the_real_container_gives_each_process_its_own_home(tmp_path):
          "-v", f"{REPO_ROOT}:/src:ro", "-v", f"{tmp_path}:/out:ro",
          "--tmpfs", f"/leerie-state:{tmpfs}",
          image, "-c",
-         "mkdir -p /leerie-toolchains/home /leerie-toolchains/mise && "
          f"{drop} env HOME=/home/leerie "
          "LEERIE_TOOLCHAIN_HOME=/leerie-toolchains/home "
          "MISE_DATA_DIR=/leerie-toolchains/mise "

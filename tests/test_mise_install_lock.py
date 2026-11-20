@@ -31,7 +31,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import REAL_HOME, XDG_BASE_DIRS
+from tests.conftest import (
+    REAL_HOME, XDG_BASE_DIRS, leerie_container_drop)
 from tests.test_corepack_shim_dir import _drive
 from tests.test_worker_confinement import (  # noqa: F401  (fixture)
     _St, pytestmark, run)
@@ -201,7 +202,7 @@ print("MEASURE " + " ".join(tail.split()), flush=True)
 # afterwards. Only processes this script started are signalled, by PID.
 _SCRIPT = r'''
 set -u
-D=/home/leerie/.local/share/mise
+D=$MISE_DATA_DIR
 run() { /usr/bin/python3 /out/driver.py /src/orchestrator/leerie.py /leerie-state "$1"; }
 run runa > /leerie-state/a.log 2>&1 & A=$!
 until [ -e $D/installs/node/22.19.0/lib ]; do
@@ -254,15 +255,20 @@ def test_two_runs_one_failing_mid_install(tmp_path):
            if rootless.is_file() else [])
     if Path("/etc/apparmor.d/leerie-container").is_file():
         sec += ["--security-opt", "apparmor=leerie-container"]
-    tmpfs = "rw,exec,size=2g,uid=1000,gid=1000"
+    # The launcher's layout: the shared data directory is the toolchain
+    # cache at /leerie-toolchains (MISE_DATA_DIR, the image's), and nothing
+    # is mounted beneath the home.
+    drop, owner = leerie_container_drop()
+    tmpfs = f"rw,exec,size=2g,{owner}"
     r = subprocess.run(
-        ["nerdctl", "run", "--rm", *sec, "--user", "leerie",
-         "--entrypoint", "bash", "-e", "HOME=/home/leerie",
-         "-e", "LEERIE_HOST_DIR=/leerie-host",
+        ["nerdctl", "run", "--rm", *sec, "--user", "0",
+         "--entrypoint", "bash",
          "-v", f"{REPO_ROOT}:/src:ro", "-v", f"{tmp_path}:/out:ro",
          "--tmpfs", f"/leerie-state:{tmpfs}", "--tmpfs", f"/leerie-host:{tmpfs}",
-         "--tmpfs", f"/home/leerie/.local/share/mise:{tmpfs}",
-         image, "/out/script.sh"],
+         "--tmpfs", f"/leerie-toolchains:{tmpfs}",
+         image, "-c",
+         f"{drop} env HOME=/home/leerie LEERIE_HOST_DIR=/leerie-host "
+         "bash /out/script.sh"],
         capture_output=True, text=True, timeout=1500, env=_users_env())
     out = dict(ln.split(" ", 1) for ln in r.stdout.splitlines()
                if ln.split(" ", 1)[0] in {"A-EXIT", "B-EXIT", "MEASURE",

@@ -368,6 +368,44 @@ def init_git_repo(path: Path) -> Path:
     return path
 
 
+def leerie_container_drop() -> tuple[str, str]:
+    """`(prefix, owner)` for a test that starts a leerie image with
+    `--user 0 --entrypoint bash` and runs a command as `leerie`: the
+    toolchain directories `/leerie-toolchains/{mise,home}` made (the
+    launcher mounts the host's toolchain cache there, outside the home,
+    beneath which nothing is mounted: DESIGN §6 *Every confined process has
+    its own home*), then the drop `scripts/container-entry.sh` makes, with
+    the chowns these tests need. The entry's other steps are not reproduced
+    (among them its chowns of `/work`, `/leerie-host` and `/tmp/.cache`,
+    the staged home's copy, the cgroup broker, and `USER`/`LOGNAME`).
+
+    Rootless maps outer root onto leerie, so what root owns is leerie's.
+    Rootful switches uid after chowning the home and the toolchains to
+    leerie (CLAUDE.md's ownership trap), recursively and always: a superset
+    of the entry's rootful chown of the image's own toolchain directories
+    where nothing is mounted there (Fly), which also makes leerie's the
+    root-made subdirectories of a test's tmpfs, as the launcher's mount of
+    the host's cache would be.
+
+    `prefix` goes before the command (`f"{prefix} env HOME=... cmd"`).
+    `owner` is the `--tmpfs` owner: root under rootless (outer root is the
+    inner leerie), else the host user, as whom the launcher builds leerie
+    (`HOST_UID`); an image built otherwise has another uid. A tmpfs on a
+    path the image lacks (`/leerie-state`) is mode 1777, and on
+    `/leerie-toolchains`, which the image has, 0755 (both measured); the
+    drop makes the latter's subdirectories leerie's whatever its owner."""
+    rootless = Path(
+        f"/run/user/{os.getuid()}/containerd-rootless/child_pid").is_file()
+    drop = ('unshare --user --map-user="$(id -u leerie)" '
+            '--map-group="$(id -g leerie)"' if rootless else
+            "chown -R leerie: /home/leerie /leerie-toolchains && "
+            "runuser -u leerie --")
+    owner = ("uid=0,gid=0" if rootless else
+             f"uid={os.getuid()},gid={os.getgid()}")
+    return ("mkdir -p /leerie-toolchains/home /leerie-toolchains/mise && "
+            + drop, owner)
+
+
 def _run(coro):
     """Run an async coroutine synchronously (this repo does not use
     pytest-asyncio). Single owner for the byte-identical helper that was
