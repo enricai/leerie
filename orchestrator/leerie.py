@@ -6123,9 +6123,11 @@ class HeldOutPathTaken(FileExistsError):
     way (`--taken-fd`). A fact about the tree a worker committed, not a
     confinement failure: an `OSError`, so each caller reads it as the run
     it could not make, never as `ConfinementRefused` (DESIGN §6 *A
-    confinement failure stops the run; it is never a result*). Each caller
-    checks the path first (`_lexists_beneath`, the shim's own rule); this
-    is the shim saying so where that check was not made."""
+    confinement failure stops the run; it is never a result*). A caller may
+    check the path first (`_lexists_beneath`, the shim's own rule); this is
+    the shim saying so where that check was not made — the writer's
+    validation makes none for the set's own files, and reads the run as
+    unmeasurable."""
 
 
 # Literal Claude Code subscription rate-limit message format, observed
@@ -58285,10 +58287,11 @@ def _acceptance_probe_rel(st: "State", test_rel: str) -> str:
 
 async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
                                   test_rel: str, targets: list[str],
-                                  log_path: Path, label: str
+                                  log_path: Path, label: str, *,
+                                  place: tuple[tuple[str, str], ...] = ()
                                   ) -> tuple[bool | None, str]:
     """Whether every one of `targets` (a writer's import-declared test file
-    and the other Python files it wrote) parses under the PROJECT's own
+    and the other Python files placed beside it) parses under the PROJECT's own
     interpreter — not the orchestrator's, which may be a different version.
 
     A throwaway test file beside `test_rel` compiles each target, and runs
@@ -58308,9 +58311,12 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
               passed and the run failed afterwards (a teardown error, a
               coverage threshold).
     Returned with a short reason for the log. Short of True, the
-    declaration is not honoured."""
+    declaration is not honoured. `place`: the writer's files, placed in the
+    probe's sandbox beside it (`HeldOutSandbox.place`), as the file's own
+    run places them."""
     probe = _acceptance_probe_rel(st, test_rel)
-    if _lexists_beneath(Path(tree), Path(tree) / probe):
+    if (_lexists_beneath(Path(tree), Path(tree) / probe)
+            or probe in {r for _s, r in place}):
         return None, "the parse check's name is taken in the tree"
     # The probe is placed in the sandbox, never written into the tree: its
     # source is a file of leerie's own, outside every grant.
@@ -58320,7 +58326,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     try:
         return await _acceptance_parse_probe_run(
             st, caps, tree, test_rel, targets, log_path, label, probe,
-            Path(src))
+            Path(src), place)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(src)
@@ -58329,10 +58335,12 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
 async def _acceptance_parse_probe_run(st: "State", caps: dict, tree: str,
                                       test_rel: str, targets: list[str],
                                       log_path: Path, label: str,
-                                      probe: str, src: Path
+                                      probe: str, src: Path,
+                                      place: tuple[tuple[str, str], ...]
                                       ) -> tuple[bool | None, str]:
     """`_acceptance_parse_probe`'s run, with the probe's source at `src`."""
-    cmd = _acceptance_cmd(st, [probe], tree, {probe: str(src)})
+    cmd = _acceptance_cmd(st, [probe], tree,
+                          {**{r: s for s, r in place}, probe: str(src)})
     if cmd is None:
         return None, "no test command here could run the parse check"
     try:
@@ -58364,7 +58372,7 @@ async def _acceptance_parse_probe_run(st: "State", caps: dict, tree: str,
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
                 verbosity="quiet",
                 sandbox=HeldOutSandbox(view=str(tree),
-                                       place=((str(src), probe),),
+                                       place=(*place, (str(src), probe)),
                                        report=str(marker)),
                 report_into=got)
     except Exception as e:
@@ -58776,19 +58784,36 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     With `rewrite_of`, this is the set's one rewrite (DESIGN §8 *A set that
     keeps failing is audited, and rewritten once*): the set's files are put
     back where the writer wrote them and `note` is appended to its payload.
-    Otherwise, when every declared defect file ran and passed, the writer
-    is asked once more with the runner's per-case result (C1's Fix A.3)."""
+    Otherwise, when no defect file fails at the own start
+    (`_collect_acceptance_set`'s `no_defect_fails`), the writer is asked
+    once more with the runner's per-case result (C1's Fix A.3)."""
     leerie_dir = st.run_dir
     name = (f"acceptance-{k}" if rewrite_of is None
             else f"acceptance-rewrite-{k}")
     sid = name if attempt == 1 else f"{name}-a{attempt}"
     wt = _helper_worktree_path(st, name)
     log_path = _held_out_logs(leerie_dir) / f"{name}.log"
+    dest_name = f"set-{k}" if rewrite_of is None else f"set-{k}-rw"
     out = {"index": k, "valid": False, "declared_defect": False}
+    # The tree the set is validated in: leerie's, at `base`, made when a
+    # collection first needs it and kept for the writer's one own-start
+    # retry.
+    views = contextlib.AsyncExitStack()
+    made_view: list[Path | None] = []
+
+    async def _view() -> Path | None:
+        if not made_view:
+            made_view.append(await views.enter_async_context(
+                _acceptance_tree(st, caps, base, f"{name}-view",
+                                 f"{dest_name}-view")))
+        return made_view[0]
     # Outside every try: budget exhaustion must propagate, not read as an
     # invalid set (the same discipline as the no_work_judge call).
     st.bump_workers(caps)
     _remove_acceptance_checkout(st, wt)
+    # A crashed attempt's validity tree goes with its checkout, whether or
+    # not this attempt opens one.
+    _remove_acceptance_checkout(st, _helper_worktree_path(st, f"{name}-view"))
     made = await asyncio.to_thread(_acceptance_writer_checkout, st, wt, base)
     if made.startswith("failed"):
         out["reason"] = made
@@ -58877,10 +58902,9 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                     res = fix
         out["declared_defect"] = any(
             f.get("kind") == "defect" for f in (res.get("files") or []))
-        dest_name = f"set-{k}" if rewrite_of is None else f"set-{k}-rw"
         got = await _collect_acceptance_set(k, st, caps, wt, base, res, refs,
                                             pre_untracked, log_path, name,
-                                            dest_name)
+                                            dest_name, _view)
         rounds = int(caps.get("acceptance_rewrite_rounds",
                               DEFAULT_CAPS["acceptance_rewrite_rounds"]))
         if (rewrite_of is None and got.get("no_defect_fails")
@@ -58899,7 +58923,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 f.get("kind") == "defect" for f in (res.get("files") or []))
             got = await _collect_acceptance_set(
                 k, st, caps, wt, base, res, refs, pre_untracked, log_path,
-                name, dest_name)
+                name, dest_name, _view)
             got["own_start_rewrite"] = True
             if got.get("no_defect_fails"):
                 # The report's defect no longer reproduces here even after
@@ -58919,7 +58943,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         out["reason"] = f"{type(e).__name__}: {e}"[:200]
         return out
     finally:
-        _remove_acceptance_checkout(st, wt)
+        try:
+            await views.aclose()
+        finally:
+            _rmtree_owned(st.run_dir / "acceptance" / f"{dest_name}.written")
+            _remove_acceptance_checkout(st, wt)
 
 
 
@@ -58953,20 +58981,28 @@ def _acceptance_new_files(wt: Path, pre_untracked: set[str],
 async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                                   base: str, res: dict, refs: list[str],
                                   pre_untracked: set[str], log_path: Path,
-                                  label: str, dest_name: str) -> dict:
-    """Collect and validate, per case at `base`, what a writer left in `wt`
-    (DESIGN §8): `{valid, reason?, dir, defect_files, control_files,
-    support_files, cases, modes, base_failing_cases}`. Valid only with at
-    least one discriminating defect file and at least one passing control
-    file. When every declared defect file ran and passed, `no_defect_fails`
-    carries their per-case statuses (the writer's one retry reads them)."""
+                                  label: str, dest_name: str,
+                                  view_of: Callable[[], Awaitable[Path | None]]
+                                  ) -> dict:
+    """Collect what a writer left in `wt` and validate it, per case, in
+    the tree `view_of` yields — leerie's, at `base`, installed
+    (`_acceptance_tree`), None when it could not be set up —
+    the writer's files placed in each run's sandbox, never in the writer's
+    own checkout (DESIGN §8 *Every measurement reads the committed view*):
+    `{valid, reason?, dir, defect_files, control_files, support_files,
+    cases, modes, base_failing_cases}`. Valid only with at least one
+    discriminating defect file and at least one passing control file. When
+    no defect file still declared fails, no declared defect file went
+    unread and no support file was missing, `no_defect_fails` carries the per-case statuses of every
+    defect file that ran and passed, in any pass (the writer's one retry
+    reads them)."""
     out: dict = {"valid": False}
-    # What the writer actually left in the tree (git porcelain —
-    # mechanical CLI output). Validation runs on THIS tree, so the set
-    # must carry exactly it: an edited tracked file invalidates the set,
-    # and every undeclared new file (a fixture module, a helper) becomes
-    # a support file copied with the set — without it a correct fix
-    # fails the set elsewhere.
+    # What the writer actually left in its checkout (git porcelain —
+    # mechanical CLI output). Validation places exactly that over the
+    # base, so the set must carry it: an edited tracked file invalidates
+    # the set, and every undeclared new file (a fixture module, a helper)
+    # becomes a support file copied with the set — without it a correct
+    # fix fails the set elsewhere.
     porcelain = _git_z_output(
         ["git", *_tree_git_args(wt), "status", "--porcelain=v1", "-z",
          "--untracked-files=no"])
@@ -58985,13 +59021,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
         p for p in post
         if p not in refs and p not in pre_untracked
         and not _acceptance_is_cache_path(p))
-    defect, control, cases, modes = [], [], {}, {}
-    # Declared defect files that ran and passed: their per-case statuses
-    # are the note of the writer's one own-start retry.
-    passed_defects: dict[str, dict] = {}
-    base_failing: dict[str, list[str]] = {}
-    case_status: dict[str, dict] = {}
-    failure_messages: dict[str, dict] = {}
+    declared: list[tuple[dict, str]] = []
     for f in (res.get("files") or []):
         rel = _acceptance_declared_rel(f)
         # Relative, inside the worktree, a real file, not the report.
@@ -59009,9 +59039,8 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                            f"{base}:{rel}"], capture_output=True,
                           check=False).returncode == 0:
             continue
-        mode = ("import" if f.get("kind") == "defect"
-                and f.get("failure_mode") == "import" else "assertion")
-        if mode == "import" and not rel.endswith(".py"):
+        if (f.get("kind") == "defect" and f.get("failure_mode") == "import"
+                and not rel.endswith(".py")):
             # The declaration cannot be honoured (no reliable parse
             # check outside Python), and an unloadable file would
             # otherwise discard the whole set: drop just this file, and
@@ -59019,90 +59048,184 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
             log(f"  acceptance set {k}: {rel} declared an import defect, "
                 "honoured only for Python test files — file dropped")
             continue
-        if mode == "import":
-            parses, why = await _acceptance_parse_probe(
-                st, caps, str(wt), rel,
-                [rel] + [n for n in new_files
-                         if n.endswith(".py") and n != rel],
-                log_path, f"{label}-base")
-            if parses is not True:
-                # A file — or another Python file the writer wrote — that
-                # does not parse under the project's interpreter fails to
-                # load by the writer's own fault; and a probe that never
-                # reached its check cannot show otherwise. Validate it as
-                # an ordinary file, so a load failure is no verdict and
-                # discards the set. The log says which it was.
-                log(f"  acceptance set {k}: {rel} declared an import "
-                    f"defect, but {why} — declaration not honoured")
-                mode = "assertion"
-        observed: dict = {}
-        verdict = await _run_acceptance_file(
-            st, caps, str(wt), rel, log_path, f"{label}-base",
-            validating=True, failure_mode=mode, observed=observed)
-        if verdict is None:
-            # Not measurable (no test command for this file, the runner
-            # is missing, or it ran no test) — never mistaken for pass
-            # or fail.
-            out["reason"] = f"could not run {rel} on the validity base"
-            return out
-        if f.get("kind") == "defect":
-            # Must FAIL on the unfixed tree, or it cannot discriminate.
-            if verdict is False:
-                defect.append(rel)
-                if observed.get("failing_cases"):
-                    base_failing[rel] = observed["failing_cases"]
-                # The scope judge's inputs (DESIGN §8 *A task that points at
-                # a report is bounded by the report's own scenarios*): every
-                # case's own-start status and the failing ones' messages.
-                if observed.get("case_status"):
-                    case_status[rel] = dict(observed["case_status"])
-                if observed.get("failure_messages"):
-                    failure_messages[rel] = dict(observed["failure_messages"])
-                # "import" only when the base run showed the file failing
-                # to load; a declared import defect that loaded and failed
-                # an assertion is an ordinary failure.
-                modes[rel] = ("import" if observed.get("load_failure")
-                              else "assertion")
-                cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
-            else:
-                passed_defects[rel] = observed.get("case_status") or {}
-        elif verdict is True:
-            control.append(rel)
-            cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
-        elif f.get("kind") == "control":
-            out["reason"] = f"control file {rel} does not pass on base"
-            return out
-    if not defect:
-        out["reason"] = "no defect file fails on the validity base"
-        if passed_defects:
-            out["no_defect_fails"] = passed_defects
-        return out
-    if not control:
-        # A set with no control cannot show an over-broad fix (DESIGN §8).
-        out["reason"] = "no control file passes on the validity base"
-        return out
-    # Every undeclared new file travels — a conftest or helper beside the
-    # tests is test-shaped by path and still needed. Declared files that
-    # were dropped (a defect file that passes on base) are not carried.
-    declared_any = {_acceptance_declared_rel(f) for f in
-                    (res.get("files") or [])}
-    not_ignored = set(visible)
-    test_dirs = {os.path.dirname(f) for f in defect + control}
+        declared.append((f, rel))
+    # The declared files and the support files below, read out of the
+    # checkout once without following a link the writer left: validation
+    # places these bytes and nothing else the writer left — not the task's
+    # report either, which no set carries — and the set carries them. A
+    # declared file that cannot be read so (a link, a file past the limit)
+    # is dropped, as one that does not discriminate is. A support file that
+    # cannot be read is never placed, and a pass run without it decides
+    # nothing but which declared files it drops: the set is discarded for
+    # it unless a later pass, the drops made, no longer holds it — never
+    # invalid for another reason, nor sent to the writer's retry, on runs
+    # that lacked a file it needed. Each copy is named by number, never by its path: the shim reads a
+    # placement as `SRC=REL` split at the first `=`, and a path the writer
+    # chose may hold one.
+    written = st.run_dir / "acceptance" / f"{dest_name}.written"
+    _rmtree_owned(written)
+    copies: dict[str, Path] = {}
 
-    def _beside_a_test(f: str) -> bool:
-        d = os.path.dirname(f)
-        return any(d == t or (t and d.startswith(t + "/"))
-                   for t in test_dirs)
-    # An ignored file travels only beside a kept test file (fixture
-    # data): elsewhere it is likely build output from the UNFIXED tree
-    # (dist/, target/), which would shadow a correct fix.
-    support = sorted(f for f in new_files if f not in declared_any
-                     and (f in not_ignored or _beside_a_test(f)))
+    def _read_out(rel: str) -> str:
+        """Empty once `rel` is copied, else why it could not be read. Only the
+        read is the writer's: a failed write into the run dir raises."""
+        if rel in copies:
+            return ""
+        try:
+            data = _read_beneath(wt, wt / rel, limit=READ_LIMIT_TEXT)
+            with _dir_beneath(wt, (wt / rel).parent) as sfd:
+                mode = os.stat(Path(rel).name, dir_fd=sfd,
+                               follow_symlinks=False).st_mode
+        except OSError as e:
+            return type(e).__name__
+        copies[rel] = written / str(len(copies))
+        _write_beneath(st.run_dir, copies[rel], data,
+                       mode=stat.S_IMODE(mode))
+        return ""
+    # Whether a file the writer left was never measured: an unreadable
+    # defect file, or a support file a pass ran without. No defect file's
+    # passing on base then says the defect is fixed — the writer's retry
+    # and the no-work verdict read `no_defect_fails` as that.
+    lacked_a_file = False
+    # Where a dropped file really is (reached through a linked directory,
+    # git lists it by its real path): never carried as a support file.
+    dropped_real: set[str] = set()
+    for f, rel in list(declared):
+        why = _read_out(rel)
+        if why:
+            log(f"  acceptance set {k}: {rel} could not be read from the "
+                f"writer's checkout ({why}) — file dropped")
+            declared.remove((f, rel))
+            lacked_a_file = lacked_a_file or f.get("kind") == "defect"
+            # The directory resolved, never the file: a declared link's
+            # target is a file of its own, carried if it is support.
+            dropped_real.add(os.path.normpath(os.path.join(os.path.relpath(
+                os.path.realpath((wt / rel).parent), os.path.realpath(wt)),
+                Path(rel).name)))
+    # Validated until every declared file still placed is kept: a file a
+    # pass drops (a defect file that passes on base) is no longer placed,
+    # nor are the ignored files beside it, and the rest is validated again
+    # without them, so what a valid set's files were validated beside is
+    # exactly what it carries.
+    # Declared defect files that ran and passed, in any pass: their per-case
+    # statuses are the note of the writer's one own-start retry.
+    passed_defects: dict[str, dict] = {}
+    while True:
+        must = {rel for _f, rel in declared}
+        # Every undeclared new file travels as a support file — a conftest or
+        # helper beside the tests is test-shaped by path and still needed —
+        # but an ignored one only beside a declared test file (fixture data):
+        # elsewhere it is likely build output from the UNFIXED tree (dist/,
+        # target/), which would shadow a correct fix. Chosen before validation
+        # from the declared files still in the set.
+        declared_any = {_acceptance_declared_rel(f) for f in
+                        (res.get("files") or [])}
+        not_ignored = set(visible)
+        test_dirs = {os.path.dirname(f) for f in must}
+
+        def _beside_a_test(f: str) -> bool:
+            d = os.path.dirname(f)
+            return any(d == t or (t and d.startswith(t + "/"))
+                       for t in test_dirs)
+        support = sorted(f for f in new_files if f not in declared_any
+                         and f not in dropped_real
+                         and (f in not_ignored or _beside_a_test(f)))
+        missing = {rel: why for rel in support if (why := _read_out(rel))}
+        lacked_a_file = lacked_a_file or bool(missing)
+
+        def _invalid(reason: str) -> dict:
+            if missing:
+                rel, why = sorted(missing.items())[0]
+                reason = (f"could not read {rel} from the writer's checkout "
+                          f"({why})")
+            out["reason"] = reason
+            return out
+        place = tuple((str(copies[rel]), rel)
+                      for rel in sorted(must | set(support))
+                      if rel not in missing)
+        view = await view_of() if declared else None
+        if declared and view is None:
+            out["reason"] = "the validity tree could not be set up"
+            return out
+        defect, control, cases, modes = [], [], {}, {}
+        base_failing: dict[str, list[str]] = {}
+        case_status: dict[str, dict] = {}
+        failure_messages: dict[str, dict] = {}
+        for f, rel in declared:
+            mode = ("import" if f.get("kind") == "defect"
+                    and f.get("failure_mode") == "import" else "assertion")
+            if mode == "import":
+                parses, why = await _acceptance_parse_probe(
+                    st, caps, str(view), rel,
+                    [rel] + [r for _s, r in place
+                             if r.endswith(".py") and r != rel],
+                    log_path, f"{label}-base", place=place)
+                if parses is not True:
+                    # A file — or another Python file the writer wrote — that
+                    # does not parse under the project's interpreter fails to
+                    # load by the writer's own fault; and a probe that never
+                    # reached its check cannot show otherwise. Validate it as
+                    # an ordinary file, so a load failure is no verdict and
+                    # discards the set. The log says which it was.
+                    log(f"  acceptance set {k}: {rel} declared an import "
+                        f"defect, but {why} — declaration not honoured")
+                    mode = "assertion"
+            observed: dict = {}
+            verdict = await _run_acceptance_file(
+                st, caps, str(view), rel, log_path, f"{label}-base",
+                validating=True, failure_mode=mode, observed=observed,
+                place=place)
+            if verdict is None:
+                # Not measurable (no test command for this file, the runner
+                # is missing, or it ran no test) — never mistaken for pass
+                # or fail.
+                return _invalid(f"could not run {rel} on the validity base")
+            if f.get("kind") == "defect":
+                # Must FAIL on the unfixed tree, or it cannot discriminate.
+                if verdict is False:
+                    defect.append(rel)
+                    if observed.get("failing_cases"):
+                        base_failing[rel] = observed["failing_cases"]
+                    # The scope judge's inputs (DESIGN §8 *A task that points at
+                    # a report is bounded by the report's own scenarios*): every
+                    # case's own-start status and the failing ones' messages.
+                    if observed.get("case_status"):
+                        case_status[rel] = dict(observed["case_status"])
+                    if observed.get("failure_messages"):
+                        failure_messages[rel] = dict(observed["failure_messages"])
+                    # "import" only when the base run showed the file failing
+                    # to load; a declared import defect that loaded and failed
+                    # an assertion is an ordinary failure.
+                    modes[rel] = ("import" if observed.get("load_failure")
+                                  else "assertion")
+                    cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+                else:
+                    passed_defects[rel] = observed.get("case_status") or {}
+            elif verdict is True:
+                control.append(rel)
+                cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+            elif f.get("kind") == "control":
+                return _invalid(f"control file {rel} does not pass on base")
+        if not defect:
+            if passed_defects and not lacked_a_file:
+                out["no_defect_fails"] = passed_defects
+            return _invalid("no defect file fails on the validity base")
+        if not control:
+            # A set with no control cannot show an over-broad fix (DESIGN §8).
+            return _invalid("no control file passes on the validity base")
+        kept = set(defect + control)
+        if kept == {rel for _f, rel in declared}:
+            if missing:
+                return _invalid("")
+            break
+        log(f"  acceptance set {k}: validating again without "
+            + ", ".join(sorted({rel for _f, rel in declared} - kept)))
+        declared = [(f, rel) for f, rel in declared if rel in kept]
     dest = st.run_dir / "acceptance" / dest_name
     _rmtree_owned(dest)
     for rel in defect + control + support:
-        # Read from the writer's checkout without following a link it left.
-        _copy_beneath(wt / rel, st.run_dir, dest / rel, src_anchor=wt, limit=READ_LIMIT_TEXT)
+        _copy_beneath(copies[rel], st.run_dir, dest / rel)
+    _rmtree_owned(written)
     out.update(valid=True, dir=str(dest), defect_files=defect,
                control_files=control, support_files=support, cases=cases,
                modes=modes, base_failing_cases=base_failing,
