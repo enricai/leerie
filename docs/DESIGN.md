@@ -6275,6 +6275,31 @@ It is constructed, not checked, in two halves.
    and disk contention, a socket a worker holds open — has no observer in
    the run while it exists.
 
+*The world that dies is the overlay, not the tree on disk.* The "world
+that dies with it" an evaluation runs in is the per-command sandbox the
+shim builds, not the git worktree the evaluation runs over. Every write an
+evaluation makes — the set's files placed into it, any file it writes
+under the tree (a package under `node_modules`, a `.venv`, a `target`), a
+runner cache, the report — lands in the overlay's upper layer on the
+sandbox's private `/tmp`, and the kernel frees that upper, with the
+namespaces, when the shim exits; the tree on disk is the overlay's
+*read-only lower layer* for the evaluation's whole life and is never
+changed by it (an attempt to write it writes the upper instead). So what
+an evaluation can change is bounded by the overlay, and the on-disk tree's
+*installed dependencies* — leerie's own install output, made from the
+commit's committed manifests before any set is placed, and holding no
+set's content — are immutable with respect to every evaluation. This is
+why leerie may keep that install on the read-only lower and reuse it
+across a run's evaluations (§8 *The evaluation tree is kept across a run's
+evaluations*) without weakening I3: the reuse is a fact about the lower
+layer, which no evaluation observes writing and none can mutate; each
+evaluation still gets its own fresh overlay and holds the lock exclusive.
+The install output reused is leerie's, identical at a given install key
+(§8 *A view moves to the next tip when the install's inputs are
+unchanged*), and re-verified untouched before each reuse (`_install_intact`)
+— so even a mutation reaching the lower (a leerie bug, a crash) refuses
+the reuse and reinstalls, never reaching the next evaluation.
+
 **The execution lock.** One per run.
 - *The run's* is the reader/writer lock the run's `/tmp` used
   (`_ExecLock`, `_exec_lock()`; one per event loop, writer preference, so
@@ -18637,9 +18662,35 @@ with a planted defect, 3/3 sets were valid, passed the fixed code and
 flagged an example-shaped patch.
 
 **The gate runs after the run's own final conformance.** Each valid set
-runs against staging's committed HEAD in a disposable worktree of its
-own — never in staging itself, where a crash mid-run (which no cleanup
+runs against staging's committed HEAD in a dedicated *evaluation tree* of
+its own — never in staging itself, where a crash mid-run (which no cleanup
 survives) would leave hidden tests for the next fixer to read or commit.
+The set never reaches that tree's disk either: every set file, and
+everything the run writes, is placed in the per-command sandbox's overlay
+and dies with it (*A held-out evaluation runs alone* — *The world that
+dies is the overlay, not the tree on disk*), so the tree on disk carries
+only leerie's own install of the commit, never a hidden test's name.
+
+*The evaluation tree is kept across a run's evaluations.* A run evaluates
+its sets many times — the repair loop's rounds, the held-back recheck, the
+re-drive's probes, the set audit — and each used to tear the evaluation
+tree down and reinstall its dependencies from scratch, 17 (barnacle) to 23
+(navegando) cold installs in a heavy run's evaluation tree, serial on the
+acceptance path. The
+evaluation tree is instead kept for the run, at one path, and moved to the
+next commit the way a committed view is (*A view moves to the next tip when
+the install's inputs are unchanged*): checked out `--detach --force` at the
+new commit, cleaned of everything untracked but the install's own outputs,
+and reused with its install in place when the install key there is the one
+that install was made from and the outputs are as it left them
+(`_install_intact`); any difference — a fix that changed the lockfile or a
+manifest the install read, or an output no longer as installed — remakes
+the tree and installs afresh. I3 is untouched: the kept install is the
+sandbox's read-only lower, which no evaluation observes writing and none
+can mutate, and each evaluation still gets its own fresh overlay and the
+lock exclusive. Like a committed view, the evaluation tree lives no longer
+than the run and is reaped with its worktrees.
+
 Judging a fix, the verdict is the exit code: a command the shell could
 not run, one the container's limits killed (a fork-exhaustion message in
 the output's tail), or any set run where a dependency install failed is
