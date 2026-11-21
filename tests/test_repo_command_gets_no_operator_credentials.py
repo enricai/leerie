@@ -216,6 +216,11 @@ def test_no_confined_process_reads_the_staged_directory(
         leerie, tmp_path, monkeypatch):
     """The reads outside the state root leave the staged directory out,
     and only it: its siblings are still read."""
+    # The session's paths lie beneath /tmp on CI (pytest's tmp_path), which
+    # `_reads_outside(tmp=False)` drops wholesale as the shim's own /tmp; so
+    # SHARED_TMP is pointed off the test tree, as test_confined_home's
+    # `homes` fixture does, or the sibling below would be dropped with it.
+    monkeypatch.setattr(leerie, "SHARED_TMP", tmp_path / "no-shared-tmp")
     top = tmp_path / "opt"
     src = top / "leerie-home-src"
     (src / "cli").mkdir(parents=True)

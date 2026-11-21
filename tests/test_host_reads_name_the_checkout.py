@@ -54,9 +54,12 @@ def _repo_with_local_identity(tmp_path: Path) -> tuple[Path, dict]:
 
 
 def _stage(tmp_path: Path) -> Path:
+    # The CLI's login is the cli/ class, which is what seed-auth tars to the
+    # machine (DESIGN §6 *A repository command gets nothing the operator
+    # handed leerie for itself*).
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    (stage / ".claude" / ".credentials.json").write_text(
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude" / ".credentials.json").write_text(
         '{"claudeAiOauth":{"accessToken":"tok"}}')
     return stage
 
