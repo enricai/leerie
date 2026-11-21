@@ -3184,6 +3184,15 @@ PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
 # one of INTENT_ANSWERS, from the user or a settled, trusted resolver
 # verdict.
 INTENT_ANSWERS = ("yes", "no")
+# The resolver's two typed facts about a question's quoted statement
+# (DESIGN §11, step 3): what the task asks for of it, and whether the base
+# already does it. Code derives the `no` class from them (`_intent_no_class`),
+# and only `task_asks == "none"` strikes a plan question's item quotes.
+# Deriving the class from the facts, rather than reading a free-text label,
+# keeps it from contradicting the resolver's own reasoning (S9-R7 B1v3: a
+# free-text `no_reason` struck a required, unmet item in 1 of 6 samples; the
+# typed facts struck it in 0 of 18).
+INTENT_TASK_ASKS = ("all", "part", "none")
 INTENT_SOURCES = ("plan", "set_aside", "contradiction", "base_form")
 INTENT_EVIDENCE_SOURCES = ("code", "history", "task", "report", "web")
 # The evidence sources code checks verbatim; `web` is not checked.
@@ -4137,8 +4146,11 @@ SCHEMAS: dict[str, dict] = {
         # evidence` checks every code/task/report/history quote.
         "type": "object",
         "additionalProperties": False,
-        "required": ["decision", "answer", "evidence", "status"],
+        "required": ["task_asks", "base_has_it", "decision", "answer",
+                     "evidence", "status"],
         "properties": {
+            "task_asks": {"type": "string", "enum": list(INTENT_TASK_ASKS)},
+            "base_has_it": {"type": "boolean"},
             "decision": {"type": "string", "minLength": 1},
             "answer": {"type": "string", "enum": list(INTENT_ANSWERS)},
             "evidence": {
@@ -65365,6 +65377,8 @@ async def _settle_intent_question(st: "State", qid: str, caps: dict,
                   if isinstance(e, dict)]
             rec.update(decision=str((out or {}).get("decision") or ""),
                        answer=(out or {}).get("answer"),
+                       task_asks=(out or {}).get("task_asks"),
+                       base_has_it=(out or {}).get("base_has_it"),
                        status=(out or {}).get("status"), evidence=ev,
                        trusted=_intent_verdict_trusted(ev))
     except (WorkerError, subprocess.TimeoutExpired) as e:
@@ -65403,13 +65417,100 @@ async def _plan_intent_check(st: "State", subtasks: dict, caps: dict,
         await _settle_intent_question(st, qid, caps, models, efforts)
 
 
+def _intent_no_class(verdict: object) -> str | None:
+    """The `no` class derived from a resolver verdict's two typed facts,
+    never from its free text: `task_asks` `none` is `not_required`, `part`
+    is `narrower`, `all` is `already_met` when `base_has_it` else
+    `contradicts` (a `no` the stated facts do not support). None when
+    `task_asks` is absent — a user's answer, or a verdict recorded before
+    the facts. The derivation is what stops the class contradicting the
+    resolver's own reasoning (DESIGN §11)."""
+    if not isinstance(verdict, dict):
+        return None
+    ta = verdict.get("task_asks")
+    if ta == "none":
+        return "not_required"
+    if ta == "part":
+        return "narrower"
+    if ta == "all":
+        return "already_met" if verdict.get("base_has_it") is True \
+            else "contradicts"
+    return None
+
+
+def _intent_strikes_items(st: "State", qid: str) -> bool:
+    """Whether the `plan` question `qid` strikes its item quotes: decided
+    `no` by a settled, trusted resolver verdict whose derived class is
+    `not_required` (`task_asks == "none"`). A user's `no`, every other
+    class, and a verdict recorded before the facts strike nothing."""
+    q = (st.data.get("intent_questions") or {}).get(qid)
+    if not isinstance(q, dict) or q.get("source") != "plan":
+        return False
+    v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+    return (_intent_decided_by(st, qid) == "resolver"
+            and _intent_decision(st, qid) == "no"
+            and _intent_no_class(v) == "not_required")
+
+
+def _strike_item_quotes(st: "State", qid: str, q: dict) -> None:
+    """Strike each conflicting `item_quote` of `qid` from its item's text or
+    the part holding it, in place, and list the ruling on the item."""
+    items = st.data.get("required_items") or []
+    v = q.get("verdict") if isinstance(q.get("verdict"), dict) else {}
+    marker = f"[intent ruling {qid}: not required by the task]"
+    by_item: dict[int, list[str]] = {}
+    for c in (q.get("context") or {}).get("conflicts") or []:
+        i = c.get("item_index")
+        # Dict items only: the strike mutates `item`/`parts` in place, which a
+        # plain-string required item has not got. Production never skips one
+        # for this reason — `phase_classify` filters `required_items` to dicts
+        # at the source — so this is a guard, not a reachable code path.
+        if (isinstance(i, int) and not isinstance(i, bool)
+                and 0 <= i < len(items) and isinstance(items[i], dict)
+                and c.get("item_quote")):
+            by_item.setdefault(i, []).append(str(c["item_quote"]))
+    for i, quotes in sorted(by_item.items()):
+        it = items[i]
+        if any(r.get("qid") == qid for r in it.get("_intent_rulings") or []):
+            continue
+        for quote in quotes:
+            if isinstance(it.get("item"), str) and _ws_norm(quote) in _ws_norm(
+                    it["item"]):
+                it["item"] = _strike_span(it["item"], quote, marker)
+                continue
+            parts = it.get("parts")
+            for n, part in enumerate(parts if isinstance(parts, list) else []):
+                if isinstance(part, str) and _ws_norm(quote) in _ws_norm(part):
+                    parts[n] = _strike_span(part, quote, marker)
+                    break
+        it.setdefault("_intent_rulings", []).append(
+            {"qid": qid, "decision": v.get("decision") or "no",
+             "evidence": [e for e in v.get("evidence") or []
+                          if e.get("ok") is not False]})
+        log(f"  intent: item {i} struck by {qid} (not required by the task)")
+        st.save()
+
+
+def _strike_span(text: str, quote: str, marker: str) -> str:
+    """`text` with `quote` replaced by `marker`; when the quote only matches
+    whitespace-collapsed, the collapsed text, which keeps every other word."""
+    if quote in text:
+        return text.replace(quote, marker)
+    return _ws_norm(text).replace(_ws_norm(quote), marker)
+
+
 def _apply_plan_intent_rulings(st: "State", subtasks: dict) -> None:
     """Amend the plan by every `plan` question decided `yes`: each
     conflicting quote is struck from its field and replaced by the ruling,
     a `verify` criterion containing one is dropped, and the subtask lists
-    the ruling in `_intent_rulings`. Deterministic from state."""
+    the ruling in `_intent_rulings`. A question decided `no` as
+    `not_required` strikes its quotes from the required items instead
+    (`_strike_item_quotes`). Deterministic from state."""
     for qid, q in sorted((st.data.get("intent_questions") or {}).items()):
         if not isinstance(q, dict) or q.get("source") != "plan":
+            continue
+        if _intent_strikes_items(st, qid):
+            _strike_item_quotes(st, qid, q)
             continue
         sid = (q.get("context") or {}).get("subtask_id")
         sub = subtasks.get(sid)
@@ -65430,14 +65531,7 @@ def _apply_plan_intent_rulings(st: "State", subtasks: dict) -> None:
                     if _ws_norm(quote) not in _ws_norm(
                         _plan_field_text({"verify": [crit]}, "verify"))]
             elif isinstance(sub.get(field), str):
-                text = sub[field]
-                if quote in text:
-                    sub[field] = text.replace(quote, marker)
-                else:
-                    # The quote checked whitespace-collapsed: strike the
-                    # collapsed field, which keeps every other word.
-                    sub[field] = _ws_norm(text).replace(_ws_norm(quote),
-                                                        marker)
+                sub[field] = _strike_span(sub[field], quote, marker)
         sub.setdefault("_intent_rulings", []).append(
             {"qid": qid, "decided_by": by, "decision": ruling,
              "evidence": [e for e in v.get("evidence") or []

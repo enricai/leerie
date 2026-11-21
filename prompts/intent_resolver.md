@@ -47,6 +47,17 @@ have is read-only.
 
 ## What to return
 
+Decide the two facts first; your answer follows from them.
+
+- `task_asks`: what the task and its referenced files, read as above, ask for
+  of the statement the question quotes (the required items' words, or the
+  behaviour it names):
+  - `all`: they ask for all of it.
+  - `part`: they ask for part of it; the statement goes further than their
+    words (an exception, a limit, or fewer cases than it names).
+  - `none`: they do not ask for it (they are silent on it, or they exclude it).
+- `base_has_it`: `true` when the repository at this commit already does what
+  the statement says, else `false`.
 - `decision`: one to three sentences. Start with the direct answer (`Yes.`,
   `No.`, or the chosen option), then the reason.
 - `answer`: `yes` or `no`, the direct answer to the question as asked. When
