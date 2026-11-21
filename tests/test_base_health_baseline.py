@@ -289,13 +289,21 @@ def test_both_conformers_inject_baseline_section(leerie):
     BASELINE: section so the conformer scopes residuals to the delta. Both
     delegate to the shared `_append_conformer_context_sections` helper
     (refactor-002) rather than calling `_format_baseline_section` inline."""
-    for fn in (leerie._run_conformer, leerie._run_final_conformance):
+    # _run_conformer injects directly; _run_final_conformance builds its
+    # prompt via the shared _final_conformer_prompt (so the final pass and
+    # its shipping-tree re-decision cannot drift, DESIGN §9), which calls the
+    # helper. Both prompt builders must carry the call.
+    for fn in (leerie._run_conformer, leerie._final_conformer_prompt):
         src = inspect.getsource(fn)
         assert "_append_conformer_context_sections(" in src, (
             f"{fn.__name__} must call _append_conformer_context_sections() "
             "so the BASELINE: context is injected into the conformer "
             "prompt — without it the conformer falls back to self-judging "
             "pre-existing.")
+    assert "_final_conformer_prompt(" in inspect.getsource(
+        leerie._run_final_conformance), (
+        "_run_final_conformance must build its prompt via "
+        "_final_conformer_prompt so the baseline section reaches it.")
     helper_src = inspect.getsource(leerie._append_conformer_context_sections)
     assert "_format_baseline_section(" in helper_src
 

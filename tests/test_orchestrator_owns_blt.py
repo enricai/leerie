@@ -43,12 +43,14 @@ def test_no_command_strings_are_injected(leerie, fn_name):
             "worker can then run a full axis without synthesising anything")
 
 
-@pytest.mark.parametrize("fn_name", ["_run_conformer", "_run_final_conformance"])
+@pytest.mark.parametrize("fn_name", ["_run_conformer", "_final_conformer_prompt"])
 def test_the_results_block_is_injected_instead(leerie, fn_name):
     """ANTI-VACUITY PARTNER for the absence test: an absence-only assertion
-    passes against a function that injects nothing at all. Both call sites
-    delegate to the shared `_append_conformer_context_sections` helper
-    (refactor-002) rather than calling `_format_blt_results_section` inline."""
+    passes against a function that injects nothing at all. The two prompt
+    builders (`_run_conformer`, and `_final_conformer_prompt` for the final
+    pass and its shipping-tree re-decision, DESIGN §9) delegate to the shared
+    `_append_conformer_context_sections` helper (refactor-002) rather than
+    calling `_format_blt_results_section` inline."""
     src = _strip_comments(inspect.getsource(getattr(leerie, fn_name)))
     assert "_append_conformer_context_sections" in src
     helper_src = _strip_comments(
@@ -224,7 +226,12 @@ def test_the_final_pass_uses_canonical_commands_only(leerie):
     src = _strip_comments(inspect.getsource(leerie._run_final_conformance))
     assert "_select_subtask_axes" not in src
     assert "resolve_blt_scoped" not in src
-    assert '_append_conformer_context_sections(up, pre, "full", st)' in src
+    # The final pass builds its prompt via the shared _final_conformer_prompt
+    # (DESIGN §9), which injects the full-scope results block.
+    assert "_final_conformer_prompt(" in src
+    prompt_src = _strip_comments(
+        inspect.getsource(leerie._final_conformer_prompt))
+    assert '_append_conformer_context_sections(up, pre or {}, "full", st)' in prompt_src
 
 
 # --------------------------------------------------------------------------

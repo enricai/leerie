@@ -520,11 +520,16 @@ class TestWiring:
         assert i_pre < i_conf < i_re
 
     def test_final_conformance_injects_the_section(self, leerie):
-        src = inspect.getsource(leerie._run_final_conformance)
+        # The unmet-items section is built in the shared
+        # _final_conformer_prompt (DESIGN §9), which _run_final_conformance
+        # and its shipping-tree re-decision both call.
+        assert "_final_conformer_prompt(" in inspect.getsource(
+            leerie._run_final_conformance)
+        src = inspect.getsource(leerie._final_conformer_prompt)
         assert "_format_unmet_required_items_section(" in src
         # Routed on EITHER half: unmet items or an unmet contract
         # (DESIGN §8 *The gate judges the finding, not only the items*).
-        assert ("if unmet_required_items or _contract_unmet is not None:"
+        assert ("if unmet_required_items or contract_unmet is not None:"
                 in src)
 
     def test_unmet_list_is_actually_passed_through(self, leerie):
