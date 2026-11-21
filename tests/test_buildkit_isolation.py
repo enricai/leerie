@@ -1546,6 +1546,40 @@ def test_the_refusal_says_where_it_asked_and_why_it_failed(tmp_path):
     assert "start buildkitd" in out and "set BUILDKIT_HOST" in out, out
 
 
+# A `colima` stub recording each argument on its own line, and a `uname`
+# forced to Darwin, so a test exercises `_leerie_on_buildkit_side`'s macOS
+# branch (the real one shells into Colima's VM, never reached on Linux CI).
+_COLIMA_RECORD_ARGV = r'''
+uname() { echo Darwin; }
+colima() { for _a in "$@"; do printf '%s\n' "$_a"; done >> "$COLIMA_LOG"; }
+'''
+
+
+def test_on_buildkit_side_forwards_argv_whole_through_colima(tmp_path):
+    """`_leerie_on_buildkit_side` must forward its args to `colima ssh` as
+    separate words, not one reconstructed `printf '%q'` string. `colima ssh
+    --` hands what follows to `limactl shell <id> <argv...>` as an argv
+    slice (no shell join), so a single blob becomes the name of one program
+    to exec and dies "command not found" (exit 127). Falsified live
+    (2026-11-21, Colima 0.10.1): the `%q` form made every `buildctl debug
+    workers` fail with 127, so `leerie_buildkit_resolve` refused every run on
+    macOS — this branch had no coverage ("not measured on macOS")."""
+    log = tmp_path / "colima.log"
+    r = subprocess.run(
+        ["bash", "-c", "set -uo pipefail\n" + FRONTEND_SH_SOURCE
+         + _COLIMA_RECORD_ARGV
+         + "_leerie_on_buildkit_side buildctl --addr A debug workers"
+         " --format '{{json .}}'\n"],
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "COLIMA_LOG": str(log)})
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    argv = log.read_text().splitlines()
+    # Every word arrives intact — the `{{json .}}` format string as one
+    # argument — and no single argument is the mangled `sudo buildctl …` blob.
+    assert argv == ["ssh", "--", "sudo", "buildctl", "--addr", "A",
+                    "debug", "workers", "--format", "{{json .}}"], argv
+
+
 _SWEEP_NERDCTL = r'''
 nerdctl() {
   echo "$*" >> "$NERDCTL_LOG"

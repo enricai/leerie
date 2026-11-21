@@ -52,10 +52,15 @@ LEERIE_BUILDKIT_RESOLVE_ERROR=""
 
 # _leerie_on_buildkit_side <cmd> [args...] — runs <cmd> where nerdctl runs
 # buildctl: on this host, or as root in Colima's VM on macOS, whose nerdctl
-# is a shim into the VM (not measured on macOS).
+# is a shim into the VM. On Darwin the args MUST be forwarded as separate
+# words, not as one `printf '%q'` string: `colima ssh --` passes what follows
+# straight to `limactl shell <id> <argv...>` as an argv slice (no shell join),
+# so a single reconstructed string becomes the name of one program to exec and
+# dies "command not found" (exit 127) — observed resolving every buildkitd
+# socket. This mirrors runtime-install.sh's `colima ssh -- sudo …`.
 _leerie_on_buildkit_side() {
   if [ "$(uname -s)" = "Darwin" ]; then
-    colima ssh -- "$(printf '%q ' sudo "$@")"
+    colima ssh -- sudo "$@"
   else
     "$@"
   fi
