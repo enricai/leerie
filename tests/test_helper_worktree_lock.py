@@ -172,8 +172,9 @@ def _blocking_add_callers(tree: ast.Module) -> list[tuple[int, str, str]]:
 
 def test_no_coroutine_calls_the_blocking_add(leerie):
     """Structural, paired with the test above: every coroutine reaches the
-    add through `asyncio.to_thread` (`_worktree_add_detached_async`, or a
-    `to_thread` of a sync checkout helper that calls it)."""
+    blocking add off the event loop (`_worktree_add_detached_async` runs it
+    in the loop's default executor; or a sync checkout helper that calls
+    it), never by a direct call in a coroutine."""
     assert _blocking_add_callers(ast.parse(inspect.getsource(leerie))) == []
 
 
@@ -185,3 +186,60 @@ def test_the_blocking_caller_scan_sees_a_transitive_call():
            "    await asyncio.to_thread(helper, st)\n")
     assert [b[1:] for b in _blocking_add_callers(ast.parse(src))] == [
         ("bad", "helper")]
+
+
+def test_a_cancelled_tree_is_removed_after_its_add_not_before(
+        leerie, tmp_path, monkeypatch):
+    """A helper tree cancelled while its add waits in its thread (the run's
+    sibling failed: `_gather_or_cancel`) is torn down after the add, never
+    before it. A thread cannot be cancelled, so the add runs on; torn down
+    first, the tree it then makes is left registered in the run's
+    repository with nothing to remove it. Driven by the repository lock the
+    add really waits on and by events, never by time."""
+    import asyncio
+    import contextlib
+    st = _st(tmp_path)
+    st.data = {}
+    common = Path(_git(st.run_dir / "repo", "rev-parse",
+                       "--path-format=absolute", "--git-common-dir").strip())
+    fd = os.open(str(common / "leerie-worktree.lock"),
+                 os.O_WRONLY | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    head = _git(st.repo_root, "rev-parse", "HEAD").strip()
+    wt = leerie._helper_worktree_path(st, "acceptance-1-view")
+    started = threading.Event()
+    real_add = leerie._worktree_add_detached
+
+    made: list[int] = []
+
+    def add(*a, **k):
+        started.set()
+        r = real_add(*a, **k)
+        made.append(r.returncode)
+        return r
+    monkeypatch.setattr(leerie, "_worktree_add_detached", add)
+
+    async def enter() -> None:
+        async with leerie._acceptance_tree(st, {}, head, "acceptance-1-view",
+                                           "set-1-view"):
+            raise AssertionError("entered a tree whose add was cancelled")
+
+    async def main() -> None:
+        task = asyncio.ensure_future(enter())
+        assert await asyncio.to_thread(started.wait, 30)
+        task.cancel()
+        # The cancellation reaches the task on the loop's next turns; a
+        # teardown that does not wait for the add runs in them.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    try:
+        asyncio.run(main())     # joins the add's thread on the way out
+    finally:
+        os.close(fd)
+    assert made == [0], "the add never made the tree"
+    listed = _git(st.run_dir / "repo", "worktree", "list", "--porcelain")
+    assert not wt.exists(), "the cancelled tree was left on disk"
+    assert str(wt) not in listed, listed

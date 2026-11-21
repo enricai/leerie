@@ -7099,9 +7099,30 @@ async def _worktree_add_detached_async(st: "State", wt: Path, rev: str, *,
                                        ) -> subprocess.CompletedProcess:
     """`_worktree_add_detached` off the event loop: its lock wait (up to
     `_WORKTREE_ADD_LOCK_WAIT_SEC`) and the checkout would otherwise stall
-    every worker's watchdog and stream reader (review r2 L3)."""
-    return await asyncio.to_thread(
-        functools.partial(_worktree_add_detached, st, wt, rev, repo=repo))
+    every worker's watchdog and stream reader (review r2 L3). Cancelled, it
+    still returns only once the add has: a thread cannot be cancelled, so
+    the add runs to its end whatever the caller does, and a caller's
+    teardown of `wt` that ran first would find nothing and leave the tree
+    the add then makes (DESIGN §6 *Never a repository-global git
+    operation*)."""
+    loop = asyncio.get_running_loop()
+    # A future, not a task: nothing but this function waits on it, and
+    # shutting the loop down cancels every task. `asyncio.wait` never
+    # cancels what it waits on.
+    add = loop.run_in_executor(None, functools.partial(
+        contextvars.copy_context().run, _worktree_add_detached, st, wt, rev,
+        repo=repo))
+    cancelled: asyncio.CancelledError | None = None
+    while not add.done():
+        try:
+            await asyncio.wait({add})
+        except asyncio.CancelledError as e:
+            cancelled = cancelled or e
+    if cancelled is not None:
+        if not add.cancelled():
+            add.exception()     # the cancellation is what the caller gets
+        raise cancelled
+    return add.result()
 
 
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:

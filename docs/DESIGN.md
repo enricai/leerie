@@ -7747,8 +7747,13 @@ run deaths across 4 chains. Four rules close it:
   a lock wait (up to that bound) plus the checkout run on the loop froze
   every worker's watchdog and stream reader while another run's script
   held the lock. A coroutine reaches the add only through a worker thread
-  (`asyncio.to_thread`), enforced by a test over every coroutine that
-  calls the add or a sync helper that reaches it.
+  (the event loop's executor), enforced by a test over every coroutine that
+  calls the add or a sync helper that reaches it. A thread cannot be
+  cancelled, so a coroutine cancelled during the add (a sibling of its
+  gather failed) still returns only once the add has: the caller then
+  removes the tree by its path, and a removal that ran first found
+  nothing and left the tree the add went on to make, registered in the
+  run's repository.
 
 The planning worktree also pruned *after* its orphan check, the order
 `new-worktree.sh` had already learned is wrong (a prune is what orphans a
