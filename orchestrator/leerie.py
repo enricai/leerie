@@ -51794,10 +51794,12 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
     """One base-paired test confirm (DESIGN §9 *Which failures are new*):
     `candidates`, failing on `final_tree`, rerun against a worktree at
     `base_sha` (`_helper_worktree_path(st, worktree)`), its dependencies
-    installed. With `reuse` (the `confirm-base` caller) that worktree is a
+    installed. With `reuse` (the `confirm-base` caller, and the `redrive-base`
+    caller `_redrive_new_failures`) that worktree is a
     kept tree moved to `base_sha` with its install reused when the install
     key there is unchanged (`_reuse_or_rebuild_kept_tree`; DESIGN §9 *The
-    base confirm worktree is kept across the run's confirms*) and is kept for
+    base confirm worktree is kept across the run's confirms*, *The delivery
+    re-drive's base confirm worktree is kept too*) and is kept for
     the run; without it the worktree is disposable, removed on every exit.
     No base checkout, or one
     whose install failed, gives every candidate `no_verdict` — never
@@ -69846,7 +69848,13 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     """B*: the IDs failing after a group and not before it, confirmed
     against a `redrive-base` worktree at `pre_sha` (`_confirm_new_failures`;
     `intermittent`: the IDs only discovery repeats found, never new on a
-    budget shortfall). Candidate files are sized to the budget
+    budget shortfall). The worktree is kept for the run and moved to
+    `pre_sha` with its install reused when the install key there is unchanged
+    (`reuse=True`, `_reuse_or_rebuild_kept_tree`; DESIGN §9 *The delivery
+    re-drive's base confirm worktree is kept too*): unlike B*'s base, the
+    re-drive's base moves as groups commit, but a start commit whose install
+    inputs are unchanged still reuses the install. Candidate files are sized
+    to the budget
     (`_confirm_sized`); one never rerun is `budget_short_unsettled` and
     listed in `sized_out`. `{new, resource_affected,
     budget_short_unsettled, sized_out, unsettled_files, unmeasured}`; no
@@ -69865,7 +69873,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
         label=label, log_path=st.run_dir / "logs" / _REDRIVE_LOG,
         worktree="redrive-base", deps_label=f"{label}-base",
         deps_log="delivery re-drive", run_prefix=label, confirm_label=label,
-        intermittent=intermittent)
+        intermittent=intermittent, reuse=True)
     unsettled = list(verdict.get("budget_short_unsettled") or [])
     return {"new": list(verdict["new"]),
             "pre_existing": list(verdict.get("pre_existing") or []),

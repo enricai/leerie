@@ -22819,6 +22819,38 @@ left on disk — a tracked file an in-place substitution rewrote, an untracked
 report or cache — reaches the next confirm. Like a committed view, the worktree
 lives no longer than the run and is reaped with its worktrees.
 
+**The delivery re-drive's base confirm worktree is kept too.** The delivery
+re-drive and the acceptance ratchet confirm their own failing-test-ID diffs
+against a base commit the same way B\* does, through the same
+`_confirm_against_base`, in a worktree named `redrive-base`. That confirm was
+disposable where B\*'s was kept — built, installed and torn down on every
+group, round and discovery re-confirm that had a candidate — and it is the
+next-heaviest base install after B\*'s: measured across the replayed-run
+corpus, 74 cold installs over 18 runs, up to 10 in the heaviest (navegando
+4e7dedc4, again), every one a reinstall at the one `redrive-base` path. So it
+joins the kept-tree mechanism unchanged — the same `_reuse_or_rebuild_kept_tree`
+move the committed view, the evaluation tree and B\*'s base worktree use — a
+third consumer, no new machinery.
+
+The one difference from B\*'s base is the commit this base sits at. B\*'s base
+is the run's fixed base commit; the re-drive confirms against each group's or
+round's *start* commit (`pre_sha`), which advances as groups commit. The
+install key is the install's inputs, not the commit (above), so this is exactly
+the case the key already covers: a start commit whose dependency inputs are
+unchanged reuses the install (the move checks it out at that commit), and one
+whose lockfile or manifest changed is a different key and reinstalls. In
+practice the re-drive rolls back every group that regresses or makes no
+committed progress, so most groups start at the same commit the first did (the
+run's re-drive start) and the rest differ only in code the install does not
+read — across the corpus every one of the 18 runs reduces to a single cold
+install (56 of 74 saved). Outcome-identity holds for the identical reason it
+holds for B\*'s base: `_install_intact` re-verifies the kept install
+entry-for-entry and the move `clean`s the tree before every confirm, so each
+base side runs on a pristine checkout of its own commit with an install a fresh
+install would reproduce. Like B\*'s base it reruns the run's own test IDs, never
+a hidden set, so it carries no I3 obligation; and it is reaped with the run's
+worktrees the same way.
+
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
 run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):

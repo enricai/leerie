@@ -207,12 +207,12 @@ def test_no_confirm_state_leaks_into_the_next(leerie, env, observed):
 
 
 def test_reuse_false_keeps_the_disposable_teardown(leerie, env, observed):
-    """The other callers (`redrive-base`, `base-form-base`, `reuse=False`)
-    keep the old behaviour: the worktree is torn down on exit and never
+    """The remaining disposable caller (`base-form-base`, `reuse=False`)
+    keeps the old behaviour: the worktree is torn down on exit and never
     entered into the kept-tree memos."""
     st, staging, base, caps = env
-    wt = leerie._helper_worktree_path(st, "redrive-base")
-    v = _confirm(leerie, st, caps, base, staging, worktree="redrive-base",
+    wt = leerie._helper_worktree_path(st, "base-form-base")
+    v = _confirm(leerie, st, caps, base, staging, worktree="base-form-base",
                  reuse=False)
     assert v["new"] == ["t_new"]
     assert not wt.exists()                              # removed on exit
