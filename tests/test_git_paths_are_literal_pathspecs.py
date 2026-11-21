@@ -25,7 +25,7 @@ from test_redrive_test_id_diff_refresh import _git  # noqa: E402
 
 SRC = Path(__file__).resolve().parent.parent / "orchestrator" / "leerie.py"
 # Wrappers whose positional args after the first are git's argv.
-GIT_WRAPPERS = {"_redrive_git", "_git_text", "_git_out"}
+GIT_WRAPPERS = {"_redrive_git", "_git_text", "_git_out", "_delivery_grep"}
 # Call sites whose pathspecs are deliberately not literal, by enclosing
 # function, each with its reason. Anything else that passes a non-constant
 # path after `--` must say `--literal-pathspecs`.

@@ -13805,6 +13805,10 @@ tree)"). So the payload, not the judge, says what must be answered:
   search hits that no member names becomes a member too: the list is at
   least as complete as the worker's own searches, whatever it chose to
   write down. A member whose `path` is not a file of `HEAD` is dropped.
+  A search is bounded as an absence claim is; one the bound cuts leaves
+  the set's members unknown, not none, so the set is not listed (its
+  other searches are not run) and is left to a person, as a set too large
+  to list is.
   A sweep's derived item is not enumerated: its entries already are its
   instances (*A sweep's instances are items*). A failed enumerator call lists nothing: the pass runs on the
   declared parts alone.
@@ -14341,7 +14345,19 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   (`_verify_delivery_cite`); `path: "RECORD"` is checked against the
   executed-commands record; `path: "ABSENT"` / `"ABSENT:<pathspec>"`
   is the absence claim, which code re-runs as `git grep -E` and accepts
-  only when nothing matches. A `met` whose parts are not all `met`, or
+  only when nothing matches. The regex is a worker's, so its run is
+  bounded (`DELIVERY_GREP_TIMEOUT_SEC`); a run the bound cuts measured
+  nothing, so the citation verifies nothing and is no finding against
+  the regex either, and a `met` part only such a claim holds back was not
+  inspected: it is re-asked and, still unread, unknown — never the unmet
+  vote the next sentence makes of an unverified `met`. The cut yields to
+  a real refutation, never hides one: when another `met` part carries a
+  citation a check on the tree refutes (a fabricated quote, a wrong line),
+  that part's unmet vote stands and the item is unmet, as it would be
+  without the cut. But a part held only by a worker's record is no such
+  refutation — leerie cannot re-run a worker's command — so it does not
+  stand against the cut: the item rides to human verification with the
+  unmeasured part, never to a re-drive no implementer could satisfy. A `met` whose parts are not all `met`, or
   whose every part does not carry at least one verified citation, is
   rejected — counted as an unmet vote — so a fabricated quote cannot buy
   a `met`. The pack and the 2-of-3 dispute vote are unchanged; the

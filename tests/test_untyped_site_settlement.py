@@ -134,3 +134,25 @@ def test_a_fabricated_quote_or_a_no_settles_nothing(leerie, tmp_path,
         sec = leerie._format_pr_end_state_section(
             {"site_claims": {"sites": [got["row"]]}})
         assert ADVISORY in sec and "(D8)" in sec, sec
+
+
+def test_a_site_resting_on_a_cut_check_is_unsettled_and_blames_no_one(
+        leerie, tmp_path, monkeypatch):
+    """A site the judge claims resolved, citing only an absence whose
+    `git grep` the bound cut (`absent_unmeasured`), is not settled — no
+    evidence — and the PR says the check did not finish, never that the
+    judge's citations fail to verify (a timeout is no verdict)."""
+    real = leerie._delivery_grep
+
+    def cut(tree, *args):
+        if "never_written" in " ".join(args):
+            return None                     # the bound cut this run
+        return real(tree, *args)
+    monkeypatch.setattr(leerie, "_delivery_grep", cut)
+    got = _gate(leerie, tmp_path, monkeypatch, [
+        {"site_id": "D8", "resolved": True, "evidence": "none left",
+         "cites": [{"path": "ABSENT:src/", "quote": r"never_written\("}]}])
+    s = got["row"]["settlement"]
+    assert s["settled"] is False
+    assert "did not finish" in s["evidence"], s
+    assert "do not verify" not in s["evidence"], s

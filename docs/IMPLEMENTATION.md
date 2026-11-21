@@ -10389,7 +10389,21 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `_DELIVERY_CITE_OK`, though `_delivery_unmet_parts` keeps it as a
   falsifier lead), or an `ABSENT[:<pathspec>]` regex that `git grep -q -E -e
   <quote> HEAD -- <pathspec>` finds nowhere (exit 1; exit 0 is
-  `absent_found`, anything else `bad_regex`) — otherwise the verdict
+  `absent_found`, anything else `bad_regex`; a run cut at
+  `DELIVERY_GREP_TIMEOUT_SEC` = 60 s is `absent_unmeasured`, logged, not
+  in `_DELIVERY_CITE_OK`, a met part no other citation verifies is typed
+  `not_inspected` by `_delivery_screen_sample` (`_part_held_by_cut_absence`)
+  — but only when no other part of the verdict is a mechanical unmet
+  (`_part_is_mechanical_unmet`: a met part with a citation that verifies
+  to a status outside `_DELIVERY_CITE_OK | {record_worker,
+  absent_unmeasured}`, i.e. a fabricated or wrong citation a check refutes
+  on the tree); such a part's unmet vote stands against the cut, while a
+  part held only by a `record_worker` citation does not and rides to human
+  verification with the cut (round 3 B: otherwise a cut absence beside a
+  worker-only part flips `record_worker_only` into a re-drive);
+  each ABSENT status is memoised in the gate's cite cache by regex and
+  pathspec; every such `git grep` is `_delivery_grep(tree, *args)`, None
+  when cut) — otherwise the verdict
   becomes `met: false, rejected: <no_parts | part_not_met | part_uncited>`.
   Then (DESIGN §8 *Execution-shaped items are judged from the run's own
   records*; review round 12 L3, round 14) each screened sample goes,
@@ -10491,7 +10505,11 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   re-runs each search as `git grep -n -z -I --max-count=1 -E -e <regex>
   HEAD -- [<pathspec>]`, adding `{member_of, path, line: <first hit>, place:
   "matches the search /<regex>/"}` for every hit file no member of that
-  entry names (a non-zero exit adds nothing); while an item's sets
+  entry names (a non-zero exit adds nothing; a search `_delivery_grep`
+  cuts at `DELIVERY_GREP_TIMEOUT_SEC` replaces that entry's members with
+  one `{member_of, unlisted: 0, unmeasured: true}` member, an `unlisted`
+  entry saying a search did not finish, counted as one toward `cap`, and
+  that set's remaining searches do not run); while an item's sets
   together hold more than `cap` (`delivery_set_members`) members, its
   largest remaining set is replaced by one `{member_of, unlisted: n}`
   member, which `_delivery_checklist` makes an `unlisted` entry;
