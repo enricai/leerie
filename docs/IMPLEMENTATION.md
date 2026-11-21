@@ -9568,7 +9568,11 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     kept (`_DEPS_INSTALLED`/`_DEPS_FAILED` dropped, `_DEPS_KEPT[realpath(wt)]
     = <outputs>`); otherwise `_eval_teardown(repo, wt)` (`git --git-dir
     <repo> worktree remove --force`, `_rmtree_owned`, `_forget_installs`)
-    then `_worktree_add_detached_async(st, wt, tip, repo=repo)`
+    then `_worktree_add_detached_async(st, wt, tip)` — no `repo=`, so the
+    default path's missing-run-repository guard runs (the eval tree lives in
+    the run's own repository; a vanished one is leerie's own bug, not "no
+    evidence either way" — DESIGN §6 *The run's own repository*, review round
+    17 H1; `tests/test_run_repo_missing_dies.py`)
     ("worktree_failed" on a non-zero add). Either way it sets
     `_EVAL_TREES[realpath(wt)] = (repo, tip)` and runs
     `_ensure_worktree_deps(str(wt), …, label_prefix="acceptance-<label>",
