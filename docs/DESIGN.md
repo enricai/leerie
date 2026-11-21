@@ -22503,6 +22503,92 @@ that side unmeasured, never "failed like the base":
 The comparison is then unknown and says so; it is never settled by two
 broken installs agreeing.
 
+**A settled base verdict is reused, never recomputed.** Whether a candidate
+is `pre_existing` — the base fails it on every one of the `k` reruns, each
+of which produced a report (step 3) — is a fact about the base: it does not
+depend on the final tree or on the candidate list, and, under the per-test
+determinism B\* already assumes everywhere — a test's base outcome is its
+own, not a function of which sibling files share the rerun process, the same
+assumption that lets a sized confirm rerun files in groups and still
+attribute a verdict per ID — it does not depend on the base rerun's
+companion file set either (where that assumption fails, the memo stays sound
+but not byte-identical, below). Across a run the same base is confirmed against many
+times: the final failing-test-ID diff of each acceptance-repair round, the
+existing-behaviour check, each delivery re-drive group and the base-form run
+all rerun a base, and the `pre_existing` candidates among them are largely
+the same — a red base stays red. Measured on a replay (barnacle, failure
+mode 4), up to 81% of one phase's candidates were already settled
+`pre_existing` at a base the run had rerun in an earlier phase, and every one
+was rebuilt, reinstalled and reran `k` times only to reach the verdict it
+already had; the base worktree was rebuilt, installed and torn down on each
+call.
+
+So the base-paired confirm memoises the `pre_existing` determination for the
+life of the run, keyed by everything that determines a candidate's base
+rerun: the base commit, the test command, the in-place substitutions and the
+base-form removals applied to the base side. A candidate known `pre_existing`
+under that exact key is not dispatched to either side — its verdict comes
+from the memo, not a rerun (a file it shares with a still-dispatched
+candidate is of course still rerun for that candidate, so the saving is a
+dropped file or, below, a dropped worktree, not a dropped line); when every
+candidate of a confirm is already settled, the base worktree is not built,
+installed or torn down at all — the per-call cost the diff pays most often.
+The memo is run state, so a resume reuses it; a run saved before the memo
+existed has none and recomputes exactly as before.
+
+The reuse is sound because `pre_existing` and `new` are mutually exclusive
+and both decided by the base: `new` requires the base to *pass* every rerun,
+`pre_existing` requires it to *fail* every rerun. A memoised `pre_existing`
+verdict can therefore never reclassify a later phase's real regression — a
+regression needs a base that passes, which this candidate's base does not —
+so the memo hides no new failure (no false `done`); and since a
+`pre_existing` candidate is never a regression and never vetoes, it adds no
+false veto. The memo only ever *reuses* `pre_existing`; it never produces a
+`new`, a `resource_affected` or a pass, so the one thing it can do to a
+candidate is withhold a rerun of a base B\* has already found
+deterministically red.
+
+What it reuses is exactly B\*'s own settled verdict, so on a base that is
+deterministic for a candidate — the model B\* already runs on, since `k`
+consecutive base failures are what it treats as "a red base, not this run's"
+within a single phase — the reused `pre_existing`/`new` verdict is the one
+the un-memoised confirm would reach. The memo does change one thing: it does
+not re-sample the base across phases. Un-memoised, each phase draws its own
+`k` base reruns, so a base that is *flaky* for a candidate gets several
+independent draws over a run, and a later draw that happened to pass every
+rerun could call the candidate `new`. The memo instead pins the first
+phase's decisive draw of `k` consecutive base failures for the rest of the
+run. This is the same judgment B\* already makes inside one phase (`k`
+consecutive failures settle the candidate as the base's own; *a red base
+stays red*), extended across phases; it trades a flaky base's extra re-draws
+for the saved reruns. A second way a non-deterministic base diverges is the
+companion-file-set assumption above: if a candidate's base outcome actually
+depends on which sibling files share its rerun process (imperfect test
+isolation — shared global state, a port, a database), a later phase whose
+companion set would have let the base pass reuses the first phase's
+`pre_existing` instead. Putting the companion set in the key would erase
+essentially all the savings — it varies every phase — and the assumption it
+rests on is one B\* already makes wherever it chooses sized over unsized
+reruns; it is not a guarantee this memo newly breaks. Two further divergences
+are sound but not identical either, and none of these can fabricate a base
+pass: a later confirm whose own base install fails still reports a memoised
+candidate `pre_existing` (a real measurement from the phase that recorded it,
+not two broken installs agreeing — so better than the `no_verdict` the
+un-memoised confirm would give); and freeing a settled file's budget can let
+a remaining candidate that was `budget_short_unsettled` (an explicit
+*unknown*, not a settled verdict) settle, always toward a more complete
+measurement, never toward a base pass that did not happen — and can likewise
+flip a confirm whose only candidate without a known file was memoised from
+unsized to sized, a different but equally valid rerun plan.
+
+The key is exact: a moved baseline (a re-drive group's own start, the
+base-form's start), a different test command or a different base form is a
+different key and shares nothing, so a verdict measured against one base is
+never read against another. And because `pre_existing` is recorded only from
+a complete set of base reruns that each produced a report (step 3), the memo
+never captures a base whose install failed — that side is `no_verdict`, not
+`pre_existing` (*A failed install is no measurement*, above).
+
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
 run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):
