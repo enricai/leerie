@@ -375,9 +375,16 @@ def leerie_container_drop() -> tuple[str, str]:
     launcher mounts the host's toolchain cache there, outside the home,
     beneath which nothing is mounted: DESIGN §6 *Every confined process has
     its own home*), then the drop `scripts/container-entry.sh` makes, with
-    the chowns these tests need. The entry's other steps are not reproduced
+    the chowns these tests need. The commands' pristine home
+    (`/leerie-command-home`) is built as the entry builds it, a copy of the
+    image's home: the image sets `LEERIE_COMMAND_HOME` so a confined
+    repository command's home overlay names it as its `--base`, and a test
+    that bypasses the entry would otherwise face a base that is not a
+    directory (DESIGN §6 *A repository command gets nothing the operator
+    handed leerie for itself*). The entry's other steps are not reproduced
     (among them its chowns of `/work`, `/leerie-host` and `/tmp/.cache`,
-    the staged home's copy, the cgroup broker, and `USER`/`LOGNAME`).
+    the staged home's copy into it, the cgroup broker, and
+    `USER`/`LOGNAME`).
 
     Rootless maps outer root onto leerie, so what root owns is leerie's.
     Rootful switches uid after chowning the home and the toolchains to
@@ -398,12 +405,17 @@ def leerie_container_drop() -> tuple[str, str]:
         f"/run/user/{os.getuid()}/containerd-rootless/child_pid").is_file()
     drop = ('unshare --user --map-user="$(id -u leerie)" '
             '--map-group="$(id -g leerie)"' if rootless else
-            "chown -R leerie: /home/leerie /leerie-toolchains && "
-            "runuser -u leerie --")
+            "chown -R leerie: /home/leerie /leerie-toolchains "
+            "/leerie-command-home && runuser -u leerie --")
     owner = ("uid=0,gid=0" if rootless else
              f"uid={os.getuid()},gid={os.getgid()}")
+    # The commands' pristine home, as the entry builds it (a copy of the
+    # image's home, before any staged credential): the image's
+    # LEERIE_COMMAND_HOME makes a repository command's overlay name it, so a
+    # test that drives `_measurement_grants` without the entry still has a
+    # base that is a directory.
     return ("mkdir -p /leerie-toolchains/home /leerie-toolchains/mise && "
-            + drop, owner)
+            "cp -a /home/leerie /leerie-command-home && " + drop, owner)
 
 
 def _run(coro):

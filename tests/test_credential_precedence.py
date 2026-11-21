@@ -717,7 +717,12 @@ def _build_call_site_harness(tmp_path: Path) -> Path:
         functions_src
         + "\n"
         + 'STAGE="${TEST_STAGE:?}"\n'
-        + 'mkdir -p "$STAGE/.claude"\n'
+        # The credential is the CLI's own class ($STAGE_CLI), the workers'
+        # alone (DESIGN §6 *A repository command gets nothing the operator
+        # handed leerie for itself*).
+        + 'STAGE_CLI="$STAGE/cli"\n'
+        + 'STAGE_HOME="$STAGE/home"\n'
+        + 'mkdir -p "$STAGE_CLI/.claude" "$STAGE_HOME"\n'
         + 'OS="Darwin"\n'
         + 'USER_REPO="${TEST_USER_REPO:-/tmp/nonexistent-repo-leerie-test}"\n\n'
         + call_site
@@ -919,7 +924,7 @@ def test_call_site_proceeds_and_warns_on_near_expiry_credential() -> None:
 )
 def test_call_site_writes_resolved_credential_to_stage_file() -> None:
     """On a successful resolution, the call site stages the resolved JSON
-    verbatim into $STAGE/.claude/.credentials.json with mode 600 -- the
+    verbatim into $STAGE_CLI/.claude/.credentials.json with mode 600 -- the
     actual side effect the whole block exists to produce, which none of
     the rc/stdout-only assertions above observe directly."""
     blob = '{"claudeAiOauth":{"accessToken":"sk-good"}}'
@@ -927,7 +932,7 @@ def test_call_site_writes_resolved_credential_to_stage_file() -> None:
         tmp_path = Path(d)
         rc, out = _run_call_site(tmp_path, stub_security_returns=blob)
         assert rc == 0, f"call site died on a healthy credential (rc={rc}): {out}"
-        staged = tmp_path / "stage" / ".claude" / ".credentials.json"
+        staged = tmp_path / "stage" / "cli" / ".claude" / ".credentials.json"
         assert staged.exists()
         assert staged.read_text() == blob
         assert oct(staged.stat().st_mode)[-3:] == "600"
@@ -939,7 +944,7 @@ def test_call_site_writes_resolved_credential_to_stage_file() -> None:
 )
 def test_call_site_removes_stale_staged_file_on_die(tmp_path: Path) -> None:
     """When the call site dies (no auth anywhere), it must remove any
-    stale $STAGE/.claude/.credentials.json left over from a prior
+    stale $STAGE_CLI/.claude/.credentials.json left over from a prior
     invocation rather than leaving a container to mount stale
     credentials it believes are fresh."""
     harness = _build_call_site_harness(tmp_path)
@@ -956,8 +961,8 @@ def test_call_site_removes_stale_staged_file_on_die(tmp_path: Path) -> None:
     sec.chmod(0o755)
 
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    stale = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    stale = stage / "cli" / ".claude" / ".credentials.json"
     stale.write_text('{"claudeAiOauth":{"accessToken":"sk-stale-from-prior-run"}}')
 
     repo_dir = tmp_path / "repo"

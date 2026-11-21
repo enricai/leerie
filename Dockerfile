@@ -260,6 +260,9 @@ ENV MISE_NODE_COREPACK=false
 ENV MISE_RUBY_COMPILE=false
 ENV MISE_DATA_DIR=/leerie-toolchains/mise
 ENV LEERIE_TOOLCHAIN_HOME=/leerie-toolchains/home
+# The commands' pristine home, filled by the entry (DESIGN §6 *A repository
+# command gets nothing the operator handed leerie for itself*).
+ENV LEERIE_COMMAND_HOME=/leerie-command-home
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 # Rootless containerd (Linux + nerdctl without setuid) runs the orchestrator
 # inside `unshare --user --map-user=leerie_uid`, which maps outer UID 0 →

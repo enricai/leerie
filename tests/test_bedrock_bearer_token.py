@@ -78,7 +78,12 @@ AUTH_MOUNTS=()
 HOME="__HOME__"
 USER_REPO="__USER_REPO__"
 STAGE="__STAGE__"
-mkdir -p "$STAGE"
+# The launcher stages each file in its purpose class; the Bedrock block
+# writes the CLI's .aws under $STAGE_CLI (DESIGN §6 *A repository command
+# gets nothing the operator handed leerie for itself*).
+STAGE_CLI="$STAGE/cli"
+STAGE_HOME="$STAGE/home"
+mkdir -p "$STAGE_CLI" "$STAGE_HOME"
 
 # ---- Bedrock activation block, extracted verbatim from the launcher -----
 __BEDROCK_BLOCK__
@@ -164,11 +169,12 @@ def _env_pairs(tokens: list[str]) -> dict[str, str]:
 
 
 def _has_aws_mount(tokens: list[str], tmp_path: Path) -> bool:
-    """`~/.aws` staged for the container: copied into `$STAGE/.aws`, which
-    the entry copies into the home (DESIGN §6 *Every confined process has
-    its own home*), and never a mount of its own."""
+    """`~/.aws` staged for the container: copied into `$STAGE/cli/.aws`, the
+    CLI's class (DESIGN §6 *A repository command gets nothing the operator
+    handed leerie for itself*), which the entry copies into the workers'
+    home and never a mount of its own."""
     assert not any(":/home/leerie/.aws" in t for t in tokens), tokens
-    return (tmp_path / "stage" / ".aws").is_dir()
+    return (tmp_path / "stage" / "cli" / ".aws").is_dir()
 
 
 # ---------------------------------------------------------------------------

@@ -175,12 +175,36 @@ cd /work
 # directly, never a live mount), so this is a no-op there. Root-owned
 # under rootless (correct there: outer root is inner leerie); the rootful
 # guard below chowns the home to leerie.
-if [ -d /opt/leerie-home-src ]; then
-  for _e in /opt/leerie-home-src/.[!.]* /opt/leerie-home-src/..?*; do
+#
+# The launcher stages each file by its purpose (DESIGN §6 *A repository
+# command gets nothing the operator handed leerie for itself*): `cli/`, the
+# CLI's own login and settings, is the workers' alone; `home/`, what the
+# repository's commands may use, is everyone's. The commands' pristine home
+# ($LEERIE_COMMAND_HOME) is a copy of the image's home made first, then
+# `home/`; the workers' home gets `home/` and `cli/`. A file the launcher
+# stages later lands in whichever class it was staged in, so nothing here
+# names one.
+_copy_dots() {  # <src-dir> <dest-dir>
+  for _e in "$1"/.[!.]* "$1"/..?*; do
     [ -e "$_e" ] || [ -L "$_e" ] || continue
-    cp -a "$_e" /home/leerie/
+    cp -a "$_e" "$2"/
   done
   unset _e
+}
+if [ -n "${LEERIE_COMMAND_HOME:-}" ]; then
+  mkdir -p "$LEERIE_COMMAND_HOME"
+  chmod 0755 "$LEERIE_COMMAND_HOME"
+  _copy_dots /home/leerie "$LEERIE_COMMAND_HOME"
+fi
+if [ -d /opt/leerie-home-src ]; then
+  if [ -d /opt/leerie-home-src/home ]; then
+    _copy_dots /opt/leerie-home-src/home /home/leerie
+    [ -n "${LEERIE_COMMAND_HOME:-}" ] \
+      && _copy_dots /opt/leerie-home-src/home "$LEERIE_COMMAND_HOME"
+  fi
+  if [ -d /opt/leerie-home-src/cli ]; then
+    _copy_dots /opt/leerie-home-src/cli /home/leerie
+  fi
 fi
 
 # /work ownership fix. On the Fly path, when FLY_VM_DISK_GB is set in
@@ -222,6 +246,11 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   # process's home is an overlay of it, and copying a file up needs to own
   # it (DESIGN §6 *Every confined process has its own home*).
   chown -R leerie: /home/leerie 2>/dev/null || true
+  # The commands' pristine home, for the same reason: a repository
+  # command's home is an overlay of it.
+  if [ -n "${LEERIE_COMMAND_HOME:-}" ] && [ -d "$LEERIE_COMMAND_HOME" ]; then
+    chown -R leerie: "$LEERIE_COMMAND_HOME" 2>/dev/null || true
+  fi
   # The toolchain directories where they are the image's own (Fly, EC2):
   # never where the launcher mounted the host's cache there, which is the
   # host user's and keeps its owner.

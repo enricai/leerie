@@ -58,7 +58,13 @@ _BLOCKS = [
     # Not a `name() {` shape — a case arm, matched at its own indent.
     ("config) case arm", "  config)"),
     ("runtime-mode knob block", "# --- runtime-mode knob ---"),
-    ("nerdctl run argv", "  _run_argv=("),
+    # Anchored on the array literal's first element (`_run_argv=(` opens the
+    # block, `--rm` is its first line): the run argv is assembled in two
+    # steps — the literal, then a one-line rebuild that names the launcher's
+    # own `-e`s in LEERIE_LAUNCHER_ENV — and only the literal is "the block"
+    # this guard forbids reproducing. Matching the bare `_run_argv=(` would
+    # also count that rebuild.
+    ("nerdctl run argv", "  _run_argv=(\n    --rm"),
     ("pre-push preflight block", "# 4. pre-push hook preflight."),
     # The chain arm's per-wave probe — a second block added by the same
     # change that registered the row above, and initially unregistered,

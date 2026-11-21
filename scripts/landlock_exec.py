@@ -23,8 +23,12 @@ stores they install from (DESIGN §6 *The write grants on one mount are one
 mount*); every other grant is its own mount.
 
 OVERLAY is `--overlay DIR [--lower L]... [--upper UPPER]` or `--home DIR
-[--lower L]... --upper UPPER` (with either): an overlay on DIR whose lower layers are each
-`--lower` that exists (the first on top) and DIR itself (`mount_overlay`).
+[--base B] [--lower L]... --upper UPPER` (with either): an overlay on DIR whose lower layers are each
+`--lower` that exists (the first on top) and DIR itself (`mount_overlay`),
+or for the home `--base B` in DIR's place: a repository command's home is
+the commands' pristine home, so the workers' beneath DIR is not reachable
+(DESIGN §6 *A repository command gets nothing the operator handed leerie
+for itself*).
 Without `--upper` it is read-only, and none is made when no `--lower`
 exists. `--upper DIR` (`--isolate` only): the upper is DIR on disk, its
 work directory `DIR.work` beside it, kept after the process (a tree's
@@ -1093,12 +1097,16 @@ def _overlay_on(target: str, lowers: list[str], up: str | None,
 
 
 def mount_overlay(target: str, lowers: list[str], upper: str | int | None,
-                  *, home: bool, grants: list[str]) -> None:
+                  *, home: bool, grants: list[str],
+                  base: str | None = None) -> None:
     """Mount an overlay on `target` (DESIGN §6 *Every confined process has
     its own home*, *The setup hook writes the run layer, never the host's
     toolchains*): its lower layers are each of `lowers` that is a directory
     (for the home, not beneath it; the first on top), then `target`
-    itself.
+    itself — or, for the home, `base` in its place (`--base`: a repository
+    command's home is the commands' pristine home, never the workers', DESIGN
+    §6 *A repository command gets nothing the operator handed leerie for
+    itself*), which must be a directory.
     `upper` None: read-only, and no overlay when no lower exists. A path:
     the upper on disk, its work directory `<upper>.work` beside it, kept
     after the process (a tree's install writes its tree home layer, the
@@ -1117,8 +1125,11 @@ def mount_overlay(target: str, lowers: list[str], upper: str | int | None,
         raise IsolationError(f"{what} {target}: not a directory")
     # A layer beneath the home is passed over; any other overlay's is kept,
     # and its mount refused where the kernel refuses it.
+    if base is not None and (not os.path.isdir(base)
+                             or os.path.islink(base)):
+        raise IsolationError(f"{what} {target} base {base}: not a directory")
     lowers = [os.path.normpath(p) for p in lowers if os.path.isdir(p)
-              and not (home and _beneath(p, target))] + [target]
+              and not (home and _beneath(p, target))] + [base or target]
     if any(c in p for p in lowers for c in ",:\\"):
         raise IsolationError(f"{what} {target}: a path overlayfs cannot name")
     for mp, _opts in _mountinfo():
@@ -1185,7 +1196,7 @@ def mount_overlays(overlays: list[dict], grants: list[str]) -> list[str]:
     writable = []
     for o in sorted(overlays, key=lambda o: not o["home"]):
         mount_overlay(o["target"], o["lowers"], o["upper"], home=o["home"],
-                      grants=grants)
+                      grants=grants, base=o.get("base"))
         if o["upper"] is not None:
             writable.append(o["target"])
     return writable
@@ -2178,7 +2189,7 @@ def _parse(argv: list[str]) -> dict | str:
                      "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd",
-                     "--link-root", "--home", "--overlay", "--lower",
+                     "--link-root", "--home", "--base", "--overlay", "--lower",
                      "--upper") \
                 or i + 1 >= len(opts):
             return f"landlock_exec.py: bad option {k!r}"
@@ -2203,6 +2214,13 @@ def _parse(argv: list[str]) -> dict | str:
             if not os.path.isabs(v) or os.path.normpath(v) in ("/", "//"):
                 return f"landlock_exec.py: bad --link-root {v!r}"
             o["link_root"] = os.path.normpath(v)
+        elif k == "--base":
+            if not o["overlays"] or not o["overlays"][-1]["home"] \
+                    or o["overlays"][-1].get("base") is not None \
+                    or not os.path.isabs(v) \
+                    or os.path.normpath(v) in ("/", "//"):
+                return f"landlock_exec.py: bad --base {v!r}"
+            o["overlays"][-1]["base"] = os.path.normpath(v)
         elif k in ("--home", "--overlay", "--lower", "--upper"):
             size = v[len("tmpfs:"):] if k == "--upper" \
                 and v.startswith("tmpfs:") else None

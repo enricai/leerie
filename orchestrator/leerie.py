@@ -25914,6 +25914,9 @@ class Overlay(NamedTuple):
     lowers: tuple[str, ...] = ()
     upper: str = ""
     home: bool = False
+    # The home's bottom layer in place of `target` (`--base`): a repository
+    # command's is the commands' pristine home (`_command_home`).
+    base: str = ""
 
 
 class WorkerGrants(NamedTuple):
@@ -25954,6 +25957,33 @@ HOME_UPPER_BYTES = 1 << 30
 # process through its home's lower layer. Unset (a test, a host harness),
 # there is none.
 TOOLCHAIN_HOME_ENV = "LEERIE_TOOLCHAIN_HOME"
+# The commands' pristine home (DESIGN §6 *A repository command gets nothing
+# the operator handed leerie for itself*): the image's home and what the
+# launcher staged for the repository's commands, never the CLI's login. The
+# image names it; the entry fills it.
+COMMAND_HOME_ENV = "LEERIE_COMMAND_HOME"
+# Every variable the launcher passed into the container, named by the
+# launcher from the run argv it executes: all of them are leerie's
+# (configuration, its workers' credentials), none the repository's.
+LAUNCHER_ENV_ENV = "LEERIE_LAUNCHER_ENV"
+# The directory the launcher stages the operator's files in, mounted
+# read-only for the entry to copy from: no confined process reads it.
+HOME_SRC = Path("/opt/leerie-home-src")
+
+
+def _command_home() -> str:
+    """The commands' pristine home (`COMMAND_HOME_ENV`), resolved, or ""
+    where none is named (a host harness)."""
+    v = os.environ.get(COMMAND_HOME_ENV, "")
+    return os.path.realpath(v) if os.path.isabs(v) else ""
+
+
+def _launcher_env_names() -> tuple[str, ...]:
+    """The names the launcher passed into the container
+    (`LAUNCHER_ENV_ENV`), the list's own name with them."""
+    raw = os.environ.get(LAUNCHER_ENV_ENV, "")
+    names = [n for n in re.split(r"[\s,]+", raw) if n]
+    return tuple(dict.fromkeys([*names, LAUNCHER_ENV_ENV])) if raw else ()
 
 
 def _confined_home(env: Mapping[str, str] | None = None) -> str:
@@ -26381,6 +26411,11 @@ def _reads_outside(root: Path, *, tmp: bool = True) -> list[str]:
                     out.append(p)
     out = [p for p in out
            if not Path(os.path.realpath(p)).is_relative_to(_DEV)]
+    # The operator's staged files, the CLI's login among them, are the
+    # entry's input alone (DESIGN §6 *A repository command gets nothing the
+    # operator handed leerie for itself*).
+    if HOME_SRC.is_dir():
+        out = _around(out, Path(os.path.realpath(HOME_SRC)))
     host = _host_dir()
     return out if host is None else _around(out, host)
 
@@ -26712,11 +26747,13 @@ def _shim_refusals(what: str) -> Iterator[int]:
 
 def _grant_overlays(home: str, lowers: tuple[str, ...], upper: str = "",
                     layers: tuple[tuple[str, str], ...] = (),
-                    layer_uppers: tuple[tuple[str, str], ...] = ()
-                    ) -> tuple[Overlay, ...]:
-    """A grant's overlays: the home first (none when `home` is empty), then
-    each read-only `(DIR, LAYER)` and each writable `(DIR, UPPER)`."""
-    return (((Overlay(home, lowers, upper, home=True),) if home else ())
+                    layer_uppers: tuple[tuple[str, str], ...] = (),
+                    base: str = "") -> tuple[Overlay, ...]:
+    """A grant's overlays: the home first (none when `home` is empty; its
+    bottom layer `base` when given), then each read-only `(DIR, LAYER)` and
+    each writable `(DIR, UPPER)`."""
+    return (((Overlay(home, lowers, upper, home=True, base=base),)
+             if home else ())
             + tuple(Overlay(d, (layer,)) for d, layer in layers)
             + tuple(Overlay(d, upper=u) for d, u in layer_uppers))
 
@@ -26726,6 +26763,8 @@ def _overlay_argv(grants: WorkerGrants) -> list[str]:
     argv: list[str] = []
     for o in grants.overlays:
         argv += ["--home" if o.home else "--overlay", o.target]
+        if o.base:
+            argv += ["--base", o.base]
         for lower in o.lowers:
             argv += ["--lower", lower]
         if o.upper or o.home:
@@ -27708,6 +27747,9 @@ def _measurement_grants(st: "State", tree: str | Path,
         layers = ()
         if layer:
             env["HOME"] = layer
+    # Nothing the launcher handed leerie for itself (DESIGN §6 *A repository
+    # command gets nothing the operator handed leerie for itself*).
+    drop = (*drop, *_launcher_env_names())
     # A measurement reaches nothing outside its own loopback; the kinds
     # that fetch (an install, a toolchain, the setup hook) reach the outside
     # through the egress proxy (DESIGN §6 *A confined process has its own network*, *An install reaches its
@@ -27719,7 +27761,7 @@ def _measurement_grants(st: "State", tree: str | Path,
         tuple(env.items()), egress=kind != MEASURE_KIND,
         link=str(run_dir.resolve() / TREES_DIRNAME), drop=drop,
         overlays=_grant_overlays(own_home, layers, upper, run_mise,
-                                 layer_uppers))
+                                 layer_uppers, base=_command_home()))
 
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:

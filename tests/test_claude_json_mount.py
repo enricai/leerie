@@ -28,12 +28,8 @@ _OLD_SINGLE_FILE_MOUNT = '-v "$STAGE/.claude.json:/home/leerie/.claude.json"'
 _NEW_DIR_MOUNT = '-v "$STAGE:/opt/leerie-home-src:ro"'
 
 
-def _entry_sh_copy_block() -> str:
-    text = ENTRY_SH.read_text()
-    marker = "if [ -d /opt/leerie-home-src ]; then"
-    start = text.index(marker)
-    end = text.index("\nfi", start) + len("\nfi")
-    return text[start:end]
+_CLI_COPY = "_copy_dots /opt/leerie-home-src/cli /home/leerie"
+_HOME_COPY = "_copy_dots /opt/leerie-home-src/home /home/leerie"
 
 
 def test_launcher_does_not_bind_mount_claude_json_as_single_file():
@@ -56,15 +52,19 @@ def test_launcher_mounts_nothing_beneath_the_home():
 
 
 def test_container_entry_copies_the_staged_home_into_place():
-    block = _entry_sh_copy_block()
-    assert 'cp -a "$_e" /home/leerie/' in block
+    """The staged classes are copied into the workers' home: the CLI's own
+    (`cli/`) and what the repository's commands may use (`home/`). Nothing
+    is bind-mounted beneath the home."""
+    text = ENTRY_SH.read_text()
+    assert _CLI_COPY in text
+    assert _HOME_COPY in text
 
 
 def test_container_entry_copy_step_is_unconditional_across_privilege_models():
     """The copy runs before the rootless/rootful branch point, so it applies
     under both unshare --map-user (rootless) and runuser (rootful)."""
     text = ENTRY_SH.read_text()
-    copy_idx = text.index('cp -a "$_e" /home/leerie/')
+    copy_idx = text.index(_CLI_COPY)
     rootful_idx = text.index('if [ "$ROOTLESS" != "true" ] && getent passwd leerie')
     assert copy_idx < rootful_idx
 
