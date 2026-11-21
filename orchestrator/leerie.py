@@ -7388,7 +7388,7 @@ def _forget_installs(tree: Path) -> None:
     """Every record this process keeps of an install in `tree`: a tree made
     again at its path installs afresh."""
     real = os.path.realpath(tree)
-    for memo in (_VIEW_INSTALLS, _EVAL_INSTALLS, _EVAL_TREES, _DEPS_FAILED,
+    for memo in (_VIEW_INSTALLS, _KEPT_INSTALLS, _KEPT_TREES, _DEPS_FAILED,
                  _DEPS_KEPT, _INSTALL_OUTPUTS):
         memo.pop(real, None)
     _DEPS_INSTALLED.discard(real)
@@ -48598,13 +48598,15 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # (`_install_snapshot`; DESIGN §8 *A view moves to the next tip when the
     # install's inputs are unchanged*). None in any other tree, and once
     # they cannot be told.
-    # A committed view, or the held-out evaluation tree opted in the same way
-    # (`_EVAL_TREES`): either records the install's snapshot and reads so it
+    # A committed view, or a kept helper tree opted in the same way
+    # (`_KEPT_TREES`: the held-out evaluation tree, the base confirm
+    # worktree): either records the install's snapshot and reads so it
     # can be moved to the next commit with the install kept (DESIGN §8 *A view
     # moves to the next tip when the install's inputs are unchanged*, *The
-    # evaluation tree is kept across a run's evaluations*).
+    # evaluation tree is kept across a run's evaluations*; §9 *The base
+    # confirm worktree is kept across the run's confirms*).
     is_view = (key in {os.path.realpath(v) for _tip, v in _VIEWS.values()}
-               or key in _EVAL_TREES)
+               or key in _KEPT_TREES)
     kept = _DEPS_KEPT.pop(key, ())
     made: set[str] | None = set(kept) if is_view else None
     # In a view, what its `install` entries open there (`_watch_reads`):
@@ -48614,11 +48616,11 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     opened: set[str] = set()
     _INSTALL_OUTPUTS.pop(key, None)
     _VIEW_INSTALLS.pop(key, None)
-    # The evaluation tree's memo is dropped at the start of a run of the
+    # A kept helper tree's memo is dropped at the start of a run of the
     # recipe too, and re-recorded only on a successful install
     # (`_record_view_install`), so a failed install leaves no stale reuse
-    # entry for the next evaluation (parity with `_VIEW_INSTALLS`).
-    _EVAL_INSTALLS.pop(key, None)
+    # entry for the next evaluation or confirm (parity with `_VIEW_INSTALLS`).
+    _KEPT_INSTALLS.pop(key, None)
     snap_due = False
 
     async def _snap() -> None:
@@ -49622,17 +49624,20 @@ InstallSnapshot = tuple[tuple[str, ...], bytes, str]
 # what the view's install was made from and what it made (DESIGN §8 *A view
 # moves to the next tip when the install's inputs are unchanged*).
 _VIEW_INSTALLS: dict[str, tuple[str, InstallSnapshot, "InstallReads"]] = {}
-# The held-out evaluation tree, kept across a run's evaluations and moved to
-# the next commit with its install kept the way a view is (DESIGN §8 *The
-# evaluation tree is kept across a run's evaluations*; §6 *A held-out
-# evaluation runs alone* — the kept install is the sandbox's read-only lower,
-# which no evaluation can mutate). `_EVAL_TREES` opts a tree into the view
-# snapshot/key recording that is otherwise `_VIEWS`-only: realpath -> (run
-# repository, tip) its commits live in, so `_install_key` can read the tip's
-# blobs. `_EVAL_INSTALLS` is its `_VIEW_INSTALLS`: realpath -> (install key,
-# snapshot, reads).
-_EVAL_TREES: dict[str, tuple[Path, str]] = {}
-_EVAL_INSTALLS: dict[str, tuple[str, InstallSnapshot, "InstallReads"]] = {}
+# A kept helper tree, kept across a run and moved to the next commit with its
+# install kept the way a view is: one mechanism, two consumers — the held-out
+# evaluation tree (DESIGN §8 *The evaluation tree is kept across a run's
+# evaluations*; §6 *A held-out evaluation runs alone* — the kept install is
+# the sandbox's read-only lower, which no evaluation can mutate) and the
+# base-paired confirm worktree (DESIGN §9 *The base confirm worktree is kept
+# across the run's confirms* — no sandbox, but a base commit fixed for a
+# confirm's key, so the install is reused and only re-verified intact).
+# `_KEPT_TREES` opts a tree into the view snapshot/key recording that is
+# otherwise `_VIEWS`-only: realpath -> (run repository, tip) its commits live
+# in, so `_install_key` can read the tip's blobs. `_KEPT_INSTALLS` is its
+# `_VIEW_INSTALLS`: realpath -> (install key, snapshot, reads).
+_KEPT_TREES: dict[str, tuple[Path, str]] = {}
+_KEPT_INSTALLS: dict[str, tuple[str, InstallSnapshot, "InstallReads"]] = {}
 # view realpath -> the outputs of the install it was moved with, to a new
 # tip: the recipe runs there again in full, and the install finds them in
 # place.
@@ -49919,18 +49924,19 @@ async def _record_view_install(st: "State", view_key: str,
     DESIGN §8 *A view moves to the next tip when the install's inputs are
     unchanged*). Nothing for a tree that is no view. The run repository is
     found from the worker tree the view shows, never from the view.
-    The held-out evaluation tree records the same way into `_EVAL_INSTALLS`,
-    but its run repository and tip are its own `_EVAL_TREES` entry's — it
-    shows no worker tree (DESIGN §8 *The evaluation tree is kept across a
-    run's evaluations*)."""
-    eval_entry = _EVAL_TREES.get(view_key)
-    if eval_entry is not None:
-        reg, tip = eval_entry
+    A kept helper tree (the held-out evaluation tree, the base confirm
+    worktree) records the same way into `_KEPT_INSTALLS`, but its run
+    repository and tip are its own `_KEPT_TREES` entry's — it shows no worker
+    tree (DESIGN §8 *The evaluation tree is kept across a run's evaluations*;
+    §9 *The base confirm worktree is kept across the run's confirms*)."""
+    kept_entry = _KEPT_TREES.get(view_key)
+    if kept_entry is not None:
+        reg, tip = kept_entry
         recipe = (st.data.get("provision") or {}).get("recipe") or []
         ikey = await asyncio.to_thread(_install_key, reg, tip, recipe, reads)
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
-            _EVAL_INSTALLS[view_key] = (ikey, snap, reads)
+            _KEPT_INSTALLS[view_key] = (ikey, snap, reads)
         return
     for tree_key, (tip, path) in list(_VIEWS.items()):
         if os.path.realpath(path) != view_key:
@@ -51785,11 +51791,17 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
                                 remove_base: tuple[str, ...] = (),
                                 remove_final: tuple[str, ...] = (),
                                 messages: dict[str, list[str]] | None = None,
-                                say_unavailable: bool = False) -> dict:
+                                say_unavailable: bool = False,
+                                reuse: bool = False) -> dict:
     """One base-paired test confirm (DESIGN §9 *Which failures are new*):
-    `candidates`, failing on `final_tree`, rerun against a disposable
-    worktree at `base_sha` (`_helper_worktree_path(st, worktree)`), its
-    dependencies installed, removed on every exit. No base checkout, or one
+    `candidates`, failing on `final_tree`, rerun against a worktree at
+    `base_sha` (`_helper_worktree_path(st, worktree)`), its dependencies
+    installed. With `reuse` (the `confirm-base` caller) that worktree is a
+    kept tree moved to `base_sha` with its install reused when the install
+    key there is unchanged (`_reuse_or_rebuild_kept_tree`; DESIGN §9 *The
+    base confirm worktree is kept across the run's confirms*) and is kept for
+    the run; without it the worktree is disposable, removed on every exit.
+    No base checkout, or one
     whose install failed, gives every candidate `no_verdict` — never
     `pre_existing` (DESIGN §9 *A failed install is no measurement*); with
     `say_unavailable` the verdict says so (`base_unavailable`,
@@ -51820,11 +51832,25 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
     weak = set(intermittent)
 
     async def _dispatch(cands: list[str]) -> dict:
-        _teardown()
+        if not reuse:
+            _teardown()
         try:
-            add = (await _worktree_add_detached_async(st, wt, base_sha)
-                   if base_sha else None)
-            installed = (add is not None and add.returncode == 0
+            if not base_sha:
+                no_worktree = True
+            elif reuse:
+                # Keep the base worktree for the run and move it to base_sha
+                # with its install reused when the key is unchanged; only the
+                # first confirm against this base installs cold (DESIGN §9
+                # *The base confirm worktree is kept across the run's
+                # confirms*). A None return is a reused intact install; a
+                # non-zero add is no base worktree.
+                add = await _reuse_or_rebuild_kept_tree(
+                    st, _run_repo(st), wt, base_sha)
+                no_worktree = add is not None and add.returncode != 0
+            else:
+                add = await _worktree_add_detached_async(st, wt, base_sha)
+                no_worktree = add.returncode != 0
+            installed = (not no_worktree
                          and await _ensure_worktree_deps(
                              str(wt), st, caps, log_path=log_path,
                              verbosity=st.data.get("verbosity",
@@ -51834,7 +51860,7 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
                 if say_unavailable:
                     log("  B*: could not create the base worktree for the "
                         "confirm — no candidate gets a verdict (no_verdict)"
-                        if add is None or add.returncode != 0 else
+                        if no_worktree else
                         "  B*: the dependency install failed in the base "
                         "worktree — no candidate gets a verdict (no_verdict)")
                 verdict = await _confirm_new_failures(
@@ -51842,7 +51868,7 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
                     observed="unseen")
                 if say_unavailable:
                     verdict["base_unavailable"] = True
-                    if add is not None and add.returncode == 0:
+                    if not no_worktree:
                         verdict["base_install_failed"] = True
                 return verdict
             n = {"i": 0}
@@ -51889,7 +51915,11 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
                     confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
             return await _pass(None, list(cands), caps, None)
         finally:
-            _teardown()
+            # A kept base worktree (`reuse`) persists for the run and is
+            # moved/cleaned on the next confirm, reaped with the run's
+            # worktrees; a disposable one is removed on every exit.
+            if not reuse:
+                _teardown()
 
     memo_key = _base_verdict_memo_key(base_sha, cmd, replace, remove_base)
     all_cands = sorted(set(candidates))
@@ -52011,7 +52041,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
             deps_label=f"{label}-base", deps_log="confirm", run_prefix=label,
             confirm_label=label,
             intermittent=[c for c in all_cand if c not in cand],
-            messages=messages, say_unavailable=True)
+            messages=messages, say_unavailable=True, reuse=True)
 
     # The candidates the run itself failed are confirmed first: a tree they
     # already reject is one no discovery can decide anything more about
@@ -60027,38 +60057,45 @@ async def _record_report_reproduced(st: "State", caps: dict,
         f"{report_base[:12]} (report_reproduced; informational)")
 
 
-def _eval_teardown(repo: Path, wt: Path) -> None:
-    """Remove the held-out evaluation worktree `wt` and forget every record
-    this process keeps of its install: a tree remade at the path installs
-    afresh (`_forget_installs`, which drops its `_EVAL_TREES`/`_EVAL_INSTALLS`
-    entries too). Absent ones are the idempotent case."""
+def _kept_teardown(repo: Path, wt: Path) -> None:
+    """Remove the kept helper worktree `wt` (the held-out evaluation tree, the
+    base confirm worktree) and forget every record this process keeps of its
+    install: a tree remade at the path installs afresh (`_forget_installs`,
+    which drops its `_KEPT_TREES`/`_KEPT_INSTALLS` entries too). Absent ones
+    are the idempotent case."""
     subprocess.run(["git", "--git-dir", str(repo), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     _rmtree_owned(wt)
     _forget_installs(wt)
 
 
-async def _prepare_eval_tree(st: "State", caps: dict, repo: Path, wt: Path,
-                             tip: str, *, log_path: Path, label: str) -> str:
-    """Put the held-out evaluation worktree `wt` at `tip` with its
-    dependencies installed, kept for the run and moved to `tip` the way a
-    committed view is (DESIGN §8 *The evaluation tree is kept across a run's
-    evaluations*; §6 *A held-out evaluation runs alone* — the kept install is
-    the sandbox's read-only lower, which no evaluation can mutate). Returns
-    "ok", "worktree_failed" (the add failed) or "deps_failed" (an install
-    did).
+async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
+                                      tip: str
+                                      ) -> "subprocess.CompletedProcess | None":
+    """Put the kept helper worktree `wt` at `tip`, reusing its recorded
+    install in place when the install key at `tip` is the one that install
+    was made from and the outputs are intact, else tearing the tree down and
+    adding it afresh. Shared by both kept-tree consumers — the held-out
+    evaluation tree (DESIGN §8 *The evaluation tree is kept across a run's
+    evaluations*) and the base confirm worktree (DESIGN §9 *The base confirm
+    worktree is kept across the run's confirms*).
 
-    When `wt` holds an install this process recorded (`_EVAL_INSTALLS`) and
+    When `wt` holds an install this process recorded (`_KEPT_INSTALLS`) and
     the install key at `tip` is the one that install was made from, the view
     move reuses it in place (`_move_view`, which re-verifies the outputs are
-    as installed with `_install_intact` and so refuses a tree an evaluation
-    or a crash left changed); any difference remakes the tree and installs
-    afresh. Either way `_ensure_worktree_deps` then runs the recipe in `wt`:
+    as installed with `_install_intact` and so refuses a tree an evaluation,
+    a confirm or a crash left changed) — returns None. Any difference tears
+    the tree down (`_kept_teardown`) and adds it detached at `tip`, returning
+    the add (a non-zero `returncode` is the add having failed; the caller
+    maps that to its own "no evidence"/`no_verdict`). Either way the tree is
+    opted into the view snapshot/key recording (`_KEPT_TREES`, read by
+    `is_view` in `_ensure_worktree_deps` and by `_record_view_install`) —
+    but on a failed add it is not, so nothing records an install for a tree
+    that is not there. The caller still runs `_ensure_worktree_deps` in `wt`:
     a kept install finds its own output in place and does only what `tip`
     needs."""
     key = os.path.realpath(wt)
-    made = _EVAL_INSTALLS.get(key)
-    moved = False
+    made = _KEPT_INSTALLS.get(key)
     if wt.is_dir() and made is not None:
         recipe = (st.data.get("provision") or {}).get("recipe") or []
         now_key = await asyncio.to_thread(_install_key, repo, tip, recipe,
@@ -60068,24 +60105,37 @@ async def _prepare_eval_tree(st: "State", caps: dict, repo: Path, wt: Path,
             _DEPS_INSTALLED.discard(key)
             _DEPS_FAILED.pop(key, None)
             _DEPS_KEPT[key] = made[1][0]
-            moved = True
-    if not moved:
-        await asyncio.to_thread(_eval_teardown, repo, wt)
-        # Add through the default repository (the run's own, which `repo`
-        # already is for the evaluation tree), not `repo=repo`: the default
-        # path keeps the invariant that a missing run repository stops the
-        # run rather than reading "no evidence" (`_worktree_add_detached`'s
-        # `repo is None` die; DESIGN §6 *The run's own repository*), the one
-        # the old per-evaluation add relied on.
-        add = await _worktree_add_detached_async(st, wt, tip)
-        if add.returncode != 0:
-            log(f"  acceptance: could not create the evaluation worktree: "
-                f"{(add.stderr or '').strip()[:200]} — no evidence either way")
-            return "worktree_failed"
-    # Opt the tree into the view snapshot/key recording (`is_view` in
-    # `_ensure_worktree_deps`, `_record_view_install`), after any teardown
-    # that would have forgotten it, before the install that fills it.
-    _EVAL_TREES[key] = (repo, tip)
+            _KEPT_TREES[key] = (repo, tip)
+            return None
+    await asyncio.to_thread(_kept_teardown, repo, wt)
+    # Add through the default repository (the run's own, which `repo` already
+    # is for a kept tree), not `repo=repo`: the default path keeps the
+    # invariant that a missing run repository stops the run rather than
+    # reading "no evidence" (`_worktree_add_detached`'s `repo is None` die;
+    # DESIGN §6 *The run's own repository*), the one the old per-use add
+    # relied on.
+    add = await _worktree_add_detached_async(st, wt, tip)
+    if add.returncode == 0:
+        # Opt the tree in only once it exists, after the teardown that would
+        # have forgotten it, before the install that fills it.
+        _KEPT_TREES[key] = (repo, tip)
+    return add
+
+
+async def _prepare_eval_tree(st: "State", caps: dict, repo: Path, wt: Path,
+                             tip: str, *, log_path: Path, label: str) -> str:
+    """Put the held-out evaluation worktree `wt` at `tip` with its
+    dependencies installed, kept for the run and moved to `tip` the way a
+    committed view is (`_reuse_or_rebuild_kept_tree`; DESIGN §8 *The
+    evaluation tree is kept across a run's evaluations*; §6 *A held-out
+    evaluation runs alone* — the kept install is the sandbox's read-only
+    lower, which no evaluation can mutate). Returns "ok", "worktree_failed"
+    (the add failed) or "deps_failed" (an install did)."""
+    add = await _reuse_or_rebuild_kept_tree(st, repo, wt, tip)
+    if add is not None and add.returncode != 0:
+        log(f"  acceptance: could not create the evaluation worktree: "
+            f"{(add.stderr or '').strip()[:200]} — no evidence either way")
+        return "worktree_failed"
     if not await _ensure_worktree_deps(
             str(wt), st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),

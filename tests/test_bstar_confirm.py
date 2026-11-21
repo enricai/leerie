@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -714,8 +715,13 @@ def test_e3_confirms_the_real_regression_and_types_the_flake(
     assert v["pairs_run"] == 3
     assert st.data["test_id_diff"]["new"] == [stable]
     assert stable in st.data["final_failing_ids"]
-    # The base worktree is disposable.
-    assert not leerie._helper_worktree_path(st, "confirm-base").exists()
+    # The base worktree is kept for the run, not torn down per confirm, and
+    # recorded as a kept tree so the next confirm reuses its install (DESIGN
+    # §9 *The base confirm worktree is kept across the run's confirms*).
+    wt = leerie._helper_worktree_path(st, "confirm-base")
+    assert wt.exists()
+    assert os.path.realpath(wt) in leerie._KEPT_TREES
+    leerie._kept_teardown(leerie._run_repo(st), wt)   # don't leak the memo
 
 
 # Drives a real confined measurement (`_confined_argv` -> the Landlock

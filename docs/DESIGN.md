@@ -22698,6 +22698,52 @@ a complete set of base reruns that each produced a report (step 3), the memo
 never captures a base whose install failed — that side is `no_verdict`, not
 `pre_existing` (*A failed install is no measurement*, above).
 
+**The base confirm worktree is kept across the run's confirms.** The memo
+above spares a confirm its base *reruns* when the verdict is already settled;
+it does not spare the one that still has a candidate to dispatch its base
+*install*. The base worktree was built, its dependencies installed and the
+tree torn down on every confirm that had any candidate left — measured across
+the replayed-run corpus, 113 cold installs over 43 runs, 2.6 per run and up
+to 10 in the heaviest (navegando 4e7dedc4, barnacle), every one a reinstall
+of the same base commit at the same path, serial on the confirm path. For a
+native-compile ecosystem (Ruby `bundle`, Go, Rust) each is minutes, not the
+seconds pnpm takes.
+
+The base confirm worktree is therefore kept for the run, at its one path, and
+moved to the base commit the way a committed view and the held-out evaluation
+tree are (*A view moves to the next tip when the install's inputs are
+unchanged*; §8 *The evaluation tree is kept across a run's evaluations* — the
+three are one mechanism, a kept tree moved same-path with its install): checked
+out `--detach --force` at the base, cleaned of everything untracked but the
+install's own outputs, and reused with its install in place when the install
+key there is the one that install was made from and the outputs are as it left
+them (`_install_intact`). The install key is the install's inputs — the recipe
+and the files and directories the install read, at the tip — not the commit
+itself, so a lockfile or a manifest the install read that changed, or an output
+no longer as installed, is a different key and remakes the tree and installs
+afresh, while a base at a different commit whose dependency inputs are unchanged
+still reuses the install (the move just checks it out at that commit). For this
+confirm the base is the run's own base commit, fixed across the run's confirms
+against it (a moved baseline, a different test command or a different base form
+is a different confirm key, above), so the install key matches and only the
+first confirm installs cold; the rest reuse it.
+
+Unlike the evaluation tree this worktree is no held-out sandbox: it reruns the
+run's own failing-test IDs against the base, never a hidden set, so it carries
+no I3 obligation and needs no overlay to keep a set off its disk. Its
+correctness constraint is instead outcome-identity — a base rerun on the kept
+install must reach the same `pre_existing`/`new` verdict a fresh install would
+— and that holds for two reasons. The reused install *is* leerie's own install
+of the same base commit, verified entry-for-entry unchanged before each reuse:
+`_install_intact` refuses a tree a prior rerun, a crash or a bug left mutated
+and reinstalls, so no drift in the install reaches a later verdict. And the
+move checks the tree out `--detach --force` and `clean`s it (keeping only the
+install's outputs) before every confirm, so the base side always runs on a
+pristine checkout of the base commit: no file a prior confirm's base rerun
+left on disk — a tracked file an in-place substitution rewrote, an untracked
+report or cache — reaches the next confirm. Like a committed view, the worktree
+lives no longer than the run and is reaped with its worktrees.
+
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
 run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):

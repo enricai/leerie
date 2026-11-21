@@ -9269,9 +9269,10 @@ than re-running once.
   candidates, id_files, label, log_path, worktree, deps_label, deps_log,
   run_prefix, confirm_label, intermittent=(), files_default=None,
   replace=(), remove_base=(), remove_final=(), messages=None,
-  say_unavailable=False) -> dict` — the side-A worktree around one paired
-  test confirm, shared by the final diff (`worktree="confirm-base"`), the
-  re-drive (`"redrive-base"`) and the base form (`"base-form-base"`): it
+  say_unavailable=False, reuse=False) -> dict` — the side-A worktree around
+  one paired test confirm, shared by the final diff
+  (`worktree="confirm-base"`, `reuse=True`), the re-drive
+  (`"redrive-base"`) and the base form (`"base-form-base"`): it
   removes what an earlier one left at `_helper_worktree_path(st,
   worktree)`, adds it detached at `base_sha` (none when `base_sha` is
   empty) and installs its deps (`_ensure_worktree_deps(label_prefix=
@@ -9287,8 +9288,14 @@ than re-running once.
   is `_confirm_sized` over `test_file_durations` (rank 1 for a file
   holding only `intermittent` IDs, else 0; `overhead, per_file =
   _rerun_cost_or_default(st)`); otherwise one unsized pass. The engine is
-  labelled `confirm_label`, `"pair"`, `intermittent` passed through. The
-  worktree is removed on every exit. Before any of that it consults the
+  labelled `confirm_label`, `"pair"`, `intermittent` passed through. With
+  `reuse=False` the worktree is removed on every exit; with `reuse=True`
+  (the `confirm-base` caller) it is instead kept for the run and moved to
+  `base_sha` via `_reuse_or_rebuild_kept_tree` (§8 *kept tree*), so the base
+  install is reinstalled only when the install key at `base_sha` differs —
+  the base commit is fixed for a confirm key, so only the first confirm
+  against it installs cold (DESIGN §9 *The base confirm worktree is kept
+  across the run's confirms*). Before any of that it consults the
   base-verdict memo (DESIGN §9 *A settled base verdict is reused, never
   recomputed*): `memo_key = _base_verdict_memo_key(base_sha, cmd, replace,
   remove_base)` (hex SHA-256 of a canonical JSON of those four), and any
@@ -9394,8 +9401,11 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   `state.data["final_failing_ids"]`; candidates are the final IDs not in
   the baseline; reruns use `_acceptance_cmd` over the candidates'
   files when every candidate has one (else the canonical `tests` command)
-  in a disposable detached worktree `worktrees/<run-id[:12]>-confirm-base` at the
-  baseline sha (else the `working_branch` merge-base) with deps installed,
+  in the run's kept detached worktree `worktrees/<run-id[:12]>-confirm-base`
+  at the baseline sha (else the `working_branch` merge-base) with deps
+  installed — kept across the run's confirms and reinstalled only when the
+  install key at that sha differs (`reuse=True`, §8 *kept tree*; DESIGN §9
+  *The base confirm worktree is kept across the run's confirms*) —
   against staging for the final side. When every candidate has a file, the
   confirm is `_confirm_sized(cand_unit, durations, *, rank, caps,
   overhead, label, confirm) -> dict` over `test_file_durations` (rank 0
@@ -9544,40 +9554,47 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     with `-e /<output>` per output, `_install_intact`, then True only when
     `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
     Pinned by `tests/test_view_moves.py`.
-    The held-out evaluation tree reuses the same move machinery (DESIGN §8
-    *The evaluation tree is kept across a run's evaluations*; §6 *A held-out
-    evaluation runs alone* — *The world that dies is the overlay, not the
-    tree on disk*). Two process-level dicts, keyed by `realpath(<eval
-    tree>)`: `_EVAL_TREES: dict[str, tuple[Path, str]]` — the run repository
-    and the tip of a tree opted into snapshot recording — and
-    `_EVAL_INSTALLS: dict[str, tuple[str, InstallSnapshot, InstallReads]]` —
-    its kept install's `(key, snapshot, reads)`, the `_VIEW_INSTALLS`
-    analogue. `_ensure_worktree_deps` treats a `realpath(tree)` in
-    `_EVAL_TREES` as a view (`is_view`), so it collects the install's
-    outputs and reads the same way; `_record_view_install`, when
-    `view_key in _EVAL_TREES`, computes `_install_key(<repo>, <tip>, recipe,
-    reads)` from that entry's `(repo, tip)` and stores
-    `(key, _INSTALL_OUTPUTS[view_key], reads)` in `_EVAL_INSTALLS` (and
-    records nothing for a non-view, non-eval tree). `_forget_installs` also
-    drops the `_EVAL_INSTALLS`/`_EVAL_TREES` entries.
+    A *kept tree* reuses the same move machinery (DESIGN §8 *The evaluation
+    tree is kept across a run's evaluations*, §9 *The base confirm worktree
+    is kept across the run's confirms* — one mechanism, two consumers: the
+    held-out evaluation tree and the base-paired confirm worktree). Two
+    process-level dicts, keyed by `realpath(<kept tree>)`: `_KEPT_TREES:
+    dict[str, tuple[Path, str]]` — the run repository and the tip of a tree
+    opted into snapshot recording — and `_KEPT_INSTALLS: dict[str, tuple[str,
+    InstallSnapshot, InstallReads]]` — its kept install's `(key, snapshot,
+    reads)`, the `_VIEW_INSTALLS` analogue. `_ensure_worktree_deps` treats a
+    `realpath(tree)` in `_KEPT_TREES` as a view (`is_view`), so it collects
+    the install's outputs and reads the same way; `_record_view_install`,
+    when `view_key in _KEPT_TREES`, computes `_install_key(<repo>, <tip>,
+    recipe, reads)` from that entry's `(repo, tip)` and stores
+    `(key, _INSTALL_OUTPUTS[view_key], reads)` in `_KEPT_INSTALLS` (and
+    records nothing for a non-view, non-kept tree). `_forget_installs` also
+    drops the `_KEPT_INSTALLS`/`_KEPT_TREES` entries.
+    `async _reuse_or_rebuild_kept_tree(st, repo, wt, tip) -> CompletedProcess
+    | None` is the shared reuse step: when `wt` is a directory and
+    `_KEPT_INSTALLS[realpath(wt)]` holds a key equal to `_install_key(repo,
+    tip, recipe, <its reads>)` and `_move_view(repo, wt, tip, <its
+    snapshot>)` succeeds, the install is kept (`_DEPS_INSTALLED`/`_DEPS_FAILED`
+    dropped, `_DEPS_KEPT[realpath(wt)] = <outputs>`, `_KEPT_TREES` set) and it
+    returns `None`; otherwise `_kept_teardown(repo, wt)` (`git --git-dir
+    <repo> worktree remove --force`, `_rmtree_owned`, `_forget_installs`) then
+    `_worktree_add_detached_async(st, wt, tip)` — no `repo=`, so the default
+    path's missing-run-repository guard runs (a kept tree lives in the run's
+    own repository; a vanished one is leerie's own bug, not "no evidence
+    either way" — DESIGN §6 *The run's own repository*, review round 17 H1;
+    `tests/test_run_repo_missing_dies.py`) — and it returns that add
+    (`_KEPT_TREES` set only when the add succeeded; a non-zero `returncode`
+    means the add failed). Its two callers map the result:
     `async _prepare_eval_tree(st, caps, repo, wt, tip, *, log_path, label)
-    -> str` ("ok" | "worktree_failed" | "deps_failed") puts `wt` at `tip`:
-    when `wt` is a directory and `_EVAL_INSTALLS[realpath(wt)]` holds a key
-    equal to `_install_key(repo, tip, recipe, <its reads>)` and
-    `_move_view(repo, wt, tip, <its snapshot>)` succeeds, the install is
-    kept (`_DEPS_INSTALLED`/`_DEPS_FAILED` dropped, `_DEPS_KEPT[realpath(wt)]
-    = <outputs>`); otherwise `_eval_teardown(repo, wt)` (`git --git-dir
-    <repo> worktree remove --force`, `_rmtree_owned`, `_forget_installs`)
-    then `_worktree_add_detached_async(st, wt, tip)` — no `repo=`, so the
-    default path's missing-run-repository guard runs (the eval tree lives in
-    the run's own repository; a vanished one is leerie's own bug, not "no
-    evidence either way" — DESIGN §6 *The run's own repository*, review round
-    17 H1; `tests/test_run_repo_missing_dies.py`)
-    ("worktree_failed" on a non-zero add). Either way it sets
-    `_EVAL_TREES[realpath(wt)] = (repo, tip)` and runs
+    -> str` ("ok" | "worktree_failed" | "deps_failed") calls it, returns
+    "worktree_failed" on a non-`None` non-zero add, else runs
     `_ensure_worktree_deps(str(wt), …, label_prefix="acceptance-<label>",
-    log_prefix="acceptance")` ("deps_failed" when it returns False, else
-    "ok"). Pinned by `tests/test_eval_tree_reuse.py`.
+    log_prefix="acceptance")` ("deps_failed" when False, else "ok"); and
+    `_confirm_against_base`'s `_dispatch` (only with `reuse=True`, the
+    `confirm-base` caller) calls it for the base worktree in place of the
+    teardown-and-add it does when `reuse` is False, and skips the per-call
+    teardown so the tree is kept. Pinned by `tests/test_eval_tree_reuse.py`
+    and `tests/test_confirm_base_reuse.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its

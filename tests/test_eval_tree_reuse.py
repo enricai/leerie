@@ -67,8 +67,8 @@ def env(leerie, tmp_path, monkeypatch):
     caps = dict(leerie.DEFAULT_CAPS)
     caps["worker_timeout_sec"] = 60
     yield st, staging, caps
-    for d in (leerie._VIEWS, leerie._VIEW_INSTALLS, leerie._EVAL_TREES,
-              leerie._EVAL_INSTALLS, leerie._DEPS_KEPT,
+    for d in (leerie._VIEWS, leerie._VIEW_INSTALLS, leerie._KEPT_TREES,
+              leerie._KEPT_INSTALLS, leerie._DEPS_KEPT,
               leerie._INSTALL_OUTPUTS):
         d.clear()
 
@@ -190,7 +190,7 @@ def test_a_failed_install_is_not_recorded_and_reinstalls(
     monkeypatch.setenv("FAIL_INSTALL", "1")
     status, wt = _prepare(leerie, st, caps, a)
     assert status == "deps_failed"
-    assert os.path.realpath(wt) not in leerie._EVAL_INSTALLS
+    assert os.path.realpath(wt) not in leerie._KEPT_INSTALLS
     monkeypatch.delenv("FAIL_INSTALL", raising=False)
     status, wt2 = _prepare(leerie, st, caps, a)
     assert status == "ok"
@@ -198,15 +198,15 @@ def test_a_failed_install_is_not_recorded_and_reinstalls(
 
 
 def test_the_tree_is_forgotten_when_torn_down(leerie, env):
-    """`_eval_teardown` removes the tree and every reuse memo of it, so a
-    tree remade at the path installs afresh (no stale `_EVAL_INSTALLS`)."""
+    """`_kept_teardown` removes the tree and every reuse memo of it, so a
+    tree remade at the path installs afresh (no stale `_KEPT_INSTALLS`)."""
     st, staging, caps = env
     a = _commit(leerie, staging, {"src/a.txt": "2"})
     _status, wt = _prepare(leerie, st, caps, a)
     key = os.path.realpath(wt)
-    assert key in leerie._EVAL_INSTALLS and key in leerie._EVAL_TREES
-    leerie._eval_teardown(leerie._run_repo(st), wt)
+    assert key in leerie._KEPT_INSTALLS and key in leerie._KEPT_TREES
+    leerie._kept_teardown(leerie._run_repo(st), wt)
     assert not wt.exists()
-    assert key not in leerie._EVAL_INSTALLS
-    assert key not in leerie._EVAL_TREES
+    assert key not in leerie._KEPT_INSTALLS
+    assert key not in leerie._KEPT_TREES
     assert key not in leerie._DEPS_INSTALLED
