@@ -22040,6 +22040,80 @@ not be), the merge checks re-run there, the unmet evidence names a
 verdict of an earlier tree as `residual`, and `base_health` is the base's
 own and says so.
 
+**The final conformance's verdict is of the tree that ships.** *Built
+2026-11-20, lane SHIP.* The same move that makes the pass's rule
+residuals a statement about another tree (above) makes its residual
+solution defects one, and those veto `done`. The held-out gate's repair
+rounds and the delivery re-drive's kept groups commit after the pass, and
+nothing measured the pass's defects again. Every other stamped input of the
+outcome is measured again on the final tree (the failing-test-ID diff, the
+held-out sets, the merge checks, the items, the base forms). Measured over
+the B11 replay corpus: the pass's stamp `tree_sha` was of an earlier tree
+than the one that ships in 40 of the 53 runs whose shipped tree is
+readable. Every other stamped input matched the shipped tree in 169 of its
+174 records. Of the 23 stale runs that recorded the pass's `end_sha`, the
+re-drive had moved the tree in 22 and the repair rounds in 8. Of the five
+finished runs whose residual defects vetoed and whose shipped tree is
+readable, four vetoed on a tree that does not ship (35999e65, 7fc42529,
+2cf0b060, b8066b2c); the interrupted e5b1cf36 shows the same. So, after the last step that commits, when `_final` left residual defects
+and its stamp is not the tree that ships, the verdict is decided again
+there. It is **the pass's own derivation, re-run on the tree that ships**:
+the same final conformer runs one round, with the same model, effort and
+tools and the shipped tree's measured axes, and the same inputs the pass's
+rounds get — the confirmed-unmet items and the verified review findings —
+followed by the same set-aside adjudication, so a task-required finding the
+conformer sets aside is a defect here as it is in the pass. The intent
+verdicts that adjudication rests on were settled by the pass and are reused,
+**never asked again** — the re-decision runs after the last point the run
+stops to ask, so it may open no question: a set-aside the pass settled is
+reused, and one it did not is skipped. Skipping it is not a silent
+false-done. The only findings the re-decision shows are on an item still
+unmet on the shipping tree (below), and an item still unmet there is already
+a veto of `done` in its own right (§8 *Delivery detection*: "N required
+item(s) still unmet", over the very same `_delivery_latest_verdict` set the
+scope below reads). So a new set-aside the re-decision drops names an item
+the run is already `unconverged` for; the cases not covered are a finding
+tied to no required item index — an item-less finding, or the defect-contract
+finding the scope keeps unconditionally — tracked residuals. Executable defects
+are thus re-measured on the shipped tree and the intent ones re-derived from
+it.
+
+Which findings are shown is itself a fact about the tree. The re-decision
+shows the conformer only the findings on an item **still unmet on the
+shipped tree** — the latest delivery verdict there, final detection's
+`unmet_final`. A finding the re-drive has since met is not re-raised: were
+it shown, the conformer, unable to confirm a live-site finding is now
+satisfied, would set it aside and the pass's settled "the task requires it"
+would refuse it — a stale veto of exactly the kind this removes. A finding
+tied to no item stays shown, as it is in the pass (a residual gap: an
+unlinked finding the re-drive met could still be re-raised; unmeasured,
+tracked). This scope is a set comparison on item indices against a verdict
+the final detection already recorded — no new measurement, no new judgment.
+
+The round runs on the run branch's head, in a throwaway checkout. Every
+actionable defect it reports is of the tree that ships, whatever its `fixed`
+says, because nothing it commits ships. The outcome reads that record,
+stamped with the shipped commit. A re-decision that crashes leaves the
+outcome on the pass's own record, worded as of its own tree (§6 *A verdict
+of another tree states no failure of the tree that ships*). A clean pass on
+a moved tree is not decided again: it vetoes nothing and states nothing of
+the tree that ships.
+
+Moving the one final conformance after the last committing step, so that
+it is decided once, cannot replace this. The pass feeds the steps that
+move the tree. The re-drive is the only fixer of a residual defect and
+drives `_final.residual_defects`, so it needs them before it runs. The
+held-out gate's conformer-flip check reads the pass's `round_starts` and
+`end_sha` before its repair rounds. And the pre-pass's unmet items and the
+review's findings have the pass as their first fixer. A pass moved after
+the re-drive either still commits, and then every verdict after it (the
+items' judge and falsifier, the held-out sets, the merge checks, the diff,
+the base forms) must be measured again, the defects it leaves reach no
+fixer and its fixes escape the flip checks; or it stops committing, and the
+run loses the fix loop the gate routes unmet items into. One more round,
+only in runs that both left defects and moved after the pass, costs less
+run time than either.
+
 **An unfixed solution defect keeps the final loop going, and what survives
 it is unfinished work, not a stop.** The round loop ends early only when
 the axes are clean against the base, nothing regressed, **and** no
@@ -22064,7 +22138,8 @@ the subtasks whose integrated diff touches the file the defect's `where`
 names, and drives it once from their shared budget. Nothing mechanical can
 re-verify a defect the conformer found, so a residual defect makes the run
 `unconverged` (§6 *The run outcome is decided once*), its reason naming
-each defect's kind, location and case — the PR is a draft that says what
+each defect's kind, location and case; a residual defect is one of the
+tree that ships, decided there again when the tree moved (above) — the PR is a draft that says what
 is open, never a run that stopped with the work on a branch nobody opens.
 `--skip-completeness-check` still demotes the defects to warnings, and
 `--strict-conformer` still stops the run on its own axes (clobbered files,
