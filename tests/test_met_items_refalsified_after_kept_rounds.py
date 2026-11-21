@@ -229,7 +229,7 @@ def test_a_kept_group_that_undoes_a_met_item_is_falsified_on_its_tree(
     gate = r.st.data["delivery_gate"]
     row0 = next(x for x in gate["items"] if x["item_index"] == 0)
     assert row0["verdict"] == "met"
-    assert row0["redrive_recheck"] == {"sha": final}
+    assert row0["redrive_recheck"] == {"sha": final, "not_inspected": False}
     assert 0 not in [u["item_index"] for u in gate["unmet_final"]]
 
 
@@ -247,7 +247,8 @@ def test_a_kept_group_that_keeps_the_met_item_leaves_it_met_on_final(
     gate = r.st.data["delivery_gate"]
     row0 = next(x for x in gate["items"] if x["item_index"] == 0)
     assert row0["verdict"] == "met"
-    assert row0["redrive_recheck"] == {"sha": final, "unmet_parts": []}
+    assert row0["redrive_recheck"] == {"sha": final, "unmet_parts": [],
+                                      "not_inspected": False}
     assert gate["unmet_final"] == []
     assert gate["final_sha"] == final
 

@@ -10351,7 +10351,11 @@ DESIGN §6 *The run outcome is decided once*. `_decide_outcome(st, *,
 any_commits: bool) -> str` is the only writer of `state.data["outcome"]`
 (`done` / `no_work` / `unconverged`, `OUTCOMES`) and of
 `state.data["outcome_reasons"]`, and mirrors `outcome` into `run.json`.
-`unconverged` when any of: a `subtask_status` value is `unconverged`;
+`unconverged` when any of: a `subtask_status` value is `unconverged` and
+`any_commits` is False or `_required_items_read_on_shipping_tree(st)` is
+False (DESIGN §6 *A subtask that did not converge is reported, not a veto*:
+otherwise it is reported, in the PR's `## Unconverged` list, and is not an
+input);
 `test_id_diff.new` is non-empty (reason `"<N> test(s) newly failing on
 the final tree, confirmed against the base"`, or, when the diff carries
 `stale_for_tree`, `"… on an earlier tree (the tree that ships could not be
@@ -10377,14 +10381,14 @@ False, else `done`.
 **The veto list (DESIGN §6 *The veto list is one list*).** Every input of
 `_decide_outcome`, in the order it appends reasons. Each is a veto: a
 non-empty reason makes the run `unconverged`; the decider has no input that
-only reports. "Compared" says whether the decider itself compares the
+only reports (V1 is an input only where its row says it is read). "Compared" says whether the decider itself compares the
 record's commit with `_shipping_tree(st)` (`_of_shipping`); "for the
 wording only" means the comparison changes the reason's text (*A failing
 verdict of another tree*, below), never whether it vetoes.
 
 | # | reason | record | commit the record is of | compared | confirmation |
 |---|---|---|---|---|---|
-| V1 | `<N> subtask(s) unconverged: <ids>` | `subtask_status` values `unconverged` (`_settle_unconverged`) | the subtask's tree (`settled_by_execution[sid].sha`); none for a cascade (`not run: predecessor(s) …`), a backed-out integration or an exhausted budget | no | the subtask's verify commands, run once in its committed view (`_settle_by_execution`), or none |
+| V1 | `<N> subtask(s) unconverged: <ids>` | `subtask_status` values `unconverged` (`_settle_unconverged`), read only when `any_commits` is False or `_required_items_read_on_shipping_tree(st)` is False: True only when `_delivery_latest_verdict` is final detection's, `_of_shipping(final_tree, _shipping_tree(st))`, `delivery_gate.final_judge` has no `error`, `delivery_ratchet.unverified` is empty, some `delivery_gate.items` row is `met` or `unmet`, and every `unknown` row was read: `test_id_diff` is not in its `by`, its `required_items` entry is neither `_test_id_diff_item` nor has `_test_outcome_parts` unless `_test_outcome_verdict(st, _shipping_tree(st))` is `met` (a worker-only or unobservable row is written before its test-outcome part is), and with a `redrive_recheck` stamp its `not_inspected` is `False` (a stamp without the key, written before it existed, is unread), else it has `unobservable` or `judge.worker_only`; `external` rows are ignored | the subtask's tree (`settled_by_execution[sid].sha`); none for a cascade (`not run: predecessor(s) …`), a backed-out integration or an exhausted budget | no for the record; whether it is read compares final detection's `final_tree` | the subtask's verify commands, run once in its committed view (`_settle_by_execution`), or none |
 | V2 | `<N> test(s) newly failing on the final tree, confirmed against the base` — `an earlier tree (the tree that ships could not be measured)` when `stale_for_tree` is set; `(<k> on fewer than every base/final pair: the confirm budget cut the rest)` for `budget_short` | `test_id_diff.new` | `test_id_diff.tree_sha` | for the wording only (below); the veto, not by this row (V13 is) | paired B\* against the base; a `budget_short` ID counts |
 | V3 | `<N> held-out acceptance set(s) still fail` | `acceptance.gate.final` (measured, failing, `_acceptance_result_has_work`), else `acceptance.gate.residual` through `_acceptance_residual_unbroken` | `acceptance.gate.final_sha` | for the wording only (below) (V13 reads `final_unremeasured`) | the unpaired B\* vote; a held case failing with no resource signature counts with no vote |
 | V4 | `the required items were not read on the tree that ships: …` | `_delivery_latest_verdict(delivery_gate)` | `final_tree`, `judged_after.tree` or `judged_before.tree` | yes: this row is the comparison | none: it is the absence of a verdict of that tree |
@@ -10403,7 +10407,8 @@ themselves: the `unrouted_item` count and each one's reason, each contested
 probe (`_redrive_contest_text`) and each probe objection
 (`_redrive_objection_text`). They are not inputs: none can make the run
 `unconverged` on its own. What the run could not verify and does not veto on
-is reported, never an input: item rows `unknown` (`needs_human_verification`),
+is reported, never an input: an `unconverged` subtask when V1 is not read
+(the PR's `## Unconverged` list), item rows `unknown` (`needs_human_verification`),
 `budget_short_unsettled` IDs (`_set_confirm_budget_gap`), held-out sets typed
 broken or variant, intermittent regressions, and the whole-PR review's
 findings.
@@ -10568,7 +10573,10 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   inspect it, even when re-asked for it"}` (when no falsifier or other
   check made it unmet), `_ratchet_prior_met_all`'s judged-record branch
   leaves it out, and `_redrive_recheck_items` returns `unknown: True` for
-  it (`tests/test_delivery_judge_uninspected.py`).
+  it (`tests/test_delivery_judge_uninspected.py`), with `not_inspected:
+  True` (absent for a worker-only met), which `_redrive_apply_item_verdicts`
+  writes into the row's `redrive_recheck` stamp as a bool, always, for
+  `_required_items_read_on_shipping_tree`.
 - **Checklist and enumeration** (DESIGN §8 *An item is judged on its
   declared parts, and a set it quantifies over is listed before it is
   judged*; lane S4). `_delivery_checklist(item, members=None)
@@ -11977,8 +11985,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   re-runs the new probe; the judge call passes `item_details={}`, and every
   item it judged carries that detail's `unmet_parts` (possibly empty) as
   `unmet_parts`, which `_redrive_apply_item_verdicts` nests in the row's
-  stamp, `redrive_recheck: {sha, unmet_parts}` — evidence only, read by no
-  verdict, `by`, evidence text or outcome (DESIGN §8 *A re-check keeps what
+  stamp, `redrive_recheck: {sha, unmet_parts, not_inspected}` — evidence
+  only, read by no verdict, `by` or evidence text; V1's reading
+  (`_required_items_read_on_shipping_tree`) takes a stamped `unknown` row's
+  cause from the stamp (`not_inspected` or not) rather than from
+  detection's `judge` record (DESIGN §8 *A re-check keeps what
   its judge showed, as detection does*); `delivery_gate.final_progress` is restored to
   what it was, and a falsifier that cannot run leaves the re-check's
   verdict); the verdicts that did not crash are applied
@@ -15147,7 +15158,7 @@ command line overrides it.
 | `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
-| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
+| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. A `done` run with `unconverged` subtasks (DESIGN §6 *A subtask that did not converge is reported, not a veto*) also starts with `## Unconverged`. In either case `_format_pr_end_state_section` lists the subtasks after the line `_PR_UNCONVERGED_NOT_IN_PR` (after the decider's reasons on a draft), each with its reason. |
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
 | `unmet_evidence` | dict | written only by `_record_unmet_evidence` — in `phase_finalize` after `_decide_outcome`, and at the dispute-bound no-work exit before `_finish_no_work_run`: `{dir, entries[{kind: falsifier \| held_out, label, file, item_index?, item?, set_index?, cases[{case, line?, assertion?, message?}], bstar, conflicts_with?[], objections?[{kind, reason}], artifact, lines_total?, excerpt_start?, excerpt?, cmd?}]}`; absent when nothing is unmet. Read only by `_pr_unmet_evidence_lines` (DESIGN §6 *What is still unmet when the run ends is shown as tests the reader can run*). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |

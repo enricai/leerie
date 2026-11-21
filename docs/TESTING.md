@@ -6546,9 +6546,31 @@ settle.
 
 `tests/test_decide_outcome.py` covers `_decide_outcome` (each unfinished-work
 signal unconverges a run with or without commits — the ordering the P7
-decider requires — an AST pin that it is the only writer of `outcome`, the
+decider requires — except an unconverged subtask, which vetoes only an empty
+branch or a run whose required items final detection did not read on the
+tree that ships, an AST pin that it is the only writer of `outcome`, the
 empty-branch `_finish_no_work_run` exit, and an execution of
 `phase_finalize` recording the outcome in `run.json`).
+`tests/test_delivery_judge_uninspected.py` and
+`tests/test_record_worker_only.py` pin the re-drive's re-check marking an
+item no sample read `not_inspected`, and a worker-only met not.
+`tests/test_unconverged_subtask_reports.py` covers DESIGN §6 *A subtask that
+did not converge is reported, not a veto*: the real `_decide_outcome` on a
+real State and run repository — `done` with commits and a delivery verdict,
+`unconverged` on an empty branch, with no delivery verdict, with only an
+earlier pass's verdict, a final verdict of another tree, a crashed judge,
+an item no judge sample inspected (at detection, or at the re-drive's
+re-check through the real `_redrive_apply_item_verdicts`), a test outcome
+not measured (also on a row the re-drive re-judged) or no item met or
+unmet, a ratchet-unverified row (through the real
+`_ratchet_mark_unverified`, over an earlier re-check's stamp), a stamp written before `not_inspected`
+existed, an unreadable tree that ships, a worker-only or unobservable row
+on an item with a test-outcome part the diff left unsettled; an unobservable
+or worker-only item counted as read, an external one ignored; another veto
+still deciding — and the PR end-state section it leads to: its
+`_PR_UNCONVERGED_NOT_IN_PR` line ordered before each subtask and, on a
+draft, after the decider's reasons; absent from a draft with no unconverged
+subtask; a subtask with no `unconverged_subtasks` record still named.
 `tests/test_host_finalize_sh.py` pins `--draft` on `unconverged` only.
 
 ## Settle by execution, spawn-held enrollment and measured sizing

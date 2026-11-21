@@ -914,8 +914,10 @@ def test_phase_finalize_writes_the_end_state_after_the_outcome(
         leerie, monkeypatch, st):
     """DESIGN §6 *The PR's end-state section is rendered by code, from typed
     state*: phase_finalize renders the section AFTER `_decide_outcome`, so
-    an unconverged run's `pr_end_state` (the text the launcher's fallback
-    appends) already says why the PR is a draft."""
+    `pr_end_state` (the text the launcher's fallback appends) already says
+    why the PR is a draft. Here final delivery detection did not read the
+    required items, so the unconverged subtask still vetoes (*A subtask that did not
+    converge is reported, not a veto*)."""
     _finalize_ready_state(st)
     st.data["subtask_status"]["feat-002"] = "unconverged"
     st.data["unconverged_subtasks"] = {
@@ -933,5 +935,6 @@ def test_phase_finalize_writes_the_end_state_after_the_outcome(
     end = run_json["pr_end_state"]
     assert end == leerie._format_pr_end_state_section(st.data)
     assert end.startswith("\n## Unconverged\n\nThis PR is a draft")
-    assert "- 1 subtask(s) unconverged: feat-002" in end
-    assert "- **feat-002**: re-drive budget spent on the parser" in end
+    assert (end.index("- 1 subtask(s) unconverged: feat-002")
+            < end.index(leerie._PR_UNCONVERGED_NOT_IN_PR)
+            < end.index("- **feat-002**: re-drive budget spent on the parser"))

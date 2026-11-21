@@ -180,8 +180,10 @@ blocker is re-driven with its blocker as the note,
 from one re-drive budget per subtask (`subtask_redrive_rounds`, bounded
 run-wide by `redrive_budget_sec`); once that budget is spent the subtask
 settles `unconverged`, the wave's successful subtasks are integrated and
-the run continues. A run with an unconverged subtask ends `unconverged`
-and its PR opens as a draft — never presented as done. Pass `--stop-on-blocked` (or set
+the run continues. The PR names every unconverged subtask and its reason;
+the run ends `unconverged` (a draft PR when anything ships) when the tree
+that ships fails any other check, when its branch is empty, or when final
+delivery detection did not read the required items on the tree that ships. Pass `--stop-on-blocked` (or set
 `LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` in `leerie.toml`) to halt
 instead: the blocker reason lands in
 `<state-root>/runs/<run-id>/state.json` and Leerie exits non-zero. You

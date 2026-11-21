@@ -60,8 +60,6 @@ def test_clean_run(leerie, st, any_commits, expected):
 
 
 @pytest.mark.parametrize("extra,reason_word", [
-    ({"subtask_status": {"a": "complete", "b": "unconverged"}},
-     "unconverged: b"),
     ({"test_id_diff": {"new": ["t :: x"]}}, "newly failing"),
     ({"acceptance": {"gate": {"final": [
         {"index": 0, "passed": True}, {"index": 1, "passed": False}]}}},
@@ -88,6 +86,23 @@ def test_unfinished_work_is_unconverged_before_the_empty_branch_check(
     assert any(reason_word in r for r in st.data["outcome_reasons"]), \
         st.data["outcome_reasons"]
     assert _run_json(st)["outcome"] == "unconverged"
+
+
+@pytest.mark.parametrize("any_commits,expected", [(True, "done"),
+                                                  (False, "unconverged")])
+def test_an_unconverged_subtask_with_items_read_vetoes_an_empty_branch(
+        leerie, st, any_commits, expected):
+    """DESIGN §6 *A subtask that did not converge is reported, not a veto*:
+    with commits and a delivery verdict of the tree that ships, that tree
+    decides; on an empty branch the unfinished work is never `no_work`."""
+    st.data.update(_ship(st, {"delivery_gate": {
+        "unmet_final": [], "final_tree": "SHIP",
+        "items": [{"item_index": 0, "verdict": "met", "by": []}]}}))
+    st.data["subtask_status"] = {"a": "complete", "b": "unconverged"}
+    assert leerie._decide_outcome(st, any_commits=any_commits) == expected
+    assert st.data["outcome_reasons"] == (
+        [] if any_commits else ["1 subtask(s) unconverged: b"])
+    assert _run_json(st)["outcome"] == expected
 
 
 @pytest.mark.parametrize("extra", [
@@ -166,8 +181,10 @@ def test_phase_finalize_normal_path_decides_with_commits(leerie):
 def test_phase_finalize_records_the_outcome_in_run_json(
         leerie, monkeypatch, tmp_path, statuses, expected):
     """Executes the consumer: a branch with commits finalizes `done`, or
-    `unconverged` when a subtask did not converge — the run.json field the
-    host launcher reads to open a draft PR."""
+    `unconverged` when a subtask did not converge and final delivery
+    detection did not read the required items (DESIGN §6 *A subtask that did not converge is
+    reported, not a veto*) — the run.json field the host launcher reads to
+    open a draft PR; `pr_end_state` names the subtask."""
     import asyncio
     import subprocess
 
@@ -188,6 +205,8 @@ def test_phase_finalize_records_the_outcome_in_run_json(
     s = leerie.State(leerie_root, "r1", repo_root=tmp_path)
     s.data.update({"waves": [sorted(statuses)], "completed_waves": 1,
                    "subtask_status": dict(statuses),
+                   "unconverged_subtasks": {
+                       "feat-002": {"reason": "re-drive budget spent"}},
                    "working_branch": "main"})
     try:
         asyncio.run(leerie.phase_finalize(
@@ -196,8 +215,12 @@ def test_phase_finalize_records_the_outcome_in_run_json(
     finally:
         s.release_lock()
     assert s.data["outcome"] == expected
-    assert json.loads((s.run_dir / "run.json").read_text())["outcome"] \
-        == expected
+    rj = json.loads((s.run_dir / "run.json").read_text())
+    assert rj["outcome"] == expected
+    if "feat-002" in statuses:
+        assert ("- **feat-002**: re-drive budget spent"
+                in rj["pr_end_state"])
+        assert leerie._PR_UNCONVERGED_NOT_IN_PR in rj["pr_end_state"]
     assert s.data["finished_at"]
 
 

@@ -3122,7 +3122,7 @@ if entry.get("outcome") == "backed_out":
     _why = entry.get("fallback_reason") or "no reason recorded"
     print(f"NOOP: subtask {sid!r} was backed out of the run branch ({_why}); "
           "none of its work is integrated, so there is no finding to accept. "
-          "It is settled unconverged; a later run redoes its work")
+          "It is settled unconverged")
     sys.exit(0)
 if entry.get("accepted"):
     print(f"NOOP: subtask {sid!r} integration finding is already accepted")

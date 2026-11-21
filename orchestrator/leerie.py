@@ -7844,6 +7844,12 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
 # or template may emit it.
 _RISK_SECTION_HEADING = "## ⚠ Residual risks"
 _UNMET_HEADING = "## Still failing when the run ended"
+# Introduces the unconverged subtasks in `## Unconverged`, whatever the
+# outcome (DESIGN §6 *A subtask that did not converge is reported, not a
+# veto*). Their own branches, never anything a re-drive later kept for them.
+_PR_UNCONVERGED_NOT_IN_PR = (
+    "These subtasks did not converge, and their own branches were not "
+    "merged into this PR:")
 _OPERATOR_ACCEPTED_HEADING = "## Held-out cases accepted by the operator"
 _PR_END_STATE_HEADINGS: tuple[str, ...] = (
     _RISK_SECTION_HEADING,
@@ -8575,8 +8581,9 @@ def _format_pr_end_state_section(state: dict) -> str:
     when there is nothing to say (DESIGN §6 *The PR's end-state section is
     rendered by code, from typed state*). Up to twelve headed lists, each
     only when non-empty, in this order: `## Unconverged` (why the PR is a
-    draft), `## Still failing when the run ended` (what is unmet, as the
-    tests that show it: `_pr_unmet_evidence_lines`), `## Held-out cases
+    draft, and every unconverged subtask whatever the outcome), `## Still
+    failing when the run ended` (what is unmet, as the tests that show it:
+    `_pr_unmet_evidence_lines`), `## Held-out cases
     accepted by the operator` (`_pr_operator_accepted_lines`), `## Scope reading`
     (the run took the broad reading of a task that reads two ways:
     `_pr_scope_reading_lines`),
@@ -8616,14 +8623,22 @@ def _format_pr_end_state_section(state: dict) -> str:
     sections: list[tuple[str, list[str]]] = []
 
     lines: list[str] = []
-    unconverged = {s: r for s, r in _dict("unconverged_subtasks").items()
-                   if statuses.get(s) == "unconverged" and isinstance(r, dict)}
+    # Every subtask whose status is `unconverged`, record or not: the PR is
+    # where an unconverged subtask is reported.
+    records = _dict("unconverged_subtasks")
+    unconverged = {s: (records.get(s) if isinstance(records.get(s), dict)
+                       else {})
+                   for s, v in statuses.items() if v == "unconverged"}
     if state.get("outcome") == "unconverged":
         lines += ["This PR is a draft: the run did not finish its work.", ""]
         reasons = state.get("outcome_reasons")
         lines += [f"- {_pr_entry(r)}" for r in
                   (reasons if isinstance(reasons, list) else [])
                   if _pr_entry(r)]
+    if unconverged:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines += [_PR_UNCONVERGED_NOT_IN_PR, ""]
     lines += [f"- **{sid}**: "
               f"{_pr_entry(unconverged[sid].get('reason')) or 'no reason recorded'}"
               for sid in sorted(unconverged)]
@@ -43777,6 +43792,65 @@ def _delivery_latest_verdict(delivery: object
     return None
 
 
+def _required_items_read_on_shipping_tree(st: "State") -> bool:
+    """Whether final delivery detection read the required items on the tree
+    that ships: its verdict is the latest, of that tree, its judge did not
+    crash, the delivery ratchet lists no item unverified, at least one item
+    is `met` or `unmet`, and every `unknown` item
+    is one a judge read but could not settle — a met resting only on a
+    worker's run, or a part nothing here can observe — never one whose test
+    outcome the failing-test-ID diff left unsettled. Only then does an
+    unconverged subtask stop vetoing (DESIGN §6 *A subtask that did not
+    converge is reported, not a veto*): every run that measurement covered
+    had this shape."""
+    gate = st.data.get("delivery_gate")
+    verdict = _delivery_latest_verdict(gate)
+    if verdict is None or verdict[2] != "final detection":
+        return False
+    shipping = _shipping_tree(st)
+    if not _of_shipping(verdict[1], shipping):
+        return False
+    judge = gate.get("final_judge")
+    if isinstance(judge, dict) and judge.get("error"):
+        return False
+    # An item the delivery ratchet lists unverified was not re-read since a
+    # move, whatever its row's earlier stamp says.
+    if _ratchet_record(st).get("unverified"):
+        return False
+    rows = [r for r in gate.get("items") or [] if isinstance(r, dict)]
+    required = st.data.get("required_items") or []
+
+    def outcome_unsettled(r: dict) -> bool:
+        # The row's item has a test outcome the failing-test-ID diff left
+        # unsettled on the tree that ships, whether or not the row says so:
+        # a worker-only or unobservable row is written before that part is.
+        i = r.get("item_index")
+        if not (isinstance(i, int) and 0 <= i < len(required)):
+            return False
+        it = _delivery_norm_item(required[i])
+        return bool(_test_id_diff_item(it) or _test_outcome_parts(it)) and (
+            _test_outcome_verdict(st, shipping)["verdict"] != "met")
+
+    def read_unknown(r: dict) -> bool:
+        # A test outcome the failing-test-ID diff did not settle was not
+        # measured, whoever judged the row's other parts.
+        if "test_id_diff" in (r.get("by") or []) or outcome_unsettled(r):
+            return False
+        # Otherwise the row's latest judge says: the re-drive's re-check when
+        # it re-judged the row (its unknown is a worker-only met unless no
+        # sample inspected it), else final detection's.
+        recheck = r.get("redrive_recheck")
+        if isinstance(recheck, dict):
+            # A stamp an older leerie wrote does not say which: unread.
+            return recheck.get("not_inspected") is False
+        judge = r.get("judge")
+        return bool(r.get("unobservable")) or (
+            isinstance(judge, dict) and bool(judge.get("worker_only")))
+    return (any(r.get("verdict") in ("met", "unmet") for r in rows)
+            and all(read_unknown(r) for r in rows
+                    if r.get("verdict") == "unknown"))
+
+
 def _shipping_tree(st: "State") -> str:
     """The tree the run ships: the run branch's,
     `refs/heads/leerie/runs/<id>^{tree}` in the run's own repository
@@ -43939,7 +44013,14 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                 if tree and _of_shipping(tree, shipping) is False
                 else current)
     statuses = st.data.get("subtask_status")
-    if isinstance(statuses, dict):
+    if isinstance(statuses, dict) and not (
+            any_commits and _required_items_read_on_shipping_tree(st)):
+        # A subtask's status is never of the tree that ships; with commits
+        # and the required items read there, what it was for is judged
+        # there by the inputs below and the PR reports it (DESIGN §6 *A
+        # subtask that did not converge is reported, not a veto*). Otherwise
+        # it still vetoes: a run that left work unfinished is never
+        # `no_work`, and otherwise nothing read what it was for.
         unconverged = sorted(s for s, v in statuses.items()
                              if v == "unconverged")
         if unconverged:
@@ -72679,8 +72760,13 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                         details[i].get("unmet_parts") or [])
                 if u is None and i in human:
                     # A met resting only on a worker's run, or an item no
-                    # sample read: unknown.
+                    # sample read: unknown. Which one is kept: an item no
+                    # sample read was not read on this commit (DESIGN §6 *A
+                    # subtask that did not converge is reported, not a
+                    # veto*).
                     out[i]["unknown"] = True
+                    if i in set(routing.get("not_inspected") or []):
+                        out[i]["not_inspected"] = True
         except Exception as e:
             log(f"  delivery re-drive: item re-judge failed "
                 f"({type(e).__name__}) — items kept unmet")
@@ -73285,7 +73371,11 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
                  "redrive_recheck": {
                      "sha": sha,
                      **({"unmet_parts": list(v["unmet_parts"])}
-                        if isinstance(v.get("unmet_parts"), list) else {})},
+                        if isinstance(v.get("unmet_parts"), list) else {}),
+                     # Always written: a stamp without it is of an older
+                     # leerie, which could not tell an item no sample read
+                     # from a worker-only met.
+                     "not_inspected": bool(v.get("not_inspected"))},
                  **({"falsifier": v["falsifier"]}
                     if isinstance(v.get("falsifier"), dict) else {})}
             if isinstance(r.get("test_outcome_part"), dict):
@@ -75435,8 +75525,10 @@ def _settle_unconverged(st: "State", sid: str, reason: str, *,
     """Settle `sid` terminally as `unconverged`: its work did not converge
     within the shared re-drive budget, or a predecessor's did not. Never
     left `blocked` — `resume` treats it as settled (`_SETTLED_STATUSES`) —
-    and the run's outcome becomes `unconverged` (`_decide_outcome`). Its
-    branch is not integrated. `kind` types the cause when one is known
+    and the PR names it; it makes the run's outcome `unconverged` only on
+    an empty run branch or when final delivery detection did not read the
+    required items on the tree that ships (`_decide_outcome`). Its branch
+    is not integrated. `kind` types the cause when one is known
     (`environment_limit`: killed by its cgroup at the measured ceiling)."""
     st.data.setdefault("subtask_status", {})[sid] = "unconverged"
     record = {
@@ -75466,7 +75558,8 @@ def _unconverged_predecessors(leerie_dir: Path, st: "State",
     on the branch: it settles only with zero commits, so the run branch a
     dependent starts from is the one it would have had, and the
     dependent's own checks then test the no-op's claim (DESIGN §8 *A no-op
-    the base already carries*). The run stays `unconverged` either way."""
+    the base already carries*). The predecessor stays `unconverged` either
+    way, and the PR names it."""
     records = st.data.get("unconverged_subtasks") or {}
     return [p for p in _settled_predecessors(leerie_dir, st, sid,
                                              "unconverged")
@@ -80807,8 +80900,8 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                     "resume.")
             # Default: the shared re-drive budget is spent (or the subtask
             # failed), so settle it `unconverged` — terminal, never left
-            # `blocked`, and never presented as done: the run's outcome
-            # becomes `unconverged` and its PR a draft (DESIGN §13). The
+            # `blocked`, and named in the PR as unconverged (DESIGN §13; §6
+            # *A subtask that did not converge is reported, not a veto*). The
             # integrate_wave above already merged the successful subtasks.
             for s in blocked:
                 blocker_text = (results[s].get("blocker")
