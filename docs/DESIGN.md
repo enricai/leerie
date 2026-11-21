@@ -22900,6 +22900,33 @@ the evidence, and its answer is applied by code:
    conflicting quoted span is struck from its field and replaced by the
    ruling, and a `verify` criterion containing it is dropped, before the
    specs the implementers read are written; `no` leaves the plan as it is.
+   For (a), the resolver first states two typed facts about the quoted
+   statement, not a free-text class: `task_asks` — whether the task and its
+   referenced files ask for `all` of it, a `part` of it (an exception, a
+   bound, or fewer cases than it names), or `none` of it — and
+   `base_has_it`, whether the repository at this commit already does it.
+   Code derives the `no` class from the two facts: `none` is
+   `not_required`, `part` is `narrower`, `all` with `base_has_it` is
+   `already_met`, and `all` without it (on a `no`) is a reading that
+   contradicts the facts and strikes nothing. **Only a settled, trusted
+   `no` whose `task_asks` is `none` changes the required items**: each
+   conflicting quoted span is struck from its item's text or part and
+   replaced by the ruling, in place (the item keeps its index), before the
+   specs are written, so every reader of the items — detection, the
+   falsifier, the re-drive, the PR — reads the item as ruled, with no rule
+   of its own. `part`, `all`, and anything else leave the items as written:
+   striking them would remove a requirement the task makes (S9-R7 B1: two
+   blind raters found 98 of 102 struck spans not required, but the four
+   that were required have `task_asks` `all` in the resolver's own facts —
+   already met, or a narrower reading — and one was an item leerie had
+   found unmet at the end). Deriving the class in code from the typed facts,
+   rather than reading a free-text label the model writes, is what keeps the
+   class from contradicting the resolver's own reasoning: a label can drift
+   from the facts the same verdict states; a derivation cannot (S9-R7 B1v3,
+   where reading a free-text `no_reason` struck a required, unmet item in 1
+   of 6 samples and the typed facts struck it in 0 of 18). A user's `no`,
+   and a verdict recorded before the facts, carry no `task_asks` and strike
+   nothing.
    For (b), `yes` refuses the set-aside, `no` accepts it. Either way the
    ruling, its status and its verified quotes are kept in state
    (`intent_questions`) and listed in the PR (`## Intent decisions`).
@@ -22915,8 +22942,10 @@ the evidence, and its answer is applied by code:
    open. `--clarify` does not gate it: a run that would otherwise pick a
    reading of the task the user never chose stops instead.
 
-A `no` ruling is the task's answer to the question asked, not a change to
-the required items: detection still judges each item as written (§15).
+A `no` ruling is the task's answer to the question asked. It changes the
+required items only as (a)'s derived `not_required` (`task_asks` `none`)
+above; otherwise detection still judges each item as written (§15). For
+(b), (c) and (d) the facts are kept with the verdict and read by nothing.
 
 ### Mid-execution clarification
 

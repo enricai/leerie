@@ -94,9 +94,10 @@ CONFLICTS = [
 
 
 def _verdict(answer="yes", status="settled", *, code_quote="# repo",
-             code_path="README.md"):
+             code_path="README.md", task_asks="all", base_has_it=False):
     return {"decision": f"{answer.capitalize()}. The report counts 303.",
             "answer": answer, "status": status,
+            "task_asks": task_asks, "base_has_it": base_has_it,
             "evidence": [
                 {"source": "report", "quote": REPORT,
                  "locator": "report.md"},
@@ -212,6 +213,129 @@ def test_a_settled_no_leaves_the_plan(env, monkeypatch):  # noqa: F811
     leerie._stop_for_intent_questions(st)
     leerie._apply_plan_intent_rulings(st, subtasks)
     assert json.dumps(subtasks, sort_keys=True) == before
+
+
+
+def _no_verdict(task_asks="none", base_has_it=False, *, drop_facts=False):
+    """A settled `no` verdict with the two typed facts. `drop_facts` models a
+    verdict recorded before the facts existed (an old state.json on resume)."""
+    v = _verdict("no", task_asks=task_asks, base_has_it=base_has_it)
+    if drop_facts:
+        del v["task_asks"]
+        del v["base_has_it"]
+    return v
+
+
+def test_a_not_required_no_strikes_the_items_quotes(env, monkeypatch):  # noqa: F811
+    """DESIGN §11 step 3: a settled, trusted `no` whose derived class is
+    `not_required` (task_asks none) strikes each conflicting item quote, in
+    place, from the item's text and from the part that holds it; the plan
+    stays. The class is derived in code from the facts, not read from text."""
+    leerie = env["leerie"]
+    st = _setup(env)
+    _stub(leerie, monkeypatch, verdict=_no_verdict(task_asks="none"))
+    subtasks = _subtasks()
+    plan_before = json.dumps(subtasks, sort_keys=True)
+    _plan(leerie, env, subtasks)
+    _no_tty(monkeypatch)
+    leerie._stop_for_intent_questions(st)
+    assert leerie._intent_strikes_items(st, QID) is True
+    leerie._apply_plan_intent_rulings(st, subtasks)
+    assert json.dumps(subtasks, sort_keys=True) == plan_before
+    marker = f"[intent ruling {QID}: not required by the task]"
+    item = st.data["required_items"][0]
+    assert item["item"] == f"preserves method, headers and body {marker}"
+    assert item["parts"] == [f"{marker} at the Location"]
+    assert st.data["required_items"][1] == "the public API is unchanged"
+    (ruling,) = item["_intent_rulings"]
+    assert ruling["qid"] == QID
+    # Saved, and a resume re-applying it changes nothing.
+    assert json.loads((env["run_dir"] / "state.json").read_text())[
+        "required_items"][0]["item"] == item["item"]
+    before = json.dumps(st.data["required_items"], sort_keys=True)
+    leerie._apply_plan_intent_rulings(st, subtasks)
+    assert json.dumps(st.data["required_items"], sort_keys=True) == before
+
+
+@pytest.mark.parametrize("verdict_kw,cls", [
+    ({"task_asks": "all", "base_has_it": True}, "already_met"),
+    ({"task_asks": "all", "base_has_it": False}, "contradicts"),
+    ({"task_asks": "part", "base_has_it": False}, "narrower"),
+    ({"drop_facts": True}, None),
+])
+def test_a_no_that_is_not_task_asks_none_leaves_the_items(
+        env, monkeypatch, verdict_kw, cls):  # noqa: F811
+    """Every derived class but `not_required` names a requirement the task
+    makes, so the items stay; a verdict with no facts (recorded before them,
+    read on resume) strikes nothing, exactly as today."""
+    leerie = env["leerie"]
+    st = _setup(env)
+    v = _no_verdict(**verdict_kw)
+    _stub(leerie, monkeypatch, verdict=v)
+    subtasks = _subtasks()
+    items_before = json.dumps(st.data["required_items"], sort_keys=True)
+    plan_before = json.dumps(subtasks, sort_keys=True)
+    _plan(leerie, env, subtasks)
+    assert leerie._intent_decision(st, QID) == "no"
+    assert leerie._intent_no_class(
+        st.data["intent_questions"][QID]["verdict"]) == cls
+    assert leerie._intent_strikes_items(st, QID) is False
+    _no_tty(monkeypatch)
+    leerie._stop_for_intent_questions(st)
+    leerie._apply_plan_intent_rulings(st, subtasks)
+    assert json.dumps(st.data["required_items"], sort_keys=True) == \
+        items_before
+    assert json.dumps(subtasks, sort_keys=True) == plan_before
+
+
+def test_a_users_no_strikes_nothing(env, monkeypatch):  # noqa: F811
+    """The user's answer is not the resolver's, so it carries no facts: even
+    over a resolver verdict with task_asks `none`, the items stay as written
+    (resume safety — a user's `no` behaves exactly as today)."""
+    leerie = env["leerie"]
+    st = _setup(env)
+    _stub(leerie, monkeypatch,
+          verdict={**_no_verdict(task_asks="none"), "status": "unsettled"})
+    subtasks = _subtasks()
+    items_before = json.dumps(st.data["required_items"], sort_keys=True)
+    _plan(leerie, env, subtasks)
+    assert leerie._intent_decision(st, QID) is None
+    st.data.setdefault("answers", {})[QID] = "no"
+    assert leerie._intent_strikes_items(st, QID) is False
+    leerie._apply_plan_intent_rulings(st, subtasks)
+    assert json.dumps(st.data["required_items"], sort_keys=True) == \
+        items_before
+
+
+def test_a_struck_quote_matches_whitespace_collapsed(env):  # noqa: F811
+    """IMPLEMENTATION: an item_quote that only matches after whitespace
+    collapse still strikes — on the item text and on a part — leaving the
+    collapsed text with the marker and every other word kept."""
+    leerie = env["leerie"]
+    st = env["st"]
+    st.data["required_items"] = [
+        {"item": "wrap every user-facing\nserver string in a catalog lookup",
+         "parts": ["catalog   lookups cover all strings"]}]
+    qid = "intent-plan-ws"
+    st.data["intent_questions"] = {qid: {
+        "qid": qid, "source": "plan", "question": "q",
+        "context": {"subtask_id": "s", "conflicts": [
+            {"item_index": 0, "item_quote": "wrap every user-facing server string",
+             "subtask_id": "s", "field": "intent", "plan_quote": "p"},
+            {"item_index": 0, "item_quote": "catalog lookups cover all strings",
+             "subtask_id": "s", "field": "intent", "plan_quote": "p"}]},
+        "verdict": {"answer": "no", "task_asks": "none", "base_has_it": False,
+                    "status": "settled", "trusted": True,
+                    "decision": "No, the task does not ask for it",
+                    "evidence": []}}}
+    st.save()
+    assert leerie._intent_strikes_items(st, qid) is True
+    leerie._apply_plan_intent_rulings(st, {})
+    marker = f"[intent ruling {qid}: not required by the task]"
+    it = st.data["required_items"][0]
+    assert it["item"] == f"{marker} in a catalog lookup"
+    assert it["parts"] == [marker]
+    assert "user-facing" not in it["item"]
 
 
 def test_no_conflict_asks_nothing(env, monkeypatch):  # noqa: F811
@@ -655,6 +779,16 @@ def test_schemas_and_tiers(leerie):
                         leerie.SCHEMAS["plan_item_checker"])
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({**_verdict(), "answer": "maybe"},
+                            leerie.SCHEMAS["intent_resolver"])
+    for ta in leerie.INTENT_TASK_ASKS:
+        jsonschema.validate(_no_verdict(task_asks=ta),
+                            leerie.SCHEMAS["intent_resolver"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_no_verdict(task_asks="maybe"),
+                            leerie.SCHEMAS["intent_resolver"])
+    # the two facts are required: a verdict missing them is rejected
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_no_verdict(drop_facts=True),
                             leerie.SCHEMAS["intent_resolver"])
     for w in ("intent_resolver", "plan_item_checker"):
         assert leerie.MODEL_DEFAULT_PER_WORKER[w] == "opus"
