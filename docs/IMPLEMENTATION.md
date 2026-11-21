@@ -9293,12 +9293,17 @@ than re-running once.
   _rerun_cost_or_default(st)`); otherwise one unsized pass. The engine is
   labelled `confirm_label`, `"pair"`, `intermittent` passed through. With
   `reuse=False` the worktree is removed on every exit; with `reuse=True`
-  (the `confirm-base` caller) it is instead kept for the run and moved to
+  (the `confirm-base` caller and the `redrive-base` caller
+  `_redrive_new_failures`) it is instead kept for the run and moved to
   `base_sha` via `_reuse_or_rebuild_kept_tree` (§8 *kept tree*), so the base
-  install is reinstalled only when the install key at `base_sha` differs —
-  the base commit is fixed for a confirm key, so only the first confirm
-  against it installs cold (DESIGN §9 *The base confirm worktree is kept
-  across the run's confirms*). Before any of that it consults the
+  install is reinstalled only when the install key at `base_sha` differs. For
+  `confirm-base` the base commit is fixed for a confirm key, so only the first
+  confirm against it installs cold (DESIGN §9 *The base confirm worktree is
+  kept across the run's confirms*); for `redrive-base` the base is each
+  group's or round's start `pre_sha`, which moves as groups commit, so a start
+  whose install inputs are unchanged still reuses the install and one whose
+  lockfile or manifest changed reinstalls (DESIGN §9 *The delivery re-drive's
+  base confirm worktree is kept too*). Before any of that it consults the
   base-verdict memo (DESIGN §9 *A settled base verdict is reused, never
   recomputed*): `memo_key = _base_verdict_memo_key(base_sha, cmd, replace,
   remove_base)` (hex SHA-256 of a canonical JSON of those four), and any
@@ -9559,8 +9564,10 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     Pinned by `tests/test_view_moves.py`.
     A *kept tree* reuses the same move machinery (DESIGN §8 *The evaluation
     tree is kept across a run's evaluations*, §9 *The base confirm worktree
-    is kept across the run's confirms* — one mechanism, two consumers: the
-    held-out evaluation tree and the base-paired confirm worktree). Two
+    is kept across the run's confirms*, *The delivery re-drive's base confirm
+    worktree is kept too* — one mechanism, three consumers: the held-out
+    evaluation tree, B\*'s base-paired confirm worktree, and the delivery
+    re-drive's `redrive-base` confirm worktree). Two
     process-level dicts, keyed by `realpath(<kept tree>)`: `_KEPT_TREES:
     dict[str, tuple[Path, str]]` — the run repository and the tip of a tree
     opted into snapshot recording — and `_KEPT_INSTALLS: dict[str, tuple[str,
