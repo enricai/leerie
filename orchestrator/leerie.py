@@ -44187,10 +44187,8 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         reasons.append(str(conflict["reason"]))
     residual_defects = _residual_defects_reason(st)
     if residual_defects:
-        final_rec = (st.data.get("conformance") or {}).get("_final")
-        reasons.append(_keyed(
-            final_rec.get("tree_sha") if isinstance(final_rec, dict)
-            else None, residual_defects, residual_defects))
+        reasons.append(_keyed((_final_defects_record(st) or ({}, ""))[1],
+                              residual_defects, residual_defects))
     unclean = st.data.get("unclean_trees")
     for rec in (unclean.values() if isinstance(unclean, dict) else ()):
         if isinstance(rec, dict):
@@ -65344,9 +65342,14 @@ async def _pr_review_record(st: "State", caps: dict, models: dict[str, str],
     return record
 
 
-def _format_pr_review_section(st: "State") -> str | None:
+def _format_pr_review_section(st: "State",
+                              keep_pr_ids: set[str] | None = None) -> str | None:
     """The final conformer's ADVISORY WHOLE-PR REVIEW section: the verified
-    findings only, or None."""
+    findings only, or None. `keep_pr_ids` (the re-decision on the shipped
+    tree) restricts to those finding ids — `pr-<k>` keyed as
+    `_set_aside_findings` keys them, so the two stay in step — dropping
+    findings on an item the re-drive has since met; None shows every verified
+    finding (the pass's own rounds)."""
     rec = st.data.get("pr_review") or {}
     shown = [{"finding_id": f"pr-{k}",
               **{key: f.get(key) for key in ("kind", "item_id", "path",
@@ -65354,6 +65357,8 @@ def _format_pr_review_section(st: "State") -> str | None:
                                              "quote", "explanation")}}
              for k, f in enumerate(rec.get("findings") or [])
              if f.get("verified")]
+    if keep_pr_ids is not None:
+        shown = [s for s in shown if s["finding_id"] in keep_pr_ids]
     if not shown:
         return None
     more = len(shown) - _PR_REVIEW_SHOWN
@@ -65984,13 +65989,27 @@ def _set_aside_question(finding: dict, entry: dict, st: "State") -> str:
 async def _adjudicate_set_asides(st: "State", res: dict,
                                  findings: dict[str, dict], caps: dict,
                                  models: dict[str, str],
-                                 efforts: dict[str, str | None]) -> None:
+                                 efforts: dict[str, str | None],
+                                 reuse_only: bool = False) -> None:
     """Source (b), one final-conformance round: every `set_aside` entry
     naming a shown finding on a required item is a question; one decided
     `yes` (the task requires it resolved) refuses the set-aside — an unfixed
     solution defect is added to `res`, so the next round gets it and the
     re-drive drives what the last round leaves. A set-aside of a finding on
-    no required item stays the conformer's (the review is advisory)."""
+    no required item stays the conformer's (the review is advisory).
+
+    `reuse_only` (the shipping-tree re-decision, `_redecide_final_defects`,
+    which runs AFTER the last intent stop): act only on a set-aside whose
+    intent question the pass already settled; never register or ask a new
+    one, so the re-decision opens no question at outcome time — it re-decides
+    the pass's verdict, it does not reach a new one. A new/unsettled set-aside
+    is skipped, never a silent false-done: an item-linked finding is shown
+    only because its item is still unmet on the shipping tree
+    (`_delivery_latest_verdict`), exactly the set `_decide_outcome` already
+    vetoes `done` on (`N required item(s) still unmet`). (A finding tied to no
+    required item index — an item-less finding, or the defect-contract
+    finding, which the scope keeps unconditionally — is not tied to that veto;
+    a tracked residual.) DESIGN §9."""
     for entry in res.get("set_aside") or []:
         if not isinstance(entry, dict):
             continue
@@ -65999,6 +66018,8 @@ async def _adjudicate_set_asides(st: "State", res: dict,
         if finding is None or finding["item"] is None:
             continue
         qid = f"intent-finding-{fid}"
+        if reuse_only and _intent_decision(st, qid) is None:
+            continue
         q = _register_intent_question(
             st, qid, "set_aside", _set_aside_question(finding, entry, st),
             {"finding": finding,
@@ -74808,6 +74829,53 @@ def _final_axes_log(leerie_dir: Path, rnd: int) -> Path:
     return leerie_dir / "logs" / f"final-conformer-r{rnd}-axes.log"
 
 
+def _final_conformer_prompt(st: State, leerie_dir: Path, working_branch: str,
+                            rules_paths_str: str,
+                            pre: dict[str, dict] | None,
+                            unmet_required_items: list[dict] | None,
+                            contract_unmet: dict | None,
+                            blt_feedback: str | None,
+                            defect_feedback: str | None,
+                            keep_pr_ids: set[str] | None = None) -> list[str]:
+    """The user prompt of one final-conformer round (DESIGN §9, final-tree
+    pass), as lines: `_run_final_conformance`'s rounds and its re-decision
+    on the tree that ships (`_redecide_final_defects`) build it here, so the
+    two cannot drift. Mirrors `_run_conformer`'s shape, but the spec and
+    criteria lines are replaced with one sentence framing this as the
+    post-integration whole-tree pass: there is no per-subtask spec file to
+    point at."""
+    up = [
+        "Run the post-integration whole-tree conformance phase on "
+        "the merged run branch. This is the final conformer pass "
+        "before the PR is opened; you are reviewing the *combined* "
+        "diff of every subtask in this run, not any one subtask.",
+        f"LEERIE_DIR is {leerie_dir} (absolute). There is no "
+        "subtask spec or criteria file for this pass — the unit "
+        "of work is the whole run.",
+        "Your current working directory IS the integrated staging "
+        "worktree. Make and commit any fixes here. Every commit "
+        "subject must start with `conformer:`.",
+        f"RULES_FILES: {rules_paths_str}",
+        f"DIFF_BASE: {working_branch} (compare with "
+        f"`git diff {working_branch}..HEAD`)",
+    ]
+    if unmet_required_items or contract_unmet is not None:
+        up.append(_format_unmet_required_items_section(
+            unmet_required_items, contract_unmet))
+    # The advisory whole-PR review (DESIGN §9): verified findings only. The
+    # re-decision on the shipped tree passes `keep_pr_ids` to show only
+    # findings on an item still unmet there (`_redecide_final_defects`).
+    pr_section = _format_pr_review_section(st, keep_pr_ids)
+    if pr_section:
+        up.append(pr_section)
+    _append_conformer_context_sections(up, pre or {}, "full", st)
+    if blt_feedback is not None:
+        up.append(blt_feedback)
+    if defect_feedback is not None:
+        up.append(defect_feedback)
+    return up
+
+
 async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None],
@@ -74969,46 +75037,17 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         near_rejected = None
         pre_tree = await _view_tree_sha(st, staging)
 
-        # Build the per-round user prompt. Mirrors _run_conformer's shape
-        # but the spec / criteria lines are replaced with one sentence
-        # framing this as the post-integration whole-tree pass — there
-        # is no per-subtask spec file to point at.
-        up = [
-            "Run the post-integration whole-tree conformance phase on "
-            "the merged run branch. This is the final conformer pass "
-            "before the PR is opened; you are reviewing the *combined* "
-            "diff of every subtask in this run, not any one subtask.",
-            f"LEERIE_DIR is {leerie_dir} (absolute). There is no "
-            "subtask spec or criteria file for this pass — the unit "
-            "of work is the whole run.",
-            "Your current working directory IS the integrated staging "
-            "worktree. Make and commit any fixes here. Every commit "
-            "subject must start with `conformer:`.",
-            f"RULES_FILES: {rules_paths_str}",
-            f"DIFF_BASE: {working_branch} (compare with "
-            f"`git diff {working_branch}..HEAD`)",
-        ]
         # Delivery-gate routing (DESIGN §8 *The delivery gate*): the
         # confirmed-unmet required items ride the existing fix loop
         # rather than getting one of their own; the gate's recheck is
         # the mechanical verification that they were actually remedied.
         _gate_contract = (st.data.get("delivery_gate")
                           or {}).get("contract_before") or {}
-        _contract_unmet = (_gate_contract
-                           if _gate_contract.get("verdict") == "unmet"
-                           else None)
-        if unmet_required_items or _contract_unmet is not None:
-            up.append(_format_unmet_required_items_section(
-                unmet_required_items, _contract_unmet))
-        # The advisory whole-PR review (DESIGN §9): verified findings only.
-        _pr_section = _format_pr_review_section(st)
-        if _pr_section:
-            up.append(_pr_section)
-        _append_conformer_context_sections(up, pre, "full", st)
-        if blt_feedback is not None:
-            up.append(blt_feedback)
-        if defect_feedback is not None:
-            up.append(defect_feedback)
+        up = _final_conformer_prompt(
+            st, leerie_dir, working_branch, rules_paths_str, pre,
+            unmet_required_items,
+            _gate_contract if _gate_contract.get("verdict") == "unmet"
+            else None, blt_feedback, defect_feedback)
 
         try:
             st.bump_workers(caps)
@@ -75332,26 +75371,228 @@ def _format_final_defects_note(defects: list[dict]) -> str:
             + json.dumps(rows, indent=1))
 
 
+def _final_defects_record(st: "State") -> tuple[dict, str] | None:
+    """The record of the final conformance's residual solution defects that
+    the outcome reads, with the tree it is of (DESIGN §9 *The final
+    conformance's verdict is of the tree that ships*): its re-decision on
+    the tree that ships (`conformance._shipped`, `_redecide_final_defects`)
+    when that record is of the tree that ships and did not crash, else the
+    pass's own (`conformance._final`, stamped `tree_sha`). None when there
+    is neither."""
+    conf = st.data.get("conformance") or {}
+    shipped = conf.get("_shipped")
+    if (isinstance(shipped, dict) and "error" not in shipped
+            and _of_shipping(shipped.get("tree"), _shipping_tree(st))):
+        return shipped, str(shipped.get("tree") or "")
+    fin = conf.get("_final")
+    if isinstance(fin, dict):
+        return fin, str(fin.get("tree_sha") or "")
+    return None
+
+
 def _residual_defects_reason(st: "State") -> str | None:
     """The outcome reason for the final conformance's residual solution
-    defects (DESIGN §6 *The run outcome is decided once*), or None."""
-    fin = (st.data.get("conformance") or {}).get("_final")
-    rows = fin.get("residual_defects") if isinstance(fin, dict) else None
-    rows = [d for d in rows or [] if isinstance(d, dict)]
+    defects (DESIGN §6 *The run outcome is decided once*), or None: of the
+    record `_final_defects_record` names."""
+    got = _final_defects_record(st)
+    if got is None:
+        return None
+    rec, _tree = got
+    rows = [d for d in rec.get("residual_defects") or []
+            if isinstance(d, dict)]
     if not rows:
         return None
+    shown = "; ".join(f"[{d.get('kind')}] {d.get('where')}: "
+                      f"{str(d.get('concrete_case') or '')[:200]}"
+                      for d in rows[:3])
+    more = f" (+{len(rows) - 3} more)" if len(rows) > 3 else ""
+    if rec is (st.data.get("conformance") or {}).get("_shipped"):
+        return (f"{len(rows)} solution defect(s) on the tree that ships, "
+                "found by the final conformance decided again there after a "
+                f"later step moved the run branch: {shown}{more}")
     rd = st.data.get("delivery_redrive")
     driven = set((rd or {}).get("defects_driven") or []
                  if isinstance(rd, dict) else [])
     n_driven = sum(1 for j in range(len(rows))
                    if _solution_defect_key(j) in driven)
-    shown = "; ".join(f"[{d.get('kind')}] {d.get('where')}: "
-                      f"{str(d.get('concrete_case') or '')[:200]}"
-                      for d in rows[:3])
-    more = f" (+{len(rows) - 3} more)" if len(rows) > 3 else ""
     return (f"{len(rows)} solution defect(s) the final conformance left "
             f"unfixed after its last round ({n_driven} of them driven by the "
             f"delivery re-drive, none re-verified): {shown}{more}")
+
+
+async def _redecide_final_defects(leerie_dir: Path, st: State, caps: dict,
+                                  models: dict[str, str],
+                                  efforts: dict[str, str | None]
+                                  ) -> dict | None:
+    """The final conformance's verdict decided again on the tree that ships
+    (DESIGN §9 *The final conformance's verdict is of the tree that
+    ships*), after the last step that commits: when `_final` left residual
+    solution defects and its stamp (`tree_sha`) is not the tree that ships,
+    one final-conformer round — the SAME derivation as the pass, differing
+    only in the tree it reads: the same prompt (`_final_conformer_prompt`)
+    built with the pass's own inputs (the confirmed-unmet items and verified
+    review findings, `_set_aside_findings`) — but scoped to the items still
+    unmet on the shipped tree (`_delivery_latest_verdict`, final detection's
+    `unmet_final`), so a finding the re-drive closed is not re-raised — the
+    same model, effort and
+    tools, the shipped tree's measured axes, and the pass's set-aside
+    adjudication (`_adjudicate_set_asides`) re-run on the result — on the run
+    branch's head, in a ref-less clone of its own (`_ref_less_clone`)
+    removed afterwards, so nothing it commits ships. Executable defects are
+    re-measured on the shipped tree; intent/set-aside defects are re-derived
+    from the already-settled intent verdicts (which are reused, not re-asked,
+    so this stays a re-decision), so a task-required finding still unmet on
+    the shipped tree is a defect and one the re-drive fixed is not. Every
+    actionable defect it reports, `fixed` or not, is of the tree that ships:
+    its fixes do not ship. Persists `conformance._shipped` `{sha, tree,
+    result, residual_defects, error?}` and returns it; `_final_defects_record`
+    reads it for the outcome.
+
+    None, with nothing run, when `_final` has no residual defects or no
+    stamp, the run branch cannot be read, or `_final` is of the tree that
+    ships. A resume returns the record while it is of that tree. A crash is
+    the record's `error`: the outcome then reads `_final`, worded as of its
+    own tree."""
+    conf = st.data.get("conformance") or {}
+    fin = conf.get("_final")
+    if not isinstance(fin, dict) or not fin.get("tree_sha") or not [
+            d for d in fin.get("residual_defects") or []
+            if isinstance(d, dict)]:
+        return None
+    commit, tree = _shipping_commit(st), _shipping_tree(st)
+    if not commit or not tree or fin["tree_sha"] == tree:
+        return None
+    prev = conf.get("_shipped")
+    if isinstance(prev, dict) and _of_shipping(prev.get("tree"), tree):
+        return prev
+    working_branch = _diff_base(st)
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not working_branch or not staging.is_dir():
+        return None
+    log(f"phase 5: final conformance decided again on the tree that ships — "
+        f"its verdict is of tree {str(fin['tree_sha'])[:12]}, the run branch "
+        f"ships {tree[:12]} (DESIGN §9)")
+    st.data["current_phase"] = "phase 5: final conformance on the shipping tree"
+    st.save()
+    record: dict = {**_stamp(st, commit)}
+    log_path = leerie_dir / "logs" / "final-conformer-shipped-axes.log"
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+    # The shipped tree's axes, as the pass's rounds get theirs: measured in
+    # staging's committed view, which is that tree (I1), and carried from the
+    # refresh that measured it last.
+    pre: dict[str, dict] = {}
+    if await _view_tree_sha(st, staging) == tree:
+        blt = resolve_blt(st.repo_root)
+        pre = await _measure_axes(
+            str(staging),
+            {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+             for axis in ("build", "lint", "tests")},
+            st, caps, log_path=log_path, verbosity=verbosity,
+            label_prefix="final-shipped", log_prefix="final-conformer",
+            failing_ids_axes={"tests"}, carry=True)
+    wt = _helper_worktree_path(st, "final-shipped")
+    _remove_acceptance_checkout(st, wt)
+    try:
+        why = await asyncio.to_thread(_ref_less_clone, _run_repo(st), wt,
+                                      commit)
+        if why:
+            raise WorkerError(f"final-shipped: no checkout of {commit[:12]} "
+                              f"({why})")
+        if not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path, verbosity=verbosity,
+                label_prefix="final-shipped", log_prefix="final-conformer"):
+            log("  final conformance (shipping tree): dependency install "
+                "failed in its checkout — the round reads the code as is")
+        # Re-derive the pass's residual defects on the shipped tree, with the
+        # SAME inputs the pass's rounds get — the confirmed-unmet items and the
+        # verified review findings (`_set_aside_findings`) — not a bare prompt.
+        # Without them the conformer re-reviews the tree blind and sets every
+        # finding aside, so no intent/set-aside-layer defect is reproduced
+        # (DESIGN §9 *The final conformance's verdict is of the tree that
+        # ships*: re-measure the executable axes, re-derive the intent ones).
+        gate = st.data.get("delivery_gate") or {}
+        # Of those inputs, which findings are shown is a fact ABOUT THE TREE:
+        # show only findings on an item still unmet on the shipped tree
+        # (final delivery detection's `unmet_final`). A finding the re-drive
+        # closed is not re-raised — else the conformer, unable to verify a
+        # live-site finding is fixed, sets it aside and the settled intent
+        # verdict refuses it, a stale veto of the very kind this fixes. An
+        # item-less finding (`item_known` false) stays shown (status quo;
+        # OPEN-ISSUES residual: an unlinked finding on a fixed tree). When no
+        # shipped-tree item verdict exists, no scope is applied.
+        latest = _delivery_latest_verdict(gate)
+        still_unmet: set[int] | None = None
+        if latest is not None and _of_shipping(latest[1], tree):
+            still_unmet = {u.get("item_index") for u in latest[0]
+                           if isinstance(u, dict)
+                           and isinstance(u.get("item_index"), int)}
+        unmet = list(gate.get("unmet_before") or [])
+        if still_unmet is not None:
+            unmet = [u for u in unmet
+                     if u.get("item_index") in still_unmet]
+        contract_before = gate.get("contract_before") or {}
+        contract_unmet = (contract_before
+                          if contract_before.get("verdict") == "unmet"
+                          else None)
+        shown_findings = _set_aside_findings(st, unmet, contract_unmet)
+        if still_unmet is not None:
+            shown_findings = {
+                fid: f for fid, f in shown_findings.items()
+                if not isinstance(f.get("item"), int)
+                or f["item"] in still_unmet}
+        keep_pr_ids = {fid for fid in shown_findings if fid.startswith("pr-")}
+        up = _final_conformer_prompt(
+            st, leerie_dir, working_branch,
+            _format_rules_paths(_discover_rules_files(st.repo_root),
+                                st.repo_root),
+            pre, unmet, contract_unmet, None, None,
+            keep_pr_ids=None if still_unmet is None else keep_pr_ids)
+        st.bump_workers(caps)
+        res = await claude_p(
+            user_prompt="\n".join(up),
+            system_prompt=_load_prompt("conformer"),
+            schema_key="conformer", cwd=str(wt),
+            allowed_tools=ACT_TOOLS, max_turns=60,
+            autonomous=True, caps=caps, st=st,
+            model=models["conformer"], effort=efforts["conformer"],
+            sid="final-conformer-shipped")
+        res = _expand_conformer_output(res)
+        err = _validate_conformance_result(res, str(wt))
+        if err:
+            raise WorkerError(f"malformed result: {err}")
+        # The pass's set-aside adjudication, re-run here but REUSE-ONLY: a
+        # set-aside of a task-required finding is an unfixed defect, decided
+        # from the verdict the pass already settled. It asks nothing new
+        # (`reuse_only`), so this re-decision — which runs after the last
+        # intent stop — opens no question at outcome time. A new/unsettled
+        # set-aside is skipped, not silently dropped: its finding is shown
+        # only because its item is still unmet on the shipping tree, which
+        # `_decide_outcome` already vetoes.
+        await _adjudicate_set_asides(st, res, shown_findings, caps, models,
+                                     efforts, reuse_only=True)
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        record["error"] = _brief_worker_exc(e)
+    else:
+        record["result"] = res
+        record["residual_defects"] = [
+            {k: str(d.get(k) or "").strip()
+             for k in ("kind", "where", "concrete_case",
+                       "why_ships_a_defect")}
+            for d in (res.get("solution_defects") or [])
+            if isinstance(d, dict) and str(d.get("where") or "").strip()
+            and str(d.get("concrete_case") or "").strip()]
+    finally:
+        _remove_acceptance_checkout(st, wt)
+    st.data.setdefault("conformance", {})["_shipped"] = record
+    st.save()
+    if "error" in record:
+        log(f"  final conformance (shipping tree): failed ({record['error']})"
+            " — the outcome reads the pass's own verdict, of its own tree")
+    else:
+        log(f"  final conformance (shipping tree): "
+            f"{len(record['residual_defects'])} solution defect(s) on "
+            f"{tree[:12]}")
+    return record
 
 
 def _solution_defect_key(j: int) -> str:
@@ -83365,6 +83606,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     await _check_existing_behaviour(leerie_dir, st, caps, models, efforts)
     # No intent question is left open when the PR is written (DESIGN §11).
     _stop_for_intent_questions(st)
+    # The final conformance's residual defects are of the tree that ships
+    # (DESIGN §9): decided again there when a step after the pass moved the
+    # run branch. Nothing after this commits.
+    try:
+        await _redecide_final_defects(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"final conformance on the shipping tree raised "
+            f"{type(e).__name__}: {e} — the outcome reads the pass's own "
+            "verdict, of its own tree")
     # The review the PR shows is of the tree that ships (DESIGN §9): made
     # again when a step after it moved the run branch. Nothing after this
     # commits, and nothing that fixes or decides reads it.
