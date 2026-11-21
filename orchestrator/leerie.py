@@ -988,6 +988,12 @@ STATE_FIELDS = (
     # The failing-test-ID diff (DESIGN §9 *Which failures are new*): base and
     # final failing IDs, and the latest B* verdict on their difference.
     "baseline_failing_ids", "final_failing_ids", "test_id_diff",
+    # Run-level memo of the base-side pre_existing determination (DESIGN §9
+    # *A settled base verdict is reused, never recomputed*): {memo_key:
+    # [test-id, ...]}, keyed by (base_sha, cmd, replace, remove_base). Lets
+    # a later base-paired confirm skip reruns whose base outcome is already
+    # settled. Absent on a run saved before the memo existed.
+    "base_pre_existing_memo",
     # Why the tree that ships has no failing-test-ID diff (DESIGN §6 *The
     # run outcome is decided once*, "`done` rests on measurements that
     # ran"); None once it has one.
@@ -51586,6 +51592,69 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     return None
 
 
+def _base_verdict_memo_key(base_sha: str, cmd: str,
+                           replace: tuple[tuple[str, str], ...],
+                           remove_base: tuple[str, ...]) -> str:
+    """Stable key for the base-side `pre_existing` memo (DESIGN §9 *A
+    settled base verdict is reused, never recomputed*): everything that
+    determines a candidate's base rerun — the base commit, the test
+    command, the in-place substitutions (kept in order, which matters) and
+    the base-form removals (a set, so sorted). A different value of any of
+    them is a different key, so a verdict measured against one base is
+    never read against another."""
+    payload = json.dumps(
+        {"base_sha": base_sha, "cmd": cmd,
+         "replace": [list(p) for p in replace],
+         "remove_base": sorted(remove_base)},
+        sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _base_verdict_cached(st: "State", memo_key: str, cid: str) -> bool:
+    """True when `cid` is already settled `pre_existing` for `memo_key`
+    (DESIGN §9 *A settled base verdict is reused, never recomputed*). A run
+    saved before the memo existed has no such state and reads False for
+    every candidate, so it recomputes exactly as before."""
+    memo = st.data.get("base_pre_existing_memo")
+    return isinstance(memo, dict) and cid in (memo.get(memo_key) or [])
+
+
+def _record_base_verdict(st: "State", memo_key: str,
+                         cids: Iterable[str]) -> None:
+    """Record `cids` as settled `pre_existing` for `memo_key`, additively
+    (DESIGN §9 *A settled base verdict is reused, never recomputed*). Only
+    `pre_existing` IDs are ever passed here, and `_confirm_new_failures`
+    sets `pre_existing` only from a complete set of base reruns that each
+    produced a report, so the memo never captures a partial or
+    install-failed base. Saves only when it grew."""
+    add = {str(c) for c in cids}
+    if not add:
+        return
+    memo = st.data.get("base_pre_existing_memo")
+    if not isinstance(memo, dict):
+        memo = {}
+        st.data["base_pre_existing_memo"] = memo
+    cur = set(memo.get(memo_key) or [])
+    grown = cur | add
+    if grown != cur:
+        memo[memo_key] = sorted(grown)
+        st.save()
+
+
+def _confirm_skeleton_paired(candidates: list[str]) -> dict:
+    """A paired B* verdict with nothing rerun: every candidate's base
+    verdict was already memoised, so no base worktree is built (DESIGN §9
+    *A settled base verdict is reused, never recomputed*). Same shape as
+    `_confirm_new_failures`'s paired skeleton; the caller fills
+    `pre_existing` from the memo."""
+    return {"candidates": list(candidates), "new": [], "pre_existing": [],
+            "no_verdict": [], "resource_affected": [],
+            "budget_short": [], "budget_short_unsettled": [],
+            "pairs_required": 0, "pairs_run": 0,
+            "budget_exhausted": False, "gate": None, "per_id": {},
+            "budget_used_sec": 0.0}
+
+
 async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
                                 final_tree: str, cmd: str,
                                 candidates: list[str],
@@ -51613,7 +51682,15 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
     reports its passed cases too (`_SideResult`): a case absent from the
     base's report is not failing there. Sized (`_confirm_sized`) when every
     candidate has a file, the files holding only `intermittent` IDs ranked
-    last; the final side's messages are appended to `messages`."""
+    last; the final side's messages are appended to `messages`.
+
+    A candidate already settled `pre_existing` for this exact base rerun
+    (`_base_verdict_memo_key(base_sha, cmd, replace, remove_base)`, DESIGN
+    §9 *A settled base verdict is reused, never recomputed*) is read from
+    the run-level memo and dispatched to neither side; only the remainder
+    builds the base worktree and reruns. When every candidate is memoised
+    the worktree is never built. The merged verdict's `pre_existing` set is
+    written back to the memo."""
     wt = _helper_worktree_path(st, worktree)
 
     def _teardown() -> None:
@@ -51624,74 +51701,99 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     weak = set(intermittent)
-    _teardown()
-    try:
-        add = (await _worktree_add_detached_async(st, wt, base_sha)
-               if base_sha else None)
-        installed = (add is not None and add.returncode == 0
-                     and await _ensure_worktree_deps(
-                         str(wt), st, caps, log_path=log_path,
-                         verbosity=st.data.get("verbosity",
-                                               VERBOSITY_DEFAULT),
-                         label_prefix=deps_label, log_prefix=deps_log))
-        if not installed:
-            if say_unavailable:
-                log("  B*: could not create the base worktree for the "
-                    "confirm — no candidate gets a verdict (no_verdict)"
-                    if add is None or add.returncode != 0 else
-                    "  B*: the dependency install failed in the base "
-                    "worktree — no candidate gets a verdict (no_verdict)")
-            verdict = await _confirm_new_failures(
-                candidates, _no_rerun, _no_rerun, caps, label=label,
-                observed="unseen")
-            if say_unavailable:
-                verdict["base_unavailable"] = True
-                if add is not None and add.returncode == 0:
-                    verdict["base_install_failed"] = True
-            return verdict
-        n = {"i": 0}
 
-        def _runner(tree: str, side: str, units: list[str] | None,
-                    gone: tuple[str, ...]):
-            async def _run(timeout: float) -> _SideResult | None:
-                n["i"] += 1
-                got = await _capture_failing_test_ids(
-                    tree, cmd, st, caps, label=f"{run_prefix}-{side}{n['i']}",
-                    log_path=log_path, timeout=timeout, serial=True,
-                    files=list(units or files_default or []) or None,
-                    replace=replace, remove=gone)
-                if got is None:
-                    return None
-                if side == "final" and messages is not None:
-                    for cid, msg in (got.get("messages") or {}).items():
-                        messages.setdefault(cid, []).append(msg)
-                return _SideResult(frozenset(got["ids"]),
-                                   frozenset(got.get("passed") or ()))
-            return _run
-
-        async def _pass(units: list[str] | None, cands: list[str],
-                        pcaps: dict, gate: dict | None,
-                        **pairs: object) -> dict:
-            return await _confirm_new_failures(
-                cands, _runner(str(wt), "base", units, remove_base),
-                _runner(final_tree, "final", units, remove_final), pcaps,
-                label=confirm_label, observed="pair",
-                intermittent=sorted(weak), absent_on_base="pass",
-                prior_gate=gate, **pairs)
-        if all(id_files.get(c) for c in candidates):
-            rank: dict[str, int] = {}
-            for c in candidates:
-                f = str(id_files[c])
-                rank[f] = min(rank.get(f, 1), 1 if c in weak else 0)
-            return await _confirm_sized(
-                {c: str(id_files[c]) for c in candidates},
-                dict(st.data.get("test_file_durations") or {}),
-                rank=rank, caps=caps,
-                overhead=_rerun_cost_or_default(st)[0], label=confirm_label,
-                confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
-        return await _pass(None, list(candidates), caps, None)
-    finally:
+    async def _dispatch(cands: list[str]) -> dict:
         _teardown()
+        try:
+            add = (await _worktree_add_detached_async(st, wt, base_sha)
+                   if base_sha else None)
+            installed = (add is not None and add.returncode == 0
+                         and await _ensure_worktree_deps(
+                             str(wt), st, caps, log_path=log_path,
+                             verbosity=st.data.get("verbosity",
+                                                   VERBOSITY_DEFAULT),
+                             label_prefix=deps_label, log_prefix=deps_log))
+            if not installed:
+                if say_unavailable:
+                    log("  B*: could not create the base worktree for the "
+                        "confirm — no candidate gets a verdict (no_verdict)"
+                        if add is None or add.returncode != 0 else
+                        "  B*: the dependency install failed in the base "
+                        "worktree — no candidate gets a verdict (no_verdict)")
+                verdict = await _confirm_new_failures(
+                    cands, _no_rerun, _no_rerun, caps, label=label,
+                    observed="unseen")
+                if say_unavailable:
+                    verdict["base_unavailable"] = True
+                    if add is not None and add.returncode == 0:
+                        verdict["base_install_failed"] = True
+                return verdict
+            n = {"i": 0}
+
+            def _runner(tree: str, side: str, units: list[str] | None,
+                        gone: tuple[str, ...]):
+                async def _run(timeout: float) -> _SideResult | None:
+                    n["i"] += 1
+                    got = await _capture_failing_test_ids(
+                        tree, cmd, st, caps,
+                        label=f"{run_prefix}-{side}{n['i']}",
+                        log_path=log_path, timeout=timeout, serial=True,
+                        files=list(units or files_default or []) or None,
+                        replace=replace, remove=gone)
+                    if got is None:
+                        return None
+                    if side == "final" and messages is not None:
+                        for cid, msg in (got.get("messages") or {}).items():
+                            messages.setdefault(cid, []).append(msg)
+                    return _SideResult(frozenset(got["ids"]),
+                                       frozenset(got.get("passed") or ()))
+                return _run
+
+            async def _pass(units: list[str] | None, cs: list[str],
+                            pcaps: dict, gate: dict | None,
+                            **pairs: object) -> dict:
+                return await _confirm_new_failures(
+                    cs, _runner(str(wt), "base", units, remove_base),
+                    _runner(final_tree, "final", units, remove_final), pcaps,
+                    label=confirm_label, observed="pair",
+                    intermittent=sorted(weak), absent_on_base="pass",
+                    prior_gate=gate, **pairs)
+            if all(id_files.get(c) for c in cands):
+                rank: dict[str, int] = {}
+                for c in cands:
+                    f = str(id_files[c])
+                    rank[f] = min(rank.get(f, 1), 1 if c in weak else 0)
+                return await _confirm_sized(
+                    {c: str(id_files[c]) for c in cands},
+                    dict(st.data.get("test_file_durations") or {}),
+                    rank=rank, caps=caps,
+                    overhead=_rerun_cost_or_default(st)[0],
+                    label=confirm_label,
+                    confirm=_pass, per_file=_rerun_cost_or_default(st)[1])
+            return await _pass(None, list(cands), caps, None)
+        finally:
+            _teardown()
+
+    memo_key = _base_verdict_memo_key(base_sha, cmd, replace, remove_base)
+    all_cands = sorted(set(candidates))
+    memoed = {c for c in all_cands if _base_verdict_cached(st, memo_key, c)}
+    rest = [c for c in all_cands if c not in memoed]
+    if memoed:
+        log(f"  B* {confirm_label}: {len(memoed)} candidate(s) already "
+            "settled pre_existing at this base — reused, not rerun")
+    # Full skip only when there was a candidate and every one is memoised:
+    # the base worktree is never built. An empty candidate list keeps the
+    # old path (`_dispatch([])`).
+    if all_cands and not rest:
+        verdict = _confirm_skeleton_paired(all_cands)
+    else:
+        verdict = await _dispatch(rest)
+        verdict["candidates"] = all_cands
+    if memoed:
+        verdict["pre_existing"] = sorted(
+            set(verdict.get("pre_existing") or []) | memoed)
+    _record_base_verdict(st, memo_key, verdict.get("pre_existing") or [])
+    return verdict
 
 
 _FINAL_DIFF_SITE = "failing-test-ID diff"
