@@ -1970,21 +1970,27 @@ reach another, each with its one writer or its sharing scope:
 3. the toolchain layer and `MISE_DATA_DIR`, written by the toolchain install
    and shared host-wide (*Every confined process has its own home*, 3);
 4. a tree's home layer, written by its install (ibid., 4);
-5. the run's stores, shared by every command leerie runs in the run (*The
-   stores a view installs from are leerie's*);
-6. a tree's stores, shared by that tree's commands, and by a worker started
-   in a tree leerie installed for;
-7. each side's worker cache set, shared by that side's workers (§8 *Nothing
-   a held-out evaluation produces reaches a fixer*);
+5. the run's stores, shared by every command leerie runs in a tree no
+   worker writes (*The stores a view installs from are leerie's*);
+6. a tree's stores, shared by the commands leerie runs in a tree and by a
+   worker started in a tree leerie installed for (in a tree a worker
+   writes, only its home layer);
+7. each side's worker cache set, shared by that side's workers and by every
+   command leerie runs in a tree a worker of that side writes (*A tree's
+   stores are the tree's, whoever writes it*; §8 *Nothing a held-out
+   evaluation produces reaches a fixer*);
 8. a tree's private temp directory and its measurement directory, shared by
    that tree's commands in turn (*A confined command's scratch is short and
    private*);
 9. a worker's notes and self-check directories, read by the workers its
    group runs.
 
-The stores (5-7) are channels by the user's decision (2026-11-14): workers
-share the run's store, and a private store is built only for a measured
-need. A shared writable store cannot be a per-process overlay anyway: one
+The stores (5-7) are channels by the user's decision (2026-11-14):
+workers share their side's cache, leerie's commands the run's store, and
+a private store is built only for a measured need; since 2026-11-20
+leerie's commands in a tree a worker writes share that side's cache (*A
+tree's stores are the tree's, whoever writes it*). A shared writable store
+cannot be a per-process overlay anyway: one
 overlay upper belongs to one mount at a time, and a store must lie on the
 trees' one mount, or a hard link from it fails with `EXDEV`. A new channel
 is a new entry here, with its reason. Every other write ends with its
@@ -2746,7 +2752,7 @@ worker gets the first block, then its kind's.
 | leerie's own code, the CLI | leerie's install (`ROOT`: the CLI hook and script shell `_worker_guard` registers, the re-drive's self-check) and the `claude` its `PATH` finds: each named, so that one under `/tmp` on a host is still read | read | — |
 | its own home | `$HOME`, an overlay of the toolchain home layer and the pristine home with a private upper, made by the shim when isolated (*Every confined process has its own home*); not isolated (a test, a host harness), `$HOME` read, unless it holds `/tmp` | write | the shim |
 | its side's download caches | one set per side of the run, shared by that side's workers (every store variable, the pnpm store, `XDG_CACHE_HOME`): `<run-dir>/worktrees/.stores/cache-held-out/` for a held-out-side worker (`HELD_OUT_LOG_WORKERS`), `<run-dir>/worktrees/.stores/cache/` for every other; never both (`_worker_cache_dir`) | write | `_worker_cache_env` |
-| its tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); the worker's per-tree store variables then name it in place of its side's cache | write for a worker that writes its tree, else read | `_tree_store_env` |
+| its tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/`, only for a tree leerie installed for in this process (`_installed_tree_stores`; *A worker started in a tree leerie installed for runs on that tree's stores*); in a tree no worker writes, the worker's per-tree store variables then name it in place of its side's cache, and in a tree a worker writes, they stay at its side's cache, as every process's there do (*A tree's stores are the tree's, whoever writes it*) | write for a worker that writes its tree, else read | `_tree_store_env` |
 | outside the state root | everything but `/tmp` (above) and `/dev` (the devices above) | read | — |
 | the run's system prompts | `<run-dir>/sysprompt/` | read | — |
 | the run's tools file | `<run-dir>/mise-tools.toml`, which `MISE_GLOBAL_CONFIG_FILE` names to every process of the run (§6½ *The tools a repository needs are read from it*): without it a worker's `mise` cannot load its configuration | read | `_discover_tools` |
@@ -2758,8 +2764,9 @@ directory is granted only when it lies beneath `<run-dir>/workers/`
 grants nothing. The caches are granted as the one directory its side
 shares, and nothing a worker's caches name outside it is: `/tmp/.cache`, the image's
 `MISE_DATA_DIR` and the run's stores `<run-dir>/worktrees/.stores/stores/` are never
-granted, so no store leerie's own commands install from can be written by
-a worker. The grants are computed after `claude_p` has named
+granted, so no store a measurement in a view installs from can be written
+by a worker (leerie's own installs in a tree a worker writes use that
+side's cache: *A tree's stores are the tree's, whoever writes it*). The grants are computed after `claude_p` has named
 the worker's own directories, and follow them.
 
 **A worker's `/tmp` is its own.** Until 2026-11-01 `/tmp` was shared by
@@ -4430,8 +4437,10 @@ confinement failure stops the run; it is never a result*).
 | leerie's install | `ROOT` (the AST scripts), named as a worker's is | read |
 | its own home | `$HOME`, as a worker's (*Every confined process has its own home*) | write |
 | the tree's git metadata | for a worktree of the run repository (a view, a helper checkout): `<run-dir>/repo/`; for a worktree of a tree repository: that repository and `<run-dir>/repo/objects/`; for a clone: `<run-dir>/repo/objects/` (its alternates) | read |
-| the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*) | write |
-| the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/`; its `home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
+| the run's stores | `<run-dir>/worktrees/.stores/stores/` (`_leerie_stores`): every store variable's run-wide directory (*The stores a view installs from are leerie's*); in a tree a worker writes, that side's worker cache set in its place (`_tree_cache`; *A tree's stores are the tree's, whoever writes it*) | write |
+| the tree's own stores | `<run-dir>/worktrees/.stores/tree-stores/<tree>/` (`_tree_store_env`: uv, bundler's path, NuGet, Go's build cache, pnpm's metadata cache, the Playwright browsers), for a tree under `<run-dir>/worktrees/` (in a tree a worker writes, only
+its `home/`, every store variable there naming the side's cache); its
+`home/` is the tree home layer, the install kind's home upper and every other kind's top lower layer (*Every confined process has its own home*) | write |
 | the run's tools file | `<run-dir>/mise-tools.toml` (§6½ *The tools a repository needs are read from it*) | read |
 | outside the state root | everything but `/tmp` and `/dev`, as a worker's | read |
 | the run layer | `<run-dir>/run-layer/` once the setup hook has published it: `home/` a lower layer of the home, `mise/` a read-only layer over `MISE_DATA_DIR`, every kind but the toolchain and setup-hook kinds (*The setup hook writes the run layer, never the host's toolchains*) | read |
@@ -4525,19 +4534,31 @@ run's report never lands there at all.
 temp directory and `MISE_STATE_DIR` at the measurement directory, laid
 over the caller's environment last. The store
 variables stay as `_leerie_stores` and `_tree_store_env` set them, each
-where the grant writes.
-A recipe entry's or a CI check's own variables still apply; a temp or cache
-path they name outside the grant is refused, which is a finding, not a
+where the grant writes: in a tree a worker writes, all of them at that
+side's worker cache set, which the grant then names in place of the run's
+stores.
+A recipe entry's or a CI check's own variables still apply, but for the
+store variables the tree's store set names (the per-tree ones, or in a
+tree a worker writes every one), which it replaces; a temp or cache path
+they name outside the grant is refused, which is a finding, not a
 grant to widen. A fixed `/tmp/<name>` path is not: every command writes
 its own `/tmp` as it would outside leerie.
 
-**The run's stores and the tree's.** The run's stores (`<run-dir>/worktrees/.stores/stores/`)
-are written by every command leerie runs in the run and read by no other
-run (*The stores a view installs from are leerie's*). The tree's own stores
-are written by that tree's commands and read by no other tree; they follow
-the measurement directory's lifetime: a tree made again at the same path
-starts with them empty (`_measure_dir`). No worker is granted any of them.
-A held-out evaluation's grant names the run's stores too, but inside its
+**The run's stores and the tree's.** The run's stores
+(`<run-dir>/worktrees/.stores/stores/`) are written by every command
+leerie runs in a tree no worker writes, read by no other run (*The stores
+a view installs from are leerie's*), and granted to no worker. In a tree
+a worker writes, leerie's commands write that side's worker cache instead,
+which that side's workers are granted too (*A tree's stores are the
+tree's, whoever writes it*). A tree's own stores
+(`<run-dir>/worktrees/.stores/tree-stores/<tree>/`) are written by that
+tree's commands and read by no other tree; in a tree a worker writes
+leerie puts only the tree home layer and its work directory there. They follow the measurement directory's
+lifetime: a tree made again at the same path starts with them empty
+(`_measure_dir`). A worker is granted its tree's own stores only when
+leerie installed in that tree in this process (`_installed_tree_stores`;
+*A worker started in a tree leerie installed for runs on that tree's
+stores*). A held-out evaluation's grant names the run's stores too, but inside its
 sandbox every write grant is an overlay whose writes vanish with it (*A
 held-out evaluation runs alone*), so nothing it writes there reaches a
 later command.
@@ -5710,7 +5731,10 @@ install its tree's.**
 5. *What stays redirected, and why.* Each variable that stays moves a write
    for a reason the tree layer does not cover:
    - the run's package stores and download caches (`_STORE_VARS`), shared by
-     every command of the run so one download feeds every tree;
+     every command leerie runs in a tree no worker writes, and each side's
+     worker cache by that side's workers and leerie's commands in its trees
+     (*A tree's stores are the tree's, whoever writes it*), so one download
+     feeds many trees;
    - in a tree, uv's cache, Go's build cache, NuGet's packages and pnpm's
      metadata cache (`UV_CACHE_DIR`, `GOCACHE`, `NUGET_PACKAGES`,
      `npm_config_cache_dir`): the tree's builds and tests write them as they
@@ -9317,7 +9341,8 @@ set by the orchestrator through environment variables, with no mount or
 `-e` of their own (*The stores a view installs from are leerie's*, *Which
 stores an install may share*, below), and every one is inside its run's
 directory: the run's own, `<run-dir>/worktrees/.stores/stores/<name>`, for every command
-leerie runs; each run's workers', `<run-dir>/worktrees/.stores/cache/<name>` (the
+leerie runs in a tree no worker writes; each run's workers' (and every
+command leerie runs in a tree a worker writes), `<run-dir>/worktrees/.stores/cache/<name>` (the
 held-out side's at `<run-dir>/worktrees/.stores/cache-held-out/<name>`); and each run
 tree's own, `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`. The state root is
 `/leerie-state` locally and `/work/.leerie` on Fly. The host cache mounts
@@ -9337,13 +9362,13 @@ store is shared across runs or repositories.* Every package store and cache
 an installer the provision recipe can name reads — pnpm, npm, yarn (classic
 and berry), bun, corepack, pip, uv, poetry, pipenv, go (modules and build),
 cargo, bundler, composer, NuGet (`_STORE_VARS`) — is the run's own, and
-writable by every command leerie runs in that run; one mechanism covers
+written only by that run's processes; one mechanism covers
 every manager, and no manager is configured differently because of it:
 
 - *The run's*, `<run-dir>/worktrees/.stores/stores/<name>`, set on the orchestrator's own
   environment once the run directory exists, before anything installs
   (`_leerie_stores`). Every install, build, test and measurement leerie
-  runs in the run reads and writes it (the measurement grant names it,
+  runs in a tree no worker writes reads and writes it (the measurement grant names it,
   *Leerie's runs of the repository's commands are confined too*); no
   worker's grant does, and a worker's environment replaces every variable
   (below). It is the run's process's scratch: removed at the process's
@@ -9353,11 +9378,14 @@ every manager, and no manager is configured differently because of it:
 - *The run's workers'*, `<run-dir>/worktrees/.stores/cache/<name>` with
   `XDG_CACHE_HOME` at `<run-dir>/worktrees/.stores/cache/xdg`
   (`_worker_cache_env`, in the worker's spawn), one set per side of the
-  run, shared by that side's workers: the held-out side's workers
+  run, shared by that side's workers and, for its store variables, by every
+  command leerie runs in a tree a worker of that side writes (*A tree's
+  stores are the tree's, whoever writes it*, below): the held-out side's workers
   (`HELD_OUT_LOG_WORKERS`) have their own, `<run-dir>/worktrees/.stores/cache-held-out/`,
   which no fixer's grant names (§8 *Nothing a held-out evaluation produces
   reaches a fixer*). Per side rather than per worker, because what a worker
-  leaves in a cache can mislead only another worker of its side, while
+  leaves in a cache can mislead only its side's workers and leerie's
+commands in its side's trees, never a measurement in a view, while
   every cold copy is paid again: a cold pnpm store costs 9–23 s and
   0.5–1.3 GB; on funeralworks, Playwright's chromium costs 20.1 s and
   656 MB cold against 2.1 s warm, and a warm-store install with a cold
@@ -9367,7 +9395,8 @@ every manager, and no manager is configured differently because of it:
   with the run directory.
 - *Each run tree's own*, `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`
   (`_tree_store_env`): the stores that hold one tree's environment or build
-  (*Which stores an install may share*, below).
+  (*Which stores an install may share*, below), in a tree no worker
+  writes.
 
 No variable is left at a value the image chose: the image holds no
 dependency (§6½ *The repository image holds no dependency*). Until
@@ -9411,9 +9440,11 @@ What still holds: nothing one run's code writes reaches another run or
 another repository — a run's stores are its directory's, and a new run
 starts with none. What is given up, deliberately: *a measurement never
 sees a file its own run's code changed.* Within one run, a committed
-`postinstall` or a worker's in-place edit of an installed dependency can
-reach a later install of that run through a hard link into the run's
-store. Two things bound it. The workers that write code are told never to
+`postinstall` can reach a later install of that run through a hard link
+into the run's store, and a worker's in-place edit of an installed
+dependency one into its side's cache, which leerie's installs in that
+side's trees share (*A tree's stores are the tree's, whoever writes
+it*). Two things bound it. The workers that write code are told never to
 edit an installed third-party dependency (`node_modules`, a virtual
 environment's `site-packages`, `vendor` and the like) but to change the
 repository's own code or use the project's own patch mechanism
@@ -9429,12 +9460,13 @@ repository", also refuses a worker's legitimate writes to its own ignored
 files (a local `.env`, build outputs).
 
 **Which stores an install may share.** Within a run, every manager's
-download store and cache is the run's (above). One class is narrower:
+download store and cache is the run's, or in a tree a worker writes that
+side's cache (above). One class is narrower:
 *per tree* — uv, cargo, bundler, NuGet, Go's build cache, pipenv's
 environments, pnpm's metadata cache, pip's user base, the .NET CLI home and
 bundler's home (`_TREE_STORE_VARS`) — one set per tree, at
 `<run-dir>/worktrees/.stores/tree-stores/<tree>/<name>`, set for every command leerie runs in
-a tree under `<run-dir>/worktrees/` (`_tree_store_env`, applied by
+a tree under `<run-dir>/worktrees/` that no worker writes (`_tree_store_env`, applied by
 `_run_streaming`), and emptied whenever a view's tip moves: a replaced
 view's go with it, and a moved view is a new tree to every measurement
 (§8 *A view moves to the next tip when the install's inputs are
@@ -9442,8 +9474,9 @@ unchanged*). These hold one tree's environment or what its build writes as
 it builds — pip's user base and bundler's path are where an install puts
 the tree's dependencies, pipenv's environments are the tree's, and uv's
 install of the project, cargo's package lock and Go's build cache write
-the store as they build — so two trees at two commits never share an
-environment. The class also holds where a user-level install lands when
+the store as they build — so two trees no worker writes never share an
+environment (the trees a worker writes share their side's cache: *A
+tree's stores are the tree's, whoever writes it*). The class also holds where a user-level install lands when
 the system location is not writable — pip's user base (`PYTHONUSERBASE`),
 the .NET CLI's home (`DOTNET_CLI_HOME`) and bundler's home
 (`BUNDLE_USER_HOME`) — because each otherwise falls back to `$HOME`, which
@@ -9532,13 +9565,140 @@ home*, 4): what the install kept beneath `~` — pip's `--user` packages,
 cargo's crates — it reads at its ordinary path, and what it writes there is
 its own.
 
+*Superseded in part 2026-11-20* by *A tree's stores are the tree's, whoever
+writes it* (below): the writer's and the surrogate's checkouts and the
+falsifier lanes are trees a worker writes, where the worker and leerie's
+install both run on that side's worker cache set, every store variable
+included; staging is one too, and leerie does install there (the browser
+suite's prerequisites before a re-drive group). What this paragraph says
+holds for the trees no worker writes: the set audit's tree and the planning
+worktree.
+
 The measurement grant gives a confined install exactly this: the run's
 stores and its own tree's `tree-stores` writable (*Leerie's runs of the
-repository's commands are confined too*).
+repository's commands are confined too*), and in a tree a worker writes,
+that side's worker cache set in place of the run's stores.
+
+**A tree's stores are the tree's, whoever writes it.** *Since 2026-11-20
+(lane S9-R4).* In a tree a worker writes, every process runs on one
+store set, chosen by the tree and never by who runs the process:
+`_tree_store_env`, which `_run_streaming` applies to every command leerie
+runs through it (and `_ts_script_run` to every AST script) and `_invoke`
+to every worker started in a tree a worker writes. In a tree no worker
+writes, leerie's commands keep the run's stores, and a read-only worker
+started there keeps its side's cache, for every variable but the per-tree
+ones when leerie installed in that tree in this process, as before.
+
+- *A tree a worker writes* runs every process on that side's worker cache
+  set, for every store variable, the per-tree ones included: the worker,
+  its self-check, and leerie's own installs there (a writer's checkout, the
+  surrogate's checkout or a falsifier lane before its worker starts, the browser suite's
+  prerequisites in a lane, and in staging before a re-drive group whose
+  probe runs through the suite). These are staging and every subtask's
+  worktree (the fixers'), the surrogate fixer's checkout (the fixers'),
+  and the acceptance writers' checkouts and the falsifier lanes (the
+  held-out side's).
+- *A tree no worker writes* keeps the run's stores, with its per-tree
+  variables at its own stores: a committed view, an evaluation tree, the
+  CI and base-form trees, the falsifier's confirm tree, the re-drive's
+  flip trees, the set audit's tree and the planning worktree. A worker
+  started there reads it and writes nothing an install wrote.
+
+Which side a tree is comes from leerie's own layout and record, never from
+the tree (`_tree_cache`). A tree of its own repository
+(`<run-dir>/tree-repos/<tree>`, *A repository per committing tree (I6)*)
+is the fixers': only their committing workers' trees have one. A ref-less
+clone made for a worker is that worker's side (`_worker_cache_dir`),
+recorded in this process when leerie makes the clone
+(`_acceptance_writer_checkout`'s `writer`, which every caller names) and
+dropped when leerie removes it. Every other tree is no worker's. A run's
+tree is found from that layout, the outermost directory under a run's
+`worktrees`, and never by its `.git` or by anything beneath it: its worker
+may remove its `.git`, plant a `.git`, a `worktrees`, a `tree-repos` or a
+`repo` deeper down, or empty its repository, and its tree stays its side's. A worker
+of one side started in the other side's tree would have its environment
+name a cache its grant does not: its install fails, and nothing crosses
+sides.
+
+**Root cause.** The writer chose the stores, not the tree: a worker's spawn
+put every store variable at its side's cache (`_worker_cache_env`), and
+leerie's commands at the run's stores (`_leerie_stores`), in whatever tree
+each ran. A tree two of them installed into then held one install output
+made against two stores, and an installer that records its store in that
+output refuses the other. Navegando b94226a8 (0.71.0), `staging`: the final
+conformer ran `pnpm install --frozen-lockfile` there on the fixers' store,
+and leerie's install of the browser suite's prerequisites before a
+re-drive group (`_ci_prepare(staging, …, "redrive")`) ran four hours later
+on the run's, three times, each ending
+`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`. It was the only refusal of
+that shape in 5,280 install sections across 95 runs. A lane fixture (pnpm
+10.4.1 and npm, each install under the real shim) reproduced it in both
+orders: worker first, and leerie first with the worker on the tree's
+per-tree stores, which share only those. pnpm refused the second install
+both times, and npm, which records no store, replaced the output. The two
+environments differed in 18 store variables, and in 11 with the per-tree
+ones shared.
+
+Why the side's cache, and not the run's stores or a store per tree: no
+worker's grant names the run's stores, and a held-out worker's install in
+them would reach every measurement and every fixer. A store per tree a
+worker writes would make each of those trees install cold: a cold pnpm
+store costs 9–23 s and 0.5–1.3 GB (above), paid again for staging, every
+subtask tree and every clone.
+The side's cache is the one a worker of that tree already writes, so
+nothing new is shared: what leerie's install leaves there reaches only
+that side's workers, as a worker's own install does. Concurrent
+installs share it with no lock of leerie's (the execution lock is held
+shared by every one of them), so the rule relies on each manager's own
+coordination, newly for the per-tree class, which leerie's installs in a
+held-out clone kept per clone before it: Go's build cache and uv's cache
+are documented safe for concurrent processes, bundler holds an `flock` on
+`<bundle_path>/bundler.lock` for its install, NuGet extracts each package
+under a file lock, Playwright locks its browsers directory, and pnpm
+writes its metadata cache by temp file and rename; two installs at once
+at worst download the same thing twice. It also closes a
+channel the writer's choice had opened: leerie's install in staging ran
+code a worker wrote with the run's stores writable, and every later
+measurement reads those stores.
+
+**No measurement in a view reads a worker's cache.** Leerie measures a
+worker's tree in its committed view (§8 *Every measurement reads the
+committed view*), and a held-out set's validation and the surrogate's
+witness run in leerie's own trees too (§8 *Held-out acceptance tests*).
+Three things leerie acts on still run in a tree a worker writes, and so
+on that side's cache, as everything there does; each ran there before
+this rule too, then with the run's stores writable:
+
+- a subtask's tree whose branch is not yet in the run repository has no
+  view (`_view_ref` gives None), and `_measured_tree` measures the tree
+  as it is;
+- the re-drive's AST gates (`_redrive_ast_available`,
+  `_redrive_escalation_gate`) parse staging as its worker left it, with
+  staging's own toolchain, and leerie acts on their verdicts;
+- `_test_db_present` asks, before the writer starts, whether a command in
+  the writer's fresh checkout is handed a database.
+
+Everything else leerie runs in a tree a worker writes prepares that tree
+for its worker. Nor does the rule mend a staging that survives from a run
+begun before it: when leerie's last install there was on the run's
+stores, pnpm's `.modules.yaml` names that store and pnpm refuses every
+install on the fixers' cache until staging's `node_modules` is replaced.
+The re-drive's `_ci_prepare(staging, …, "redrive")` is such preparation, not a
+measurement: it runs the browser suite's prerequisites (a code generator,
+the runner's browser) in staging, so that the fixer's self-check finds
+them (§8 *A probe is re-run through the channel that confirmed it*). That
+self-check runs in the fixer's own process over a copy of staging, and no
+verdict of leerie's reads it; every verdict on the group's probes is
+measured in a view. Pinned by `tests/test_tree_decides_its_stores.py`:
+two writers install into one tree, the worker with the environment
+`_invoke` spawns it with and leerie through `_run_streaming`, in both
+orders, with pnpm and with npm, each under the real shim. Both installs
+must succeed, and every store variable must name the same directory.
 
 **corepack never floats.** corepack picks a manager's version from the
 repository's `packageManager`, else a last-known-good it keeps in
-`COREPACK_HOME` (the run's own), else the newest on the registry; it can
+`COREPACK_HOME` (the run's own, or in a tree a worker writes that
+side's cache), else the newest on the registry; it can
 also prompt before a download and write `packageManager` into the tree's
 `package.json`. So every command leerie runs has `_COREPACK_PIN_ENV`
 (`COREPACK_DEFAULT_TO_LATEST=0`, `COREPACK_ENABLE_AUTO_PIN=0`,
@@ -14767,7 +14927,10 @@ The mechanism:
    (measured: the tree's `XDG_CACHE_HOME` is empty inside its held-out
    sandbox) — and a worker started in a tree leerie installed for runs
    that browser (§6 *A worker started in a tree leerie installed for runs
-   on that tree's stores*). In the run's shared stores it was invisible to
+   on that tree's stores*); in a tree a worker writes (a falsifier lane, or
+   staging before a re-drive), the install fetches it into that side's cache, which the worker's
+   variables name (§6 *A tree's stores are the tree's, whoever writes
+   it*). In the run's shared stores it was invisible to
    the falsifier, whose store variables name its side's cache: both
    samples that wrote a browser probe failed at the browser's launch
    ("Playwright's chromium executable is missing").

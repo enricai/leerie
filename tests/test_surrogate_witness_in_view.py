@@ -92,7 +92,7 @@ def test_the_witness_runs_in_a_view_of_the_surrogate_s_commit(
     kinds = []
     real_checkout = leerie._acceptance_writer_checkout
     monkeypatch.setattr(leerie, "_acceptance_writer_checkout",
-                        lambda *a: kinds.append(real_checkout(*a))
+                        lambda *a, **k: kinds.append(real_checkout(*a, **k))
                         or kinds[-1])
     w = Workers(audit=lambda kw, n: {"cases": []}, surrogate=fix)
     _run(leerie, st, staging, sha, w, monkeypatch)

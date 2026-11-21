@@ -58,17 +58,19 @@ def _view(run) -> Path:
 
 def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
                                                                   run):
-    """Same paths, same env (the run's stores and its own tree stores
-    written, as a measurement's are); only `egress` differs."""
+    """Same paths, same env (the tree's stores and its own tree stores
+    written, as a measurement's are: the run's in a tree no worker writes,
+    the fixers' cache in a subtask's tree); only `egress` differs."""
     st = _St(run["user"], run["run_dir"])
-    for tree in (_view(run), run["wts"]["wt-a"]):
+    home = run["run_dir"] / "worktrees" / ".stores"
+    for tree, stores in ((_view(run), home / "stores"),
+                         (run["wts"]["wt-a"], home / "cache")):
         m = leerie._measurement_grants(st, tree, leerie.MEASURE_KIND)
         i = leerie._measurement_grants(st, tree, leerie.INSTALL_KIND)
         assert (m.egress, i.egress) == (False, True)
         me, ie = dict(m.env), dict(i.env)
         assert (i.rw, i.ro, ie) == (m.rw, m.ro, me)
-        stores = str(run["run_dir"] / "worktrees" / ".stores" / "stores")
-        assert stores in i.rw and stores not in i.ro
+        assert str(stores) in i.rw and str(stores) not in i.ro
 
 
 def test_an_unknown_kind_is_refused(leerie, run):

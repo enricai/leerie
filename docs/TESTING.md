@@ -7690,7 +7690,8 @@ sample's probe never counts for the next.
 - `tests/test_install_reaches_inputs.py` (9 test functions; DESIGN §6 *An
   install reaches its inputs*; review round 22 execution H3). Anywhere:
   `INSTALL_KIND` is `MEASURE_KIND`'s grant with `egress` and nothing else
-  (the run's stores written, as a measurement's are); the consumers executed — a
+  (the measurement grant's stores written: the run's, or in a tree a
+  worker writes that side's cache); the consumers executed — a
   recipe's `install` entries get egress and its `build` entry none
   (`_ensure_worktree_deps`), CI parity's recipe install and prerequisites
   get it and its check none (`_ci_prepare`, `_ci_run`), a `settle_by:
@@ -7721,26 +7722,56 @@ sample's probe never counts for the next.
   on PATH" warning, and its console script then run by a measurement.
   Live-falsified on the host and in the container: `_tree_store_env`
   without the call turned 2 host tests and 3 container tests red.
-- `tests/test_worker_sees_tree_install.py` (4 test functions, 7 cases;
+- `tests/test_worker_sees_tree_install.py` (5 test functions, 7 cases;
   DESIGN §6 *A worker started in a tree leerie installed for runs on that
-  tree's stores*, review round 23 exec M1): for a tree in `_DEPS_INSTALLED`,
-  the environment `_invoke` actually spawns the falsifier, acceptance
-  writer, surrogate fixer and set auditor with names, for every
-  `_TREE_STORE_VARS` variable, the value `_tree_stores_for` gives leerie's
-  commands in that tree (never the worker cache's), every other store stays
-  the side cache, `PATH` carries the tree's `pyuser/bin` and not the
-  cache's; the grant names the tree's stores `rw` for the three committing
-  workers and `ro` for the set auditor; a tree leerie never installed for
-  (a subtask's) keeps the implementer on its cache. Under real Landlock, the
-  falsifier's confined process runs by name a script an install-kind command
-  put in the tree's user base. In a runtime that can isolate: a real
-  `_ensure_worktree_deps` pip-installing pytest into the lane's user base,
-  then the falsifier's confined process running `pytest --version` and
-  `import pytest` from it. Live-falsified: `_invoke` without the overlay
-  turned 5 host cases red and the container pip case red with `exec pytest:
-  No such file or directory` (the review's symptom); `_installed_tree_stores`
-  ignoring `_DEPS_INSTALLED` turned the subtask-tree case red. Green rootless
-  and rootful in `leerie:r23` under the leerie-container profile.
+  tree's stores*, review round 23 exec M1, and *A tree's stores are the
+  tree's, whoever writes it*): for a tree in `_DEPS_INSTALLED` that no
+  worker writes (a committed view), the environment `_invoke` actually
+  spawns the set auditor with names, for every `_TREE_STORE_VARS` variable,
+  the value `_tree_stores_for` gives leerie's commands in that tree (never
+  the worker cache's), every other store stays the side cache, and the
+  grant names the tree's stores `ro`; in a falsifier lane, the acceptance
+  writer's and the surrogate fixer's checkouts (ref-less clones made for
+  them), every store variable of that worker's environment is its side's
+  cache and the install's value, and the grant names the tree's stores
+  `rw`; in each, the tree home layer is the top of the worker's home once
+  it exists; a tree leerie never installed for (a subtask's) keeps the
+  implementer on its cache. Where the runtime can isolate: the falsifier's
+  confined process runs by name a script an install-kind command put in the
+  tree home layer, and a real `_ensure_worktree_deps` pip-installing pytest
+  into the lane, then the falsifier's confined process running `pytest
+  --version` and `import pytest` from it. Live-falsified (review round
+  23): `_invoke` without the overlay turned 5 host cases red and the
+  container pip case red with `exec pytest: No such file or directory` (the
+  review's symptom); `_installed_tree_stores` ignoring `_DEPS_INSTALLED`
+  turned the subtask-tree case red.
+- `tests/test_tree_decides_its_stores.py` (11 test functions, 16 cases;
+  DESIGN §6 *A tree's stores are the tree's, whoever writes it*; lane
+  S9-R4, navegando b94226a8's `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`):
+  `_tree_cache` is the fixers' cache for a tree of its own repository, the
+  recorded side for a clone made for the falsifier, the acceptance writer
+  or the surrogate fixer (dropped when the clone is removed), and None for
+  a committed view or a path outside the run, and stays so when the tree's
+  worker removes its `.git`, plants one deeper, empties its tree
+  repository, or plants a `worktrees`, `tree-repos` and `repo` beneath a
+  path a command runs in (in staging and in a view); a run whose state root lies in a checkout under a
+  `worktrees` directory finds its own tree; an AST script
+  (`_ts_script_run`) in staging runs on the fixers' cache; `writer` is
+  keyword-only with
+  no default, and every call names who writes its checkout (an AST walk);
+  in staging every store variable `_tree_stores_for` and `_invoke` give is
+  the fixers' cache, in a view only the per-tree ones move; the
+  measurement grant names the tree's store set and no other. Then two
+  writers of staging, under real Landlock and no isolation, in both orders,
+  with pnpm 10.4.1 and npm: the worker with `_invoke`'s environment under
+  its grant, leerie through `_ensure_worktree_deps` under its measurement
+  grant; both installs succeed, every store variable each ran with is the
+  same fixers'-cache directory, and pnpm's `.modules.yaml` records that
+  store. Live-falsified on the code before the change: all four two-writer
+  cases red (pnpm's second install stopped at "The modules directory …
+  will be removed and reinstalled from scratch. Proceed? (Y/n)" until the
+  60 s bound, in both orders; npm's two environments named different
+  directories for some store variables).
 - `tests/test_heldout_sandbox_preflight.py` (10 test functions, 22 cases):
   `_sandbox_fix` on the shim's measured failure lines (and the specific
   `setgroups` rule winning over the generic `EACCES` one), the gate's die

@@ -38,7 +38,7 @@ def _events_env(leerie, tmp_path, monkeypatch, *, lanes: int,
     def ev(kind, who):
         events.append((time.monotonic(), kind, who))
 
-    def checkout(st, label, sha):
+    def checkout(st, label, sha, *, writer):
         d = tmp_path / label
         (d / "falsify_probe").mkdir(parents=True, exist_ok=True)
         return d

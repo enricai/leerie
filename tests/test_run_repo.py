@@ -310,7 +310,8 @@ def test_every_tree_of_a_run_hangs_off_the_run_repository(leerie, env):
     assert add.returncode == 0, add.stderr
     writer = leerie._helper_worktree_path(st, "acceptance-1")
     assert leerie._acceptance_writer_checkout(
-        st, writer, _git(repo, "rev-parse", "HEAD")) == "clone"
+        st, writer, _git(repo, "rev-parse", "HEAD"),
+        writer="acceptance_writer") == "clone"
 
     run_repo = (st.run_dir / "repo").resolve()
     user_list = _git(repo, "worktree", "list", "--porcelain")
@@ -648,7 +649,7 @@ def test_every_tree_works_under_safe_bare_repository_explicit(
         st, helper, _git(repo, "rev-parse", "HEAD")).returncode == 0
     assert leerie._acceptance_writer_checkout(
         st, leerie._helper_worktree_path(st, "acceptance-1"),
-        _git(repo, "rev-parse", "HEAD")) == "clone"
+        _git(repo, "rev-parse", "HEAD"), writer="acceptance_writer") == "clone"
     asyncio.run(leerie._prune_subtask_worktree("s1", st.run_dir))
     assert not wt.exists()
     leerie._prune_leerie_worktrees(st.run_dir)

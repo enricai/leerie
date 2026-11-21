@@ -494,15 +494,19 @@ def test_the_runners_browser_is_the_trees_own_store(leerie, tmp_path):
     """The browser a tree's install fetched is the one every command in the
     tree runs — leerie's and, once leerie installed there, its worker's
     (DESIGN §6 *A worker started in a tree leerie installed for runs on that
-    tree's stores*)."""
+    tree's stores*): in a tree no worker writes (the falsifier's confirm
+    checkout), the tree's own store. In a tree a worker writes, a falsifier
+    lane, it is that side's cache, as every store there is (DESIGN §6 *A
+    tree's stores are the tree's, whoever writes it*;
+    `tests/test_tree_decides_its_stores.py`)."""
     run_dir = tmp_path / "state" / "runs" / "r1"
-    lane = run_dir / "worktrees" / "falsifier-lane0"
+    lane = run_dir / "worktrees" / "falsifier-confirm"
     lane.mkdir(parents=True)
     (lane / ".git").write_text("gitdir: elsewhere\n")
     env = {"PLAYWRIGHT_BROWSERS_PATH": "/elsewhere"}
     leerie._tree_store_env(env, lane)
     assert Path(env["PLAYWRIGHT_BROWSERS_PATH"]).parts[-2:] == (
-        "falsifier-lane0", "playwright-browsers")
+        "falsifier-confirm", "playwright-browsers")
     # A value the image chose (beneath /opt/) is no exception: the image
     # holds no dependency (DESIGN §6½ *The repository image holds no
     # dependency*), so the tree's own store is the one its commands use.

@@ -166,7 +166,8 @@ the rest of the family stay denied.
   the setup hook, `mise`, the AST scripts — writes its tree, its
   measurement directory, its tree's private temp directory
   (`/tmp/l/<id>/`, 0700, its `TMPDIR` and `XDG_CACHE_HOME`), the run's
-  stores and its tree's own stores, and by kind `MISE_DATA_DIR` or
+  stores and its tree's own stores (in a tree a worker writes, that side's
+  worker cache in place of the run's stores), and by kind `MISE_DATA_DIR` or
   `~/.local/bin` (`_measurement_grants`, through `_run_streaming`, whose `grants` has no
   default). No grant names `/tmp`: once the confinement check every entry
   runs (`_require_confinement`) has built a sandbox,
@@ -194,8 +195,11 @@ the rest of the family stay denied.
   repository's refs. DESIGN §6 *The run's own repository*, *A repository
   per committing tree (I6)*.
 - **Every measurement runs in a committed view installed from the run's
-  own stores,** never in a worker's tree, and no store is shared across
-  runs or repositories. DESIGN §8 *Every measurement reads the committed
+  own stores,** never in a worker's tree (but a subtask's tree with no view
+  yet, measured as it is, the re-drive's AST gates in staging, and
+  `_test_db_present` in the writer's checkout, each on that side's cache),
+  and no store is shared
+  across runs or repositories. DESIGN §8 *Every measurement reads the committed
   view*; §6 *The stores a view installs from are leerie's*.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
