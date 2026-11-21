@@ -59990,7 +59990,13 @@ async def _prepare_eval_tree(st: "State", caps: dict, repo: Path, wt: Path,
             moved = True
     if not moved:
         await asyncio.to_thread(_eval_teardown, repo, wt)
-        add = await _worktree_add_detached_async(st, wt, tip, repo=repo)
+        # Add through the default repository (the run's own, which `repo`
+        # already is for the evaluation tree), not `repo=repo`: the default
+        # path keeps the invariant that a missing run repository stops the
+        # run rather than reading "no evidence" (`_worktree_add_detached`'s
+        # `repo is None` die; DESIGN §6 *The run's own repository*), the one
+        # the old per-evaluation add relied on.
+        add = await _worktree_add_detached_async(st, wt, tip)
         if add.returncode != 0:
             log(f"  acceptance: could not create the evaluation worktree: "
                 f"{(add.stderr or '').strip()[:200]} — no evidence either way")
