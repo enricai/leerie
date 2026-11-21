@@ -9528,6 +9528,36 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     with `-e /<output>` per output, `_install_intact`, then True only when
     `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
     Pinned by `tests/test_view_moves.py`.
+    The held-out evaluation tree reuses the same move machinery (DESIGN §8
+    *The evaluation tree is kept across a run's evaluations*; §6 *A held-out
+    evaluation runs alone* — *The world that dies is the overlay, not the
+    tree on disk*). Two process-level dicts, keyed by `realpath(<eval
+    tree>)`: `_EVAL_TREES: dict[str, tuple[Path, str]]` — the run repository
+    and the tip of a tree opted into snapshot recording — and
+    `_EVAL_INSTALLS: dict[str, tuple[str, InstallSnapshot, InstallReads]]` —
+    its kept install's `(key, snapshot, reads)`, the `_VIEW_INSTALLS`
+    analogue. `_ensure_worktree_deps` treats a `realpath(tree)` in
+    `_EVAL_TREES` as a view (`is_view`), so it collects the install's
+    outputs and reads the same way; `_record_view_install`, when
+    `view_key in _EVAL_TREES`, computes `_install_key(<repo>, <tip>, recipe,
+    reads)` from that entry's `(repo, tip)` and stores
+    `(key, _INSTALL_OUTPUTS[view_key], reads)` in `_EVAL_INSTALLS` (and
+    records nothing for a non-view, non-eval tree). `_forget_installs` also
+    drops the `_EVAL_INSTALLS`/`_EVAL_TREES` entries.
+    `async _prepare_eval_tree(st, caps, repo, wt, tip, *, log_path, label)
+    -> str` ("ok" | "worktree_failed" | "deps_failed") puts `wt` at `tip`:
+    when `wt` is a directory and `_EVAL_INSTALLS[realpath(wt)]` holds a key
+    equal to `_install_key(repo, tip, recipe, <its reads>)` and
+    `_move_view(repo, wt, tip, <its snapshot>)` succeeds, the install is
+    kept (`_DEPS_INSTALLED`/`_DEPS_FAILED` dropped, `_DEPS_KEPT[realpath(wt)]
+    = <outputs>`); otherwise `_eval_teardown(repo, wt)` (`git --git-dir
+    <repo> worktree remove --force`, `_rmtree_owned`, `_forget_installs`)
+    then `_worktree_add_detached_async(st, wt, tip, repo=repo)`
+    ("worktree_failed" on a non-zero add). Either way it sets
+    `_EVAL_TREES[realpath(wt)] = (repo, tip)` and runs
+    `_ensure_worktree_deps(str(wt), …, label_prefix="acceptance-<label>",
+    log_prefix="acceptance")` ("deps_failed" when it returns False, else
+    "ok"). Pinned by `tests/test_eval_tree_reuse.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
@@ -9607,8 +9637,8 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     (`_relative_cites(v, cwd)`, `_delivery_cite_rel`; `RECORD`/`ABSENT`
     left alone) before screening against staging's HEAD. `_verify_delivery_cite` reads
     `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
-    `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
-    worktree at `rev`, and a `RECORD` cite verifies only against
+    `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` the run's kept
+    evaluation tree at `rev`, and a `RECORD` cite verifies only against
     `_orchestrator_results_digest(st, staging)`, carried apart from the
     record's text as `_ExecutedRecord.own` (a `str` subclass `_delivery_record`
     returns), whose lines are each present only while they

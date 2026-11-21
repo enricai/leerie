@@ -326,8 +326,12 @@ def _tree_snapshot(tree: Path) -> list[tuple[str, bytes]]:
 def test_evaluation_never_touches_the_tree_and_never_overwrites(
         leerie, tmp_path):
     """Round-4 M1: sets copied into staging survived a crash mid-run (no
-    `finally` survives a SIGKILL). Each evaluation now runs in a disposable
-    worktree at the tree's HEAD; the tree itself is never written."""
+    `finally` survives a SIGKILL). Each evaluation runs in the run's kept
+    evaluation tree at the tree's HEAD, never in staging; the staging tree is
+    never written, and a set's own files never reach the evaluation tree's
+    disk either — they run in the per-command sandbox's overlay (DESIGN §6 *A
+    held-out evaluation runs alone* — *The world that dies is the overlay,
+    not the tree on disk*)."""
     repo, head = _repo(tmp_path)
     (repo / ".leerie" / "config.toml").write_text(
         'test_scoped = "python3 -m pytest -q {test_files}"\n')
@@ -359,7 +363,14 @@ def test_evaluation_never_touches_the_tree_and_never_overwrites(
         (False, True), (False, False)]
     assert _tree_snapshot(staging) == before    # not a byte changed
     assert seen_trees and all(t != str(staging) for t in seen_trees)
-    assert not leerie._helper_worktree_path(st, "acceptance-eval").exists()
+    # The evaluation tree is kept for the run (not torn down between
+    # evaluations), but set 2's own files — placed in the sandbox overlay,
+    # never on disk — are not on its disk (set 1's defect path is the run's
+    # own committed file, which the checkout rightly has).
+    eval_tree = leerie._helper_worktree_path(st, "acceptance-eval")
+    assert eval_tree.is_dir()
+    assert not (eval_tree / "acc" / "test_defect_2.py").exists()
+    assert not (eval_tree / "acc" / "test_control_2.py").exists()
 
 
 @pytest.mark.parametrize("committed,uncommitted,passes", [
@@ -385,6 +396,10 @@ def test_the_final_remeasure_reads_the_committed_tree(
 
 
 def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
+    """A worktree a crashed evaluation left (no reuse memo survives a new
+    process) is replaced by a fresh checkout at the fix, not reused: what the
+    crash left on its disk is gone. The path is kept for the run, so it is the
+    clean checkout, never the crash's leftovers."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
@@ -397,15 +412,21 @@ def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
         st, _caps(leerie, 1), str(staging), _make_sets(leerie, st, 1), "t"))
     assert res == [{"index": 1, "passed": True, "unmeasured": False,
                     "failing_files": []}]
-    assert not stale.exists()
+    # The crash's leftover is gone — a fresh checkout at the fix, which does
+    # not carry it (the install memo did not survive the new process, so the
+    # tree was remade, not reused).
+    assert not (stale / "acc" / "test_defect_1.py").exists()
 
 
 @needs_landlock
 @skip_without_landlock
 def test_each_evaluation_installs_into_its_fresh_worktree(
         leerie, tmp_path, monkeypatch):
-    """The evaluation worktree's path is reused; a stale install memo would
-    skip installing into the second, fresh checkout."""
+    """The evaluation tree's path is kept across evaluations; each
+    evaluation still runs the recipe in it (a kept install incrementally,
+    a remade one afresh), so both evaluations are measured — a memo that
+    skipped the second evaluation's install would read as every test
+    failing."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
