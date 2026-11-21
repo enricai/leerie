@@ -374,7 +374,12 @@ def _producer_constants(leerie) -> set[str]:
     out: set[str] = set()
     for fn in (leerie._acceptance_run_placed,
                leerie._evaluate_acceptance_sets,
-               leerie._evaluate_acceptance_sets_inner):
+               leerie._evaluate_acceptance_sets_inner,
+               # `_prepare_eval_tree` returns the worktree_failed/deps_failed
+               # codes that `_evaluate_acceptance_sets_inner` now propagates
+               # through `unmeasured_all(status)` (it moved there with the
+               # kept evaluation tree).
+               leerie._prepare_eval_tree):
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
         out |= {n.value for n in ast.walk(tree)
                 if isinstance(n, ast.Constant) and isinstance(n.value, str)}
