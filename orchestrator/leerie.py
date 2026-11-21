@@ -1264,9 +1264,13 @@ def _fold_collisions(added: Iterable[str], tree: Iterable[str], *,
     return hits
 
 _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
-# Judgment workers get no blanket Read/Grep/Glob grant. The CLI allows those
-# tools inside the working directories (cwd plus `--add-dir`) and refuses them
+# The judgment profiles get no blanket Read/Grep/Glob grant (the contradiction
+# judge's and the intent resolver's own lists name them). The CLI allows `Read`
+# inside the working directories (cwd plus `--add-dir`) and refuses it
 # outside, the boundary it already holds every allowlisted shell read to.
+# `Grep` and `Glob` it leaves out of the worker's context altogether, so a
+# prompt sent on this read set names neither (DESIGN §7 *A prompt names only
+# the tools its worker can call*).
 # Measured live (claude 2.1.310, a scratch run dir): with a bare `Read`
 # granted, a judgment worker read `<run-dir>/state.json` and a staged system
 # prompt; without it, both were refused while a file in its cwd still read.
@@ -1587,7 +1591,7 @@ def _widen_inspect_tools(base: str, repo_root: Path) -> str:
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
 # workers (classifier, planner, reconciler, plan_overlap_judge, provision) read access to via the
-# Claude Code CLI's --add-dir flag. Without this, Read/Grep/Glob and the
+# Claude Code CLI's --add-dir flag. Without this, `Read` and the
 # allowlisted Bash verbs in INSPECT_TOOLS are sandboxed to the repo cwd,
 # so cross-repo references like "~/src/enric/beacon" fail with "blocked,
 # outside allowed working directories". Repeatable on the CLI; env var is
@@ -32559,7 +32563,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
     `add_dirs` are extra paths forwarded to the CLI as `--add-dir` entries.
     Used by the inspect bucket (classifier, planner, reconciler, plan_overlap_judge, provision)
-    so the `Read`/`Grep`/`Glob` sandbox and the allowlisted `Bash` verbs can
+    so the `Read` sandbox and the allowlisted `Bash` verbs can
     reach sibling repos referenced in the task description. Resolved by
     `resolve_inspect_dirs()` and persisted under `st.data["inspect_dirs"]`
     so `resume` honors the original choice.

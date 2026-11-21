@@ -104,7 +104,7 @@ manifest — open it. Those files routinely carry the concrete requirements
 the task text only gestures at ("follow the conventions in X", "implement
 the items in Y"), and a plan that covers the task's sentences while
 missing what its referenced files require is exactly the missing-work gap
-you exist to catch. Use `Read` / `Grep` / `Glob`; do not go browsing the
+you exist to catch. Use `Read`, `grep` and `find`; do not go browsing the
 wider codebase beyond what the task points you at.
 
 Judge the *substance*, not the wording. A subtask covers a requirement

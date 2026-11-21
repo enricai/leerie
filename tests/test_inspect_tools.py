@@ -110,9 +110,11 @@ def test_inspect_tools_verbs_all_carry_wildcard(leerie):
 
 
 def test_inspect_tools_grants_no_blanket_read_tools(leerie):
-    """Read/Grep/Glob stay the primary tools, but they are NOT granted.
-    The CLI allows them inside the working directories with no grant, and a
-    bare grant would let them read any path, including the run directory
+    """Read/Grep/Glob are NOT granted. The CLI allows `Read` inside the
+    working directories with no grant and leaves `Grep` and `Glob` out of the
+    worker's context (so no prompt sent on INSPECT_TOOLS alone names them:
+    DESIGN §7 *A prompt names only the tools its worker can call*); a bare
+    grant would let them read any path, including the run directory
     (DESIGN §7 *The system prompt is staged in the run directory*; measured
     live on claude 2.1.310). The boundary is what keeps a judgment worker
     out of the run directory, so the bucket must not carry them."""

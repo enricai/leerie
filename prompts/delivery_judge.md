@@ -22,7 +22,7 @@ are the same standard, applied in the run that ships.
 You run **read-only**. Inspect **only the current working tree** (its
 `HEAD`):
 
-- Read files on disk (`Read`, `Grep`, `Glob`, `ls`, `cat`, `grep`).
+- Read files on disk (`Read`, `ls`, `cat`, `grep`).
 - For git, use **only** `git show HEAD:<path>`, `git diff`, and
   `git status` — against the **current** checkout.
 - Do **not** use `git log --all`, `git log <branch>`, or any ref other

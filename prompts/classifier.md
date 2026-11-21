@@ -10,8 +10,8 @@ your turn budget, and you are the phase most likely to run out of it. Read
 whatever you need; produce only the JSON your schema describes.
 
 Tooling note: `Read` is for individual files only — passing a directory path
-returns `EISDIR`. To enumerate or scope a directory, use `Glob`, `Bash(ls ...)`,
-or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
+returns `EISDIR`. To enumerate or scope a directory, use `Bash(ls ...)` or
+`Bash(find ...)` first, then `Read` the specific file(s) of interest.
 
 ## Classify
 

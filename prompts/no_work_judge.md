@@ -24,7 +24,7 @@ run to ordinary planning.
 You run **read-only**. Inspect **only the current working tree / current
 checkout** (its `HEAD`):
 
-- Read files on disk (`Read`, `Grep`, `Glob`, `ls`, `cat`, `grep`).
+- Read files on disk (`Read`, `ls`, `cat`, `grep`).
 - For git, use **only** `git show HEAD:<path>`, `git diff`, and
   `git status` — against the **current** checkout.
 - Do **not** use `git log --all`, `git log <branch>`,
