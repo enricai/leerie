@@ -117,11 +117,74 @@ def test_control_place_still_never_writes_over_a_file(view):
 
 def test_the_shim_parses_replace_and_remove_only_in_a_sandbox():
     sh = _shim()
-    o = sh._parse(["--sandbox", "--view", "/v", "--replace", "/s=a/b.py",
+    o = sh._parse(["--sandbox", "--view", "/v", "--replace", "/s", "a/b.py",
                    "--remove", "a/c.py", "--", "true"])
     assert o["replace"] == [("/s", "a/b.py")] and o["remove"] == ["a/c.py"]
-    assert isinstance(sh._parse(["--replace", "/s=a", "--", "true"]), str)
+    assert isinstance(sh._parse(["--replace", "/s", "a", "--", "true"]), str)
+    assert isinstance(sh._parse(["--sandbox", "--view", "/v", "--replace",
+                                 "/s", "--", "true"]), str)
     assert isinstance(sh._parse(["--remove", "a", "--", "true"]), str)
+
+
+@pytest.mark.real_heldout_sandbox
+def test_a_path_holding_an_equals_sign_reaches_the_shim_whole(leerie,
+                                                               tmp_path):
+    """What `_confined_argv` hands the real shim is what the shim places: a
+    source or a destination holding `=` (a set beneath `year=2024/`, a
+    state root named `a=b`) names the same two paths on the shim's side,
+    and the file lands where it was meant to."""
+    v = tmp_path / "view"
+    (v / "t=1").mkdir(parents=True)
+    (v / "t=1" / "test_a.py").write_text("final\n")
+    held = tmp_path / "set=1" / "acc" / "year=2024"
+    held.mkdir(parents=True)
+    (held / "test_s.py").write_text("held\n")
+    (held / "test_a.py").write_text("base\n")
+    sb = leerie.HeldOutSandbox(
+        view=str(v), place=((str(held / "test_s.py"),
+                             "acc/year=2024/test_s.py"),),
+        replace=((str(held / "test_a.py"), "t=1/test_a.py"),))
+    argv = leerie._confined_argv(leerie.WorkerGrants((), ()), ["true"],
+                                 sandbox=sb, refusal_fd=None,
+                                 worker_root=False)
+    sh = _shim()
+    o = sh._parse(argv[4:])
+    assert not isinstance(o, str), o
+    assert o["place"] == list(sb.place) and o["replace"] == list(sb.replace)
+    sh.place(o["place"], str(v), over=o["replace"])
+    assert (v / "acc" / "year=2024" / "test_s.py").read_text() == "held\n"
+    assert (v / "t=1" / "test_a.py").read_text() == "base\n"
+
+
+@pytest.mark.real_heldout_sandbox
+def test_a_placed_file_named_like_the_separator_is_a_value(leerie, tmp_path):
+    """A placed file at the root named `--` (a writer's support file) is the
+    pair's destination, not the end of the shim's options: the shim reads
+    its options in order, as does the suite's emulator."""
+    v = tmp_path / "view"
+    v.mkdir()
+    held = tmp_path / "held"
+    held.write_text("held\n")
+    sb = leerie.HeldOutSandbox(view=str(v), place=((str(held), "--"),))
+    argv = leerie._confined_argv(leerie.WorkerGrants((), ()), ["true"],
+                                 sandbox=sb, refusal_fd=None,
+                                 worker_root=False)
+    sh = _shim()
+    o = sh._parse(argv[4:])
+    assert not isinstance(o, str), o
+    assert o["place"] == [(str(held), "--")] and o["cmd"] == ["true"]
+    sh.place(o["place"], str(v))
+    assert (v / "--").read_text() == "held\n"
+    assert isinstance(sh._parse(["--sandbox", "--view", str(v)]), str)
+    (v / "--").unlink()
+    import subprocess, sys
+    r = subprocess.run(
+        [sys.executable, "-I", str(REPO_ROOT / "tests"
+                                   / "heldout_sandbox_emulator.py"),
+         "--view", str(v), "--place", str(held), "--", "--",
+         sys.executable, "-c", "print(open('--').read().strip())"],
+        cwd=str(v), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.strip() == "held", r.stderr
 
 
 @pytest.mark.real_heldout_sandbox
@@ -132,7 +195,7 @@ def test_the_sandbox_argv_carries_replace_and_remove(leerie):
     argv = leerie._confined_argv(
         leerie.WorkerGrants((), ()), ["true"], sandbox=sb, refusal_fd=None)
     i = argv.index("--replace")
-    assert argv[i + 1] == "/s=t/test_a.py"
+    assert argv[i + 1:i + 3] == ["/s", "t/test_a.py"]
     assert argv[argv.index("--remove") + 1] == "t/test_new.py"
 
 

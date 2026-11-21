@@ -1143,9 +1143,9 @@ def _emulated_heldout_sandbox(request, monkeypatch):
         out = [sys.executable, "-I", str(HELDOUT_SANDBOX_EMULATOR),
                "--view", sandbox.view]
         for src, rel in sandbox.place:
-            out += ["--place", f"{src}={rel}"]
+            out += ["--place", src, rel]
         for src, rel in sandbox.replace:
-            out += ["--replace", f"{src}={rel}"]
+            out += ["--replace", src, rel]
         for rel in sandbox.remove:
             out += ["--remove", rel]
         if taken_fd is not None:

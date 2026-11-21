@@ -543,6 +543,28 @@ def test_sets_are_isolated_from_one_another(leerie, tmp_path):
         (True, False), (True, False)]
 
 
+def test_a_set_path_holding_an_equals_sign_is_evaluated(leerie, tmp_path):
+    """A set's files beneath `year=2024/` (a path the writer chose) are
+    placed whole and run: the fixed tree passes the set, measured."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    _commit_fix(staging)
+    d = st.run_dir / "acceptance" / "set-1" / "acc" / "year=2024"
+    d.mkdir(parents=True)
+    (d / "test_defect_1.py").write_text(DEFECT_TEST)
+    (d / "test_control_1.py").write_text(CONTROL_TEST)
+    sets = [{"index": 1, "valid": True,
+             "dir": str(st.run_dir / "acceptance" / "set-1"),
+             "defect_files": ["acc/year=2024/test_defect_1.py"],
+             "control_files": ["acc/year=2024/test_control_1.py"],
+             "cases": {"acc/year=2024/test_defect_1.py": ["sums"],
+                       "acc/year=2024/test_control_1.py": ["control"]}}]
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, "t"))
+    assert [(r["passed"], r["unmeasured"]) for r in res] == [(True, False)]
+
+
 def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
                                                      monkeypatch):
     """Round-3 H2: a helper under a test-shaped directory (`tests/`) was
