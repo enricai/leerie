@@ -801,9 +801,12 @@ def spawn(log_path: str | None = None) -> int:
     if pid == 0:
         try:
             ours.close()
-            os.setsid()
             # Never PID 1's (or the wrapper's) stdio: a broker holding the
-            # container's output pipe delays its EOF past PID 1's exit.
+            # container's output pipe delays its EOF past PID 1's exit. Redirect
+            # before anything else — before `setsid()` and before the parent
+            # execs CMD — so there is no window in which this child is visible
+            # (in `/proc/<pid1>/task/*/children`) while still holding the
+            # inherited pipe on fd 1/2 (CI flake: the probe read `pipe:[...]`).
             null = os.open(os.devnull, os.O_RDONLY)
             os.dup2(null, 0)
             os.close(null)
@@ -815,6 +818,7 @@ def spawn(log_path: str | None = None) -> int:
             os.dup2(out, 1)
             os.dup2(out, 2)
             os.close(out)
+            os.setsid()
             _start()
             serve(theirs)
         except BaseException as e:  # noqa: BLE001 - a child never returns

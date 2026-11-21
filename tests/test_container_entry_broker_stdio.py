@@ -81,11 +81,21 @@ def _broker_stdio(tmp_path: Path) -> dict:
     import sys
     broker = REPO_ROOT / "scripts" / "cgroup-broker.py"
     log = tmp_path / "broker.log"
+    # The broker redirects its stdio in its first syscalls after fork, but it
+    # becomes visible as our child the instant the fork returns — a brief
+    # window in which fd 1 can still be the inherited pipe. The invariant is
+    # that it redirects *promptly*, not *before it is first observable*, so
+    # poll for the settled fds rather than sample once and race the setup.
     probe = (
-        "import json, os\n"
+        "import json, os, time\n"
         "kid = open(f'/proc/self/task/{os.getpid()}/children').read().split()[0]\n"
-        "print(json.dumps({n: os.readlink(f'/proc/{kid}/fd/{n}') "
-        "for n in ('0', '1', '2')}))\n")
+        "deadline = time.monotonic() + 5\n"
+        "while True:\n"
+        "    fds = {n: os.readlink(f'/proc/{kid}/fd/{n}') for n in ('0','1','2')}\n"
+        "    if not fds['1'].startswith('pipe:') or time.monotonic() > deadline:\n"
+        "        break\n"
+        "    time.sleep(0.01)\n"
+        "print(json.dumps(fds))\n")
     root = tmp_path / "cg"
     root.mkdir()
     r = subprocess.run(
