@@ -54677,6 +54677,28 @@ def _executed_command_entries(leerie_dir: Path, repo_root: Path,
 _DELIVERY_CITE_MIN_QUOTE = 8
 # Citation statuses that verify (`_verify_delivery_cite`).
 _DELIVERY_CITE_OK = frozenset({"ok", "drift", "record_ok", "absent_ok"})
+# The bound on one re-run of a worker's regex (an `ABSENT` citation, an
+# enumerator's search) as `git grep -E` on HEAD: the regex is the worker's,
+# and its run blocks the event loop. The bound `_sweep_site_lines` puts on
+# its `git grep`. A run it cuts measured nothing — never a verdict on the
+# regex or on the tree (DESIGN §8 *The judge cites, and code checks every
+# citation*).
+DELIVERY_GREP_TIMEOUT_SEC = 60
+
+
+def _delivery_grep(tree: str | Path, *args: str
+                   ) -> subprocess.CompletedProcess | None:
+    """`git grep <args>` in `tree`, bytes captured; None when it ran past
+    `DELIVERY_GREP_TIMEOUT_SEC` (killed: what it found so far is not
+    read)."""
+    try:
+        return subprocess.run(["git", *_tree_git_args(tree), "grep", *args],
+                              capture_output=True, check=False,
+                              timeout=DELIVERY_GREP_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        log(f"  git grep {' '.join(args)[:120]} ran past "
+            f"{DELIVERY_GREP_TIMEOUT_SEC}s — not measured")
+        return None
 
 
 class _ExecutedRecord(str):
@@ -54728,7 +54750,10 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     file HEAD lacks (review round 11 claims M1) — else `record_absent`;
     `absent_ok` / `absent_found` / `bad_regex` for `path: "ABSENT"` or
     `"ABSENT:<pathspec>"`, whose quote is an extended regex `git grep -E`
-    must find nowhere. Substring checks after NFC/whitespace normalisation —
+    must find nowhere — `absent_unmeasured` when that run is cut by
+    `DELIVERY_GREP_TIMEOUT_SEC`: it verifies nothing, and a met part it
+    alone holds back is not inspected (`_delivery_screen_sample`), never
+    an unmet vote. Substring checks after NFC/whitespace normalisation —
     never a parse of the judge's prose."""
     path = str(cite.get("path") or "").strip()
     quote = cite.get("quote") if isinstance(cite.get("quote"), str) else ""
@@ -54738,12 +54763,17 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
         if not raw:
             return "bad_regex"
         spec = path.split(":", 1)[1].strip() if ":" in path else ""
-        r = subprocess.run(
-            ["git", *_tree_git_args(tree), "grep", "-q", "-E", "-e", raw, "HEAD",
-             "--", *([spec] if spec else [])],
-            capture_output=True, check=False)
-        return {0: "absent_found", 1: "absent_ok"}.get(r.returncode,
-                                                        "bad_regex")
+        # Once per regex and pathspec: the same claim is checked by every
+        # reader of a verdict, and a cut run costs the whole bound each time.
+        memo = cache if cache is not None else {}
+        key = ("ABSENT", raw, spec)
+        if key not in memo:
+            r = _delivery_grep(tree, "-q", "-E", "-e", raw, "HEAD", "--",
+                               *([spec] if spec else []))
+            memo[key] = ("absent_unmeasured" if r is None else
+                         {0: "absent_found", 1: "absent_ok"}.get(
+                             r.returncode, "bad_regex"))
+        return memo[key]
     q = _scope_norm(quote)
     if len(q) < _DELIVERY_CITE_MIN_QUOTE:
         return "short"
@@ -54862,6 +54892,34 @@ def _relative_cites(v: dict, cwd: str | Path) -> dict:
         for p in parts]}
 
 
+def _part_held_by_cut_absence(p: object, tree: str | Path, record: str,
+                              cache: dict | None) -> bool:
+    """A part typed `met` none of whose citations verifies, one of them an
+    `ABSENT` claim whose run the bound cut (`absent_unmeasured`)."""
+    if not isinstance(p, dict) or p.get("status") != "met":
+        return False
+    got = [_verify_delivery_cite(c, tree, record, cache)
+           for c in p.get("cites") or [] if isinstance(c, dict)]
+    return ("absent_unmeasured" in got
+            and not any(g in _DELIVERY_CITE_OK for g in got))
+
+
+def _part_is_mechanical_unmet(p: dict, tree: str | Path, record: str,
+                              cache: dict | None = None) -> bool:
+    """A `met` part a check refutes on the tree: it carries a citation that
+    verifies to a status outside success, a worker's record and a bound-cut
+    absence — a fabricated quote or a wrong line. Its unmet vote is a real
+    refutation a cut elsewhere must not hide; a `record_worker` citation
+    (leerie cannot re-run the worker) and an `absent_unmeasured` one (the
+    bound cut) are not, so a part resting only on those is no refutation."""
+    if not isinstance(p, dict) or p.get("status") != "met":
+        return False
+    soft = _DELIVERY_CITE_OK | {"record_worker", "absent_unmeasured"}
+    return any(isinstance(c, dict)
+               and _verify_delivery_cite(c, tree, record, cache) not in soft
+               for c in p.get("cites") or [])
+
+
 def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
                             cache: dict | None = None,
                             checklists: dict[int, list] | None = None
@@ -54871,7 +54929,9 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     `_delivery_unmet_majority` tallies unchanged. `checklists` maps an
     item index to the checklist its verdict must answer
     (`_delivery_checklist`); a rejection for an unanswered entry is not an
-    unmet vote either — `_delivery_uninspected` re-asks it."""
+    unmet vote either — `_delivery_uninspected` re-asks it — nor is a met
+    part an absence the bound cut alone holds back
+    (`_part_held_by_cut_absence`): it is typed `not_inspected`."""
     out = []
     for v in sample.get("verdicts") or []:
         if not isinstance(v, dict):
@@ -54893,6 +54953,21 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
         if v.get("settled_by") == "test_id_diff":
             out.append(v)
             continue
+        if v.get("met") is True and isinstance(v.get("parts"), list):
+            # A met part no citation verifies, one of them an absence the
+            # bound cut, was not measured: not inspected — re-asked, then
+            # unknown — never an unmet vote, since a timeout is no verdict.
+            # The cut yields to a real refutation but never hides one: a
+            # part a check refutes on the tree (`_part_is_mechanical_unmet`)
+            # keeps its unmet vote, while a part held only by a worker's
+            # record rides to human verification with the cut (round 3 B).
+            held = [_part_held_by_cut_absence(p, tree, record, cache)
+                    for p in v["parts"]]
+            if any(held) and not any(
+                    _part_is_mechanical_unmet(p, tree, record, cache)
+                    for p in v["parts"]):
+                v = {**v, "parts": [{**p, "status": "not_inspected"} if h
+                                    else p for p, h in zip(v["parts"], held)]}
         status, why = _delivery_verdict_check(v, tree, record, cache,
                                               entries)
         if status == "unverified":
@@ -55514,11 +55589,15 @@ def _delivery_checklist(item: dict, members: list[dict] | None = None
     out = [{"checklist_index": j, "part": p}
            for j, p in enumerate(own or [str(item.get("item") or "")])]
     for m in members or []:
-        if m.get("unlisted"):
-            # A set too large to list (`delivery_set_members`): one entry no
-            # verdict can answer, so the item cannot be met on it.
+        if m.get("unlisted") or m.get("unmeasured"):
+            # A set too large to list (`delivery_set_members`), or one whose
+            # search did not finish (`_delivery_grep`): one entry no verdict
+            # can answer, so the item cannot be met on it.
             out.append({"checklist_index": len(out),
-                        "part": (f"{m['unlisted']} members of entry "
+                        "part": (f"entry {m['member_of']}'s set — a search "
+                                 "for its members did not finish; left to "
+                                 "a person" if m.get("unmeasured") else
+                                 f"{m['unlisted']} members of entry "
                                  f"{m['member_of']}'s set — too many to "
                                  "list and judge here; left to a person"),
                         "member_of": m["member_of"], "unlisted": True,
@@ -55584,13 +55663,18 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
     together hold more than `cap` members, its largest sets are not listed
     until the rest fit: each becomes one `{member_of, unlisted: n}` member,
     n the members found, which `_delivery_checklist` makes an entry no
-    verdict can answer. Malformed fields are skipped, never raised on."""
+    verdict can answer. A set one of whose searches the bound cut
+    (`_delivery_grep`) is one `{member_of, unlisted: 0, unmeasured: true}`
+    member, made that entry too, and its remaining searches do not run.
+    Malformed fields are skipped, never raised on."""
     ls = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r",
                          "--name-only", "-z", "HEAD"],
                         capture_output=True, check=False)
     files = (set(ls.stdout.decode("utf-8", "replace").split("\0")) - {""}
              if ls.returncode == 0 else set())
     out: dict[int, list[dict]] = {}
+    # The sets one of whose searches was cut (`_delivery_grep`).
+    unmeasured: set[tuple[int, int]] = set()
     for s in raw.get("sets") or []:
         if not isinstance(s, dict):
             continue
@@ -55619,7 +55703,9 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
                         "place": str(m.get("place") or "")[:200]})
         searches = s.get("searches")
         for q in searches if isinstance(searches, list) else []:
-            if not isinstance(q, dict):
+            if not isinstance(q, dict) or (i, j) in unmeasured:
+                # A set one search left unknown is unknown whatever the
+                # others find: they would only spend the bound again.
                 continue
             regex = str(q.get("regex") or "").strip()
             if not regex:
@@ -55627,11 +55713,13 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
             spec = str(q.get("pathspec") or "").strip()
             # One line per file (`--max-count=1`): a member is a file, so
             # the output grows with the files hit, never their lines.
-            r = subprocess.run(
-                ["git", *_tree_git_args(tree), "grep", "-n", "-z", "-I",
-                 "--max-count=1", "-E", "-e", regex, "HEAD", "--",
-                 *([spec] if spec else [])],
-                capture_output=True, check=False)
+            r = _delivery_grep(tree, "-n", "-z", "-I", "--max-count=1",
+                               "-E", "-e", regex, "HEAD", "--",
+                               *([spec] if spec else []))
+            if r is None:
+                # Its members are unknown, not none: the set is not listed.
+                unmeasured.add((i, j))
+                continue
             if r.returncode != 0:
                 continue
             first: dict[str, int] = {}
@@ -55649,12 +55737,16 @@ def _delivery_enumeration(raw: dict, tree: str | Path,
                 named.add(f)
                 got.append({"member_of": j, "path": f, "line": line,
                             "place": f"matches the search /{regex[:80]}/"})
+    for i, j in sorted(unmeasured):
+        out[i] = ([m for m in out[i] if m["member_of"] != j]
+                  + [{"member_of": j, "unlisted": 0, "unmeasured": True}])
     for i, ms in out.items():
-        sizes = Counter(m["member_of"] for m in ms)
+        sizes = Counter(m["member_of"] for m in ms if not m.get("unmeasured"))
         over: set[int] = set()
         # Largest first: an unlisted set still costs its one entry.
         for j in sorted(sizes, key=lambda j: (-sizes[j], j)):
-            if sum(1 if k in over else n for k, n in sizes.items()) <= cap:
+            if (sum(1 if k in over else n for k, n in sizes.items())
+                    + sum(1 for m in ms if m.get("unmeasured"))) <= cap:
                 break
             over.add(j)
         if over:
@@ -56250,15 +56342,19 @@ def _settle_untyped_sites(st: "State", untyped: list[dict],
                 continue
             cites = [c for c in (sv.get("cites") or [])
                      if isinstance(c, dict)]
+            got = [_verify_delivery_cite(c, tree, record, cache)
+                   for c in cites]
             ok = (sv.get("resolved") is True and bool(cites)
                   and len(cites) == len(sv.get("cites") or [])
-                  and all(_verify_delivery_cite(c, tree, record, cache)
-                          in _DELIVERY_CITE_OK for c in cites))
+                  and all(g in _DELIVERY_CITE_OK for g in got))
             votes += 1 if ok else 0
             if not ok and not evidence:
+                # A check the bound cut is no fault of the citation.
                 evidence = (str(sv.get("evidence") or "").strip()
                             if sv.get("resolved") is not True else
-                            "claimed resolved, but its citations do not "
+                            "claimed resolved, but a check of its citations "
+                            "did not finish" if "absent_unmeasured" in got
+                            else "claimed resolved, but its citations do not "
                             "verify on the tree")
         row["settlement"] = {"settled": 2 * votes > len(samples),
                              "votes": votes, "samples": len(samples),

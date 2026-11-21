@@ -368,3 +368,157 @@ def test_enumerators_are_bounded_and_set_items_judged_alone(
     assert [1] in judged
     assert all(1 not in j for j in judged if j != [1])
     assert routing["packs"] == len({tuple(j) for j in judged})
+
+
+def _stall_blob(tree: Path, rel: str) -> None:
+    """Make every read of `rel`'s blob on HEAD block: its loose object
+    becomes a FIFO no one writes, so a real `git grep` over it stalls in
+    `open` until killed — a regex that never finishes, without depending
+    on how fast a machine runs one."""
+    sha = subprocess.run(["git", "-C", str(tree), "rev-parse",
+                          f"HEAD:{rel}"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+    obj = tree / ".git" / "objects" / sha[:2] / sha[2:]
+    obj.unlink()
+    os.mkfifo(obj)
+
+
+def test_a_search_cut_by_the_bound_leaves_the_set_unlisted(leerie, tmp_path,
+                                                           monkeypatch):
+    """The enumerator's search is the worker's regex, run on the event
+    loop: it is bounded, and one the bound cuts leaves the set's members
+    unknown, not none — the set is one entry no verdict answers (left to a
+    person), never a set of the members listed so far."""
+    tree = _sender_tree(tmp_path)
+    _stall_blob(tree, "src/b.py")
+    monkeypatch.setattr(leerie, "DELIVERY_GREP_TIMEOUT_SEC", 1,
+                        raising=False)
+    lists = {4: leerie._delivery_checklist(ITEM)}
+    raw = {"sets": [{"item_index": 4, "checklist_index": 0, "set": "senders",
+                     "members": [{"path": "src/a.py", "line": 2,
+                                  "place": "a sends"}],
+                     "searches": [{"regex": r"send\(", "pathspec": "src/"},
+                                  {"regex": r"post\(", "pathspec": "src/"}]}]}
+    real = leerie._delivery_grep
+    runs: list[tuple] = []
+
+    def counted(*a):
+        runs.append(a)
+        return real(*a)
+    monkeypatch.setattr(leerie, "_delivery_grep", counted)
+    got = leerie._delivery_enumeration(raw, tree, lists)
+    assert got == {4: [{"member_of": 0, "unlisted": 0, "unmeasured": True}]}
+    # The set is unknown after its first search: the second is not run.
+    assert len(runs) == 1, runs
+    checklist = leerie._delivery_checklist(ITEM, got[4])
+    assert checklist[2]["unlisted"] is True
+    assert "did not finish" in checklist[2]["part"]
+    every = {"item_index": 4, "met": True, "evidence": "e",
+             "parts": [_part(0), _part(1), _part(2)]}
+    assert leerie._delivery_verdict_check(every, tree, "", {}, checklist) == (
+        "unverified", "checklist_unanswered")
+
+
+def test_an_absence_claim_cut_by_the_bound_verifies_nothing(leerie, tmp_path,
+                                                            monkeypatch):
+    """An `ABSENT` citation's regex is re-run under the same bound; a run
+    it cuts is `absent_unmeasured` — it verifies nothing, and it is not
+    `bad_regex`, which would blame a regex git never finished reading, nor
+    an unmet vote: the met part it holds back was not inspected."""
+    tree = _sender_tree(tmp_path)
+    _stall_blob(tree, "src/b.py")
+    monkeypatch.setattr(leerie, "DELIVERY_GREP_TIMEOUT_SEC", 1,
+                        raising=False)
+    cite = {"path": "ABSENT:src/", "quote": r"never_written\("}
+    real = leerie._delivery_grep
+    runs: list[tuple] = []
+
+    def counted(*a):
+        runs.append(a)
+        return real(*a)
+    monkeypatch.setattr(leerie, "_delivery_grep", counted)
+    cache: dict = {}
+    got = leerie._verify_delivery_cite(cite, tree, "", cache)
+    assert got == "absent_unmeasured"
+    assert got not in leerie._DELIVERY_CITE_OK
+    # A met part only that claim holds is not inspected — re-asked, then
+    # unknown — never the unmet vote an unverified met is.
+    sample = {"verdicts": [{"item_index": 0, "met": True, "evidence": "e",
+                            "parts": [{**_part(0), "cites": [cite]}]}]}
+    screened = leerie._delivery_screen_sample(sample, tree, "", cache)
+    v = screened["verdicts"][0]
+    assert v["parts"][0]["status"] == "not_inspected"
+    assert v.get("rejected") != "part_uncited"
+    assert leerie._delivery_uninspected(screened, [0]) == [0]
+    # Every reader of the claim shares one run: the bound is paid once.
+    assert len(runs) == 1, runs
+    # A part whose other citation verifies stays met: the cut adds nothing.
+    good = {"path": "src/a.py", "line_start": 2, "line_end": 2,
+            "quote": (tree / "src" / "a.py").read_text().splitlines()[1]}
+    both = leerie._delivery_screen_sample({"verdicts": [{
+        "item_index": 0, "met": True, "evidence": "e",
+        "parts": [{**_part(0), "cites": [cite, good]}]}]}, tree, "", cache)
+    assert both["verdicts"][0]["parts"][0]["status"] == "met", both
+    assert both["verdicts"][0]["met"] is True, both
+    # Beside a part whose citation is made up, it is still that part's
+    # unmet vote: a cut never cancels another part's verdict.
+    made_up = {"path": "src/a.py", "line_start": 1, "line_end": 1,
+               "quote": "export const nowhere_in_this_file = 42;"}
+    mixed = leerie._delivery_screen_sample({"verdicts": [{
+        "item_index": 0, "met": True, "evidence": "e",
+        "parts": [{**_part(0), "cites": [cite]},
+                  {**_part(1), "cites": [made_up]}]}]}, tree, "", cache)
+    assert mixed["verdicts"][0]["rejected"] == "part_uncited", mixed
+    assert leerie._delivery_uninspected(mixed, [0]) == []
+    # Beside a part held only by a worker's record (unverifiable, human-
+    # bound), the cut does NOT become a re-drive: the cut part is typed
+    # not_inspected and the item is re-asked, as `record_worker_only` would
+    # send it without the cut (round 3 B: otherwise the cut flipped the
+    # worker-only disposition into a confirmed unmet).
+    rec = leerie._ExecutedRecord("the e2e suite passed here", own="",
+                                 workers=[("the e2e suite passed here",
+                                           "pytest -q")])
+    rcite = {"path": "RECORD", "line_start": 0, "line_end": 0,
+             "quote": "the e2e suite passed here"}
+    assert leerie._verify_delivery_cite(rcite, tree, rec, {}) == \
+        "record_worker"
+    wsample = {"verdicts": [{"item_index": 0, "met": True, "evidence": "e",
+                            "parts": [{**_part(0), "cites": [cite]},
+                                      {**_part(1), "cites": [rcite]}]}]}
+    wscr = leerie._delivery_screen_sample(wsample, tree, rec, cache)
+    assert wscr["verdicts"][0]["parts"][0]["status"] == "not_inspected", wscr
+    assert wscr["verdicts"][0].get("rejected") != "part_uncited", wscr
+    assert leerie._delivery_uninspected(wscr, [0]) == [0]
+    marked = leerie._mark_worker_only(wscr, wsample, tree, rec, cache)
+    assert marked["verdicts"][0].get("rejected") != "part_uncited", marked
+    # Unstalled, the same claim verifies (on the ordinary bound).
+    monkeypatch.setattr(leerie, "DELIVERY_GREP_TIMEOUT_SEC", 60)
+    assert leerie._verify_delivery_cite(
+        {"path": "ABSENT:docs/", "quote": r"never_written\("}, tree, "") \
+        == "absent_ok"
+
+
+def test_a_cut_set_costs_one_member_toward_the_cap(leerie, tmp_path,
+                                                   monkeypatch):
+    """A set whose search the bound cut is one entry, and costs one toward
+    `delivery_set_members`: with it, a second set that alone fits the cap
+    no longer does, and is not listed either."""
+    tree = _sender_tree(tmp_path)
+    item = {"item": "two sets", "parts": ["first set", "second set"]}
+    lists = {4: leerie._delivery_checklist(item)}
+
+    def grep(t, *args):
+        return None if "cut_me" in " ".join(args) else real(t, *args)
+    real = leerie._delivery_grep
+    monkeypatch.setattr(leerie, "_delivery_grep", grep)
+    raw = {"sets": [
+        {"item_index": 4, "checklist_index": 0, "set": "cut", "members": [],
+         "searches": [{"regex": "cut_me", "pathspec": "src/"}]},
+        {"item_index": 4, "checklist_index": 1, "set": "senders",
+         "members": [], "searches": [{"regex": r"send\(", "pathspec": ""}]}]}
+    got = leerie._delivery_enumeration(raw, tree, lists, cap=3)
+    assert got == {4: [{"member_of": 0, "unlisted": 0, "unmeasured": True},
+                       {"member_of": 1, "unlisted": 3}]}, got
+    alone = leerie._delivery_enumeration({"sets": raw["sets"][1:]}, tree,
+                                         lists, cap=3)
+    assert len(alone[4]) == 3 and all("path" in m for m in alone[4]), alone
