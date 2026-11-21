@@ -729,7 +729,16 @@ def test_e3_a_regression_the_budget_cut_short_is_still_new(
     on the final tree and passes on the base — and the next final rerun is
     cut by the budget. Before: `resource_affected`, no `new`, and the run
     `done`. The cut is not a run: the regression is `new` on the pair the
-    budget allowed, and the run is `unconverged`."""
+    budget allowed, and the run is `unconverged`.
+
+    The budget runs on a clock the test drives (`_Clock`): each real rerun
+    spends one second of it, and the cut rerun the rest. On the wall clock
+    the three real reruns took about 3.5 s of the 8 s budget on an idle
+    host and 6.2-6.7 s at half a CPU (`CPUQuota=50%`); at a quarter they
+    took 4-7 s each, the budget ran out during `final2`, and this test
+    failed on a correct gate — as it did at host load around 100. A real
+    rerun's own timeout is then the run's ordinary bound, not what is left
+    of a budget on a clock that does not move with it."""
     monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
     st, staging = e3_repo["st"], e3_repo["staging"]
     stable = "tests/test_suite.py :: tests.test_suite.test_stable"
@@ -742,20 +751,38 @@ def test_e3_a_regression_the_budget_cut_short_is_still_new(
                       "failing_id_files": {stable: "tests/test_suite.py"}}}
     real = leerie._capture_failing_test_ids
     labels: list[str] = []
+    clock = _Clock()
+    real_confirm = leerie._confirm_new_failures
+
+    async def confirm(*a, **kw):
+        return await real_confirm(*a, **{**kw, "clock": clock})
+    monkeypatch.setattr(leerie, "_confirm_new_failures", confirm)
+
+    cut_timeouts: list[float] = []
+    handed: list[float] = []
 
     async def capture(tree, cmd, st_, caps_, *, label, timeout, **kw):
         labels.append(label)
+        handed.append(timeout)
         if label.endswith("-final4"):
-            # Cut by the budget: its timeout is the budget left.
-            await asyncio.sleep(timeout)
+            # Cut by the budget: its timeout is the budget left, and a cut
+            # run ends a little past it.
+            cut_timeouts.append(timeout)
+            await clock.sleep(timeout + 0.1)
             return None
-        return await real(tree, cmd, st_, caps_, label=label,
-                          timeout=timeout, **kw)
+        got = await real(tree, cmd, st_, caps_, label=label,
+                         timeout=float(leerie.DEFAULT_CAPS[
+                             "worker_timeout_sec"]), **kw)
+        await clock.sleep(1.0)
+        return got
     monkeypatch.setattr(leerie, "_capture_failing_test_ids", capture)
     v = asyncio.run(leerie._confirm_final_test_failures(
         st, _caps(leerie, confirm_budget_sec=8.0), str(staging), post,
         log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
     assert labels[-1] == "final-r0-final4", labels
+    assert cut_timeouts == [5.0], cut_timeouts
+    # Each rerun is handed what is left of the budget.
+    assert handed == [8.0, 7.0, 6.0, 5.0], handed
     assert v["pairs_run"] == 1 and v["budget_exhausted"] is True
     assert v["new"] == [stable] and v["budget_short"] == [stable]
     st.data["subtask_status"] = {}
