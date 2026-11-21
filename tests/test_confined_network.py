@@ -593,7 +593,7 @@ def test_r6_a_placed_file_never_follows_a_link_in_the_view(root):
     for rel in ("tests/held.sh", "deep/in/held.sh", "tests/new/held.sh"):
         r = subprocess.run(
             [sys.executable, "-I", "-S", str(SHIM), "--sandbox", "--view",
-             str(v), "--place", f"{held}={rel}", "--rw", str(v), *DEV,
+             str(v), "--place", str(held), rel, "--rw", str(v), *DEV,
              "--ro", "/", "--", "true"],
             cwd=str(v), capture_output=True, text=True, timeout=60)
         assert r.returncode == 126, (rel, r.stderr)
@@ -602,7 +602,7 @@ def test_r6_a_placed_file_never_follows_a_link_in_the_view(root):
     # A real directory on the path still takes the file.
     r = subprocess.run(
         [sys.executable, "-I", "-S", str(SHIM), "--sandbox", "--view",
-         str(v), "--place", f"{held}=deep/real/held.sh", "--rw", str(v),
+         str(v), "--place", str(held), "deep/real/held.sh", "--rw", str(v),
          *DEV, "--ro", "/", "--", "cat", "deep/real/held.sh"],
         cwd=str(v), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and secret in r.stdout, r.stderr
@@ -620,7 +620,7 @@ def test_r6_the_emulator_refuses_a_linked_directory_too(tmp_path):
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "tests" /
                              "heldout_sandbox_emulator.py"),
-         "--view", str(v), "--place", f"{held}=tests/held.sh", "--",
+         "--view", str(v), "--place", str(held), "tests/held.sh", "--",
          "true"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 126 and "tests/held.sh" in r.stderr
     assert list(out.iterdir()) == []

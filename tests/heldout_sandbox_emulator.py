@@ -2,8 +2,8 @@
 build one (DESIGN §6 *A held-out evaluation runs alone, in a world that dies
 with it (I3)*; `tests/conftest.py::_emulated_heldout_sandbox`).
 
-    heldout_sandbox_emulator.py --view V [--place SRC=REL]...
-        [--replace SRC=REL]... [--remove REL]...
+    heldout_sandbox_emulator.py --view V [--place SRC REL]...
+        [--replace SRC REL]... [--remove REL]...
         [--report PATH --report-fd N] [--taken-fd N] -- INNER...
 
 It keeps the sandbox's contract with leerie, not its isolation: each placed
@@ -28,8 +28,7 @@ from pathlib import Path
 
 
 def main(argv: list[str]) -> int:
-    sep = argv.index("--")
-    opts, inner = argv[:sep], argv[sep + 1:]
+    opts, inner = argv, None
     view = None
     place: list[tuple[str, str]] = []
     over: list[tuple[str, str]] = []
@@ -39,15 +38,19 @@ def main(argv: list[str]) -> int:
     taken_fd = None
     i = 0
     while i < len(opts):
+        if opts[i] == "--":
+            # The first `--` where an option is expected, as the shim reads
+            # it: a placed file may be named `--`.
+            inner = opts[i + 1:]
+            break
         k, v = opts[i], opts[i + 1]
+        if k in ("--place", "--replace"):
+            # Two arguments, as the shim takes them.
+            (place if k == "--place" else over).append((v, opts[i + 2]))
+            i += 3
+            continue
         if k == "--view":
             view = Path(v)
-        elif k == "--place":
-            src, rel = v.split("=", 1)
-            place.append((src, rel))
-        elif k == "--replace":
-            src, rel = v.split("=", 1)
-            over.append((src, rel))
         elif k == "--remove":
             remove.append(v)
         elif k == "--report":
@@ -60,7 +63,7 @@ def main(argv: list[str]) -> int:
             print(f"emulator: unknown option {k}", file=sys.stderr)
             return 126
         i += 2
-    assert view is not None
+    assert view is not None and inner is not None
     def _blocked(rel: str) -> bool:
         # The shim resolves each directory with O_NOFOLLOW | O_DIRECTORY: a
         # link or a non-directory on the path leaves no room for the file.

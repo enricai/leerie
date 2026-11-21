@@ -86,7 +86,7 @@ def _sandbox(root: Path, code: str, *, place=(), report=None,
     opts = ["--sandbox", "--view", str(v), "--rw", str(v), "--rw",
             "/dev/null", "--ro", "/"]
     for src, rel in place:
-        opts += ["--place", f"{src}={rel}"]
+        opts += ["--place", src, rel]
     if report is not None:
         opts += ["--report", report, "--report-fd", str(report_fd)]
     return _shim(opts, code, cwd=v, extra_fds=extra_fds)
@@ -323,6 +323,21 @@ def test_placed_files_are_in_the_overlay_only(root):
         """, place=[(str(held), "tests/held_test.py")])
     assert r.returncode == 0, r.stderr
     assert r.stdout.split() == ["HELD-OUT", "0o444"]
+    assert not (v / "tests").exists()
+
+
+def test_a_placed_path_holding_an_equals_sign_is_placed_whole(root):
+    """The real sandbox, through the shim's own argument parsing: a source
+    and a destination that hold `=` name the same two files inside."""
+    v = _view(root)
+    held = root / "acceptance" / "set=1" / "year=2024" / "held_test.py"
+    held.parent.mkdir(parents=True)
+    held.write_text("HELD-OUT\n")
+    r = _sandbox(root, """
+        print(open("tests/year=2024/held_test.py").read().strip())
+        """, place=[(str(held), "tests/year=2024/held_test.py")])
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["HELD-OUT"]
     assert not (v / "tests").exists()
 
 

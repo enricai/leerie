@@ -26672,9 +26672,9 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     if sandbox is not None:
         argv += ["--sandbox", "--view", sandbox.view]
         for src, rel in sandbox.place:
-            argv += ["--place", f"{src}={rel}"]
+            argv += ["--place", src, rel]
         for src, rel in sandbox.replace:
-            argv += ["--replace", f"{src}={rel}"]
+            argv += ["--replace", src, rel]
         for rel in sandbox.remove:
             argv += ["--remove", rel]
         if taken_fd is not None:
@@ -59067,9 +59067,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     # nothing but which declared files it drops: the set is discarded for
     # it unless a later pass, the drops made, no longer holds it — never
     # invalid for another reason, nor sent to the writer's retry, on runs
-    # that lacked a file it needed. Each copy is named by number, never by its path: the shim reads a
-    # placement as `SRC=REL` split at the first `=`, and a path the writer
-    # chose may hold one.
+    # that lacked a file it needed.
     written = st.run_dir / "acceptance" / f"{dest_name}.written"
     _rmtree_owned(written)
     copies: dict[str, Path] = {}
@@ -59086,7 +59084,7 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                                follow_symlinks=False).st_mode
         except OSError as e:
             return type(e).__name__
-        copies[rel] = written / str(len(copies))
+        copies[rel] = written / rel
         _write_beneath(st.run_dir, copies[rel], data,
                        mode=stat.S_IMODE(mode))
         return ""

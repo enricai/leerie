@@ -151,7 +151,7 @@ def test_a_good_sandbox_turns_isolation_on_and_cleans_up(
     assert os.environ[leerie.ISOLATE_ENV] == "1"
     assert not (tmp_path / leerie._SANDBOX_PROBE_DIRNAME).exists()
     (argv,) = seen
-    assert argv[argv.index("--place") + 1].endswith("=probe/placed.txt")
+    assert argv[argv.index("--place") + 2] == "probe/placed.txt"
     assert "--isolate" not in argv
 
 
@@ -178,7 +178,7 @@ def test_a_held_out_run_is_always_sandboxed(leerie, monkeypatch):
             monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
         argv = leerie._confined_argv(g, ["run"], sandbox=sb, report_fd=7)
         assert argv[4:] == ["--sandbox", "--view", "/v", "--place",
-                            "/a/s.py=t/s.py", "--report", "/v/r.json",
+                            "/a/s.py", "t/s.py", "--report", "/v/r.json",
                             "--report-fd", "7", "--rw", "/v", "--ro", "/",
                             "--", "run"]
 

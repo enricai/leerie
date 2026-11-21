@@ -122,8 +122,8 @@ def test_validation_runs_in_leerie_s_tree_with_the_set_placed(
         assert {r: text for r, (_s, text) in placed.items()} == {
             "acc/test_control_zero.py": CONTROL_TEST,
             "acc/test_defect_sum.py": DEFECT_TEST}
-        assert all(Path(src).parent == written
-                   for src, _text in placed.values())
+        assert all(Path(src) == written / r
+                   for r, (src, _text) in placed.items())
     # Both trees and leerie's copy are gone; the set holds what it carries.
     assert not writer_wt.exists() and not view.exists()
     assert not written.exists()
@@ -323,9 +323,8 @@ def test_the_parse_probe_checks_only_what_is_placed(leerie, tmp_path,
 
 def test_a_path_holding_an_equals_sign_is_placed_whole(leerie, tmp_path,
                                                        monkeypatch):
-    """The shim reads a placement as `SRC=REL` split at the first `=`:
-    leerie's copy is named by number, so a writer's path that holds one
-    still names the right file."""
+    """A writer's path that holds `=` is placed whole: the shim takes a
+    placement's source and destination as two arguments."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     _writer_stub(leerie, monkeypatch, {1: {

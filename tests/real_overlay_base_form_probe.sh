@@ -42,7 +42,7 @@ printf "import { expect, test } from 'vitest';\nimport { fmt } from './fmt.js';\
 before_sha=$(cd "$W/t1" && git hash-object src/fmt.test.js)
 
 # 1. --replace and --remove, observed from inside the sandbox.
-out=$(run_shim "$W/t1" --taken-fd 7 --replace "$BASE=src/fmt.test.js" \
+out=$(run_shim "$W/t1" --taken-fd 7 --replace "$BASE" src/fmt.test.js \
       --remove src/added.test.js "${WR[@]}" "${DEV[@]}" --ro / -- \
       /bin/sh -c 'cat src/fmt.test.js; echo "--- added:"; ls src/added.test.js 2>&1; echo "--- status:"; git status --porcelain')
 rc=$?
@@ -67,7 +67,7 @@ for shape in file_link dir_link; do
     fi
     mkdir -p /leerie-state/outdir; printf 'outside\n' > /leerie-state/outside.js; printf 'outside\n' > /leerie-state/outdir/fmt.test.js
     $G add -A >/dev/null; $G commit -qm link; cd "$W"
-    if [ $op = replace ]; then o=(--replace "$BASE=$rel"); else o=(--remove "$rel"); fi
+    if [ $op = replace ]; then o=(--replace "$BASE" "$rel"); else o=(--remove "$rel"); fi
     run_shim "$t" --taken-fd 7 "${o[@]}" "${WR[@]}" "${DEV[@]}" --ro / -- /bin/echo RAN > "$W/o.txt" 2>&1
     rc=$?
     if [ $rc -eq 126 ] && [ -s "$W/taken.txt" ] && [ ! -s "$W/refusal.txt" ] && ! grep -q RAN "$W/o.txt" \
@@ -86,7 +86,7 @@ cd "$W/t1"
 run_shim "$W/t1" --taken-fd 7 "${WR[@]}" "${DEV[@]}" --ro / -- \
   "$NODE" "$VT" run src/fmt.test.js > "$W/v0.txt" 2>&1
 rc0=$?
-run_shim "$W/t1" --taken-fd 7 --replace "$BASE=src/fmt.test.js" --remove src/added.test.js \
+run_shim "$W/t1" --taken-fd 7 --replace "$BASE" src/fmt.test.js --remove src/added.test.js \
   "${WR[@]}" "${DEV[@]}" --ro / -- "$NODE" "$VT" run src/fmt.test.js src/added.test.js > "$W/v1.txt" 2>&1
 rc1=$?
 cd "$W"

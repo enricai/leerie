@@ -9,8 +9,8 @@ Usage: landlock_exec.py [--isolate [--egress SOCK] [--forward PORT=SOCK]...
                          [OVERLAY]...]
                          [--refusal-fd N]
                         [--rw PATH]... [--ro PATH]... -- CMD [ARGS...]
-       landlock_exec.py --sandbox --view TREE [--place SRC=REL]...
-                        [--replace SRC=REL]... [--remove REL]...
+       landlock_exec.py --sandbox --view TREE [--place SRC REL]...
+                        [--replace SRC REL]... [--remove REL]...
                         [--report PATH --report-fd N] [--worker-root DIR]
                         [OVERLAY]...
                         [--refusal-fd N] [--taken-fd N]
@@ -51,7 +51,11 @@ on its way — is a fact about the tree, not a refusal. The shim writes that
 reason to N (never to the refusal descriptor), exits 126 and does not run
 CMD.
 
-`--replace SRC=REL` and `--remove REL` (`--sandbox`): an existing test file's
+`--place SRC REL` (`--sandbox`): the held-out file SRC is placed at REL,
+relative to the view. SRC and REL are two arguments, never one joined by a
+separator: either path may hold any character a file name can.
+
+`--replace SRC REL` and `--remove REL` (`--sandbox`): an existing test file's
 base form is run in place of its final form (DESIGN §8 *What an existing test
 pins on the base holds on the tree that ships*). `--replace` writes SRC over
 the regular file at REL (or creates it), `--remove` deletes the regular file
@@ -2136,30 +2140,41 @@ def leave_terminal() -> str | None:
 
 
 def _parse(argv: list[str]) -> dict | str:
-    """The shim's options, or a usage error."""
-    if "--" not in argv:
-        return ("usage: landlock_exec.py [--isolate [--egress SOCK] "
-                "[--forward PORT=SOCK]... [--link-root DIR] | --sandbox --view TREE "
-                "[--place SRC=REL]... [--replace SRC=REL]... [--remove REL]... "
-                "[--report PATH --report-fd N]] "
-                "[--rw PATH]... [--ro PATH]... -- CMD")
-    sep = argv.index("--")
+    """The shim's options, or a usage error. The options end at the first
+    `--` met where an option is expected — never at one that is an option's
+    value (a placed file may be named `--`)."""
+    usage = ("usage: landlock_exec.py [--isolate [--egress SOCK] "
+             "[--forward PORT=SOCK]... [--link-root DIR] | --sandbox --view TREE "
+             "[--place SRC REL]... [--replace SRC REL]... [--remove REL]... "
+             "[--report PATH --report-fd N]] "
+             "[--rw PATH]... [--ro PATH]... -- CMD")
     o: dict = {"rw": [], "ro": [], "isolate": False, "sandbox": False,
                "view": None, "place": [], "replace": [], "remove": [],
                "report": None,
                "report_fd": None, "egress": None, "forward": [],
                "worker_root": None, "cli": False, "refusal_fd": None,
                "taken_fd": None, "link_root": None,
-               "overlays": [], "cmd": argv[sep + 1:]}
-    opts = argv[:sep]
+               "overlays": [], "cmd": None}
+    opts = argv
     i = 0
     while i < len(opts):
         k = opts[i]
+        if k == "--":
+            o["cmd"] = opts[i + 1:]
+            break
         if k in ("--isolate", "--sandbox", "--cli"):
             o[k[2:]] = True
             i += 1
             continue
-        if k not in ("--rw", "--ro", "--view", "--place", "--replace",
+        if k in ("--place", "--replace"):
+            # Two arguments: a separator inside one would be ambiguous,
+            # since a path may hold any character but NUL.
+            if i + 2 >= len(opts) or not opts[i + 1] or not opts[i + 2]:
+                return f"landlock_exec.py: bad {k} {opts[i + 1:i + 3]!r}"
+            o[k[2:]].append((opts[i + 1], opts[i + 2]))
+            i += 3
+            continue
+        if k not in ("--rw", "--ro", "--view",
                      "--remove", "--report",
                      "--report-fd", "--egress", "--forward",
                      "--worker-root", "--refusal-fd", "--taken-fd",
@@ -2170,11 +2185,6 @@ def _parse(argv: list[str]) -> dict | str:
         v = opts[i + 1]
         if k in ("--rw", "--ro"):
             o[k[2:]].append(v)
-        elif k in ("--place", "--replace"):
-            src, eq, rel = v.partition("=")
-            if not eq or not src or not rel:
-                return f"landlock_exec.py: bad {k} {v!r}"
-            o[k[2:]].append((src, rel))
         elif k == "--remove":
             if not v:
                 return f"landlock_exec.py: bad --remove {v!r}"
@@ -2228,6 +2238,8 @@ def _parse(argv: list[str]) -> dict | str:
         else:
             o[k[2:]] = v
         i += 2
+    if o["cmd"] is None:
+        return usage
     if not o["cmd"]:
         return "landlock_exec.py: no command"
     if o["isolate"] and o["sandbox"]:
