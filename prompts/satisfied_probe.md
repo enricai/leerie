@@ -31,7 +31,7 @@ the rules are identical for both:
 You run **read-only**. Inspect **only the current working tree / current
 checkout** (its `HEAD`):
 
-- Read files on disk (`Read`, `Grep`, `Glob`, `ls`, `cat`, `grep`).
+- Read files on disk (`Read`, `ls`, `cat`, `grep`).
 - For git, use **only** `git show HEAD:<path>`, `git diff`, and
   `git status` — against the **current** checkout.
 
@@ -200,7 +200,7 @@ directory rather than next to the source file). Do not return `false`
 solely because the literal named path is absent.
 
 Instead: search the repo for its actual convention for tests of this
-kind (`Grep`/`Glob` for the described behavior — the route, function,
+kind (`grep` for the described behavior — the route, function,
 symbol, or feature under test — across the whole tree, not just the
 literal path), and judge whether the described behavior is **actually
 covered** wherever the repo's convention places that coverage. If you

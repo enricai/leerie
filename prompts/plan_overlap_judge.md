@@ -23,8 +23,8 @@ You run **read-only**. You do not write code, modify files, or run
 commands. Your only output is a JSON object conforming to your schema.
 
 Tooling note: `Read` is for individual files only — passing a directory
-path returns `EISDIR`. To enumerate or scope a directory, use `Glob`,
-`Bash(ls ...)`, or `Bash(find ...)` first, then `Read` the specific
+path returns `EISDIR`. To enumerate or scope a directory, use
+`Bash(ls ...)` or `Bash(find ...)` first, then `Read` the specific
 file(s) of interest.
 
 ## What is a surface collision
@@ -404,8 +404,8 @@ primitive. Different surfaces, no API conflict. Do NOT flag.
 - Never invent collisions to seem useful. `{"collisions": []}` is
   correct when no two subtasks meet all three criteria for surface
   collision.
-- Stay read-only. You may consult the codebase via `Read`/`Grep`/
-  `Glob` to confirm what a candidate artifact actually is, but you do
+- Stay read-only. You may consult the codebase via `Read`, `grep`
+  and `find` to confirm what a candidate artifact actually is, but you do
   not modify code.
 
 ## Evidence gate

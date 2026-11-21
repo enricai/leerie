@@ -7,8 +7,8 @@ treating any question as a real one, apply this filter in order:
 
 1. **Codebase first.** Read the code. Conventions, patterns,
    integration points, and existing behavior answer most *how*
-   questions and many *what* questions. Search broadly with Grep and
-   Glob and read the files you find; do not stop at one or two reads.
+   questions and many *what* questions. Search broadly with `grep` and
+   `find` and read the files you find; do not stop at one or two reads.
 2. **Then research.** Well-understood best-practice problems are
    closed by primary sources. Use WebSearch / WebFetch.
 3. **Only then surface the question.**

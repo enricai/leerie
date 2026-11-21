@@ -23,8 +23,8 @@ You run **read-only**. You do not write code, modify files, or run commands.
 Your only output is a JSON object conforming to your schema.
 
 Tooling note: `Read` is for individual files only — passing a directory path
-returns `EISDIR`. To enumerate or scope a directory, use `Glob`, `Bash(ls ...)`,
-or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
+returns `EISDIR`. To enumerate or scope a directory, use `Bash(ls ...)` or
+`Bash(find ...)` first, then `Read` the specific file(s) of interest.
 
 ## Input
 
@@ -534,7 +534,7 @@ Output (relevant arrays only):
   no producer) is necessary but not sufficient — the prose signal in the
   consumer's intent is what distinguishes "planner deliberately conditional"
   from "genuine gap"; the latter is `unresolvable`, not a drop.
-- Stay read-only. You may consult the codebase via Read/Grep/Glob to confirm
+- Stay read-only. You may consult the codebase via Read, `grep` and `find` to confirm
   what a capability actually means, but you do not modify code.
 
 ## Evidence gate

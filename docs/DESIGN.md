@@ -4063,10 +4063,11 @@ nothing else since 2026-11-12 (§6½ *The repository image holds no
 dependency*), so a failure of its build is the build's error, with no
 fallback.
 
-**Residuals.** A worker's CLI reads with its `Read`, `Grep` and `Glob`
-tools in leerie's root: a path only the worker root has (a Debian
-package's files) is found by a command, not by those tools. A worker stage whose last
-stage has no `/bin/sh` cannot record its environment, so its build fails.
+**Residuals.** A worker's CLI reads with its `Read` tool (and `Grep` and
+`Glob`, where granted) in leerie's root: a path only the worker root has (a
+Debian package's files) is found by a command, not by those tools. A worker
+stage whose last stage has no `/bin/sh` cannot record its environment, so its
+build fails.
 The pinned frontend image is a network pull (about 14 MB), as a
 `# syntax=` frontend was. The launcher pulls it into the containerd
 namespace BuildKit's worker reads before its first build
@@ -12978,6 +12979,30 @@ prevent that. On the seven live 0.43.0 barnacle runs the refusal naming
 this directory appears on 39 log lines (streams and transcripts
 overlap, so lines, not refusals). The system temp dir remains the
 fallback only when the run directory cannot hold the file.
+
+**A prompt names only the tools its worker can call.** A worker's prompt
+and its tool grant are two halves of one contract, as its prompt and its
+schema are. A worker told to use a tool its grant lacks spends a turn
+calling it, is refused, and then falls back to what it has. The CLI leaves
+`Grep` and `Glob` out of a worker's context unless the grant names them.
+`Read` stays, and the CLI lets it read inside the working directories
+without a grant. When the judgment read set became `WebSearch,WebFetch`, the
+judgment prompts kept saying "use `Grep` and `Glob`". In the field logs that
+cost 114 refusals on the delivery judge, 47 on the delivery ratchet and 20
+on the satisfied probe, among others. The prompts now name the shell verbs
+their grants hold (`grep`, `find`, `ls`). This was measured in a
+pre-registered replay of 14 recorded calls (lane TR-D2, 248 samples). Over
+the 10 cases whose prompt changed, calls to an absent tool fell from 3 to 1
+per 100. Other refusals per call fell from 0.66 to 0.58, wasted turns per
+call from 0.57 to 0.47, and turns per call went from 4.67 to 4.85. No
+majority verdict changed. The replay effect is thin; the field rate is the main
+evidence for its size.
+`tests/test_prompts_name_only_granted_tools.py` derives the rule from the
+code. It pairs every `claude_p` call with the prompts it sends and the
+tools it grants, and fails when a prompt names a tool that one of its
+workers cannot call. A prompt sent to two workers must fit the narrower
+grant: `delivery_judge.md` also goes to the ratchet, on
+`SATISFIED_PROBE_TOOLS`.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
@@ -24481,8 +24506,8 @@ The group layer adds four thin capabilities on top:
 
 2. **Read-only cross-repo visibility.** Each member is launched with its
    siblings seeded as read-only inspect-dirs (`--inspect-dir <sibling-repo>`).
-   Workers may `Read`/`Grep`/`Glob` under `/inspect/<name>` but not write
-   there, enforced by the existing `_filter_offtree_subtasks` guard (§12),
+   Workers may read under `/inspect/<name>` (`Read`, `ls`, `find`, `grep`) but
+   not write there, enforced by the existing `_filter_offtree_subtasks` guard (§12),
    unchanged.
 
 3. **Deploy-ordering notes.** When a member's planner declares a cross-repo

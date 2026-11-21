@@ -136,7 +136,8 @@ the run must meet, instance by instance:
   and the code's other literals are not, words and characters typical of
   that language; a literal then counts only if it holds one.
 
-Grep before you write it: the sweep should find the instances you saw. One
+Check the sweep with `grep` before you write it: it should find the
+instances you saw. One
 that matches nothing, or more than a few hundred instances, comes back to
 you to fix, and so does a `"pattern"` site without a sweep or a site whose
 `file` is a directory typed `"one_place"`. When the pattern lives in

@@ -8775,3 +8775,22 @@ never in the real home, and is absent from another tree.
 `tests/test_worker_sees_tree_install.py` runs, where isolation works, a script
 leerie's install put in `~/.local/bin` from the falsifier's confined process.
 `tests/test_user_scripts_on_path.py` is removed with `_with_user_scripts`.
+
+## A prompt names only the tools its worker can call
+
+`tests/test_prompts_name_only_granted_tools.py` (DESIGN §7 *A prompt names only
+the tools its worker can call*) pairs every `claude_p` call in leerie.py with the
+prompts its `system_prompt` is built from (`_load_prompt` literals, followed
+through locals, closures, forwarding helpers' parameters and `**dict(...)`
+spreads; includes expanded) and the bare tool names its `allowed_tools` grants,
+plus the CLI's ungated `Read` and `StructuredOutput`. It fails when a prompt
+names a `KNOWN_TOOLS` name that any one of its workers cannot call. An
+anti-vacuity arm requires every shipped worker prompt to be paired with at least
+one call, every call to resolve to its prompts (`leerie replay`'s, which
+re-sends a recorded prompt, is the one exception: `_SENDS_NO_SHIPPED_PROMPT`)
+and its tools, and `delivery_judge.md` to reach both the delivery judge and the
+ratchet. A matcher arm pins what counts as naming a
+tool (backticked, or a whole word; a name that is also an English word, such as
+`Read` or `Write`, only where it does not begin a sentence) and what does not
+(`Task-Context`, "Read the file."). Falsified on origin/main
+3f73fd78's prompts: red, naming 12 prompts across 13 (prompt, worker) pairs.

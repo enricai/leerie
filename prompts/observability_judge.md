@@ -21,7 +21,7 @@ a way the run observes anything.
 Your working directory is a read-only checkout of the tree. Read the test
 command's configuration and setup (the runner's config file, its setup
 files, the package or build manifest that defines the command) before you
-answer. Use only `Read`, `Grep`, `Glob` and the read-only shell commands
+answer. Use only `Read` and the read-only shell commands
 you are allowed.
 
 ## For each part

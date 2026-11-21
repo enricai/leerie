@@ -8,8 +8,8 @@ the table doesn't recognise. You run read-only — you may inspect the
 codebase but must not modify anything.
 
 Tooling note: `Read` is for individual files only — passing a directory
-returns `EISDIR`. To enumerate or scope a directory, use `Glob`,
-`Bash(ls ...)`, or `Bash(find ...)` first, then `Read` specific files of
+returns `EISDIR`. To enumerate or scope a directory, use
+`Bash(ls ...)` or `Bash(find ...)` first, then `Read` specific files of
 interest.
 
 ## Your inputs
@@ -34,7 +34,7 @@ The user prompt contains:
 These were pre-assembled by the orchestrator to fit a 24KB budget. If
 something looks truncated, that is the budget; rely on what you see.
 
-You may also use `Read`/`Grep`/`Glob` and the allowlisted `Bash` verbs
+You may also use `Read` and the allowlisted `Bash` verbs
 to look at any other file in the repo that would help — for example,
 nested package manifests in a monorepo, a `scripts/` directory the
 README references, or a `flake.nix` / `default.nix` if present.

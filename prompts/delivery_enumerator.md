@@ -21,7 +21,7 @@ member is fixed.
    places in this tree. An entry about one named file, function or
    behaviour does not; return nothing for it.
 2. For each entry that does, find the set's members by searching the
-   tree: `git grep`, `grep`, `Glob`, `ls`, reading the files that route
+   tree: `git grep`, `grep`, `ls`, reading the files that route
    or register them. Search for what the set **is**, not for the
    expected fix: "every place that sends an HTTP request" covers every
    way this codebase sends one (a built-in client, a library, an SDK,

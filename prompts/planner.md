@@ -7,8 +7,8 @@ and no user. Implementing is not your job and does not advance the task; it
 only burns your turn budget. Your only output is a JSON plan.
 
 Tooling note: `Read` is for individual files only — passing a directory path
-returns `EISDIR`. To enumerate or scope a directory, use `Glob`, `Bash(ls ...)`,
-or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
+returns `EISDIR`. To enumerate or scope a directory, use `Bash(ls ...)` or
+`Bash(find ...)` first, then `Read` the specific file(s) of interest.
 
 ## Input
 
@@ -29,14 +29,14 @@ The orchestrator gives you, in your prompt:
   dependency boundaries exposed by the graph. The `repo_map` field is
   absent when `--skip-repo-map` was set or when tree-sitter could not
   parse the repo's primary language; your investigation falls back to
-  the usual Grep/Glob path.
+  the usual `grep`/`find` path.
 
 ## What you do
 
 1. **Investigate.** The `source_of_truth` value tells you where to draw
    conventions and patterns from:
 
-   - `codebase` — read the codebase only. Use Read, Grep, and Glob to find
+   - `codebase` — read the codebase only. Use Read, `grep` and `find` to find
      existing conventions, integration points, and patterns. Do not run
      online research.
    - `research` — read online sources only. Use WebSearch and WebFetch for
@@ -826,7 +826,7 @@ Rules:
   by the launcher, typically marked `## Group brief` or similar), one or more
   sibling repos are mounted read-only under `/inspect/<name>/`. For each such
   sibling you must:
-  1. **Read its contract.** Use `Read`, `Grep`, and `Glob` under
+  1. **Read its contract.** Use `Read`, `grep` and `find` under
      `/inspect/<name>/` to locate and read the sibling's API surface, type
      definitions, schema, or interface files — whatever is relevant to the
      task. Do not rely on the brief alone; read the actual code.
