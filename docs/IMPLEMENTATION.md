@@ -14285,8 +14285,9 @@ at `_helper_worktree_path(st, name)` (`<run-dir>/worktrees/<run-id[:12]>-
 wt, rev)`: the add under the same `leerie-worktree.lock` (non-blocking
 retries for at most `_WORKTREE_ADD_LOCK_WAIT_SEC` = 120 s, then unlocked,
 logged). It blocks, so a coroutine calls `await
-_worktree_add_detached_async(st, wt, rev)` (the same call in
-`asyncio.to_thread`), and reaches the sync checkout helpers that call it
+_worktree_add_detached_async(st, wt, rev)` (the same call in the loop's
+default executor, never cancelled with its caller: cancelled, it waits for the add's thread and
+then re-raises the cancellation), and reaches the sync checkout helpers that call it
 (`_acceptance_writer_checkout`, `_falsifier_checkout`) through
 `asyncio.to_thread` too; `tests/test_helper_worktree_lock.py` fails on any
 coroutine that calls one of them directly.
