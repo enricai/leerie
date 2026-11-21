@@ -64,7 +64,8 @@ def test_a_round_reread_that_crashed_is_read_again_on_the_tree_that_ships(
     assert row1["verdict"] == "met", row1
     # Its judge read it and found nothing unmet (DESIGN §8 *A re-check
     # keeps what its judge showed*).
-    assert row1["redrive_recheck"] == {"sha": final, "unmet_parts": []}
+    assert row1["redrive_recheck"] == {"sha": final, "unmet_parts": [],
+                                      "not_inspected": False}
     assert [u["item_index"] for u in gate["unmet_final"]] == []
     assert not (st.data.get("delivery_ratchet") or {}).get("unverified")
     assert gate["final_sha"] == final
@@ -115,5 +116,6 @@ def test_apply_read_stamps_only_what_was_read(leerie, tmp_path, crashed):
         assert "redrive_recheck" not in row
         assert unv == {"0": {"sha": "F", "label": "the delivery re-drive"}}
     else:
-        assert row["redrive_recheck"] == {"sha": "F"}
+        assert row["redrive_recheck"] == {"sha": "F",
+                                         "not_inspected": False}
         assert unv == {}

@@ -293,5 +293,13 @@ def test_a_redrive_recheck_writes_an_unread_item_unknown(
         run_dir, st, dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS, staging,
         [2]))
     assert out[2]["unmet"] is False and out[2]["unknown"] is True
+    # Which unknown it is reaches the row's stamp, so the outcome can tell
+    # an item no sample read from a worker-only met (DESIGN §6 *A subtask
+    # that did not converge is reported, not a veto*).
+    assert out[2]["not_inspected"] is True
+    leerie._redrive_apply_item_verdicts(st, out, "f" * 40)
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "unknown"
+    assert row["redrive_recheck"]["not_inspected"] is True
     assert [c["indices"] for c in calls] == [[2]] * 6
     assert [e["item_index"] for e in _gap(st)] == [2]

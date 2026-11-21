@@ -282,8 +282,14 @@ def test_pr_section_skips_still_blocked_subtasks(leerie):
              "subtask_status": {"s1": "blocked", "s2": "complete",
                                 "s3": "unconverged"}}
     sec = leerie._format_pr_end_state_section(state)
-    assert "**s2**" in sec
-    assert "**s1**" not in sec and "**s3**" not in sec
+    # s3 is named under `## Unconverged`, which comes first; its risks are
+    # not in what follows.
+    start = sec.index("## Unconverged")
+    end = sec.index("\n## ", start)
+    head, rest = sec[start:end], sec[end:]
+    assert "**s3**" in head
+    assert "**s2**" in rest
+    assert "**s1**" not in sec and "**s3**" not in rest
     only_blocked = {"risk_register": {"s1": entry},
                     "subtask_status": {"s1": "blocked"}}
     assert leerie._format_pr_end_state_section(only_blocked) == ""

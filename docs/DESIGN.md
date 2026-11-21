@@ -866,9 +866,12 @@ when that budget is spent — or a subtask `failed` (the two-tier retry policy
 already spent its retries) — it is settled **`unconverged`**: a terminal
 status that is never left `blocked`, whose branch is not integrated, whose
 dependents settle `unconverged` without running (bar a zero-commit
-`undecidable_no_op`'s, which run), and which makes the run's
-outcome `unconverged` (§6 *The run outcome is decided once*), so the PR
-opens as a draft. Accepting an auto-accepted blocker as `complete` used to
+`undecidable_no_op`'s, which run), and which the PR names with its reason.
+It makes the run's outcome `unconverged` only when the run branch is empty
+or final delivery detection did not read the required items on the tree
+that ships; otherwise the outcome rests on what was
+measured on the tree that ships (§6 *A subtask that did not converge is
+reported, not a veto*). Accepting an auto-accepted blocker as `complete` used to
 present unfinished work as done; `unconverged` says what happened. With
 `--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
 `leerie.toml`) the run instead halts with `wave has unresolved
@@ -8082,7 +8085,8 @@ Two outcomes are not failures of the integrator but facts about the work:
   conflict takes the same fallback as a failed repair round (below): the
   merge is abandoned, the run branch is reset to the merge's first parent,
   the subtask settles `unconverged` and the wave continues, with the lost work
-  recorded and the PR opened as a draft so the conflict reaches a human. So
+  recorded and named in the PR so the conflict reaches a human (§6 *A
+  subtask that did not converge is reported, not a veto*). So
   does an unverified `resolved` claim. An unresolved conflict never proceeds
   silently onto a corrupt run-branch state, and neither verdict kills the
   run: it used to, discarding every completed subtask of the run over one
@@ -8180,9 +8184,11 @@ the subtask out:
 hold — the judge quotes both), an integrator verdict of `design-conflict` or
 `failed` during repair, or exhausted rounds reset the run branch to the
 merge's first parent, settle the subtask `unconverged` (§5; its dependents
-settle `unconverged` without running) and continue the wave. The outcome
-becomes `unconverged`, so the PR opens as a draft, and the backed-out work is
-recorded as residual content loss on the subtask, which the PR reports.
+settle `unconverged` without running) and continue the wave. The PR names
+the subtask as unconverged, and the backed-out work is recorded as residual
+content loss on the subtask, which the PR reports; whether the run is done
+is decided on the tree that ships (§6 *A subtask that did not converge is
+reported, not a veto*).
 
 Benched (q4 S3, 11 cases × 2 samples, sonnet): 22/22 gate passes, 0/22 new
 test failures under B\*. Lost content by diff read on 9/22 samples (7 clear,
@@ -8524,9 +8530,10 @@ every composition path.** `_format_pr_end_state_section` turns what the run
 recorded into at most eleven short lists, each under its own heading, each
 present only when it has an entry:
 
-- `## Unconverged` — why the PR is a draft: the outcome decider's reasons
-  (§6 *The run outcome is decided once*) and every `unconverged` subtask
-  with its own reason.
+- `## Unconverged` — every `unconverged` subtask with its own reason, after
+  a line saying their own branches were not merged, whatever the outcome;
+  on a draft, first why it is one: the outcome decider's reasons (§6 *The
+  run outcome is decided once*).
 - `## Still failing when the run ended` — every required item unmet on a
   confirmed falsifier probe and every held-out case still failing on the
   tree that ships, each as a test the reader can run (below, *What is
@@ -8908,8 +8915,10 @@ writer of state's `outcome` — `done`, `no_work` or `unconverged` — and every
 terminal path reaches it: the planning-time no-work exits and finalize's
 empty-branch exit (both through `_finish_no_work_run`) and the normal
 finalize path. The rule, benched as the P7 outcome simulation (90 historical
-runs, 2000 trials each): the run is `unconverged` when any subtask settled
-`unconverged`, when the failing-test-ID diff confirmed a new failure (§9
+runs, 2000 trials each): the run is `unconverged` when a subtask settled
+`unconverged` and either the run branch is empty or final delivery detection
+did not read the required items on the tree that ships (*A subtask that did not converge is reported, not a veto*, below),
+when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
 that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case), or when an existing test's base form fails on the tree that ships (`existing_behaviour_changed`, §8 *What an existing test pins on the base holds on the tree that ships*), or when text the task asked to move into the message files is back in the production code it left (`literal_restored`, §8 *A broken base-form case whose cause is a change the run made is a question first*), or when a run that changed nothing fails tests that passed when the same task last ended `done` (§8 *Done is a fixed bar per task*), or when a worker's round was rolled back because it left its tree unclean (§8 *A worker leaves its tree clean*), or when what `done` rests on was not measured on the tree that ships (*`done` rests on measurements that ran*, below) —
@@ -8920,12 +8929,14 @@ into `run.json`, and the host launcher opens the PR as a **draft** when it
 is `unconverged` — the PR still carries everything that did converge, but it
 cannot be mistaken for finished work — and the body says why: the end-state
 section (§6 *Finalization*) opens with `## Unconverged`, the decider's
-reasons followed by each unconverged subtask's own. Before this, no-work was decided in
+reasons followed by each unconverged subtask's own (listed whatever the
+outcome). Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
 
 *The veto list is one list, and a check joins or leaves it under one bar.*
 Each input above is a veto: any one makes the run `unconverged`, and the
-decider has no input that only reports. The inputs, each with the record it
+decider has no input that only reports (an unconverged subtask is an input
+only where the paragraph below keeps it one). The inputs, each with the record it
 reads, the commit that record is of, whether the decider compares that
 commit with the tree that ships, and what confirmed the verdict, are listed
 once, in IMPLEMENTATION's *Run outcome* table, in the order the decider
@@ -8941,7 +8952,10 @@ reported). So a check's veto is demoted only when, judged
 verdict by verdict on the shipped commit over recorded runs and bench
 samples, no run ground truth calls unfinished becomes `done`, and every true
 verdict of that check is also caught by another true veto in the same run.
-The mirror form governs a ruling that lifts a veto (a set typed broken, a
+The bar counts the verdicts ground truth decides; a verdict it cannot decide
+is reported beside the bar, as the worst case that counts it true and
+uncaught. And a demotion reaches only the shapes the measured runs had: a
+shape none of them had keeps the veto. The mirror form governs a ruling that lifts a veto (a set typed broken, a
 case outside a set's counted bound, a base-form case a required item
 contradicts): it may lift one only when no true verdict is lifted by it.
 Being shown on the shipped commit is necessary but does not separate true
@@ -8949,6 +8963,49 @@ from false where the check executes: a falsifier probe or a base form that
 over-reaches still fails on the final tree (lane S8: 24 of 36 false
 falsifier vetoes, 19 of 19 false base-form cases); their lever is the
 task's intent, decided once per behaviour, not this list.
+
+*A subtask that did not converge is reported, not a veto.* The first
+demotion to meet that bar. A subtask's `unconverged` status is never of the
+commit that ships: it is of the subtask's own tree, or of no tree at all (a
+cascade from an unconverged predecessor, a backed-out integration, a spent
+budget). What the subtask was for is judged on the tree that ships by the
+inputs that read that tree: the required items (V4, V5), the new failures, the held-out
+sets, the merge checks, the residual defects and *`done` rests on
+measurements that ran*. So on a run branch with commits whose required
+items final delivery detection read on the tree that ships, an unconverged
+subtask is reported — the PR names it and its reason (§6 *Finalization*) —
+and no longer vetoes `done`. "Read" is the shape every measured run had:
+final detection's verdict is the latest one and is of the tree that ships,
+its judge did not crash, the delivery ratchet lists no item unverified since,
+at least one item is met or unmet, and every
+unknown item is one a judge read but could not settle — a met resting only
+on a worker's run, or a part nothing in the run can observe (measured runs
+had both) — at detection or at the delivery re-drive's re-check. An item
+the classifier typed external is read by no one here and is left out, as
+in measured runs, which had them. Elsewhere
+it still vetoes: on an empty run branch nothing ships for the other inputs
+to read, and a run that left work unfinished is never `no_work`; without
+that reading (detection skipped, no required items, only an earlier pass's
+verdict, a verdict of another tree, a crashed judge, an item not
+re-verified or no sample inspected, a test outcome not measured) nothing
+read what the subtask was
+for. Measured (lane S9-R1
+M2, 2026-11-20, frozen pre-registration, labels by lane M1's two-rater
+protocol: 15 subtask verdicts in 7 runs, 2 of them done and 5 unfinished by
+ground truth): no unfinished run becomes `done`; the 4 verdicts whose
+subtask's item is truly unmet are each caught by another true veto of the
+same run (8 false, 3 undecided). Two runs that were truly done become
+`done`. Two limits are stated with it. The 3 undecided verdicts are all
+verification-only subtasks (a final scope check; twice, "run the task's
+prescribed verification commands") whose work maps to no counted item:
+counted as true and uncaught, the bar would fail (the worst case reported
+beside it). And one true verdict's item is caught only by the
+residual-defect veto, so this demotion holds while that veto stands: a
+change to the residual-defect veto is judged with this one. A run that ends
+`done` this way records the task's settled bar like any `done` (§8 *Done is
+a fixed bar per task*), so a later run of the same task does not redo the
+unconverged subtask's work while that bar holds: the task is done on what
+was measured, and the subtask's work was not part of it.
 
 *A delivery verdict counts only on the tree it was measured on.* Each
 delivery pass records the committed tree it read beside its verdict
@@ -17865,8 +17922,9 @@ the one way left to test the claim: in `2a663a3e` the dependent was the
 parity test over every audited site, which passes only if the audit's
 claim holds. If the claim was false, the dependent's own checks fail and
 it is re-driven or settles `unconverged` on its own evidence. Nothing is
-presented as done: the predecessor stays `unconverged`, so the run's
-outcome is `unconverged` and its PR opens as a draft. Skipping the
+presented as done: the predecessor stays `unconverged` and the PR names it
+as not done, and the run is `done` only if the tree that ships passes every
+veto (§6 *A subtask that did not converge is reported, not a veto*). Skipping the
 dependent instead discards the cheapest available evidence about the
 claim and leaves its work undone for a reason that is not on the tree.
 
@@ -24265,10 +24323,10 @@ builds on the predecessor's output, and that output is exactly what never
 reaches the run branch (an accepted-external branch is not integrated). Run
 anyway, the dependent cannot succeed — it ends `blocked` on the missing
 upstream (`upstream_missing`), spends its re-drive rounds rediscovering
-that, and settles `unconverged`, turning the run `unconverged` for what is
+that, and settles `unconverged`, reported as unfinished work, for what is
 really the one human-only resource the run already reported. Settled this
-way it spends no implementer and no re-drive round, does not make the run
-`unconverged`, and the human sees one resource gating both subtasks. A
+way it spends no implementer and no re-drive round, is not reported as
+unfinished work, and the human sees one resource gating both subtasks. A
 subtask with an `unconverged` predecessor still settles `unconverged`
 (§13 *One re-drive budget per subtask*): unfinished work outranks
 human-gated work, since a human supplying the resource would not finish it.

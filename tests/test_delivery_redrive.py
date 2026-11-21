@@ -1129,8 +1129,8 @@ def test_falsifier_probe_saved_and_rechecked(leerie, tmp_path, monkeypatch):
     leerie._redrive_apply_item_verdicts(st, got, "sha1")
     assert st.data["delivery_gate"]["unmet_final"] == []
     row = st.data["delivery_gate"]["items"][0]
-    assert row["verdict"] == "met" and row["redrive_recheck"] == {"sha":
-                                                                  "sha1"}
+    assert row["verdict"] == "met" and row["redrive_recheck"] == {
+        "sha": "sha1", "not_inspected": False}
 
     async def unmeasured(st_, caps, tree, sets, label, **kw):
         return [{"index": sets[0]["index"], "passed": False,

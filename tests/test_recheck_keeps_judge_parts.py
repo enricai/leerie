@@ -95,5 +95,6 @@ def test_a_met_recheck_records_that_its_judge_found_nothing(
         leerie, tmp_path, monkeypatch):
     row, st, head = _recheck(leerie, tmp_path, monkeypatch, met=True)
     assert row["verdict"] == "met"
-    assert row["redrive_recheck"] == {"sha": head, "unmet_parts": []}
+    assert row["redrive_recheck"] == {"sha": head, "unmet_parts": [],
+                                     "not_inspected": False}
     assert st.data["delivery_gate"]["unmet_final"] == []

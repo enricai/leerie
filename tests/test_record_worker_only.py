@@ -240,9 +240,13 @@ def test_a_recheck_writes_the_row_unknown_not_met(leerie, world, monkeypatch):
     out = asyncio.run(leerie._redrive_recheck_items(
         st.run_dir, st, dict(leerie.DEFAULT_CAPS), {}, {}, staging, [0]))
     assert out[0]["unmet"] is False and out[0]["unknown"] is True
+    # A worker-only met was read: not `not_inspected` (DESIGN §6 *A subtask
+    # that did not converge is reported, not a veto*).
+    assert "not_inspected" not in out[0]
     leerie._redrive_apply_item_verdicts(st, out, "sha")
     gate = st.data["delivery_gate"]
     assert [r["verdict"] for r in gate["items"]] == ["unknown"]
+    assert gate["items"][0]["redrive_recheck"]["not_inspected"] is False
     assert gate["unmet_final"] == []
     assert leerie._ratchet_prior_met(st) == {}
     assert _human(st)

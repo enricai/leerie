@@ -143,9 +143,15 @@ def test_integration_loss_is_not_filed_as_a_worker_risk(leerie):
          "where": "src/api.ts"}]},
         "subtask_status": {"feat-003": "unconverged"}}
     sec = leerie._format_pr_end_state_section(state)
-    assert sec == ("\n## Integration content loss\n\nWork a merge did not "
-                   "carry into this branch.\n\n- **feat-003**: dropped hunk "
-                   "(`src/api.ts`)")
+    # The unconverged subtask is named under `## Unconverged` (DESIGN §6 *A
+    # subtask that did not converge is reported, not a veto*); its loss only
+    # under its own heading.
+    head, loss = sec.split("\n\n## Integration content loss\n\n")
+    assert head == ("\n## Unconverged\n\n"
+                    + leerie._PR_UNCONVERGED_NOT_IN_PR
+                    + "\n\n- **feat-003**: no reason recorded")
+    assert loss == ("Work a merge did not carry into this branch.\n\n"
+                    "- **feat-003**: dropped hunk (`src/api.ts`)")
 
 
 def test_done_run_has_no_unconverged_section(leerie):
