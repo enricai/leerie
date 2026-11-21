@@ -150,6 +150,17 @@ mkdir -p /home/leerie/.local/state/mise \
          /home/leerie/.gnupg
 chmod 700 /home/leerie/.gnupg
 chown -R leerie: /home/leerie
+
+# The commands' pristine home (DESIGN §6 *A repository command gets nothing
+# the operator handed leerie for itself*): a copy of the image's home before
+# any run's credentials reach it. On an instance the seed only ships the
+# CLI's class into /home/leerie at boot, never into this copy, so a
+# repository command's --base home stays free of the operator's login.
+# container-entry.sh builds it on the container runtimes; an instance has no
+# PID 1 entry, so the bake builds it, owned by leerie as the rest of the
+# home (literal uid: EC2 is the rootful case).
+cp -a /home/leerie /leerie-command-home
+chown -R leerie: /leerie-command-home
 mkdir -p /tmp/.cache
 chown -R leerie: /tmp/.cache
 chmod -R a+rwX /tmp/.cache

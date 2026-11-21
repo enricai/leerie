@@ -52,7 +52,7 @@ def test_seed_auth_fails_without_stage(tmp_path):
 def test_seed_auth_fails_without_credentials_or_token(tmp_path):
     """seed_auth returns 1 with an actionable error when no credentials are available."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude").mkdir(parents=True)
     # .credentials.json absent; CLAUDE_CODE_OAUTH_TOKEN unset
 
     fake_flyctl = tmp_path / "flyctl"
@@ -84,8 +84,8 @@ def test_seed_auth_fails_without_credentials_or_token(tmp_path):
 def test_seed_auth_fails_without_git_identity(tmp_path):
     """seed_auth returns 1 with an actionable error when git user identity is missing."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     # stub flyctl: tar exec succeeds, git config calls succeed.
@@ -125,8 +125,8 @@ def test_seed_auth_fails_without_git_identity(tmp_path):
 def test_seed_auth_succeeds_with_credentials_file(tmp_path):
     """seed_auth returns 0 when $STAGE has .credentials.json and git identity is set."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     # Drain stdin so the gzipped tar producer doesn't SIGPIPE under GNU
@@ -166,7 +166,7 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
 def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     """seed_auth writes a credentials file from $CLAUDE_CODE_OAUTH_TOKEN when none in $STAGE."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude").mkdir(parents=True)
     # No .credentials.json in $STAGE
 
     received_stdin = tmp_path / "received_stdin.txt"
@@ -209,8 +209,8 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
 def test_seed_auth_tar_failure_returns_nonzero(tmp_path):
     """seed_auth returns 1 when the tar pipe into flyctl machine exec fails."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     # stub flyctl: machine exec fails on the tar pipe call

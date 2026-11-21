@@ -303,7 +303,7 @@ unset _clk _k
 # unaffected: Keychain/file resolution below is unchanged.
 #
 # Used by:
-#   - the STAGE-assembly block (sources $STAGE/.claude/.credentials.json
+#   - the STAGE-assembly block (sources $STAGE_CLI/.claude/.credentials.json
 #     for the Fly seed-auth tar pipe) — this is the active path.
 #
 # (The function is also called by chain-aware tests; nothing in the
@@ -9108,7 +9108,7 @@ mkdir -p "$HOME/.cache/leerie"
 # once. A name with no PID (a launcher from before this rule) or a PID a live
 # process reuses goes once untouched for a day (-mmin +1440; `-mtime +1`
 # meant more than 48 h). `-mmin` tests the entry's OWN mtime, which freezes
-# at staging-completion — the container's writes into $STAGE/.claude/* do
+# at staging-completion — the container's writes into $STAGE_CLI/.claude/* do
 # NOT bump it (the container no longer writes there at all: it copies the
 # stage, DESIGN §6 *Every confined process has its own home*) — so the keepalive below `touch`es a live $STAGE hourly. Every
 # entry type goes: a 0-byte regular `cfg-*` file sat beside the dirs for
@@ -9173,6 +9173,16 @@ _stage_keepalive_pid=$!
 trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _repo_build_done 2>/dev/null || true; leerie_unlock "${_image_hold_holder:-}" || true; rm -rf "$STAGE" 2>/dev/null' EXIT
 # `|| true`: under set -e a failed kill (keepalive already gone) would end
 # the trap before $STAGE — staged credentials — is removed.
+# Each file is staged by its purpose (DESIGN §6 *A repository command gets
+# nothing the operator handed leerie for itself*): STAGE_CLI the CLI's own
+# login and settings, the workers' alone; STAGE_HOME what the repository's
+# commands may use too. The entry builds each home from its classes, so a
+# file staged here later lands in a class by construction. Each class maps
+# to paths beneath the home. Defined after the EXIT trap so the trap stays
+# next to the mktemp: the trap removes $STAGE whole, these subdirs with it.
+STAGE_CLI="$STAGE/cli"
+STAGE_HOME="$STAGE/home"
+mkdir -p "$STAGE_CLI" "$STAGE_HOME"
 # The launch's snapshot of its code, taken before any image step
 # (_snapshot_leerie_code, above), moves into $STAGE, which every later exit
 # path removes; a remote runtime runs the code baked into its image and only
@@ -9205,16 +9215,14 @@ _remote_launcher_exit_cleanup() {
 # (lastSessionId, lastCost, MCP allowlists). Stripping it gives the
 # worker a clean slate on /work as a brand-new project.
 #
-# Written at $STAGE/.claude.json (not a dedicated subdirectory) because
-# $STAGE is also the exact tree scripts/remote/seed-auth.sh /
-# ec2-seed-auth.sh tar-pipe wholesale to Fly/EC2 machines (tar -czC
-# "$STAGE" .) — moving this file to a subdirectory would silently change
-# where it lands on those remote runtimes too. The local-only fix below
-# instead mounts the whole of $STAGE read-only at a staging path and has
-# container-entry.sh copy just .claude.json out of it — see the
-# AUTH_MOUNTS comment below for why a single-file bind mount of this path
-# corrupts it under concurrent workers.
-python3 -I - "$HOME/.claude.json" "$STAGE/.claude.json" <<'PY'
+# Written at $STAGE_CLI/.claude.json, the CLI's class: each class's tree
+# maps to paths beneath the home, which scripts/remote/seed-auth.sh /
+# ec2-seed-auth.sh tar-pipe to Fly/EC2 machines class by class. Locally the
+# whole of $STAGE is mounted read-only at a staging path and
+# container-entry.sh copies the classes out of it — see the AUTH_MOUNTS
+# comment below for why a single-file bind mount of this path corrupts it
+# under concurrent workers.
+python3 -I - "$HOME/.claude.json" "$STAGE_CLI/.claude.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 d.pop("projects", None)
@@ -9225,7 +9233,7 @@ PY
 # Blacklist (not whitelist) so a newly-added capability dir Anthropic
 # ships in a future release rides along by default. Update this list
 # only when something *bulky and session-shaped* lands.
-mkdir "$STAGE/.claude"
+mkdir "$STAGE_CLI/.claude"
 CLAUDE_SKIP=(
   history.jsonl     # global prompt history (22+ MB)
   projects          # per-project session transcripts
@@ -9262,16 +9270,16 @@ if command -v rsync >/dev/null 2>&1; then
   EXCLUDES=()
   for s in "${CLAUDE_SKIP[@]}"; do EXCLUDES+=(--exclude="$s"); done
   rsync -a "${EXCLUDES[@]}" --exclude='settings.json.*' \
-    "$HOME/.claude/" "$STAGE/.claude/"
+    "$HOME/.claude/" "$STAGE_CLI/.claude/"
 else
-  cp -aR "$HOME/.claude/." "$STAGE/.claude/"
+  cp -aR "$HOME/.claude/." "$STAGE_CLI/.claude/"
   for s in "${CLAUDE_SKIP[@]}"; do
-    rm -rf "$STAGE/.claude/$s"
+    rm -rf "$STAGE_CLI/.claude/$s"
   done
-  rm -f "$STAGE"/.claude/settings.json.*
+  rm -f "$STAGE_CLI"/.claude/settings.json.*
 fi
 
-# -- Extract OAuth credentials for the staged $STAGE/.claude/. --
+# -- Extract OAuth credentials for the staged $STAGE_CLI/.claude/. --
 # On macOS the CLI stores its OAuth token in the Keychain (service
 # `Claude Code-credentials`), not in a file. The Linux CLI reads the
 # same JSON from ~/.claude/.credentials.json, so writing whatever
@@ -9340,11 +9348,11 @@ if _CLAUDE_CREDS_JSON="$(_extract_claude_credentials_json)" \
    && [ -n "$_CLAUDE_CREDS_JSON" ]; then
   rm -f "$_CLAUDE_CREDS_REJECT_REASON_FILE"
   _check_claude_credential_ttl "$_CLAUDE_CREDS_JSON" || exit 1
-  printf '%s' "$_CLAUDE_CREDS_JSON" >"$STAGE/.claude/.credentials.json"
-  chmod 600 "$STAGE/.claude/.credentials.json"
+  printf '%s' "$_CLAUDE_CREDS_JSON" >"$STAGE_CLI/.claude/.credentials.json"
+  chmod 600 "$STAGE_CLI/.claude/.credentials.json"
   unset _CLAUDE_CREDS_JSON
 else
-  rm -f "$STAGE/.claude/.credentials.json"
+  rm -f "$STAGE_CLI/.claude/.credentials.json"
   # Read the rejection reason back from the file _extract_claude_credentials_json
   # wrote it to. This must be a file, not a plain shell var set inside the
   # function: the function above is invoked via $(...), which forks a
@@ -9406,11 +9414,11 @@ fi
 # to its default in-container location.
 for f in "$HOME"/.git*; do
   [ -e "$f" ] || continue
-  cp -aR "$f" "$STAGE/"
+  cp -aR "$f" "$STAGE_HOME/"
 done
 if [ -d "$HOME/.config/git" ]; then
-  mkdir -p "$STAGE/.config"
-  cp -aR "$HOME/.config/git" "$STAGE/.config/"
+  mkdir -p "$STAGE_HOME/.config"
+  cp -aR "$HOME/.config/git" "$STAGE_HOME/.config/"
 fi
 
 # -- ~/.netrc, ~/.ssh/, ~/.gnupg/ (auth/signing material). --
@@ -9423,41 +9431,41 @@ fi
 # (S.gpg-agent, ssh-agent's UNIX sockets) are host-bound, can't be
 # `cp -a`'d cleanly, and aren't reachable from inside the container.
 if [ -f "$HOME/.netrc" ]; then
-  cp -a "$HOME/.netrc" "$STAGE/.netrc"
+  cp -a "$HOME/.netrc" "$STAGE_HOME/.netrc"
 fi
 if [ -d "$HOME/.ssh" ]; then
-  mkdir -p "$STAGE/.ssh"
+  mkdir -p "$STAGE_HOME/.ssh"
   if command -v rsync >/dev/null 2>&1; then
     rsync -a \
       --exclude='agent' --exclude='S.*' --exclude='*.sock' \
-      "$HOME/.ssh/" "$STAGE/.ssh/"
+      "$HOME/.ssh/" "$STAGE_HOME/.ssh/"
   else
-    cp -aR "$HOME/.ssh/." "$STAGE/.ssh/"
-    rm -rf "$STAGE/.ssh/agent"
-    find "$STAGE/.ssh" -name 'S.*' -delete 2>/dev/null
-    find "$STAGE/.ssh" -name '*.sock' -delete 2>/dev/null
+    cp -aR "$HOME/.ssh/." "$STAGE_HOME/.ssh/"
+    rm -rf "$STAGE_HOME/.ssh/agent"
+    find "$STAGE_HOME/.ssh" -name 'S.*' -delete 2>/dev/null
+    find "$STAGE_HOME/.ssh" -name '*.sock' -delete 2>/dev/null
   fi
-  chmod 700 "$STAGE/.ssh"
+  chmod 700 "$STAGE_HOME/.ssh"
 fi
 if [ -d "$HOME/.gnupg" ]; then
-  mkdir -p "$STAGE/.gnupg"
+  mkdir -p "$STAGE_HOME/.gnupg"
   if command -v rsync >/dev/null 2>&1; then
     rsync -a --exclude='S.*' --exclude='*.sock' \
-      "$HOME/.gnupg/" "$STAGE/.gnupg/"
+      "$HOME/.gnupg/" "$STAGE_HOME/.gnupg/"
   else
-    cp -aR "$HOME/.gnupg/." "$STAGE/.gnupg/"
-    find "$STAGE/.gnupg" -name 'S.*' -delete 2>/dev/null
-    find "$STAGE/.gnupg" -name '*.sock' -delete 2>/dev/null
+    cp -aR "$HOME/.gnupg/." "$STAGE_HOME/.gnupg/"
+    find "$STAGE_HOME/.gnupg" -name 'S.*' -delete 2>/dev/null
+    find "$STAGE_HOME/.gnupg" -name '*.sock' -delete 2>/dev/null
   fi
-  chmod 700 "$STAGE/.gnupg"
+  chmod 700 "$STAGE_HOME/.gnupg"
   # Strip use-keyboxd: macOS GnuPG 2.4+ enables keyboxd by default, but
   # the container can't reach the host daemon (socket excluded above) and
   # gpg crashes with "SQL library used incorrectly" during mise's Node
   # signature verification. Falling back to file-based pubring.kbx lookup.
-  if [ -f "$STAGE/.gnupg/common.conf" ]; then
-    grep -v '^[[:space:]]*use-keyboxd[[:space:]]*$' "$STAGE/.gnupg/common.conf" \
-      > "$STAGE/.gnupg/common.conf.tmp" || true
-    mv "$STAGE/.gnupg/common.conf.tmp" "$STAGE/.gnupg/common.conf"
+  if [ -f "$STAGE_HOME/.gnupg/common.conf" ]; then
+    grep -v '^[[:space:]]*use-keyboxd[[:space:]]*$' "$STAGE_HOME/.gnupg/common.conf" \
+      > "$STAGE_HOME/.gnupg/common.conf.tmp" || true
+    mv "$STAGE_HOME/.gnupg/common.conf.tmp" "$STAGE_HOME/.gnupg/common.conf"
   fi
 fi
 
@@ -9517,12 +9525,12 @@ if [ "$_BEDROCK_BEARER_ACTIVE" = "false" ] && detect_bedrock_mode; then
     exit 1
   fi
   bedrock_preflight
-  mkdir -p "$STAGE/.aws"
+  mkdir -p "$STAGE_CLI/.aws"
   if command -v rsync >/dev/null 2>&1; then
-    rsync -a --exclude='cli/cache' "$HOME/.aws/" "$STAGE/.aws/"
+    rsync -a --exclude='cli/cache' "$HOME/.aws/" "$STAGE_CLI/.aws/"
   else
-    cp -aR "$HOME/.aws/." "$STAGE/.aws/"
-    rm -rf "$STAGE/.aws/cli/cache"
+    cp -aR "$HOME/.aws/." "$STAGE_CLI/.aws/"
+    rm -rf "$STAGE_CLI/.aws/cli/cache"
   fi
   # Copied into the home by the entry with the rest of $STAGE (below).
   # Belt-and-suspenders: also inject Bedrock env vars explicitly so
@@ -9571,17 +9579,17 @@ fi
 
 # -- The staged home reaches the container as a copy, never a mount. --
 # The whole of $STAGE is mounted read-only at /opt/leerie-home-src, and
-# container-entry.sh copies its dot-entries (`.claude`, `.claude.json`, the
-# git files, `.config/git`, `.netrc`, `.ssh`, `.gnupg`, `.aws`) into
-# /home/leerie as real files of the container's own filesystem before it
-# drops privilege. Nothing is mounted beneath /home/leerie: each confined
+# container-entry.sh copies its classes into the homes as real files of the
+# container's own filesystem before it drops privilege: `home/` into the
+# workers' /home/leerie and the commands' pristine home, `cli/` into
+# /home/leerie only; no confined process reads the mount itself. Nothing is mounted beneath /home/leerie: each confined
 # process gets an overlay copy of the home, and an overlay's lower layer
 # cannot hold a mount; and no write inside the container reaches $STAGE or
 # the host (DESIGN §6 *Every confined process has its own home*). A copied
 # .claude.json also keeps the CLI's atomic rename() working, which a
 # bind-mounted single file breaks (EBUSY, then a non-atomic truncate under
-# concurrent workers: N19). The same tree is what seed-auth.sh /
-# ec2-seed-auth.sh tar-copy to Fly/EC2.
+# concurrent workers: N19). `cli/` is what seed-auth.sh / ec2-seed-auth.sh
+# tar-copy to Fly/EC2.
 AUTH_MOUNTS+=(-v "$STAGE:/opt/leerie-home-src:ro")
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
@@ -10372,6 +10380,12 @@ child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
+# Every variable set below is for leerie itself (its configuration, the
+# credentials of its workers), never for the repository: named, so the
+# orchestrator keeps them out of the environment of every repository
+# command (DESIGN section 6, A repository command gets nothing the operator
+# handed leerie for itself).
+_identity = dict(child_env)
 # Carry the host repo basename so the log() prefix of the orchestrator
 # (Path(USER_REPO).name) matches the host-side remote_log() prefix.
 # Without this the orchestrator cwd=/work falls back to basename
@@ -10404,6 +10418,8 @@ if ${_oauth_token_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_oauth_token_json}
 if ${_oauth_tokens_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_oauth_tokens_json}
+child_env["LEERIE_LAUNCHER_ENV"] = ",".join(
+    k for k in child_env if _identity.get(k) != child_env[k])
 PY
           _render_launch_suffix
         )"
@@ -10788,6 +10804,12 @@ except FileNotFoundError:
 child_env["HOME"] = "/home/leerie"
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
+# Every variable set below is for leerie itself (its configuration, the
+# credentials of its workers), never for the repository: named, so the
+# orchestrator keeps them out of the environment of every repository
+# command (DESIGN section 6, A repository command gets nothing the operator
+# handed leerie for itself).
+_identity = dict(child_env)
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = "${_ec2_host_tz}"
 child_env["LEERIE_COMMIT"] = ${_ec2_leerie_commit_json}
@@ -10795,6 +10817,8 @@ if ${_ec2_oauth_token_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_ec2_oauth_token_json}
 if ${_ec2_oauth_tokens_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_ec2_oauth_tokens_json}
+child_env["LEERIE_LAUNCHER_ENV"] = ",".join(
+    k for k in child_env if _identity.get(k) != child_env[k])
 PY
             _render_launch_suffix
           )"
@@ -11502,6 +11526,29 @@ else
     "${REPO_IMAGE_REF:-$IMAGE_TAG}" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}
     ${REWRITTEN_TAIL[@]+"${REWRITTEN_TAIL[@]}"}
   )
+  # Every variable passed above is leerie's — its configuration or its
+  # workers' credentials — and none the repository's: name them all, from
+  # the argv itself, so the orchestrator keeps them out of every repository
+  # command's environment, one passed here later included (DESIGN §6 *A
+  # repository command gets nothing the operator handed leerie for
+  # itself*). Every `-e` comes before the working directory's `-w`.
+  _launcher_env=""
+  _with_env=()
+  _prev=""
+  _named=false
+  for _rarg in "${_run_argv[@]}"; do
+    if [ "$_prev" = "-e" ]; then
+      _launcher_env="${_launcher_env:+$_launcher_env,}${_rarg%%=*}"
+    fi
+    if [ "$_rarg" = "-w" ] && [ "$_named" = false ]; then
+      _with_env+=(-e "LEERIE_LAUNCHER_ENV=$_launcher_env")
+      _named=true
+    fi
+    _with_env+=("$_rarg")
+    _prev="$_rarg"
+  done
+  _run_argv=("${_with_env[@]}")
+  unset _with_env _prev _named _launcher_env
   if [ -n "$_run_log" ]; then
     # Decoupled: nerdctl → run-log file; a tail WE own streams the file to our
     # own stdout so the SSH mux never holds our stdout pipe (see above).

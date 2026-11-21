@@ -4571,6 +4571,86 @@ confined worker's shell and spawns the runner itself, so it runs inside
 that worker's grants (*A worker writes only where it is granted*): no
 second grant applies.
 
+### A repository command gets nothing the operator handed leerie for itself
+
+*Designed 2026-11-21 (lane R8's finding, lane PX).*
+
+**Root cause.** The operator hands leerie two things for its own use:
+its workers' credentials (the CLI's login, a subscription token, a
+Bedrock profile or bearer token) and leerie's configuration. They reached
+every repository command leerie runs by three channels, measured at
+3f73fd78 in the leerie image with a confined command of the measurement,
+install and setup-hook kinds:
+
+- *the environment*: a command's environment was the orchestrator's
+  (`_repo_command_env` started from `os.environ`, `_acceptance_report_spec`
+  from `{**os.environ, …}`), and the launcher passes the token in it
+  (`-e CLAUDE_CODE_OAUTH_TOKEN`), so the command printed it;
+- *the home*: each command's `$HOME` is an overlay of the pristine home
+  (*Every confined process has its own home*), and the entry copies the
+  whole staged directory into it, `.claude/.credentials.json` included,
+  so `cat ~/.claude/.credentials.json` printed the login;
+- *the staged directory itself*: `/opt/leerie-home-src`, the read-only
+  mount the entry copies from, lies outside the state root, which every
+  confined process reads.
+
+An install, a toolchain install and the setup hook have the outside
+network (*A confined process has its own network*), so a `postinstall`
+could send the login out. The defect is not a missing name on a deny
+list: what a command started with was derived from what leerie itself
+was given, and leerie is given secrets.
+
+**Invariant: a repository command's world is built from what is for the
+repository, never from what the operator handed leerie for itself.** What
+the launcher hands the container says who it is for where it is handed,
+so a credential or setting added later lands in a class by construction:
+
+1. *The environment.* Every variable the launcher passes into the
+   container (`-e`) is leerie's: its configuration (`LEERIE_*`, the run's
+   identity) or its workers' credentials. None is the repository's. The
+   launcher names them all in `LEERIE_LAUNCHER_ENV`, computed from the run
+   argv it is about to execute, so a variable added to that argv later is
+   named with it. A repository command's grant drops every name listed
+   there, and the list itself (`_measurement_grants`' `drop`, applied by
+   `_grant_env`, which every confined repository command's environment goes
+   through). What it keeps is the container's own environment — the
+   image's, the entry's identity — and what leerie sets for the command.
+   A worker is the CLI, and keeps them: it authenticates by them.
+2. *The home.* The launcher stages each file by its purpose: the CLI's own
+   login and settings (`.claude/`, `.claude.json`, and `.aws/`, staged only
+   for Bedrock) in `$STAGE/cli/`; what the repository's commands may use
+   (the git files, `.netrc`, `.ssh/`, `.gnupg/`) in `$STAGE/home/`. The
+   entry makes the commands' pristine home, `/leerie-command-home`, a copy
+   of the image's home and `home/` only; the workers' home, `/home/leerie`,
+   is the image's home and both. A repository command's home overlay has
+   the commands' pristine home as its bottom layer in place of the
+   workers' (`--home $HOME --base /leerie-command-home`), so `~` still
+   names `$HOME` and the workers' home beneath it is not reachable.
+3. *The staged directory.* No confined process reads it: the reads
+   outside the state root leave it out, as they leave out the host
+   directory (`_reads_outside`).
+
+The commands' pristine home is owned as the workers' is on each runtime
+(CLAUDE.md's three-runtime rule): made by the entry's root, so leerie's
+under rootless; chowned to leerie by the rootful guard. On Fly and EC2,
+where the stage is tar-copied into a running machine rather than mounted,
+only `cli/` is copied, into the workers' home (the repository's git and
+signing material never left the host there: git's auth is host-side,
+*Finalization*); the launch wrapper names what it sets in the
+orchestrator's environment the same way, in `LEERIE_LAUNCHER_ENV`.
+
+*Open, for the user: what of `home/` the repository's commands keep.*
+`.ssh/`, `.gnupg/`, `.netrc` and the git files (`.git-credentials`
+among them) are credentials too, but a private git dependency over SSH or
+HTTPS, and a test that signs a commit, need them; they stay the commands'
+until the user decides.
+
+*Not in this invariant: a worker's own commands.* A worker's shell runs in
+the worker's world, which is the CLI's: the login is there because the CLI
+authenticates by it, and a command a worker runs reads what the worker
+can. A worker's grant (I5) bounds what it writes, not what its session
+knows.
+
 ### Leerie's git never takes a tree's repository from the tree
 
 **Root cause (review round 19 isolation H1).** Confined code writes its

@@ -48,14 +48,15 @@ def test_claude_json_is_never_bind_mounted_as_a_single_file():
     assert '.claude.json:/home/leerie/.claude.json' not in text
 
 
-def test_claude_json_still_written_at_the_stage_root():
-    """$STAGE is also the exact tree seed-auth.sh/ec2-seed-auth.sh
-    tar-pipe wholesale to Fly/EC2; .claude.json must stay at $STAGE's
-    root (not move into a subdirectory) or the remote seeding paths would
-    silently relocate it too."""
+def test_claude_json_written_in_the_cli_class():
+    """.claude.json is the CLI's own (DESIGN §6 *A repository command gets
+    nothing the operator handed leerie for itself*), staged under
+    $STAGE_CLI — not at $STAGE's root, where the entry would copy it into
+    the commands' pristine home too, and not the repository's class."""
     text = _launcher_text()
-    assert '"$STAGE/.claude.json"' in text
-    assert 'mkdir "$STAGE/claude-json-src"' not in text
+    assert '"$STAGE_CLI/.claude.json"' in text
+    # Never at the stage root (the entry's cli-vs-home split keys on it).
+    assert '"$STAGE/.claude.json"' not in text
 
 
 def test_stage_mounted_as_a_readonly_directory_for_the_local_container():
@@ -75,36 +76,61 @@ def test_claude_dir_is_copied_not_mounted():
 # ---------------------------------------------------------------------------
 
 
-def _entry_sh_claude_json_copy_block() -> str:
+_CLI_COPY = "_copy_dots /opt/leerie-home-src/cli /home/leerie"
+_HOME_COPY = "_copy_dots /opt/leerie-home-src/home /home/leerie"
+_CMD_HOME_BUILD = '_copy_dots /home/leerie "$LEERIE_COMMAND_HOME"'
+
+
+def _entry_sh_copy_region() -> str:
+    """The copy region: the `_copy_dots` helper, the commands'-home build,
+    and the staged-class copies."""
     text = _entry_sh_text()
-    marker = "if [ -d /opt/leerie-home-src ]; then"
-    start = text.index(marker)
-    end = text.index("\nfi", start)
+    start = text.index("_copy_dots() {")
+    end = text.index("_copy_dots /opt/leerie-home-src/cli /home/leerie")
+    end = text.index("\nfi", end) + len("\nfi")
     return text[start:end]
 
 
-def test_container_entry_copies_the_staged_home_into_place():
-    block = _entry_sh_claude_json_copy_block()
-    assert 'cp -a "$_e" /home/leerie/' in block
+def test_container_entry_copies_each_staged_class_into_place():
+    """The CLI's own class (`cli/`) and the repository's (`home/`) are
+    copied into the workers' home; nothing is bind-mounted beneath it."""
+    text = _entry_sh_text()
+    assert _CLI_COPY in text
+    assert _HOME_COPY in text
+
+
+def test_container_entry_builds_the_commands_home_from_image_plus_home_class():
+    """The commands' pristine home is the image's home and `home/` only —
+    never `cli/`, so the operator's login (`.claude/.credentials.json`) is
+    not in it (DESIGN §6 *A repository command gets nothing the operator
+    handed leerie for itself*)."""
+    text = _entry_sh_text()
+    build_idx = text.index(_CMD_HOME_BUILD)
+    home_into_cmd = text.index(
+        '_copy_dots /opt/leerie-home-src/home "$LEERIE_COMMAND_HOME"')
+    assert build_idx < home_into_cmd
+    # cli/ goes into /home/leerie only, never the commands' home.
+    assert '_copy_dots /opt/leerie-home-src/cli "$LEERIE_COMMAND_HOME"' \
+        not in text
 
 
 def test_container_entry_copy_step_does_not_itself_chown():
     """The copy runs unconditionally (regardless of ROOTLESS); ownership
-    is handled entirely by the shared rootful guard below it, not by a
-    second, separate ROOTLESS check duplicated here."""
-    block = _entry_sh_claude_json_copy_block()
+    is handled by the shared rootful guard below it."""
+    block = _entry_sh_copy_region()
     assert "chown" not in block
     assert "ROOTLESS" not in block
 
 
-def test_container_entry_chowns_the_home_in_the_shared_rootful_guard():
+def test_container_entry_chowns_both_homes_in_the_shared_rootful_guard():
     block = _entry_sh_rootful_block()
     assert "chown -R leerie: /home/leerie " in block
+    assert 'chown -R leerie: "$LEERIE_COMMAND_HOME"' in block
 
 
-def test_container_entry_claude_json_copy_precedes_privilege_drop():
+def test_container_entry_copy_precedes_privilege_drop():
     text = _entry_sh_text()
-    copy_idx = text.index('cp -a "$_e" /home/leerie/')
+    copy_idx = text.index(_CLI_COPY)
     unshare_idx = text.index("unshare --user --map-user=")
     orchestrator_idx = text.rindex(
         "python3 /opt/leerie-image/orchestrator/leerie.py"
@@ -113,9 +139,9 @@ def test_container_entry_claude_json_copy_precedes_privilege_drop():
     assert copy_idx < orchestrator_idx
 
 
-def test_container_entry_claude_json_copy_precedes_the_rootful_chown():
+def test_container_entry_copy_precedes_the_rootful_chown():
     text = _entry_sh_text()
-    copy_idx = text.index('cp -a "$_e" /home/leerie/')
+    copy_idx = text.index(_CLI_COPY)
     chown_idx = text.index("chown -R leerie: /home/leerie ")
     assert copy_idx < chown_idx
 
@@ -126,116 +152,122 @@ def test_container_entry_claude_json_copy_precedes_the_rootful_chown():
 # ---------------------------------------------------------------------------
 
 
-def _run_copy_and_ownership(
-    rootless: bool, has_leerie_user: bool
-) -> tuple[bool, str | None, bool]:
-    """Execute the real copy block plus the real shared rootful-guard
-    block from container-entry.sh, back to back (as they run in the
-    script), in a throwaway sh with `cp`/`chown`/`getent` faked onto PATH
-    so no real privilege changes happen. Returns (dest_exists,
-    dest_content, chown_invoked_on_claude_json) — read out *inside* the
-    tempdir's lifetime, since the tempdir (and everything under it,
-    including the dest file) is removed the moment the `with` block
-    exits."""
-    copy_block = _entry_sh_claude_json_copy_block() + "\nfi\n"
+def _run_entry_copies(rootless: bool) -> dict:
+    """Run the real entry copy region (the `_copy_dots` helper, the
+    commands'-home build, the staged-class copies) plus the shared rootful
+    guard, back to back as the entry runs them, in a throwaway sh with
+    `cp`/`chown`/`getent` faked onto PATH. The staged directory holds the
+    CLI's login (`cli/.claude/.credentials.json`) and a repository file
+    (`home/.gitconfig`). Returns what landed in each home and which homes
+    were chowned. Read out inside the tempdir's lifetime."""
+    region = _entry_sh_copy_region()
     rootful_block = _entry_sh_rootful_block() + "\nfi\n"
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        src_dir = tmp_path / "opt" / "leerie-home-src"
-        src_dir.mkdir(parents=True)
-        (src_dir / ".claude.json").write_text('{"ok": true}')
-        (src_dir / "leerie-code").mkdir()
-        dest_dir = tmp_path / "home" / "leerie"
-        dest_dir.mkdir(parents=True)
+        src = tmp_path / "opt" / "leerie-home-src"
+        (src / "cli" / ".claude").mkdir(parents=True)
+        (src / "cli" / ".claude" / ".credentials.json").write_text("LOGIN")
+        (src / "cli" / ".claude.json").write_text('{"ok": true}')
+        (src / "home").mkdir()
+        (src / "home" / ".gitconfig").write_text("[user]\n")
+        (src / "leerie-code").mkdir()           # neither class: not copied
+        home = tmp_path / "home" / "leerie"
+        home.mkdir(parents=True)
+        (home / ".image-file").write_text("img")   # the image's own home
+        cmd_home = tmp_path / "leerie-command-home"
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         chown_log = tmp_path / "chown.log"
-
-        # Fake getent: succeeds (user "leerie" exists) iff has_leerie_user.
-        getent_rc = 0 if has_leerie_user else 1
-        (bin_dir / "getent").write_text(f"#!/bin/sh\nexit {getent_rc}\n")
+        (bin_dir / "getent").write_text("#!/bin/sh\nexit 0\n")
         (bin_dir / "getent").chmod(0o755)
-
         (bin_dir / "chown").write_text(
-            f'#!/bin/sh\necho "$@" >> "{chown_log}"\nexit 0\n'
-        )
+            f'#!/bin/sh\necho "$@" >> "{chown_log}"\nexit 0\n')
         (bin_dir / "chown").chmod(0o755)
 
-        def _rewrite(text: str) -> str:
-            return text.replace(
-                "/opt/leerie-home-src", str(src_dir),
-            ).replace(
-                "/home/leerie/", str(dest_dir) + "/"
-            ).replace(
-                "/home/leerie ", str(dest_dir) + " "
-            ).replace(
-                "/work ", str(tmp_path / "work") + " "
-            ).replace(
-                "/tmp/.cache", str(tmp_path / "tmpcache")
-            )
+        def _rw(text: str) -> str:
+            return (text.replace("/opt/leerie-home-src", str(src))
+                        .replace("/home/leerie", str(home))
+                        .replace("/work ", str(tmp_path / "work") + " ")
+                        .replace("/tmp/.cache", str(tmp_path / "tmpcache")))
 
         script = (
             "#!/bin/sh\nset -e\n"
             f'ROOTLESS={"true" if rootless else "false"}\n'
+            f'export LEERIE_COMMAND_HOME="{cmd_home}"\n'
             f'export PATH="{bin_dir}:$PATH"\n'
-            + _rewrite(copy_block)
-            + "\n"
-            + _rewrite(rootful_block)
-        )
-        subprocess.run(
-            ["sh", "-c", script], check=True, cwd=tmp_path, timeout=10
-        )
-        dest_file = dest_dir / ".claude.json"
-        dest_exists = dest_file.exists()
-        dest_content = dest_file.read_text() if dest_exists else None
-        # The home is chowned whole (`chown -R leerie: <home>`).
-        chown_invoked = chown_log.exists() and any(
-            line.split()[-1] == str(dest_dir)
-            for line in chown_log.read_text().splitlines()
-            if line.startswith("-R "))
-        assert not (dest_dir / "leerie-code").exists()
-        return dest_exists, dest_content, chown_invoked
+            + _rw(region) + "\n" + _rw(rootful_block))
+        subprocess.run(["sh", "-c", script], check=True, cwd=tmp_path,
+                       timeout=10)
+
+        def _chowned(path: Path) -> bool:
+            return chown_log.exists() and any(
+                line.split()[-1] == str(path)
+                for line in chown_log.read_text().splitlines()
+                if line.startswith("-R "))
+        return {
+            "worker_login": (home / ".claude" / ".credentials.json").exists(),
+            "worker_claude_json": (home / ".claude.json").exists(),
+            "worker_gitconfig": (home / ".gitconfig").exists(),
+            "cmd_login": (cmd_home / ".claude" / ".credentials.json").exists(),
+            "cmd_claude_json": (cmd_home / ".claude.json").exists(),
+            "cmd_gitconfig": (cmd_home / ".gitconfig").exists(),
+            "cmd_image_file": (cmd_home / ".image-file").exists(),
+            "worker_leerie_code": (home / "leerie-code").exists(),
+            "worker_chowned": _chowned(home),
+            "cmd_chowned": _chowned(cmd_home),
+        }
 
 
-def test_copy_happens_and_content_matches_under_rootless():
-    exists, content, chowned = _run_copy_and_ownership(
-        rootless=True, has_leerie_user=True
-    )
-    assert exists
-    assert content == '{"ok": true}'
-    # Rootless: must NOT chown to leerie — a root-owned file is what maps
-    # correctly through the single-entry unshare --map-user remap; an
-    # explicit chown to the image's literal leerie UID would make it
-    # appear as nobody/65534 inside the remapped namespace.
-    assert chowned is False
+def test_the_login_reaches_the_worker_home_but_not_the_commands_home():
+    """The two-sided security property at the entry (DESIGN §6 *A
+    repository command gets nothing the operator handed leerie for
+    itself*): the CLI's login is in the workers' home and absent from the
+    commands' pristine home, while a repository file (.gitconfig) is in
+    both. This is the regression anchor against a future change leaking the
+    credential back into the command home."""
+    for rootless in (True, False):
+        r = _run_entry_copies(rootless)
+        # Worker home: both the login (cli class) and the repo file.
+        assert r["worker_login"] and r["worker_claude_json"], r
+        assert r["worker_gitconfig"], r
+        # Commands' home: the repo file and the image's own, never the login.
+        assert r["cmd_gitconfig"] and r["cmd_image_file"], r
+        assert not r["cmd_login"], r
+        assert not r["cmd_claude_json"], r
+        # `leerie-code` is neither class and is copied nowhere.
+        assert not r["worker_leerie_code"], r
 
 
-def test_copy_happens_and_chowns_under_rootful():
-    exists, content, chowned = _run_copy_and_ownership(
-        rootless=False, has_leerie_user=True
-    )
-    assert exists
-    assert content == '{"ok": true}'
-    # Rootful: `runuser -u leerie` is a real uid switch with no remap, so
-    # the copied file must be explicitly chowned to leerie.
-    assert chowned is True
+def test_both_homes_chowned_under_rootful_not_rootless():
+    """Rootless: a root-owned copy maps to leerie through the single-entry
+    unshare remap, so NO chown (CLAUDE.md's Dockerfile:235-241 trap).
+    Rootful: `runuser -u leerie` is a real uid switch, so BOTH the workers'
+    home and the commands' home are chowned to leerie."""
+    rootless = _run_entry_copies(True)
+    assert rootless["worker_chowned"] is False
+    assert rootless["cmd_chowned"] is False
+    rootful = _run_entry_copies(False)
+    assert rootful["worker_chowned"] is True
+    assert rootful["cmd_chowned"] is True
 
 
 def test_copy_is_a_noop_when_source_mount_absent():
-    """Fly/EC2 seed .claude.json directly; no such mount exists there, so
-    the copy step must not error when the source is missing."""
-    block = _entry_sh_claude_json_copy_block() + "\nfi\n"
+    """Fly/EC2 seed the stage differently; no `/opt/leerie-home-src` mount
+    exists there, so the staged-class copy must not error when the source
+    is missing (the commands'-home build still runs from the image home)."""
+    region = _entry_sh_copy_region()
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        dest_dir = tmp_path / "home" / "leerie"
-        dest_dir.mkdir(parents=True)
+        home = tmp_path / "home" / "leerie"
+        home.mkdir(parents=True)
+        cmd_home = tmp_path / "leerie-command-home"
         script = (
-            "#!/bin/sh\nset -e\nROOTLESS=false\n"
-            + block.replace(
-                "/opt/leerie-home-src", str(tmp_path / "nonexistent"),
-            ).replace(
-                "/home/leerie/", str(dest_dir) + "/"
-            )
-        )
-        subprocess.run(["sh", "-c", script], check=True, cwd=tmp_path, timeout=10)
-        assert not (dest_dir / ".claude.json").exists()
+            "#!/bin/sh\nset -e\n"
+            f'export LEERIE_COMMAND_HOME="{cmd_home}"\n'
+            + region.replace(
+                "/opt/leerie-home-src", str(tmp_path / "nonexistent"))
+                    .replace("/home/leerie", str(home)))
+        subprocess.run(["sh", "-c", script], check=True, cwd=tmp_path,
+                       timeout=10)
+        assert not (home / ".claude.json").exists()
+        assert cmd_home.is_dir()

@@ -167,7 +167,7 @@ def test_ec2_seed_auth_fails_when_aws_missing(tmp_path):
 
 def test_ec2_seed_auth_fails_without_credentials_or_token(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude").mkdir(parents=True)
     # .credentials.json absent; CLAUDE_CODE_OAUTH_TOKEN unset
 
     dest = tmp_path / "instance"
@@ -188,8 +188,8 @@ def test_ec2_seed_auth_fails_without_credentials_or_token(tmp_path):
 
 def test_ec2_seed_auth_fails_without_git_identity(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
@@ -214,10 +214,10 @@ def test_ec2_seed_auth_fails_without_git_identity(tmp_path):
 
 def test_ec2_seed_auth_succeeds_with_credentials_file(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
-    (stage / ".claude.json").write_text('{"projects":{}}')
+    (stage / "cli" / ".claude.json").write_text('{"projects":{}}')
 
     dest = tmp_path / "instance"
     dest.mkdir()
@@ -239,9 +239,44 @@ def test_ec2_seed_auth_succeeds_with_credentials_file(tmp_path):
     assert (home / ".claude.json").exists()
 
 
+def test_ec2_seed_auth_ships_the_cli_class_only_not_the_home_class(tmp_path):
+    """Only $STAGE/cli reaches the instance (DESIGN §6 *A repository command
+    gets nothing the operator handed leerie for itself*): the CLI's login
+    arrives in /home/leerie, while a $STAGE/home-class file (the repo's git
+    or ssh material) does not ride the tar — the remote's git auth is
+    host-side (DESIGN §6 *Finalization*), and the instance builds the
+    commands' pristine home itself (ec2-bake.sh), never from a run's stage."""
+    stage = tmp_path / "stage"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude" / ".credentials.json").write_text(
+        '{"claudeAiOauth":{"accessToken":"tok"}}')
+    # A home-class secret the launcher would stage for repository commands.
+    (stage / "home" / ".ssh").mkdir(parents=True)
+    (stage / "home" / ".ssh" / "id_x").write_text("PRIVATE-KEY")
+
+    dest = tmp_path / "instance"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    _make_stub_aws(tmp_path / "aws", exec_log, dest)
+    _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
+    _make_stub_timeout(tmp_path)
+    _make_stub_git(tmp_path / "git")
+
+    result = run_bash(
+        f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
+        env=_base_env(tmp_path, stage),
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    home = dest / "home" / "leerie"
+    # The CLI class arrived; the home class did not.
+    assert (home / ".claude" / ".credentials.json").exists()
+    assert not (home / ".ssh").exists(), (
+        "a $STAGE/home-class file must not ship to the instance")
+
+
 def test_ec2_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
+    (stage / "cli" / ".claude").mkdir(parents=True)
     # No .credentials.json in $STAGE
 
     dest = tmp_path / "instance"
@@ -284,11 +319,11 @@ def test_ec2_seed_auth_plugin_cache_and_marketplaces_not_re_excluded_by_tar(tmp_
     tar-exclude list was ported verbatim rather than gaining a new
     exclusion this script was never asked to own."""
     stage = tmp_path / "stage"
-    (stage / ".claude" / "plugins" / "cache").mkdir(parents=True)
-    (stage / ".claude" / "plugins" / "cache" / "big-blob.bin").write_text("x" * 100)
-    (stage / ".claude" / "plugins" / "marketplaces").mkdir(parents=True)
-    (stage / ".claude" / "plugins" / "marketplaces" / "mkt.json").write_text("{}")
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude" / "plugins" / "cache").mkdir(parents=True)
+    (stage / "cli" / ".claude" / "plugins" / "cache" / "big-blob.bin").write_text("x" * 100)
+    (stage / "cli" / ".claude" / "plugins" / "marketplaces").mkdir(parents=True)
+    (stage / "cli" / ".claude" / "plugins" / "marketplaces" / "mkt.json").write_text("{}")
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
@@ -363,8 +398,8 @@ def test_ec2_seed_auth_fixes_ownership_to_leerie(tmp_path):
     actually issued both ownership-fix calls (bulk tree + gitconfig),
     not merely that the literal string appears in the source."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
@@ -394,8 +429,8 @@ def test_ec2_seed_auth_fixes_ownership_to_leerie(tmp_path):
 
 def test_ec2_seed_auth_uses_ec2_transport_never_flyctl(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
@@ -419,8 +454,8 @@ def test_ec2_seed_auth_uses_ec2_transport_never_flyctl(tmp_path):
 
 def test_ec2_seed_auth_writes_git_identity(tmp_path):
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
@@ -463,8 +498,8 @@ def test_ec2_seed_auth_transport_stall_yields_124_or_137(tmp_path):
     must be killed by the timeout wrapper and produce a non-hanging
     failure — ec2_seed_auth returns non-zero rather than hanging."""
     stage = tmp_path / "stage"
-    (stage / ".claude").mkdir(parents=True)
-    creds = stage / ".claude" / ".credentials.json"
+    (stage / "cli" / ".claude").mkdir(parents=True)
+    creds = stage / "cli" / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
     dest = tmp_path / "instance"
