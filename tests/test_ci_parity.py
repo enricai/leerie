@@ -825,7 +825,7 @@ def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
         return {"rc": 1 if bad else 0, "passed": not bad,
                 "timed_out": False}
 
-    async def fake_wt(st, name, sha):
+    async def fake_wt(st, name, sha, *, reuse=False):
         return tmp_path / name
 
     async def fake_prepare(*a, **k):

@@ -19569,8 +19569,9 @@ shipped red and ended `unconverged`.
 
 **The rule.** After every acceptance-repair round and every re-drive group
 that commits and survives its own rules, the ratchet runs every gating
-check and ratchet on the round's commit, in a fresh worktree of it
-(`_ci_round_regressions`). It runs them in their recorded order, in one
+check and ratchet on the round's commit, in a pristine worktree of it
+(`_ci_round_regressions`; kept and moved, §9 *The merge checks' trees are
+kept too*). It runs them in their recorded order, in one
 tree, as the final pass does: a check may read what an earlier one built.
 B\*'s reruns keep that order (§9 *A merge check's rerun sees what its
 measurement saw*).
@@ -22970,7 +22971,7 @@ regression check — the existing test-case files the base had and the tree that
 ships modified or deleted, run in their *base form* and confirmed under B\*
 against a base commit (*What an existing test pins on the base holds*, §8) —
 confirms through the same `_confirm_against_base`, in the one remaining
-disposable base worktree, named `base-form-base`. Three callers share it: the
+disposable `_confirm_against_base` base worktree, named `base-form-base`. Three callers share it: the
 phase-5 existing-behaviour check and the re-drive's base-form-fixed check
 confirm against the run's fixed base commit (like B\*'s base), while the
 acceptance ratchet's committing rounds confirm against the round's *start*
@@ -22980,7 +22981,9 @@ over 17 runs, 4.2 per run and up to 8 in the heaviest, every one a reinstall at
 the one `base-form-base` path. So it joins the kept-tree mechanism as the fourth
 consumer, the same `_reuse_or_rebuild_kept_tree` move the committed view, the
 evaluation tree, B\*'s base and the re-drive's base use — no new machinery, and
-the last of the four base worktrees to stay disposable is now kept.
+the last of the four `_confirm_against_base` base worktrees to stay disposable
+is now kept (CI parity's own base worktree, `ci-confirm-base`, is kept too:
+*The merge checks' trees are kept too*, below).
 
 Its two base-commit shapes are exactly the two the mechanism already covers: the
 fixed-base callers are B\*'s case (the install key matches across the run, so
@@ -23001,6 +23004,49 @@ base's own and no base form a prior confirm placed reaches the install or the
 next confirm. Like the other three it reruns the run's own test IDs, never a
 hidden set, so it carries no I3 obligation, and it is reaped with the run's
 worktrees.
+
+**The merge checks' trees are kept too, where a run uses them again.** CI
+parity (*The repository's own merge checks run too*, below) measures the
+repository's own checks in helper worktrees of its own: `ci-round` at each kept
+repair round's commit, `ci-round-pre` at a round's start when its ratchets were
+never measured there, `ci-final` at the tree that ships, and `ci-confirm-base`
+for B\*'s base reruns of a red check — at the run's base for the final pass, at
+a round's start for a round. Each was built, installed and torn down on every
+use. Measured across the replayed-run corpus (`logs/ci-parity.log`, 21 runs on
+0.70 or later): `ci-round` 42 cold installs in 14 runs (up to 9 in one run),
+`ci-final` 23 in 20, `ci-confirm-base` 9 in 5; all but the first at each path
+in a run, about 35, were reinstalls of the one path. So these four join the
+kept-tree mechanism as consumers, unchanged — the same
+`_reuse_or_rebuild_kept_tree` move. `ci-round`, `ci-round-pre` and `ci-final`
+sit at a commit that moves (each round's, each final pass's), the re-drive's
+case: the install key is the install's inputs, not the commit, so a commit whose
+lockfiles and manifests are unchanged reuses the install and one that changed
+them reinstalls — the same rule that moves a committed view, whose commits are
+the run's too. `ci-confirm-base` has both of the base shapes, each already
+covered. `ci-base` and `ci-browser` stay disposable: each is used once per
+process, so keeping it would only hold its disk. The cost of the others is
+disk: each holds one install until the run's worktrees are reaped (or, for a
+run that stops early, until `prune`), as the other kept trees do. A move
+whose bounded git commands time out is a difference like any other: the tree
+is remade and installed afresh, for these and every other kept tree.
+
+A merge check is not a test rerun: it builds, writes caches and reports,
+generates code, and its prerequisites run as installs. None of that reaches the
+next use. The move checks the tree out `--detach --force` and `clean`s
+everything untracked but the install's outputs; under those, `_install_intact`
+removes every entry the install did not make (a tool's cache under
+`node_modules`, a generated client) and refuses — tearing the tree down and
+installing afresh — a tree where an entry the install made was changed; and the
+move gives the tree a new measurement id, so its stores and measurement
+directory start empty. What every use then runs on is the commit's pristine
+checkout with an install a fresh install would reproduce, and it does what a
+fresh tree did: the recipe runs again (finding its output in place), every
+prerequisite runs again, and `ci-confirm-base`'s set-up checks run again from
+its first, since each B\* confirm starts its own record of what the base tree
+has been brought to. Each check's database is its own command's, whatever the
+tree. So a reused tree reaches the verdict a fresh one would. Like the other
+kept trees they run the repository's own checks, never a hidden set, so they
+carry no I3 obligation, and they are reaped with the run's worktrees.
 
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
@@ -23203,7 +23249,8 @@ on the final tree:
      benched repo's coverage job was red at the baseline on 13 of 15 PRs, so
      the binary gate dropped out and missed the regression the ratchet
      caught.
-5. *Final.* The same checks run on the final tree in a fresh worktree; a
+5. *Final.* The same checks run on the final tree in a pristine worktree
+   of it (kept and moved, *The merge checks' trees are kept too*, §9); a
    gate red there is confirmed under B\* (interleaved base/final reruns) and
    only a confirmed one counts — anything else is typed as B\* types it
    (`resource_affected`, `pre_existing`, `no_verdict`, or
@@ -23241,7 +23288,8 @@ on the final tree:
    prerequisites are the repository's own and can be minutes. The base
    worktree is now created on the first pass, kept for the later ones —
    each later pass runs only the prerequisites of checks no earlier pass
-   prepared — and removed when the confirm ends, so the uncharged setup
+   prepared — and kept for the run's next confirm, which moves and cleans
+   it (§9 *The merge checks' trees are kept too*), so the uncharged setup
    is what a single-pass confirm pays: one checkout, one install, one
    database, each distinct prerequisite once, and each gating check
    recorded up to the last red one once (*A merge check's rerun sees what

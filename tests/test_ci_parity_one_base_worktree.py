@@ -6,9 +6,10 @@ confirm re-created its `ci-confirm-base` worktree on every pass, outside
 install — its installed-once mark leaves with the worktree — the
 throwaway database and every prerequisite) and tore it down, once per pass.
 With round 8 L3's one-pair-first passes and their continuations, that is
-up to two setups per red check. Now the confirm creates one base worktree,
-prepares each check and each prerequisite once, and removes it at the
-end."""
+up to two setups per red check. Now the confirm creates one base worktree
+and prepares each check and each prerequisite once; the tree is kept for
+the run's next confirm (DESIGN §9 *The merge checks' trees are kept
+too*)."""
 from __future__ import annotations
 
 import os
@@ -26,7 +27,8 @@ def _drive(leerie, env, monkeypatch, tmp_path):
     prepared: list[list[str]] = []
     pre_runs: list[str] = []
 
-    async def fake_wt(st, name, sha):
+    async def fake_wt(st, name, sha, *, reuse=False):
+        assert reuse is True       # kept for the run (DESIGN §9)
         made.append(name)
         return tmp_path / name
 
@@ -80,7 +82,9 @@ def test_every_pass_shares_one_base_worktree(leerie, env, monkeypatch,
     assert [p["pairs_run"] for p in v["passes"]] == [2, 2]
     assert not v["budget_short"]
     assert made == ["ci-confirm-base"]
-    assert torn == ["ci-confirm-base"]
+    # Kept for the run, moved by the next confirm, never torn down here
+    # (DESIGN §9 *The merge checks' trees are kept too*).
+    assert torn == []
     # Each check prepared once, by the pass that first chose it; the shared
     # prerequisite run once.
     assert prepared == [["a"], ["b"]]
@@ -91,7 +95,7 @@ def test_a_base_that_cannot_be_created_is_tried_once(leerie, env,
                                                      monkeypatch, tmp_path):
     made: list[str] = []
 
-    async def no_wt(st, name, sha):
+    async def no_wt(st, name, sha, *, reuse=False):
         made.append(name)
         return None
     monkeypatch.setattr(leerie, "_ci_worktree", no_wt)
