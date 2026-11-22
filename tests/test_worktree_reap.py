@@ -12,6 +12,7 @@ import fcntl
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,7 +203,8 @@ def test_preflight_reaps_before_the_disk_check(leerie, env, monkeypatch):
     monkeypatch.setattr(leerie, "_disk_free_ratio", ratio)
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "log", lambda m: logs.append(m))
-    asyncio.run(leerie.preflight(me, skip_smoke=True))
+    asyncio.run(leerie.preflight(me, skip_smoke=True,
+                                 st=SimpleNamespace(data={}), caps={}))
     assert order == ["reap:me", "disk"]
     assert not (idle / "worktrees").exists()
     (line,) = [m for m in logs if "reaped the worktrees" in m]
@@ -220,7 +222,8 @@ def test_a_reap_failure_never_stops_preflight(leerie, env, monkeypatch):
     monkeypatch.setattr(leerie, "log", lambda m: logs.append(m))
     me = env[1] / "me"
     me.mkdir()
-    asyncio.run(leerie.preflight(me, skip_smoke=True))
+    asyncio.run(leerie.preflight(me, skip_smoke=True,
+                                 st=SimpleNamespace(data={}), caps={}))
     assert any("worktree reap skipped" in m for m in logs)
 
 
@@ -250,7 +253,8 @@ def test_preflight_reaps_idle_launcher_logs(leerie, env, monkeypatch):
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda p: 1.0)
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "log", lambda m: logs.append(m))
-    asyncio.run(leerie.preflight(me, skip_smoke=True))
+    asyncio.run(leerie.preflight(me, skip_smoke=True,
+                                 st=SimpleNamespace(data={}), caps={}))
     assert not old_log.exists() and not old_runlog.exists()
     assert new_log.exists() and other.exists()
     assert link.is_symlink() and target.exists()

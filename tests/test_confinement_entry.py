@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -140,7 +141,7 @@ def test_preflight_no_longer_runs_either_check(leerie, monkeypatch,
     run_dir = tmp_path / "runs" / "r1"
     run_dir.mkdir(parents=True)
     with pytest.raises(Stop):
-        asyncio.run(leerie.preflight(run_dir))
+        asyncio.run(leerie.preflight(run_dir, st=SimpleNamespace(data={}), caps={}))
     assert calls == []
 
 

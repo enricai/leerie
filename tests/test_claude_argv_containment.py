@@ -287,6 +287,9 @@ def _worker_argv(leerie, monkeypatch) -> list[str]:
 def _smoke_argv(leerie, monkeypatch, tmp_path) -> list[str]:
     """The argv `preflight`'s smoke test produces."""
     captured: dict = {}
+    # A run with one credential: a host's own token list must not send
+    # the smoke test's rotation probing the network.
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKENS", raising=False)
 
     async def fake_invoke(cmd, cwd=None, **_kw):
         captured["cmd"] = list(cmd)
@@ -300,7 +303,8 @@ def _smoke_argv(leerie, monkeypatch, tmp_path) -> list[str]:
     # Same reaping as _run_preflight, same `finally` reasoning.
     try:
         asyncio.run(leerie.preflight(tmp_path, skip_smoke=False,
-                                     model="sonnet"))
+                                     model="sonnet",
+                                     st=SimpleNamespace(data={}), caps={}))
     finally:
         with contextlib.suppress(OSError, KeyError):
             shutil.rmtree(captured["cwd"])
@@ -353,6 +357,8 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
 # --- the smoke test's own argv, cwd, and error path ---
 
 def _run_preflight(leerie, monkeypatch, leerie_dir, envelope=None, model="sonnet"):
+    # As in _smoke_argv: one credential, whatever the host exports.
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKENS", raising=False)
     captured: dict = {}
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
@@ -375,7 +381,8 @@ def _run_preflight(leerie, monkeypatch, leerie_dir, envelope=None, model="sonnet
     # several callers here drive preflight to a die() or a ContextOverflow and
     # a cleanup placed after the call would be skipped for exactly those.
     try:
-        asyncio.run(leerie.preflight(leerie_dir, skip_smoke=False, model=model))
+        asyncio.run(leerie.preflight(leerie_dir, skip_smoke=False, model=model,
+                                     st=SimpleNamespace(data={}), caps={}))
     finally:
         with contextlib.suppress(OSError, KeyError):
             shutil.rmtree(captured["cwd"])

@@ -4485,9 +4485,10 @@ unconditionally — see `code.claude.com/docs/en/authentication`,
 a given `claude -p` spawn uses; no rewrite of the mounted
 `.credentials.json` is needed on token switch. `claude_p`'s
 `_spawn` passes `active_token=st.data.get("active_oauth_token")` on
-every `_invoke` call; when unset (singular-var-only runs), `None` is
-passed and behavior is byte-identical to before this feature (the
-existing `env=None`/full-inherit path).
+every `_invoke` call, and so does `preflight`'s smoke test (its
+`_smoke_spawn`, given the run's `st`); when unset (singular-var-only
+runs), `None` is passed and behavior is byte-identical to before this
+feature (the existing `env=None`/full-inherit path).
 
 **`active_oauth_token`** is a `State` field (`STATE_FIELDS`): the raw
 value of the token currently selected for this run. It is mutated via the
@@ -4518,10 +4519,12 @@ floor) from handing V8 a non-positive or degenerately small ceiling. The
 variable is absent for a non-Node repo or when `worker_memory_max_bytes`
 is `None`.
 
-**Start-of-run probe + selection.** After `preflight()` returns and before
-`phase_classify`, if `CLAUDE_CODE_OAUTH_TOKENS` is present, each token is
-probed for remaining runway and the winner becomes
-`st.data["active_oauth_token"]`:
+**Start-of-run probe + selection.** `_select_active_oauth_token(st, caps)`,
+on a fresh run, immediately before `preflight()` (whose smoke test is the
+run's first `claude -p` call; its probes precede preflight's own cheap
+checks) — after the cgroup containment gate: if
+`CLAUDE_CODE_OAUTH_TOKENS` is present, each token is probed for remaining
+runway and the winner becomes `st.data["active_oauth_token"]`:
 
 - **Probe A** (tried first): `GET https://api.anthropic.com/api/oauth/usage`
   with `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
@@ -4562,37 +4565,58 @@ probed for remaining runway and the winner becomes
   contract drift` plus the missing field name. A 401/expired token is
   logged as a distinct per-token dead-token signal.
 
-**Mid-run failover.** A rate-limited active token can reach `claude_p`
-through TWO independent surfaces, both covered by one shared helper,
+**Mid-run failover.** A rate-limited active token can reach a `claude -p`
+call through TWO independent surfaces, both covered by one shared helper,
 `_rotate_oauth_token_or_raise(st, caps, *, known_reset_at, raw_message,
-retry_fn)`:
+retry_fn, limit_type=None)`, by way of one wrapper every spawn the run's
+process makes goes through, `_spawn_with_token_rotation(st, caps, spawn)
+-> dict`: `claude_p`'s `_spawn` (each attempt of its 2-attempt loop and
+each attempt of its auth/quota backoff loop) and `preflight`'s smoke test
+(`preflight(..., *, st, caps)`, both required; `_run_phases` passes the
+run's). It returns the spawn's envelope, or the retried one; it returns
+the envelope unchanged when it is not a rate-limit/quota failure, is a
+terminal-auth failure, is a 529 (`_api_error_category` `overload`: the
+gateway's, not the token's), or no rotation was possible:
 
 1. **Protocol-level**: a `rate_limit_event` stream event (an unexpected
    `status`) is detected inside `_invoke`'s own streaming loop and raises
    `RateLimitedExit` directly — `_spawn` never returns an envelope.
-   `claude_p`'s retry loop wraps `await _spawn(retry_note)` in
+   `_spawn_with_token_rotation` wraps the spawn in
    `try/except RateLimitedExit`, catching it before it can propagate to
    `main()`'s single-token pause/auto-resume path. `out_of_credits=True`
    bypasses rotation entirely and re-raises immediately — account-level
    exhaustion is not a per-token rate limit.
 2. **Envelope-level**: once `_spawn` returns a completed envelope, if it
    is a rate-limit/quota failure (`_is_auth_or_quota_failure`, not
-   terminal-auth) and `CLAUDE_CODE_OAUTH_TOKENS` has more than one token,
-   the same helper runs again (checked between the terminal-auth check
-   and the tenacity backoff loop's entry).
+   terminal-auth, not a 529) and `CLAUDE_CODE_OAUTH_TOKENS` has more than one token,
+   the same helper runs, inside the wrapper — so in `claude_p` before the
+   terminal-auth check and the tenacity backoff loop's entry (the two
+   predicates overlap — a gateway 401 reading "failed to authenticate"
+   matches both — and the wrapper's own `_is_terminal_auth_failure`
+   exclusion is what keeps a dead credential from being rotated), and in
+   the smoke test before its `is_error` die.
 
-In both cases the helper probes/ranks the *other* tokens (respecting the
-shared cache); if one has runway, switches `active_oauth_token` and
-retries immediately via the caller-supplied `retry_fn` — no re-exec, no
+In both cases the helper probes/ranks the tokens this call has not yet
+seen limited (the active one on entry has been; respecting the shared
+cache); if one has runway, switches `active_oauth_token` and retries
+immediately via the caller-supplied `retry_fn` — no re-exec, no
 container restart, strictly before any `auth_retry_max_sec` is spent on
-a token already known exhausted. If every token is rate-limited, it
-picks the one with the soonest `resets_at` — preferring a live signal
-(`known_reset_at`, e.g. a just-caught `RateLimitedExit.reset_at`) over a
-possibly stale `_TOKEN_PROBE_CACHE` entry — and raises the existing
-`RateLimitedExit`, picked up unchanged by `_sleep_then_reexec`. A probe
-failure, or no probe data for any token, never raises from the helper
-itself (returns `None`); each call site falls through to its own
-pre-existing behavior. Terminal-auth failures are unaffected — a
+a token already known exhausted. A retry refused by a protocol-level
+`RateLimitedExit` (not `out_of_credits`, which re-raises) marks its token
+limited with that exception's `reset_at` and the next token with runway
+is tried; any other outcome of the retry is returned or raised to the
+caller as is. If every token is rate-limited, it picks the one with the
+soonest `resets_at` — preferring a token's live signal from this call
+(`known_reset_at` for the token active on entry, a refused retry's
+`reset_at` for each token tried) over its possibly stale
+`_TOKEN_PROBE_CACHE` entry — and raises the existing `RateLimitedExit`
+(with that token's refused retry's `raw_message` and `limit_type` when it
+was one this call tried; the caller's `raw_message`, and its `limit_type`
+when the token is the one active on entry, otherwise), picked up
+unchanged by `_sleep_then_reexec`. When no token has a reset to offer —
+no probe data and no live signal carrying one — the helper returns
+`None` and each call site falls through to its own pre-existing
+behavior. Terminal-auth failures are unaffected — a
 dead/expired credential is never rotated.
 
 Maps to `DESIGN.md`: §6 *Multi-token rotation*.
@@ -5418,7 +5442,7 @@ call none and, but for three existence-only ones, use no `.is_file()`,
 
 | Phase | Function(s) | What it does |
 |-------|-------------|--------------|
-| Preflight | `preflight` | disk headroom on the state-dir filesystem (N30 — see "Disk headroom" above), git identity, clean working tree, external `leerie` branch collision (DESIGN §6 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. The smoke test uses the shared contained argv (`_contained_claude_argv`, so tool denies + `--strict-mcp-config` apply), `SMOKE_MAX_TURNS`=5 against a measured happy path of 3, and the **resolved `classifier` model** — the tier the run's first worker actually spawns with. It runs in an **empty cwd with no repository ancestor** — a stable path under the system temp dir, named from a hash of the state root (the CLI resolves project context by walking UP from cwd, so a directory under `<repo>/.leerie` would reload the very CLAUDE.md this avoids). Not cleaned up: it is empty by construction and two runs of one state root share it. It validates the CLI, not the repo. A client-side context refusal is classified via `_is_context_overflow` and **raises `ContextOverflow`** (resumable `EXIT_LOCKED` pause) rather than printing a bare `Prompt is too long`. Run-id collisions are detected at two points: filesystem side in `State.__init__`; git side in `setup-run.sh`'s branch-creation step, which repeats the check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
+| Preflight | `preflight` | disk headroom on the state-dir filesystem (N30 — see "Disk headroom" above), git identity, clean working tree, external `leerie` branch collision (DESIGN §6 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. The smoke test uses the shared contained argv (`_contained_claude_argv`, so tool denies + `--strict-mcp-config` apply), `SMOKE_MAX_TURNS`=5 against a measured happy path of 3, and the **resolved `classifier` model** — the tier the run's first worker actually spawns with. It spawns with the run's active token, selected just before it, and rotates on a rate limit as a worker does (*Multi-token rotation*). It runs in an **empty cwd with no repository ancestor** — a stable path under the system temp dir, named from a hash of the state root (the CLI resolves project context by walking UP from cwd, so a directory under `<repo>/.leerie` would reload the very CLAUDE.md this avoids). Not cleaned up: it is empty by construction and two runs of one state root share it. It validates the CLI, not the repo. A client-side context refusal is classified via `_is_context_overflow` and **raises `ContextOverflow`** (resumable `EXIT_LOCKED` pause) rather than printing a bare `Prompt is too long`. Run-id collisions are detected at two points: filesystem side in `State.__init__`; git side in `setup-run.sh`'s branch-creation step, which repeats the check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
 | 1 Classify | `phase_classify`, `_d1_units`, `_d1_split_spans`, `_d1_split_sections`, `_d1_report_paths`, `_d1_report_sources`, `_d1_render`, `_d1_coverage_holes`, `_d1_closure` | one classifier worker → categories + questions + requirement-coverage items (DESIGN §8 *Requirement coverage*). The user prompt carries the task cut into spans `[S1]`… (`_d1_split_spans`: a heading line, a blank line, or a list item at any indent opens a span; a fenced block stays whole; `[Sx < Sy]` marks a nested item and its `parent`; a re-classify from the classification gate passes its feedback as `phase_classify`'s `review_note`, shown after the cut task and never cut with it, so coverage accounts for the user's task, not the orchestrator's note) and each report from `_d1_report_sources` — a `_glob_task_references` hit with a `.md`/`.markdown`/`.mdx` suffix that the repository does not track (`_checkout_file_tracked`), at most `D1_REPORT_MAX_BYTES` (256 KiB) — cut at headings into sections `[R1]`… (`_d1_split_sections`). The check chains `_d1_coverage_holes` after `check_classifier_output`; `D1_REPORT_WITHOUT_REQUIREMENT` is raised only on the first check of the call. After the loop it writes `required_items`, `requirement_coverage` and `needs_human_verification`; residual holes are logged, never fatal. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive. On a fresh (non-resumed) run, `run.json`'s identity fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`, `task`) are written immediately BEFORE this phase runs — not after, as originally implemented — so any early-exit path reachable from classification (including the classification gate's no-work routing, below) sees a fully-identified `run.json` rather than one carrying only `_finish_no_work_run`'s own `{finished_at, no_push, no_verify}` (DESIGN §8 *Reaching the cleared-but-empty state from classification*) |
 |   • Classification gate | `phase_classification_gate` | independent adversarial verifier of the classifier's category set (DESIGN §8 *Independent adversarial verification*). One `classification_judge` worker attacks the chosen categories against the task + codebase; a non-empty `miscategorizations` array (a missing category the work requires, or a spurious one) re-drives `phase_classify` via `_run_checked_loop` (bounded by `judgment_check_rounds`, and cut short earlier by `_run_checked_loop`'s own oscillation guard when a round's issues repeat an earlier round's exactly — DESIGN §8 *The CRITIC retry pattern's oscillation guard*). Skipped entirely by `--skip-classification-check`, which returns `False` without spawning the judge and without writing the audit key — a bypass is not a clean-pass judgment, matching every sibling skip path. Across rounds, the gate accumulates a `judge_confirmed` set — every category the judge has reviewed without objection or explicitly asked to add — and passes it into the re-invoked `phase_classify`, so `check_classifier_output`'s `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK`/`CATEGORY_NO_DIR` self-checks never strip a category the judge has already vetted. `CATEGORY_NO_DIR` honours it for the same reason as the two RISK advisories, but on a **single** category rather than a pair, and for `infrastructure` as well as `documentation`. Separately, what counts as evidence for a category is `CATEGORY_EVIDENCE` + `_category_evidence_found`: directories matched case-insensitively at the root **or one level down** (`src/infrastructure/`), root marker files by case-folded stem (`cdk.json`, `readme`), and root globs (`*.tf`). Suppression is empty-handed on the initial classify, so a signal that mis-describes a correct classification fires before any judge runs — measured at 27 firings across 19 runs, all false. `_category_evidence_summary` derives the advisory text from the same table so the remedy it names cannot drift from the rule. The set is monotone except under an evidenced retraction (DESIGN §8 *`judge_confirmed` is monotone except under an evidenced retraction*): a narrower later round does not retract an earlier confirmation, but an **evidenced** `spurious_category` does — `_check` applies `judge_confirmed.difference_update(spurious)` and will not re-add a category the same round called spurious. `_gating_spurious_categories` is the single definition of "concretely objected to", shared by `_check` and the feedback builder; a vague entry (empty `concrete_work_evidence`) neither gates nor retracts. `_on_feedback` names the drop list outright in the re-classify prompt and `die()`s rather than emit a keep-list and drop-list that intersect — the failure mode of the contradiction is not a wrong answer but an unsatisfiable instruction that silently burns the round budget. On exhaustion, `die()`s with the residuals named and the **actual** number of re-classify rounds that ran (tracked by the gate, not read off the cap: `_run_checked_loop` fires feedback only while `rnd < max_rounds - 1`, so a 3-round budget re-classifies at most twice, and once when the oscillation guard aborts early) — UNLESS `st.data["likely_already_satisfied"]` is `True` with non-empty evidence, in which case it routes to `_finish_no_work_run` (the same terminal state `_detect_no_work` produces post-plan; DESIGN §8 *Reaching the cleared-but-empty state from classification*) and returns `True` — except that when `_acceptance_can_check(st)` holds, a confirmation is held as `no_work_pending` (and `False` returned) until `_settle_pending_no_work` decides it on the held-out sets (see the `no_work_pending` state row) — signaling the caller (`_run_phases`) to stop the pipeline. Gates before provision/plan spend. Runs inside the `plans_after_classify` checkpoint block (DESIGN §6 "Resumable planning"), so a resume past classify skips it. Persists to `state.data["classification_coverage_gate"]`. **On the CONVERGED path** (gate clean), `_confirm_no_work_on_converged_gate` consults the same `likely_already_satisfied` signal — but through an independent `no_work_judge` (read-only, `SATISFIED_PROBE_TOOLS`, current-checkout-only) rather than raw trust: only `confirmed: true` with non-empty evidence routes to `_finish_no_work_run` (audit record in `state.data["no_work_confirmation"]`, returns `True`); a dispute, crash, timeout, or empty evidence falls through to planning unchanged — a dispute with non-empty judge evidence additionally persists both halves of the disagreement to `state.data["no_work_dispute"]`, which `phase_plan` injects into every planner's ctx so the plan targets the disputed residual rather than re-deriving the task (DESIGN §8 *A dispute's evidence is planning input, not log noise*) — and `skip_satisfied_check` suppresses the consult entirely (DESIGN §8 *The healthy-path consumer*). |
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ *The repository image holds no dependency*). Always runs, for every task whatever its categories (DESIGN §6½: every measurement installs from the recipe). Five steps: `_discover_tools` (the `tool_discovery` worker → `<run>/mise-tools.toml`, `MISE_GLOBAL_CONFIG_FILE`) → `.leerie-setup.sh` hook if present → `mise install` in a throwaway checkout of the planning commit (steps 2–4; reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `_detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block**, every `install` and `build` entry (never run by the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The tools file's env var `MISE_GLOBAL_CONFIG_FILE` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `_run_streaming` so their output is visible live. Skipped on `resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |

@@ -277,7 +277,8 @@ def test_the_smoke_test_runs_after_the_run_tmp_is_set(leerie, world,
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda _p: 0.9)
-    asyncio.run(leerie.preflight(st.run_dir, skip_smoke=False,
+    asyncio.run(leerie.preflight(st.run_dir, skip_smoke=False, st=st,
+                                 caps=dict(leerie.DEFAULT_CAPS),
                                  model="haiku", verbosity="quiet"))
     env = _assert_inside(leerie, st, log, grants)
     own = st.run_dir / "workers" / "smoke"

@@ -1,9 +1,9 @@
 """Tests for mid-run multi-token failover inside `claude_p` (DESIGN §6
 *Multi-token rotation*).
 
-When the ACTIVE token is rate-limited (401/429/529/auth-message, not
-terminal-auth) and more than one CLAUDE_CODE_OAUTH_TOKENS token is
-configured, claude_p tries rotating to another token with runway BEFORE
+When the ACTIVE token is rate-limited (401/429/auth-message, not
+terminal-auth, not a 529 overload) and more than one
+CLAUDE_CODE_OAUTH_TOKENS token is configured, claude_p tries rotating to another token with runway BEFORE
 spending any of the tenacity backoff budget on a token already known to
 be exhausted. If every token is currently rate-limited, it picks the
 soonest-reset token and falls through to the EXISTING RateLimitedExit /
@@ -521,3 +521,119 @@ class TestRotateOnProtocolLevelRateLimitedExit:
         )
         assert isinstance(exc, leerie.RateLimitedExit)
         assert not isinstance(exc, leerie.TerminalAuthFailure)
+
+
+class TestARefusedRetryTriesTheNextToken:
+    """A rotation's retry refused by the stream's own `rate_limit_event`
+    (the probe that ranked its token had gone stale) is not the end of the
+    search: the next token with runway is tried, and the run pauses only
+    when none is left — at the soonest reset among the live signals."""
+
+    def _limit(self, leerie, reset, limit_type=None):
+        return leerie.RateLimitedExit(
+            reset_at=reset, raw_message=f"rejected until {reset}",
+            out_of_credits=False, limit_type=limit_type)
+
+    def test_a_third_token_carries_the_call(self, leerie, monkeypatch,
+                                            tmp_path):
+        r = leerie.datetime(2026, 1, 3, tzinfo=leerie.timezone.utc)
+        result, exc, st = _call_claude_p_with_invoke_sequence(
+            leerie, monkeypatch,
+            [self._limit(leerie, r), self._limit(leerie, r),
+             dict(_SUCCESS_ENVELOPE)],
+            tmp_path,
+            oauth_tokens="tok-a,tok-b,tok-c",
+            active_token="tok-a",
+            # tok-b ranks first on a stale probe; its retry is refused.
+            probe_utils={"tok-b": (5.0, 5.0), "tok-c": (40.0, 40.0)},
+        )
+        assert exc is None
+        assert result == {"categories": ["feature-implementation"]}
+        assert st.data["active_oauth_token"] == "tok-c"
+
+    def test_every_retry_refused_pauses_at_the_soonest_live_reset(
+            self, leerie, monkeypatch, tmp_path):
+        late = leerie.datetime(2026, 1, 9, tzinfo=leerie.timezone.utc)
+        soon = leerie.datetime(2026, 1, 2, tzinfo=leerie.timezone.utc)
+        result, exc, st = _call_claude_p_with_invoke_sequence(
+            leerie, monkeypatch,
+            [self._limit(leerie, late), self._limit(leerie, late),
+             self._limit(leerie, soon, "seven_day")],
+            tmp_path,
+            oauth_tokens="tok-a,tok-b,tok-c",
+            active_token="tok-a",
+            probe_utils={"tok-b": (5.0, 5.0), "tok-c": (40.0, 40.0)},
+        )
+        assert isinstance(exc, leerie.RateLimitedExit)
+        # Every token was refused live in this call, so each one's live
+        # reset stands over its probe's (the fixture's 2026-08-01); tok-c's
+        # is the soonest, not the first retry's.
+        assert exc.reset_at == soon
+        # The pause names that refusal's own message and window.
+        assert exc.raw_message == f"rejected until {soon}"
+        assert exc.limit_type == "seven_day"
+        assert st.data["active_oauth_token"] == "tok-c"
+
+    def test_a_pause_on_the_entry_token_keeps_its_window(
+            self, leerie, monkeypatch, tmp_path):
+        """The entry refusal resets soonest: the pause names its window, as
+        the bare exception did before rotation caught it."""
+        soon = leerie.datetime(2026, 1, 2, tzinfo=leerie.timezone.utc)
+        result, exc, st = _call_claude_p_with_invoke_sequence(
+            leerie, monkeypatch,
+            [self._limit(leerie, soon, "seven_day")],
+            tmp_path,
+            oauth_tokens="tok-a,tok-b",
+            active_token="tok-a",
+            probe_utils={"tok-b": (100.0, 100.0)},
+        )
+        assert isinstance(exc, leerie.RateLimitedExit)
+        assert exc.reset_at == soon
+        assert exc.limit_type == "seven_day"
+        assert st.data["active_oauth_token"] == "tok-a"
+
+    _DROP = {"type": "result", "subtype": "success", "is_error": True,
+             "terminal_reason": "api_error", "api_error_status": None,
+             "result": ("API Error: Connection closed mid-response. "
+                        "The response above may be incomplete."),
+             "structured_output": None}
+
+    @pytest.mark.parametrize("refusal", ["stream", "envelope"])
+    def test_a_backoff_attempt_refused_rotates_too(
+            self, leerie, monkeypatch, tmp_path, refusal):
+        """A transport drop sends claude_p into its backoff loop; the
+        loop's next attempt is refused, by the stream or by a 429 result.
+        That attempt is a `claude -p` call like the first, so it rotates
+        rather than pausing or backing off on the limited token (tenacity
+        runs its first retry without sleeping)."""
+        r = leerie.datetime(2026, 1, 3, tzinfo=leerie.timezone.utc)
+        refused = (self._limit(leerie, r) if refusal == "stream"
+                   else dict(_RATE_LIMITED_ENVELOPE))
+        result, exc, st = _call_claude_p_with_invoke_sequence(
+            leerie, monkeypatch,
+            [dict(self._DROP), refused, dict(_SUCCESS_ENVELOPE)],
+            tmp_path,
+            oauth_tokens="tok-a,tok-b",
+            active_token="tok-a",
+            probe_utils={"tok-b": (5.0, 5.0)},
+        )
+        assert exc is None
+        assert result == {"categories": ["feature-implementation"]}
+        assert st.data["active_oauth_token"] == "tok-b"
+
+
+def test_a_529_overload_backs_off_on_the_token_in_use(leerie, monkeypatch,
+                                                    tmp_path):
+    """A 529 is the gateway's overload, which every token meets alike: it is
+    not counted against the active token. tok-b has runway, so a rotation
+    would switch to it; instead the backoff loop retries on tok-a
+    (tenacity's first retry does not sleep)."""
+    overload = dict(_RATE_LIMITED_ENVELOPE, api_error_status=529,
+                    result="overloaded")
+    result, exc, st = _call_claude_p_with_invoke_sequence(
+        leerie, monkeypatch, [overload, dict(_SUCCESS_ENVELOPE)], tmp_path,
+        oauth_tokens="tok-a,tok-b", active_token="tok-a",
+        probe_utils={"tok-b": (5.0, 5.0)})
+    assert exc is None
+    assert result == {"categories": ["feature-implementation"]}
+    assert st.data["active_oauth_token"] == "tok-a"
