@@ -21,7 +21,7 @@ from tests.conftest import measured_tmp_files  # noqa: E402
 
 
 def test_the_per_tree_class_is_a_subset_of_the_store_variables(leerie):
-    assert leerie._TREE_STORE_VARS <= set(leerie._STORE_VARS)
+    assert (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS) <= set(leerie._STORE_VARS)
 
 
 def _tree(tmp_path) -> tuple[Path, Path]:
@@ -42,7 +42,7 @@ def test_a_command_in_a_run_tree_gets_that_trees_own_stores(leerie,
            "UV_CACHE_DIR": "/shared/uv"}
     leerie._tree_store_env(env, t / "sub")
     root = run / "worktrees" / ".stores" / "tree-stores" / t.name
-    for var in leerie._TREE_STORE_VARS:
+    for var in (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS):
         assert env[var] == str(root / leerie._STORE_VARS[var]), var
         assert Path(env[var]).is_dir()
     assert env["pnpm_config_cache_dir"] == env["npm_config_cache_dir"]
@@ -65,7 +65,7 @@ def test_a_trees_own_stores_are_made_private(leerie, tmp_path):
         os.umask(old)
     root = run / "worktrees" / ".stores" / "tree-stores" / t.name
     made = [root.parent, root,
-            *(Path(env[v]) for v in leerie._TREE_STORE_VARS)]
+            *(Path(env[v]) for v in (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS))]
     for d in made:
         assert d.is_dir(), d
         assert (d.stat().st_mode & 0o777) == 0o700, (d, oct(d.stat().st_mode))
@@ -174,3 +174,26 @@ def test_a_replaced_view_takes_its_tree_stores_with_it(leerie, tmp_path,
     asyncio.run(leerie._committed_view(st, str(staging)))
     assert not (stores / "uv" / "planted").exists()
     leerie._VIEWS.clear()
+
+
+def test_trees_with_equal_install_keys_share_the_keyed_store(leerie, tmp_path):
+    run, t = _tree(tmp_path)
+    t2 = run / "worktrees" / "r1-view-other"
+    (t2).mkdir(parents=True)
+    (t2 / ".git").write_text("gitdir: x\n")
+    t3 = run / "worktrees" / "r1-view-third"
+    t3.mkdir(parents=True)
+    (t3 / ".git").write_text("gitdir: x\n")
+    assert "BUNDLE_USER_CACHE" in leerie._STORE_VARS
+    try:
+        for tree, key in ((t, "k1"), (t2, "k1"), (t3, "k2")):
+            leerie._TREE_INSTALL_KEYS[os.path.realpath(tree)] = key
+        envs = []
+        for tree in (t, t2, t3):
+            e: dict[str, str] = {}
+            leerie._tree_store_env(e, tree)
+            envs.append(e["BUNDLE_PATH"])
+    finally:
+        for tree in (t, t2, t3):
+            leerie._TREE_INSTALL_KEYS.pop(os.path.realpath(tree), None)
+    assert envs[0] == envs[1] != envs[2]
