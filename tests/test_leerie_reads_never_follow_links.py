@@ -482,6 +482,8 @@ _SYSTEM = {
     "_own_addresses", "_sigchld_is_ignored", "_collect_memory_sample",
     "_network_local_host", "_beside", "_service_credential_source",
     "_disk_place",
+    # The process's own umask, from `/proc/self/status`.
+    "_checkout_dir_mode",
 }
 _OPERATOR = {
     # A file the operator named: `--answers`, host settings, a task file
@@ -497,6 +499,9 @@ _NAMES_ONLY = {
     "_node_lockfile_paths", "_output_entries", "_same_settings_path",
     "_tree_bytes", "_vitest_filter_colliders", "_restore_write_bits",
     "_rmtree_owned",
+    # A moved clone's tracked directory, listed through a descriptor
+    # `_dir_beneath` reached and each name `stat`ed without following it.
+    "_reset_tracked_dir",
     # A tree's ignored paths made a copy's own (`_share_ignored_paths`):
     # listed and opened relative to a directory reached without following a
     # link, a file's bytes (where it cannot be linked) through `O_NOFOLLOW`.

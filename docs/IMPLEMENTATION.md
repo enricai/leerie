@@ -2804,7 +2804,7 @@ judgment/workhorse split once existed and why it no longer applies.
 | observability_judge | sonnet | types each part of each judged required item `reading`, `test_command` or `neither` (+ `needs`) on the final tree (DESIGN §8 *A met is only what the run could observe*) — read-only judgment in staging, `medium` effort |
 | forbidden_command_extractor | sonnet | re-draws the classifier's forbidden-command extraction `forbidden_command_samples` (3) times per classify, unioned (DESIGN §9 *A command the task forbids*) — read-only judgment, `medium` effort |
 | delivery_ratchet | sonnet | after a repair that committed, re-verifies the previously met `in_tree` items with their prior evidence and the repair's diff (same section) — read-only judgment, `medium` effort |
-| falsifier | sonnet | on the final tree, tries to prove ONE required item undelivered by writing and running one probe test through a public entry point, in a disposable ref-less checkout; code confirms or discards the claim (DESIGN §8 *Delivery detection*) — acting, `medium` effort |
+| falsifier | sonnet | on the final tree, tries to prove ONE required item undelivered by writing and running one probe test through a public entry point, in a ref-less checkout kept for the run (DESIGN §8 *The falsifier's checkouts are kept too*); code confirms or discards the claim (DESIGN §8 *Delivery detection*) — acting, `medium` effort |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
 lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
@@ -9009,12 +9009,25 @@ DESIGN §8 *The settings are leerie's* and *One ignore rule*.
   False. None for a tree outside every run. `_ref_less_clone(src, wt, rev)`
   runs its own setup with the clone's `.git` named explicitly (`-C wt
   --git-dir wt/.git --work-tree wt` and the pins) and then, for a `wt`
-  whose parent is `worktrees`, `_make_clone_git_dir(src, wt, rev) -> bool`:
+  whose parent is `worktrees`, `_make_clone_git_dir(src, wt, rev, *,
+  refresh=True) -> bool`:
   `git --git-dir <shadow> --work-tree wt init -q`, an
   `objects/info/alternates` line naming `src`'s objects, HEAD written as
-  `rev`, `read-tree rev`, `update-index -q --refresh`; a failure removes
-  both. `_remove_acceptance_checkout` removes the shadow with the
-  checkout. Shell: `leerie_tree_location` prints
+  `rev`, `read-tree rev`, `update-index -q --refresh` (not with
+  `refresh=False`, a moved clone's, whose git steps are each bounded at
+  300 s, a timeout False); a failure removes
+  both. `_ref_less_clone(src, wt, rev, *, keep=False)`: with `keep`, `wt`
+  already holds `rev`'s files: the clone is made at
+  `<clone-gits>/.reclone-<name>`, `wt/.git` removed and replaced by its
+  `.git` (`os.rename`), `update-ref --no-deref HEAD rev`, `read-tree rev`,
+  `update-index -q --refresh`, then the same ref, remote and reflog
+  deletion, each git step bounded at 300 s (a timeout raises to
+  `_move_view`, which reads it as no move); no shadow is made, and on a
+  failure only the `.reclone-<name>` directory is removed (not on a
+  timeout: the next move's `keep` removes it first, and the process's
+  release all of `clone-gits`); the move that calls it made the shadow,
+  and its caller tears the tree down. `_remove_acceptance_checkout`
+  removes the shadow with the checkout. Shell: `leerie_tree_location` prints
   `<run>/clone-gits/<name>` twice for such a clone, and refuses one
   without it. Pinned by `tests/test_ref_less_clone_git_is_leeries.py`.
   `_common_dir_of` and `_run_settings_of` use it for a run tree (a clone
@@ -9130,7 +9143,7 @@ one primitive:
   call takes effect; review round 16 H1); `_drop_lying_index(tree, prefix,
   env)` (unlinks `git rev-parse --git-path index` when `_fresh_only` of
   the real and fresh status reads is not empty); with `branch`
-  (required; None only for the falsifier's disposable detached checkout),
+  (required; None only for the falsifier's detached checkout),
   `git checkout -q -f <branch>` first (review round 15
   H2: a reset alone moved a worker's detached HEAD and left the branch
   where it was); `git reset -q --hard <rev>` (up to three attempts,
@@ -9598,10 +9611,88 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_measure_dir_at` gives the view a new measurement directory and moves
     its `tree-stores/<view>` aside), `checkout -q --detach --force <tip>`,
     `clean -ffdqx`
-    with `-e /<output>` per output (each bounded at 300 s; a timeout is
-    False), `_install_intact`, then True only when
-    `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
-    Pinned by `tests/test_view_moves.py`.
+    with `-e /<output>` per output, the name `_gitignore_escape`d (each
+    bounded at 300 s; a timeout is
+    False), `_install_intact`, then True only when every submodule's path
+    is empty (`_listdir_beneath`, first: neither checkout nor clean enters
+    one, and the status would read its HEAD), `HEAD` is `tip` (`rev-parse
+    HEAD`, 60 s) and `status --porcelain -z --untracked-files=no
+    --ignore-submodules=dirty` (300 s: a submodule's HEAD is compared with
+    its gitlink, nothing in it is run) is empty; either timing out, or an
+    `OSError`, is False.
+    `_tree_entries(repo, tip) -> tuple[list[str], list[str]] | None`,
+    read first, before `wt/.git` is touched (a False move must leave a
+    worktree git can still remove): `tip`'s tracked directories (`""`
+    first, each before those in it) and gitlink paths from `ls-tree -r -t -z <tip>` (120 s;
+    None on a non-zero exit or a timeout, and the move is False), through
+    `--git-dir <repo>` with `_GIT_VIEW_PINS`. The checkout and clean carry
+    `_NO_SUBMODULES` (`-c submodule.recurse=false`).
+    A `wt` with no admin directory in `repo` that is a ref-less clone of it
+    (`_run_tree_location(wt)` names its `clone-gits` directory) moves too.
+    `_clone_head(wt) -> str | None` second, after `_tree_entries` (`rev-parse HEAD` through
+    leerie's git directory for it, 60 s; None on a failure, an `OSError` or
+    a timeout): the commit it was at. Then `wt/.git` removed,
+    `_make_clone_git_dir(repo, wt, tip)` in place of the gitdir file and the
+    id removal (`refresh=False`; a new shadow has no id), and
+    `_unshape_clone(wt, entries) -> bool` before any git command reads a
+    tracked directory (for each tracked directory, top-down,
+    `_reset_tracked_dir(wt, rel) -> bool` and, below the root,
+    `_remove_beneath(wt, wt/<rel>/.git)`; then `_remove_beneath(wt,
+    wt/<path>)` for each gitlink; each skipped where the directory, or the
+    gitlink's parent, is not one reached without a link
+    (`_dir_beneath_exists`: the checkout makes it again); False when a
+    directory fails or a path removed is still there, `_lexists_beneath`).
+    `_reset_tracked_dir`: `_add_dir_bits_beneath(wt, rel, 0o700)`, then
+    through `_dir_beneath` `os.fchmod` to `_checkout_dir_mode()` (0o777
+    less the umask read from `/proc/self/status`, 0o755 when it cannot be),
+    `_strip_dir_xattrs(dfd)` (each of `_worker_xattrs(fd) -> list[str]`
+    removed: the `user.` and `system.posix_acl_*` attributes, the ones an
+    unprivileged owner can set — a `security.` label is never removable —
+    and none on a file system without attributes, `ENOTSUP`), and every
+    entry neither a regular file, a directory nor a link `_unlink_beneath`
+    (False when `_worker_xattrs` still lists one); True when the directory
+    is missing or not one (`FileNotFoundError`,
+    `NotADirectoryError`, a link included: the checkout makes it), False on
+    another `OSError` or an entry left. Then `_restore_write_bits(wt)` (an
+    `OSError` is False), the same checkout, clean and `_install_intact`
+    through it (an `OSError` from a step, like a timeout, is False), then
+    `_strip_output_xattrs(wt, snap[0]) -> bool` (`_strip_dir_xattrs` on
+    each directory above an output, through `_dir_beneath`, and on the
+    output and every directory under it through `os.fwalk(dir_fd=,
+    follow_symlinks=False, onerror=_raise)`, `_raise(e) -> NoReturn`; a
+    missing or non-directory component ends that output's walk; False on
+    another `OSError` or when `_worker_xattrs` still lists one), then
+    `_rewrite_clone_files(wt, tip) -> bool` (with `-c
+    core.checkStat=default`: `read-tree <tip>` and `checkout-index -f -a
+    -u`, each 300 s, False on a non-zero exit; `update-index -q
+    --refresh`, 300 s, its exit ignored; False on an `OSError` or a
+    timeout), then `_keep_unchanged_times(repo, wt, old, tip) -> bool`
+    (only with `old` and a `_CLONE_TIMES[realpath(wt)]` record, popped:
+    `diff-tree -r -z --name-only --no-renames <old> <tip>` through
+    `--git-dir <repo>` with `_GIT_VIEW_PINS`, 120 s, False on a non-zero
+    exit; each of `_blob_paths(repo, tip) -> list[str] | None` (`ls-tree
+    -r -z <tip>`, 120 s, its `100644`/`100755` blobs) not in the diff and
+    in the record given its recorded time, `os.utime(ns=(t, t), dir_fd=,
+    follow_symlinks=False)` through `_dir_beneath`, grouped by
+    `_by_dir(paths) -> dict[str, list[str]]`; then `update-index -q
+    --refresh`, 300 s, its exit ignored; False on an `OSError` or a
+    timeout; then `_record_clone_times(repo, wt, tip) -> bool`, whose
+    result it returns; no file keeps its time when a `.gitattributes` is in
+    the diff), the same HEAD and status checks, and
+    then `_ref_less_clone(repo, wt, tip, keep=True)` (True only when that
+    returns ""); any other tree without an admin directory is False.
+    `_CLONE_TIMES: dict[str, dict[str, int]]`, by realpath: each of
+    `tip`'s regular files' `st_mtime_ns`, read without following a link,
+    just after leerie wrote the clone (`_record_clone_times`, which pops
+    the old record first and records nothing when a read fails, returning
+    False): in `_reuse_or_rebuild_kept_tree` when its writer checkout made
+    a clone, before it returns, and in each clone's move by
+    `_keep_unchanged_times` (before the HEAD and status checks and
+    `_ref_less_clone(keep=True)`, any of which can still fail the move, the
+    record then dropped with the checkout); popped in
+    `_acceptance_writer_checkout` and `_remove_acceptance_checkout`.
+    Pinned by `tests/test_view_moves.py` and
+    `tests/test_falsifier_checkout_reuse.py`.
     A *kept tree* reuses the same move machinery (DESIGN §8 *The evaluation
     tree is kept across a run's evaluations*, §9 *The base confirm worktree
     is kept across the run's confirms*, *The delivery re-drive's base confirm
@@ -9609,8 +9700,10 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     kept too*, *The merge checks' trees are kept too* — one mechanism, its
     consumers the held-out evaluation tree, B\*'s base-paired confirm
     worktree, the delivery re-drive's `redrive-base` and the base-form
-    check's `base-form-base` confirm worktrees, and CI parity's `ci-round`,
-    `ci-round-pre`, `ci-final` and `ci-confirm-base`). Two
+    check's `base-form-base` confirm worktrees, CI parity's `ci-round`,
+    `ci-round-pre`, `ci-final` and `ci-confirm-base`, and delivery
+    detection's `falsifier-confirm` and `falsifier-lane<n>` — DESIGN §8
+    *The falsifier's checkouts are kept too*). Two
     process-level dicts, keyed by `realpath(<kept tree>)`: `_KEPT_TREES:
     dict[str, tuple[Path, str]]` — the run repository and the tip of a tree
     opted into snapshot recording — and `_KEPT_INSTALLS: dict[str, tuple[str,
@@ -9623,8 +9716,9 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `(key, _INSTALL_OUTPUTS[view_key], reads)` in `_KEPT_INSTALLS` (and
     records nothing for a non-view, non-kept tree). `_forget_installs` also
     drops the `_KEPT_INSTALLS`/`_KEPT_TREES` entries.
-    `async _reuse_or_rebuild_kept_tree(st, repo, wt, tip) -> CompletedProcess
-    | None` is the shared reuse step: when `wt` is a directory and
+    `async _reuse_or_rebuild_kept_tree(st, repo, wt, tip, *,
+    writer_checkout=False, writer=None) -> CompletedProcess | None` is the
+    shared reuse step: when `wt` is a directory and
     `_KEPT_INSTALLS[realpath(wt)]` holds a key equal to `_install_key(repo,
     tip, recipe, <its reads>)` and `_move_view(repo, wt, tip, <its
     snapshot>)` succeeds, the install is kept (`_DEPS_INSTALLED`/`_DEPS_FAILED`
@@ -9637,7 +9731,17 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     either way" — DESIGN §6 *The run's own repository*, review round 17 H1;
     `tests/test_run_repo_missing_dies.py`) — and it returns that add
     (`_KEPT_TREES` set only when the add succeeded; a non-zero `returncode`
-    means the add failed). Its three callers map the result:
+    means the add failed). With `writer_checkout` (the falsifier's
+    checkouts, DESIGN §8 *The falsifier's checkouts are kept too*) there is
+    no reuse unless `_CLONE_CACHES.get(realpath(wt))` is
+    `_worker_cache_dir(run_dir, writer)` (None when `writer` is None) and
+    `wt` has no admin directory in `repo` (a checkout that fell back to a
+    worktree is never moved), and the rebuild is
+    `_remove_acceptance_checkout(st, wt)`, `_forget_installs(wt)` and
+    `_acceptance_writer_checkout(st, wt, tip, writer=writer)`, then, when
+    its kind is "clone", `_record_clone_times(repo, wt, tip)`, returned as
+    `CompletedProcess(["checkout"], 1 if its kind starts "failed" else 0,
+    "", kind)` (`_KEPT_TREES` set only for a kind that did not fail). Its callers map the result:
     `async _prepare_eval_tree(st, caps, repo, wt, tip, *, log_path, label)
     -> str` ("ok" | "worktree_failed" | "deps_failed") calls it, returns
     "worktree_failed" on a non-`None` non-zero add, else runs
@@ -9650,11 +9754,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_ci_worktree` (only with `reuse=True`: `ci-round`, `ci-round-pre`,
     `ci-final`, `ci-confirm-base`) calls it in place of its teardown-and-add,
     returning the tree on `None` or a zero add, and its callers skip
-    `_ci_teardown`. Pinned by
+    `_ci_teardown`; and
+    `async _falsifier_kept_checkout(st, name, sha, *, writer) -> Path |
+    None` (`_falsify_items`' `falsifier-confirm` and `falsifier-lane<n>`)
+    calls it with `writer_checkout=True`, returning `wt` on `None` or a zero
+    add and None, logged, on a failed add. Pinned by
     `tests/test_eval_tree_reuse.py`, `tests/test_confirm_base_reuse.py`,
     `tests/test_redrive_base_reuse.py`,
-    `tests/test_base_form_base_reuse.py` and
-    `tests/test_ci_tree_reuse.py`.
+    `tests/test_base_form_base_reuse.py`, `tests/test_ci_tree_reuse.py` and
+    `tests/test_falsifier_checkout_reuse.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
@@ -10767,16 +10875,19 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   `untouched_paths`. Skipped
   (recorded in `falsifier.skipped`) when `falsifier_samples` is 0, no item
   qualifies, the repository has no scoped test template, the
-  `falsifier-confirm` checkout (`_falsifier_checkout(st, name, sha, *,
-  writer)`: the acceptance writers' ref-less clone,
-  `_acceptance_writer_checkout`, at the final sha; `writer=None` here,
-  `"falsifier"` for each lane) cannot be made or its `_ensure_worktree_deps` install fails, or
+  `falsifier-confirm` checkout (`_falsifier_kept_checkout(st, name, sha,
+  *, writer)`: the acceptance writers' ref-less clone,
+  `_acceptance_writer_checkout`, at the final sha, kept for the run and
+  moved there with its install reused when the install key is unchanged —
+  DESIGN §8 *The falsifier's checkouts are kept too*; `writer=None` here,
+  `"falsifier"` for each lane; none is removed when the call ends) cannot be made or its `_ensure_worktree_deps` install fails, or
   `_ts_resolvable` loads no compiler API from it (`node
   scripts/load-typescript.cjs`, cwd the checkout, env
   `_ts_script_env()` = `LEERIE_BUNDLED_TYPESCRIPT=<BUNDLED_TYPESCRIPT>`:
   the tree's `typescript` when it has `createSourceFile`, else the
   bundled copy — always present in the image). Up to `max_parallel`
-  lane checkouts `falsifier-lane<n>`, each installed once.
+  lane checkouts `falsifier-lane<n>` (kept the same way), each installed
+  once per call.
   In a Prisma/PostgreSQL repo each sample's falsifier worker and each
   confirm-checkout command (`_capture_failing_test_ids`) is wrapped by
   `scripts/sandbox-db.sh` (§ *Isolation and the held-out sandbox (I3)*,

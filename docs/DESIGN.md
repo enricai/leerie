@@ -2799,7 +2799,7 @@ the container's `/tmp`.
 | Kind | Workers | Tree | Run repository | Run files |
 |---|---|---|---|---|
 | committing, run worktree | implementer, per-subtask conformer (subtask worktree); final conformer, acceptance-repair conformer, delivery re-drive implementer, integrator (staging) | write | its `objects/` read, nothing else of it; the tree's git metadata write (below) | read `subtasks/`, `task.md`, `task-files/`, `notes/`; the implementer writes its own `notes/<id>/` (`criteria.md`, `checkpoint.md`) |
-| committing, disposable clone | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
+| committing, ref-less clone (the falsifier's kept for the run, §8 *The falsifier's checkouts are kept too*) | acceptance writer, surrogate fixer, falsifier | write (its `.git` is inside it) | its `objects/` read (the clone's objects borrow them), nothing else of it | — |
 | non-committing, own checkout | delivery judge, observability judge, integration judge, CI checks, PR reviewer, set auditor, verifiability classifier, delivery ratchet, replay capture, satisfied probe on a subtask tree | write with bare `Bash`, else read | read | — |
 | judgment, shared planning worktree | classifier, planners, reconciler, the judges, splitter, fit judge, satisfied probe, provision | read | read | — |
 | payload-only | judge, patch generator, PR writer, dep capture, scope judge, contract extractor | read its empty directory | read | — |
@@ -7101,9 +7101,9 @@ the run repository, which holds every taken branch; the state tar excludes
 `<id>/tree-repos` as it excludes `<id>/repo`.
 
 **Unchanged.** The planning worktree and every helper checkout (none
-commits) stay worktrees of the run repository. The disposable clones of the
-acceptance writer, the surrogate fixer and the falsifier
-(`_ref_less_clone`) are already their own repositories.
+commits) stay worktrees of the run repository. The clones of the acceptance
+writer, the surrogate fixer and the falsifier (`_ref_less_clone`; the
+falsifier's kept across a run's calls) are already their own repositories.
 
 ### The run identifier
 
@@ -7913,8 +7913,8 @@ ignored. A file leerie places in a checkout and must keep out of commits
 ignored by a self-ignoring `.gitignore` beside it — `/.gitignore` and the
 file's literal name, under a leerie tag — written only in a directory that
 has no `.gitignore` of its own and removed with the file. A directory that
-has one is never edited: the falsifier's (disposable, never committed)
-checkout leaves that file visible. (The delivery re-drive no longer places
+has one is never edited: the falsifier's (never committed) checkout
+leaves that file visible. (The delivery re-drive no longer places
 anything in its checkout: §8 *A held-out set never enters a tree a worker
 commits from*.) The alternatives fail on correctness: a per-worktree
 `core.excludesFile` needs `extensions.worktreeConfig`, itself a write to
@@ -14831,8 +14831,9 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   judge is asked about (never an `external` item, never an
   `untouched_paths` item — code and the PR's "needs human
   verification" own those) gets up to `falsifier_samples` (3)
-  independent `falsifier` samples. Each runs in a disposable checkout
-  of the final commit with dependencies installed (and, on a Prisma
+  independent `falsifier` samples. Each runs in a checkout of the
+  final commit, kept for the run and moved there (*The falsifier's
+  checkouts are kept too*), with dependencies installed (and, on a Prisma
   repository, a fresh throwaway database — §8 *Prisma repositories get
   a real database*), and gets the item,
   the run's own diff (start commit and stat), the run's shown
@@ -16760,7 +16761,8 @@ one makes nothing *met*:
 - a test-outcome part is read from the failing-test-ID diff of the
   committed tree (above);
 - the held-out sets, the re-measure included, and the falsifier run in
-  disposable checkouts of the commit, never in staging;
+  checkouts of the commit (the falsifier's kept for the run and moved to
+  it), never in staging;
 - a `RECORD` cite verifies only against the orchestrator's own lines of
   the executed-commands record — the final-tree build/lint/test axes,
   the B\* diff, the held-out sets' final verdicts — and those are in it
@@ -17531,8 +17533,9 @@ and a report that names the test's cases or path, which carries no source
 line — the case names are given to the implementer in a held-back round
 anyway. The acceptance evaluation, the set audit, the surrogate witness
 and the falsifier (its `.leerie-falsifier/` leads and the confirm
-checkout) all work in disposable checkouts that are removed and never
-committed from onto a branch: the surrogate's fix is committed by leerie
+checkout) all work in checkouts that are never committed from onto a
+branch — removed, or the falsifier's kept for the run and moved (*The
+falsifier's checkouts are kept too*): the surrogate's fix is committed by leerie
 on no branch, only for the witness's tree.
 
 **A finished verdict is reused only on the commit it was measured on.** A
@@ -18862,6 +18865,110 @@ sandbox's read-only lower, which no evaluation observes writing and none
 can mutate, and each evaluation still gets its own fresh overlay and the
 lock exclusive. Like a committed view, the evaluation tree lives no longer
 than the run and is reaped with its worktrees.
+
+*The falsifier's checkouts are kept too.* Delivery detection's falsifier
+(*Delivery detection*) runs in checkouts of its own: `falsifier-confirm`,
+where leerie confirms a probe, and up to `max_parallel` lanes
+`falsifier-lane<n>`, where a falsifier worker writes one. Each is a writer's
+checkout — a ref-less clone of the run's repository (*The validity tree is
+the run's own start*) with a `.git` of its own that its worker writes and a
+git directory of leerie's that leerie reads it through — and each was made,
+installed and removed on every call: the phase-3 drop check, detection, and
+every re-drive re-check. Measured across the replayed-run corpus
+(`logs/falsifier-setup.log`, 21 runs on 0.70 or later): 266 lane installs and
+77 confirm-checkout installs, 16 per run, up to 9 calls in one run; all but
+the first at each path in a run, 229, were reinstalls of the one path — the
+largest repeated install a run makes. So they join the kept-tree mechanism
+as consumers, moved the way the other kept trees are: the install key is the
+install's inputs, not the commit, so a later call at a commit whose lockfiles
+and manifests are unchanged reuses the install, and one that changed them
+reinstalls.
+
+A clone moves as a worktree does, with more steps, because a worker wrote
+it. The `.git` its last worker wrote — configuration, hooks, any ref it
+made — is removed; leerie's git directory is made again at the new commit
+(a new measurement id with it, so the confirm checkout's stores start empty;
+a lane's stores are its side's worker cache, below) without reading the
+files the worker shaped. Then, before any git command reads a tracked
+directory, what a
+checkout and a clean would not undo, or would read as the worker shaped it,
+is undone, from the commit's objects alone: whatever is at a submodule's
+path is removed (neither enters a gitlink), as is any `.git` inside a
+tracked directory (git lists no path named `.git` as untracked, so no clean
+reaches one); every tracked directory is given the mode a checkout gives one
+(none of the bits its worker added or took away), stripped of every
+extended attribute its worker could set (an ACL, a `user.` attribute) and
+emptied of what git neither tracks
+nor cleans there — a FIFO, a socket, a device, which git would also block
+reading were one named `.gitignore`. (One in a directory the commit does not
+track is left to the clean, which reads no `.gitignore`; the listing of
+untracked directories that gives their owner bits back first does, and
+waits out its 300 s bound on one: a slower move, never a different tree.)
+The tree is then checked out `--detach
+--force` through leerie's git directory, never recursing into a submodule,
+cleaned of everything untracked but the install's outputs, and its outputs
+verified as installed (`_install_intact`, which removes what the install did
+not make and refuses a tree where something it made was changed), and every
+directory at, above or under an output stripped of those attributes too
+(a default ACL there moves neither the directory's mode nor its inode, all
+that check compares for a directory, yet decides the mode of everything made
+under it later). Every
+tracked file is then written anew from an index with no stat data, under the
+commit's own attributes and git's default stat check, and a submodule's path
+made the empty directory a fresh checkout makes: a file git reads as
+unchanged only through attributes its worker added (CRLF line ends under its
+own `eol=crlf`, an encoding), or with the modes its worker took away, is the
+commit's again. Each tracked file the commit did not change is then given
+back the time it had when leerie last wrote it, which leerie recorded then,
+before any worker or install ran; which files is decided from the two
+commits' objects alone. So an unchanged input is older than the outputs
+installed from it, as after a fresh clone and install, and a file the commit
+changed has a new time of its own: a tool that compares times rebuilds what
+it should, and a cache that knows a file by its size and time never sees two
+contents under one key (unless a worker set a file's time back to one
+leerie gave it, which the worker cache's being shared already allows).
+When the commit changes a `.gitattributes`, which can write a file its
+commit did not change as other bytes, no file keeps its time. No time its
+worker set on a tracked file survives, and nothing it wrote is read to
+decide. Leerie's status of the moved tree never enters a submodule's
+path, whose configuration would be no commit's, and a move of any kept tree
+refuses one whose submodule path holds anything. Only then is the clone's own `.git`
+made again — detached at the new commit, every ref and the remote deleted —
+exactly as a fresh clone's would be. Anything else, a step that times out
+included, remakes the checkout and installs afresh, as does a writer's
+checkout that fell back to a worktree when no clone could be made (the
+clone's move is what undoes a worker's leavings) and a checkout
+whose install ran on another side's worker cache than the one its next
+writer's would (a lane taken for leerie alone, say): what the install linked
+from that cache is that side's.
+
+The bar is that a reused checkout gives the same verdict a fresh one would,
+and a writer is the hardest case: a falsifier worker writes its lane with
+`--dangerously-skip-permissions`. What it can leave behind is bounded by
+where it may write: its own tree, its side's worker cache (the falsifier
+cache every lane in the run already shares, kept or not) and its private
+HOME, a copy made per worker. In the tree, a file it added anywhere is
+cleaned, under the install's outputs included, and any file the install made
+that it changed, replaced, linked or removed refuses the reuse: a change
+moves the file's change time or inode, and no owner can set a change time
+back; a directory's mode and inode are compared, and its extended attributes
+removed. Its processes end with it (§6 *A confined command's processes end with
+it*), so nothing writes the tree after the move has verified it. A lane is
+already reused between the samples of one call with only the restore
+(*One restore*), which keeps ignored files; the move a later call makes is
+the stricter of the two. A probe is never placed on the confirm checkout's
+disk (it runs in a held-out sandbox), and leerie's own leads are untracked
+files the clean removes.
+
+The cost is disk. Like the other kept trees the checkouts live no longer
+than the run and are reaped with its worktrees, but until then they hold
+their installs: those phase 3's drop check makes stay through every wave,
+and a lane a later call with fewer items does not use stays unused. The
+saving is smaller where the install hard-links its files from a store
+another tree's install also links from (pnpm, bun, uv on Linux): each such
+link moves the change time of every copy, which `_install_intact` reads as
+a change, so the checkout reinstalls, as before. Reuse is never wrong
+there, only rarer.
 
 Judging a fix, the verdict is the exit code: a command the shell could
 not run, one the container's limits killed (a fork-exhaustion message in

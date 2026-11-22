@@ -216,7 +216,7 @@ def test_every_checkout_names_who_writes_it(leerie):
     """`writer` has no default, and each call names the worker the checkout
     is made for: leerie's own confirm and flip checkouts none."""
     for fn in (leerie._acceptance_writer_checkout,
-               leerie._falsifier_checkout):
+               leerie._falsifier_checkout, leerie._falsifier_kept_checkout):
         p = inspect.signature(fn).parameters["writer"]
         assert p.kind is p.KEYWORD_ONLY and p.default is p.empty
     tree = ast.parse(inspect.getsource(leerie))
@@ -229,12 +229,23 @@ def test_every_checkout_names_who_writes_it(leerie):
         if name == "to_thread" and args:
             name = getattr(args[0], "id", "")
             args = args[1:]
-        if name not in ("_acceptance_writer_checkout", "_falsifier_checkout"):
+        if name not in ("_acceptance_writer_checkout", "_falsifier_checkout",
+                        "_falsifier_kept_checkout"):
             continue
         kw = {k.arg: k.value for k in node.keywords}
         assert "writer" in kw, ast.unparse(node)
         label = ast.unparse(args[1]) if len(args) > 1 else "?"
         got.setdefault(ast.unparse(kw["writer"]), set()).add(label)
+    # The kept tree's rebuild passes `writer` on (it has a default there,
+    # for the trees no worker writes): every writer's checkout it makes
+    # names its writer at the call.
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") ==
+                "_reuse_or_rebuild_kept_tree"):
+            kw = {k.arg for k in node.keywords}
+            if "writer_checkout" in kw:
+                assert "writer" in kw, ast.unparse(node)
     assert got == {
         "'acceptance_writer'": {"wt"},
         "'surrogate_fixer'": {"wt"},

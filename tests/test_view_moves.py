@@ -216,6 +216,58 @@ def test_a_rewritten_dot_git_is_pointed_back(leerie, env, tmp_path):
     assert (v2 / ".git").read_text() == f"gitdir: {admin}\n"
 
 
+def test_a_move_that_cannot_read_the_commit_is_made_afresh(
+        leerie, env, monkeypatch):
+    """A move that cannot read the commit's tree is no move, and leaves a
+    view git can still remove: the next measurement makes it afresh."""
+    st, staging, caps, _count = env
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    assert _count(v1) == 1
+    monkeypatch.setattr(leerie, "_tree_entries", lambda *a, **k: None)
+    b = _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert _git(v2, "rev-parse", "HEAD") == b
+    assert (v2 / "src" / "a.txt").read_text() == "3"
+    assert _count(v2) == 1                    # installed afresh, not moved
+
+
+def test_a_view_whose_submodule_path_holds_anything_is_made_afresh(
+        leerie, env):
+    """A submodule's path (a gitlink) is entered by neither the move's
+    checkout nor its clean, so a view where anything is there is not moved
+    but made afresh: the next commit's measurement never sees it. An empty
+    one, as every checkout makes it, still moves."""
+    st, staging, caps, _count = env
+    sha = _git(staging, "rev-parse", "HEAD")
+    _git(staging, "update-index", "--add", "--cacheinfo",
+         f"160000,{sha},src/sub")
+    _git(staging, "-c", "user.name=w", "-c", "user.email=w@w", "commit",
+         "-qm", "a submodule")
+    leerie._take_tree_branch(staging)
+    v1 = _measure(leerie, st, staging, caps)
+    assert _count(v1) == 1
+    assert (v1 / "src" / "sub").is_dir()
+    # Empty, as every checkout makes it: the view still moves.
+    (staging / "src" / "c.txt").write_text("1")
+    _git(staging, "add", "src/c.txt")
+    _git(staging, "-c", "user.name=w", "-c", "user.email=w@w", "commit",
+         "-qm", "more")
+    leerie._take_tree_branch(staging)
+    v1 = _measure(leerie, st, staging, caps)
+    assert _count(v1) == 2                    # moved, the install kept
+    (v1 / "src" / "sub" / "left.txt").write_text("x")
+    (staging / "src" / "b.txt").write_text("1")
+    _git(staging, "add", "src/b.txt")
+    _git(staging, "-c", "user.name=w", "-c", "user.email=w@w", "commit",
+         "-qm", "work")
+    leerie._take_tree_branch(staging)
+    v2 = _measure(leerie, st, staging, caps)
+    assert (v2 / "src" / "b.txt").read_text() == "1"
+    assert not os.path.lexists(v2 / "src" / "sub" / "left.txt")
+    assert _count(v2) == 1                    # installed afresh, not moved
+
+
 def test_a_failed_install_is_not_recorded(leerie, env, monkeypatch):
     st, staging, caps, _count = env
     monkeypatch.setenv("FAIL_INSTALL", "1")
