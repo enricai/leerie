@@ -429,7 +429,8 @@ def test_a_held_out_side_workers_cache_is_never_a_fixers(leerie, run):
 # never writes through a path confined code shaped*).
 _PRIMITIVES = {
     "_open_dir_beneath", "_write_beneath", "_unlink_beneath",
-    "_remove_beneath", "_rmdirs_beneath", "_copytree_beneath",
+    "_remove_beneath", "_rmdirs_beneath", "_rename_dir_beneath",
+    "_copytree_beneath",
     "_add_dir_bits_beneath", "_mkdir_private",
     "_rmtree_owned", "_own_private_dir",
 }
@@ -557,5 +558,6 @@ def test_the_converted_sites_write_only_beneath():
                "_probe_case_facts_placed", "_acceptance_report_spec",
                "_redrive_ast_hits", "_rescue_integrator_work",
                "_writable_dirs_to", "_restore_write_bits",
-               "_tree_store_env", "_cache_vars", "_write_config_toml_keys"):
+               "_tree_store_env", "_cache_vars", "_write_config_toml_keys",
+               "_adopt_install_store"):
         assert fn not in found, (fn, found.get(fn))

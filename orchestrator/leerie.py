@@ -6970,22 +6970,29 @@ def _content_install_key(tree: str | Path) -> str | None:
     has not installed in: equal root files, equal key, whatever the tree
     (DESIGN §8 *An install's output outside the tree is a store keyed by the
     install inputs*). None when the tree has no such file."""
+    # A tree's root is confined code's to shape (its measured commands write
+    # it): each file is read beneath the tree, so a link, a FIFO or a file
+    # over the limit is skipped, never read through (DESIGN §6 *Leerie never
+    # reads through a link a repository holds*, *No read is unbounded*).
+    # Only a regular file is opened: this runs while an install's reads are
+    # watched, and opening a directory there (`src/`) would make it one of
+    # the install's inputs, so every commit beneath it moved the key.
+    root = Path(tree)
     h = hashlib.sha256()
     found = False
     try:
-        names = sorted(os.listdir(tree))
+        names = sorted(_listdir_beneath(root, root))
     except OSError:
         return None
     for name in names:
         if name == ".git" or Path(name).suffix.lower() not in _DECLARATION_SUFFIXES \
                 or Path(name).stem.lower() in _PROSE_STEMS:
             continue
-        f = Path(tree) / name
+        if not _regular_file_beneath(root, root / name):
+            continue
         try:
-            if f.is_symlink() or not f.is_file() \
-                    or f.stat().st_size > _CONTENT_KEY_MAX_BYTES:
-                continue
-            data = f.read_bytes()
+            data = _read_beneath(root, root / name,
+                                 limit=_CONTENT_KEY_MAX_BYTES)
         except OSError:
             continue
         found = True
@@ -7010,23 +7017,30 @@ def _adopt_install_store(tree: str, key: str) -> None:
         return
     run_dir = found[0].parent.parent
     ckey = _content_install_key(found[0])
+
+    def filled(d: Path) -> bool:
+        # A store is a directory confined installs write: one reached only
+        # through a link is no store of the run's.
+        try:
+            return bool(_listdir_beneath(run_dir, d))
+        except OSError:
+            return False
+
     for var in sorted(_KEYED_STORE_VARS):
         src = found[1] / _STORE_VARS[var]
-        if ckey and ckey != key:
-            csrc = _keyed_store(run_dir, ckey, var)
-            with contextlib.suppress(OSError):
-                if csrc.is_dir() and any(csrc.iterdir()):
-                    src = csrc
+        if ckey and ckey != key and filled(csrc := _keyed_store(
+                run_dir, ckey, var)):
+            src = csrc
         dst = _keyed_store(run_dir, key, var)
+        if not filled(src) or filled(dst):
+            continue
+        # Every step from the run directory, which no grant names, without
+        # following a link (DESIGN §6 *Leerie never writes through a path
+        # confined code shaped*): what stands at `dst` (an empty store, or a
+        # link or file an install left) is removed, never moved through.
         with contextlib.suppress(OSError):
-            if not src.is_dir() or not any(src.iterdir()):
-                continue
-            if dst.is_dir() and any(dst.iterdir()):
-                continue
-            if dst.is_dir():
-                dst.rmdir()
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(src, dst)
+            _mkdir_private(dst.parent, run_dir)
+            _rename_dir_beneath(run_dir, src, dst)
             _mkdir_private(src, run_dir)
 
 
@@ -27555,6 +27569,27 @@ def _rmdirs_beneath(anchor: Path, path: Path) -> None:
                 os.rmdir(parts[i - 1], dir_fd=dfd)
         except OSError:
             return
+
+
+def _rename_dir_beneath(anchor: Path, src: Path, dst: Path) -> None:
+    """Rename the directory `src` to `dst`, both beneath `anchor`, each
+    parent reached without following a link: a link or file at `src`
+    refuses the rename (`OSError` ENOTDIR), and a link, file or empty
+    directory at `dst` is removed first, so nothing is moved through a link
+    (a directory there that is not empty refuses it)."""
+    src, dst = Path(src), Path(dst)
+    with _dir_beneath(anchor, src.parent) as sfd, \
+            _dir_beneath(anchor, dst.parent) as dfd:
+        if not stat.S_ISDIR(os.stat(src.name, dir_fd=sfd,
+                                    follow_symlinks=False).st_mode):
+            raise OSError(errno.ENOTDIR, f"{src} is not a directory")
+        with contextlib.suppress(FileNotFoundError):
+            if stat.S_ISDIR(os.stat(dst.name, dir_fd=dfd,
+                                    follow_symlinks=False).st_mode):
+                os.rmdir(dst.name, dir_fd=dfd)
+            else:
+                os.unlink(dst.name, dir_fd=dfd)
+        os.rename(src.name, dst.name, src_dir_fd=sfd, dst_dir_fd=dfd)
 
 
 def _copy_beneath(src: Path, anchor: Path, dst: Path, *,

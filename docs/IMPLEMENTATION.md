@@ -5326,7 +5326,10 @@ link:
   link or non-directory on the way counts as taken), `_unlink_beneath`,
   `_remove_beneath` (a directory through `_rmtree_owned` of
   `/proc/self/fd/<dirfd>/<name>`), `_rmdirs_beneath` (`os.removedirs` up to
-  the anchor), `_copy_beneath(src, anchor, dst, *, src_anchor=None, limit=None)`
+  the anchor), `_rename_dir_beneath(anchor, src, dst)` (the directory `src`
+  renamed to `dst`, both parents reached from `anchor`; a link or file at
+  `src` refuses it, a link, file or empty directory at `dst` is removed
+  first), `_copy_beneath(src, anchor, dst, *, src_anchor=None, limit=None)`
   (with `src`'s mode; `src_anchor` reads `src` through `_read_beneath`
   within `limit`), `_copytree_beneath(src, anchor, dst, *, ignore=None,
   src_anchor=None, limit=None)` (links copied as
@@ -5349,7 +5352,9 @@ Callers: `_restore_tracked_content`, `_remove_new_untracked`,
 checkouts), `_checkout_ignorable`/`_checkout_ignore`,
 `_falsifier_place_leads` (leads written mode 0444; the `rglob` chmods
 before removal are gone, `_rmtree_owned` gives the bits),
-`_falsifier_gates`, `_falsifier_save_probe`, `_collect_acceptance_set`.
+`_falsifier_gates`, `_falsifier_save_probe`, `_collect_acceptance_set`,
+`_adopt_install_store` (a tree's install moved into its keyed store with
+`_rename_dir_beneath` from the run directory).
 `_rescue_integrator_work`'s throwaway index is in
 a `tempfile.mkdtemp(prefix="leerie-rescue-")` directory, not the tree's
 git directory. Tests: `tests/test_leerie_writes_never_follow_links.py`
@@ -5427,7 +5432,11 @@ notes_dir=None)` (read beneath `notes_dir`, which the gate passes as
 `_notes_dir(leerie_dir, sid)`), `_introduced_conflict_markers`,
 `_restore_git_pointer`, `_admin_dir_of`, `_run_tree_location`,
 `_stage_worktree_extras`, `_copy_task_references`,
-`_verify_set_audit_case`, `_category_evidence_found`
+`_verify_set_audit_case`, `_content_install_key(tree)` (a tree's root
+declaration files, each within `_CONTENT_KEY_MAX_BYTES`; a link, a
+non-regular file or one over the limit is skipped),
+`_adopt_install_store` (the stores it moves, listed beneath the run
+directory), `_category_evidence_found`
 (`follow_symlinks=False`). The launcher, after its `--help` scan and
 before any verb but `version`, exits 1 when `_checkout_config_links`
 names a link among `leerie.toml`, `.leerie`, `.leerie/config.toml`,
