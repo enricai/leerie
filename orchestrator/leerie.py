@@ -14130,6 +14130,13 @@ async def _preflight_repo() -> None:
                 "subprocess machinery is broken. Most likely a stray reaper "
                 "`waitpid`ing asyncio's children (DESIGN §6 *Zombie "
                 "reaping*), or an inherited SIGCHLD disposition.")
+        if r.returncode == 128 or "not a git repository" in (r.stderr or "").lower():
+            die(f"/work is not a usable git repository in the container "
+                f"(`git config {key}` exited {r.returncode}: "
+                f"{(r.stderr or '').strip()[:200]}). If it is a git "
+                "worktree, its .git file points at a host gitdir that is not "
+                "mounted here. This is NOT a missing git identity; run from "
+                "a standalone clone.")
         if r.returncode != 0 or not r.stdout.strip():
             die(f"git {key} is not configured. "
                 f"Run: git config --global {key} \"<value>\"")
