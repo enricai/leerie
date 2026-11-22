@@ -3229,7 +3229,10 @@ PLANNER_BLOCKER_KINDS = ("none", "external_precondition", "evidence_gap")
 # triggers is in CI_GATING_TRIGGERS and none of its `requires` is in
 # CI_EXTERNAL_REQUIRES. `database` is not external — bench n6 scored a
 # database-backed coverage check gate-eligible; without one it is red at the
-# baseline and drops out on its own.
+# baseline and drops out on its own. Nor is `network`: a check runs with the
+# measurement grant, which reaches the outside through the egress proxy as
+# the repository's CI does (DESIGN §9 *A merge check that needs the network
+# runs*); the worker still records it, as it records `database`.
 CI_CHECK_KINDS = ("build", "lint", "format", "typecheck", "test", "coverage",
                   "other")
 CI_TRIGGERS = ("pull_request", "push_default_branch", "push_other",
@@ -3238,8 +3241,8 @@ CI_GATING_TRIGGERS = frozenset({"pull_request", "pre_push_hook",
                                 "pre_commit_hook"})
 CI_REQUIRES = ("database", "browser", "network", "secrets",
                "cloud_credentials", "gpu")
-CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
-                                  "cloud_credentials", "gpu"})
+CI_EXTERNAL_REQUIRES = frozenset({"browser", "secrets", "cloud_credentials",
+                                  "gpu"})
 CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
 # What of a CI prerequisite needs root (DESIGN §9 *A prerequisite runs in the
 # form that needs no root*): a CI runner has it, nothing leerie runs does
@@ -53078,7 +53081,9 @@ def _ci_run_key(check: dict) -> str:
         [[argv, os.path.normpath((p.get("cwd") or ".").strip() or ".")]
          for p in (check.get("prerequisites") or [])
          if (argv := _ci_prereq_argv(p)) is not None],
-        sorted(str(r) for r in (check.get("requires") or [])),
+        # Of `requires`, only a database changes what runs (`_ci_run` wraps
+        # the check in one); `network` is a fact, not a different command.
+        _ci_requires_db(check),
         check.get("coverage") if check.get("kind") == "coverage" else None,
     ], sort_keys=True)
 

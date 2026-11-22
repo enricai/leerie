@@ -7745,6 +7745,27 @@ sample's probe never counts for the next.
   origin/main before the funeralworks change (measurements offline), the
   four egress-table tests and the PyPI test were red, the build download
   failing name resolution.
+- `tests/test_ci_parity.py`, a check that needs the network (DESIGN §9
+  *A merge check that needs the network runs*). Anywhere:
+  `test_selection_is_code` selects a check tagged `requires: network` like
+  one tagged `database`; `test_the_run_key_reads_what_runs_and_nothing_else`
+  keys a check on whether it needs a database, never on `network`; and
+  `test_a_hook_running_what_a_network_ci_step_runs_runs_once` merges a
+  workflow step tagged `network` with the hook running the same command
+  (review round 1: keyed on raw `requires`, both ran). In a runtime that can isolate,
+  `test_a_check_that_needs_the_network_gates_through_the_proxy` drives the
+  real baseline and final halves over a fixture repository whose build
+  fetches its input with `urllib` through the proxy variables: green at the
+  baseline and a gate, its fetch reaching an outside stand-in through the
+  egress proxy; a sibling check whose host is inside the container refused
+  by the proxy, red at the baseline and no gate, the stand-in (listening on
+  every IPv4 address) never reached for it; a final change that breaks the
+  fetch a red B\* confirms. It was red on origin/main before this change
+  (the check skipped as `external_resource`), as were the three tests
+  above. Live-falsified in the
+  container: the measurement kind without egress (no gate), the proxy
+  refusing nothing (the inside check a gate); on the host, the run key
+  reading raw `requires` (two tests red).
 - `tests/test_user_scripts_on_path.py` (7 test functions; DESIGN §6
   *Which stores an install may share*, a moved user base's scripts on
   `PATH`): `_with_user_scripts` appending `<base>/bin` last in place of the

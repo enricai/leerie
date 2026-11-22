@@ -10978,8 +10978,11 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   `ci_parity.skipped`); `_ci_select(checks, tree, forbidden=())` keeps a check only when it
   is not `kind: test` (left to the test axis), one `trigger` is in
   `CI_GATING_TRIGGERS` (`pull_request`, `pre_push_hook`, `pre_commit_hook`),
-  no `requires` is in `CI_EXTERNAL_REQUIRES` (`browser`, `network`,
-  `secrets`, `cloud_credentials`, `gpu` — `database` is not), and
+  no `requires` is in `CI_EXTERNAL_REQUIRES` (`browser`, `secrets`,
+  `cloud_credentials`, `gpu` — `database` and `network` are not: a
+  `network` check runs, reaching the outside through the egress proxy as
+  every `_measurement_grants` command does, DESIGN §9 *A merge check that
+  needs the network runs*), and
   `_ci_check_problems` is empty, and its `argv` does not run a command the
   task forbids (`_forbidden_command_hit` over `shlex.join(argv)` against
   `_forbidden_specs(st.data)`; else `reason: "forbidden_by_task"`, `forbidden: <hit>`) — a
@@ -10991,7 +10994,9 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   that would be selected but runs exactly what an earlier selected one runs
   (`_ci_run_key(check) -> str`: `kind`, `argv`, `cwd`, `env`, each
   prerequisite as it runs (`_ci_prereq_argv` and its `cwd`; one that runs
-  nothing is left out), `requires`, `coverage`; never `id`, `trigger`,
+  nothing is left out), `_ci_requires_db(check)` (`database` in
+  `requires`, the one value that changes what runs; never `network`),
+  `coverage`; never `id`, `trigger`,
   `source`, `path_filters`, `notes` or `strict_argv`)
   is not selected: `reason: "duplicate"`, `duplicate_of: <that check's
   id>`; when the kept check has no strict form left and the duplicate
