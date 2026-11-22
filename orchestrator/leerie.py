@@ -6939,24 +6939,50 @@ _KEYED_STORE_VARS: frozenset[str] = frozenset({"BUNDLE_PATH"})
 _TREE_INSTALL_KEYS: dict[str, str] = {}
 
 
-# The files a tree's bundler install reads that name its gems; a tree with
-# none of them has no content key.
-_CONTENT_KEY_FILES = ("Gemfile", "Gemfile.lock", "gems.rb", "gems.locked",
-                      ".ruby-version", ".tool-versions")
+# A tree with no recorded install has no `_install_key`; its key is taken from
+# its root files by one structural rule, naming no package manager or
+# language: the regular root files that are declarations, not code or prose
+# (no suffix, or a config-format suffix) and not large. A manifest, a lock
+# or a toolchain pin is such a file; a README or a source edit does not move
+# the key.
+_DECLARATION_SUFFIXES = frozenset({"", ".lock", ".toml", ".json", ".yaml",
+                                   ".yml", ".txt", ".cfg", ".ini", ".gemspec"})
+_PROSE_STEMS = frozenset({"readme", "license", "licence", "changelog",
+                          "copying", "notice", "authors", "contributing"})
+_CONTENT_KEY_MAX_BYTES = 1 << 20
+
+
+def _tree_is_bare(tree: str | Path) -> bool:
+    """True when `tree` holds no regular file at its root but its `.git`."""
+    try:
+        return not any(n != ".git" and (Path(tree) / n).is_file()
+                       for n in os.listdir(tree))
+    except OSError:
+        return False
 
 
 def _content_install_key(tree: str | Path) -> str | None:
     """The key of the install inputs `tree` holds on disk, for a tree leerie
-    has not installed in: equal files, equal key, whatever the tree (DESIGN
-    §8 *An install's output outside the tree is a store keyed by the install
-    inputs*). None when the tree has none of `_CONTENT_KEY_FILES`."""
+    has not installed in: equal root files, equal key, whatever the tree
+    (DESIGN §8 *An install's output outside the tree is a store keyed by the
+    install inputs*). None when the tree has no such file."""
     h = hashlib.sha256()
     found = False
-    for name in _CONTENT_KEY_FILES:
+    try:
+        names = sorted(os.listdir(tree))
+    except OSError:
+        return None
+    for name in names:
+        if name == ".git" or Path(name).suffix.lower() not in _DECLARATION_SUFFIXES \
+                or Path(name).stem.lower() in _PROSE_STEMS:
+            continue
+        f = Path(tree) / name
         try:
-            data = (Path(tree) / name).read_bytes()
+            if f.is_symlink() or not f.is_file() \
+                    or f.stat().st_size > _CONTENT_KEY_MAX_BYTES:
+                continue
+            data = f.read_bytes()
         except OSError:
-            h.update(b"-\0")
             continue
         found = True
         h.update(os.fsencode(name) + b"\0" + data + b"\0")
@@ -7058,6 +7084,13 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
         dst = root / _STORE_VARS[var]
         if var in _KEYED_STORE_VARS and key:
             dst = _keyed_store(found[0].parent.parent, key, var)
+        elif (var in _KEYED_STORE_VARS and not _TREE_INSTALL_KEYS
+              and _tree_is_bare(found[0]) and env.get(var) == str(
+                  _stores_home(found[0].parent.parent) / RUN_STORES_DIRNAME
+                  / _STORE_VARS[var])):
+            # No install is recorded and the tree holds no files to key
+            # by: the run's store the command already has stands.
+            continue
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
