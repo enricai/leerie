@@ -15933,7 +15933,21 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    no escalation.
 8. *One budget.* Every group draws one round from each member's shared
    counter (§13 *One re-drive budget per subtask*) and its wall time from
-   `redrive_budget_sec`, the hard stop.
+   `redrive_budget_sec`, the hard stop. One exception keeps that counter
+   from ending a run with drivable work it never attempted: before the run
+   is declared `unconverged`, any unmet item carrying a drivable evidence
+   key never handed to a worker (`"<item_index>:<key>"` ∉
+   `delivery_redrive.evidence_handed`) gets one swing even when its owners'
+   shared counters are already spent — subordinate only to
+   `redrive_budget_sec`, never to a round count. The counter cannot stop a
+   first attempt at evidence no worker has seen: a round count there only
+   re-creates the stop-short waste the run would otherwise defer to a whole
+   new run (minutes of a swing versus hours of a fresh run). A key, once
+   driven, is recorded handed and never re-grants a swing — a fix that did
+   not pass is never re-forced — so the handed set only grows, each
+   `(item, key)` swings at most once, and termination rests solely on the
+   wall clock (every swing charges it). A group whose unmet notes are all
+   already-handed keys is the `budget` case and still stops there.
 
 *One routing table.* Every confirmed finding goes to the owners its kind names, each a worker
 handed evidence it can run or read on its own tree, or it becomes one question to the user, or
@@ -16194,9 +16208,17 @@ the operator accepted, or one settled `accepted_external` is not driven.
 An item no group drives is recorded as a typed
 `unrouted_item` (`{item_index, item, reason: no_owner | budget |
 unreproducible | no_code_target | after_last_round}`). Its reason says
-why: every group holding it was out of its members' re-drive rounds, or
-the time budget ran out first (`budget`), or it was confirmed after the
-last round (`after_last_round`). An item no subtask claims is not
+why: the time budget stopped the re-drive before its drivable evidence
+could be driven (`budget`), or that evidence was confirmed on the tree that
+ships with no wall time left to take a swing at it (`after_last_round`). A
+drivable key never handed does not stop here at all while wall time
+remains: rule 8's one swing drives it — a group out of its members'
+re-drive rounds is admitted when it still holds such a key, whether a kept
+group's item, set, check or defect left it unmet — so it reaches a worker
+instead of being deferred to the next run. An item whose drivable evidence
+was already handed and whose fix did not pass is not recorded here: it
+reached a worker, so it stays an ordinary unmet item and the run is
+`unconverged` on it. An item no subtask claims is not
 `no_owner`: rule 2 drives it by every subtask. `no_owner` is recorded
 only when the loop stopped before a group was handed the item (a
 conflict, a failed rollback, the round ceiling, a head it could not read),
@@ -16235,15 +16257,26 @@ confirmed later is another finding than one a group was handed, and the
 same probe confirmed again is the same; any other source is its name (a
 judge re-reading the item unmet again is the same finding). The re-drive
 records every key a driven group's note carried
-(`delivery_redrive.evidence_handed`), and at the end an open item with a
-key never handed is recorded, with the first reason that holds: for a key
-its note carries, `budget` (a group held it with no member left a round,
-or the time budget stopped the re-drive), else `after_last_round` (the
-key was confirmed after the last round began — by the re-check of the
-tree that ships — so no round followed it), else `no_owner`; for a key no
-note may carry, `unreproducible` (a probe no fixer may be shown) or
+(`delivery_redrive.evidence_handed`, written through `State.save()`, so a
+resume never re-grants a swing for a key already driven). A drivable key
+never handed is driven, not merely recorded: rule 8 gives it one swing
+before the run ends, bounded only by `redrive_budget_sec` — a group out of
+its members' rounds that still holds such a key is admitted, and the
+re-drive re-enters for a key the re-check of the tree that ships first
+surfaces, as long as the pass drove work (a drive charges the budget, so
+re-entry is bounded by it; a pass that drove nothing cannot re-enter) and
+wall time remains. What reaches the end still unhanded is recorded, with
+the first reason that holds: for a key its note carries, `budget` (the time
+budget stopped the re-drive before the key could be driven — a group held
+it with no member left a round while the clock was already spent, or the
+re-drive stopped on its budget), else `after_last_round` (the key was
+confirmed after the last round began — by the re-check of the tree that
+ships — and no wall time remained to swing at it), else `no_owner`; for a
+key no note may carry, `unreproducible` (a probe no fixer may be shown) or
 `no_code_target` (a process item's evidence that names no code a subtask
-changed). Before this, an item counted as reached once any round had
+changed). A key whose note was already handed and whose fix did not pass is
+not recorded here at all: it reached a worker, and its item stays unmet by
+the ordinary path. Before this, an item counted as reached once any round had
 driven it, whatever it was driven on. In 87580f62, item 8 was driven in
 rounds 1 and 2, each on another probe; the re-check after round 2
 confirmed a third, round 3's group was skipped for budget, and the item

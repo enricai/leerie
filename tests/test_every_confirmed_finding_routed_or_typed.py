@@ -27,7 +27,6 @@ the confirmed probe the run recorded. Synthetic text.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -194,11 +193,14 @@ def test_a_process_items_probe_follows_a_kept_rounds_diff(
     assert "unrouted_items" not in rec
 
 
-def test_a_process_item_confirmed_after_the_last_round_is_typed(
+def test_a_process_item_confirmed_after_the_last_round_gets_a_swing(
         leerie, tmp_path, monkeypatch):
     """87580f62 item 0 itself: the shipping-tree re-check (`_redrive_met_
-    unread`) confirms the regression after the last group; no round follows,
-    so it is recorded, never dropped."""
+    unread`) confirms the regression after the last group. Rather than end
+    the run with drivable work it never attempted, DESIGN §8 rule 8 re-enters
+    and drives it (edit (d)): the confirmed probe now names the code s2's
+    commit changed, so it reaches s2, bounded by the budget. Before the fix
+    this item was recorded `after_last_round` and deferred to a new run."""
     rel = "src/zz-probe/regress.test.ts"
     w = _process_world(
         leerie, tmp_path, monkeypatch,
@@ -207,25 +209,24 @@ def test_a_process_item_confirmed_after_the_last_round_is_typed(
         rows=[{"item_index": 0, "verdict": "met", "by": []},
               {"item_index": 1, "verdict": "unmet", "by": ["judge"]}])
     d = _probe(w.st.run_dir, rel, "../c", "c")
-    asked = _recheck(monkeypatch, leerie, [
+    _recheck(monkeypatch, leerie, [
         {1: _verdict(None)}, {0: _verdict(_falsifier(d, rel, "c"))}])
     w.edits = [lambda w: _commit(w, {
         "src/b.ts": "export const b = 3;\n",
         "src/c.ts": "export const v = (h: string) => h.startsWith('::0');\n"})]
     w.run()
     rec = w.st.data["delivery_redrive"]
-    assert [c["sid"] for c in _drives(w)] == ["delivery-redrive-r1-g0"]
-    # The met item no re-check had read on the moved tree was falsified.
-    assert asked == [[1], [0]]
-    assert rec["unrouted_items"] == [
-        {"item_index": 0, "item": NO_REGRESSIONS,
-         "reason": "after_last_round"}]
-    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
-    reasons = w.st.data["outcome_reasons"]
-    assert any("item 0 (after_last_round)" in r for r in reasons)
-    assert ("item 0's unmet evidence was confirmed on the tree that ships "
-            "after the re-drive's last round, so no re-drive worker was "
-            "handed it") in reasons
+    sids = [c["sid"] for c in _drives(w)]
+    # Round 1 drove the feature item (s2); the re-entry drove item 0, routed
+    # to s2 whose kept commit the probe exercises.
+    assert sids == ["delivery-redrive-r1-g0", "delivery-redrive-r2-g0"]
+    assert _drives(w)[1]["prompt"].startswith("Execute subtask `s2`.")
+    work, _f = _note_work_and_selfcheck(_drives(w)[1]["prompt"])
+    assert [x["item"] for x in work] == [NO_REGRESSIONS]
+    assert 0 in rec["items_driven"]
+    # It reached a worker, so it is not recorded `after_last_round`.
+    assert not any(u["reason"] == "after_last_round"
+                   for u in rec.get("unrouted_items") or [])
 
 
 @pytest.mark.parametrize("shape", ["judge_only", "probe_without_owner"])
@@ -266,11 +267,14 @@ def test_a_process_item_with_no_code_target_is_typed(
 # === a driven item's later probe ============================================
 
 @pytest.mark.parametrize("same_probe", [False, True])
-def test_a_driven_items_unshown_later_probe_is_recorded(
+def test_a_driven_items_later_probe_reaches_a_worker(
         leerie, tmp_path, monkeypatch, same_probe):
-    """87580f62 item 8: driven on one probe, re-confirmed on another, the
-    next group skipped for budget. The control: re-confirmed on the probe it
-    was handed, it reached a worker and is not unrouted."""
+    """87580f62 item 8: driven on one probe, re-confirmed on another after
+    the owner's round was spent. Before the fix the later probe was stranded
+    `budget`; now DESIGN §8 rule 8 gives that never-handed key its own swing
+    (edit (b), over the spent counter), so the latest probe reaches a worker.
+    The control (`same_probe`): re-confirmed on the handed probe, it is the
+    same key and grants no second swing."""
     items = [{"item": "a does X", "span": "S1", "verifiability": "tree"}]
     w = World(leerie, tmp_path, n_sets=0, items=items,
               unmet=[{"item_index": 0, "item": "a does X",
@@ -294,22 +298,25 @@ def test_a_driven_items_unshown_later_probe_is_recorded(
     w.edits = [lambda w: w.write("export const a = 1; // tried\n")]
     w.run()
     rec = w.st.data["delivery_redrive"]
-    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0"]
-    work, _f = _note_work_and_selfcheck(w.calls[0]["prompt"])
-    assert [x["probe"]["test_file"] for x in work] == [first]
+    sids = [c["sid"] for c in w.calls]
+    work0, _f = _note_work_and_selfcheck(w.calls[0]["prompt"])
+    assert [x["probe"]["test_file"] for x in work0] == [first]
     assert rec["items_driven"] == [0]
-    assert rec["items_budget_skipped"] == [0]
     w.L._decide_outcome(w.st, any_commits=True)
     reasons = w.st.data["outcome_reasons"]
     if same_probe:
+        # The same key was handed in round 1: no extra swing, no unrouted.
+        assert sids == ["delivery-redrive-r1-g0"]
+        assert rec["items_budget_skipped"] == [0]
         assert "unrouted_items" not in rec
         assert not any("unrouted_item" in r for r in reasons)
         return
-    assert rec["unrouted_items"] == [
-        {"item_index": 0, "item": "a does X", "reason": "budget"}]
-    assert ("item 0 was driven on earlier evidence; its latest confirmed "
-            "evidence reached no re-drive worker (budget)") in reasons
-    # The next run is handed it.
-    on_disk = json.loads((w.dir / "state.json").read_text())
-    assert on_disk["delivery_redrive"]["unrouted_items"][0]["reason"] == \
-        "budget"
+    # The later probe is a key no worker was handed: it gets one swing, over
+    # the spent round counter.
+    assert sids == ["delivery-redrive-r1-g0", "delivery-redrive-r2-g0"]
+    assert rec["rounds"][1]["groups"][0].get("extra_swing") is True
+    work1, _f = _note_work_and_selfcheck(w.calls[1]["prompt"])
+    assert [x["probe"]["test_file"] for x in work1] == [later]
+    # Having reached a worker, its latest probe is not recorded unrouted.
+    assert "unrouted_items" not in rec
+    assert not any("unrouted_item" in r for r in reasons)
