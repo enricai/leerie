@@ -51794,12 +51794,14 @@ async def _confirm_against_base(st: "State", caps: dict, *, base_sha: str,
     """One base-paired test confirm (DESIGN §9 *Which failures are new*):
     `candidates`, failing on `final_tree`, rerun against a worktree at
     `base_sha` (`_helper_worktree_path(st, worktree)`), its dependencies
-    installed. With `reuse` (the `confirm-base` caller, and the `redrive-base`
-    caller `_redrive_new_failures`) that worktree is a
+    installed. With `reuse` (the `confirm-base` caller, the `redrive-base`
+    caller `_redrive_new_failures`, and the `base-form-base` caller
+    `_base_form_regressions`) that worktree is a
     kept tree moved to `base_sha` with its install reused when the install
     key there is unchanged (`_reuse_or_rebuild_kept_tree`; DESIGN §9 *The
     base confirm worktree is kept across the run's confirms*, *The delivery
-    re-drive's base confirm worktree is kept too*) and is kept for
+    re-drive's base confirm worktree is kept too*, *The base-form check's base
+    confirm worktree is kept too*) and is kept for
     the run; without it the worktree is disposable, removed on every exit.
     No base checkout, or one
     whose install failed, gives every candidate `no_verdict` — never
@@ -60075,10 +60077,14 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
     """Put the kept helper worktree `wt` at `tip`, reusing its recorded
     install in place when the install key at `tip` is the one that install
     was made from and the outputs are intact, else tearing the tree down and
-    adding it afresh. Shared by both kept-tree consumers — the held-out
+    adding it afresh. Shared by both kept-tree call sites — the held-out
     evaluation tree (DESIGN §8 *The evaluation tree is kept across a run's
-    evaluations*) and the base confirm worktree (DESIGN §9 *The base confirm
-    worktree is kept across the run's confirms*).
+    evaluations*) and the base confirm worktree, which is every base-paired
+    confirm `_confirm_against_base` runs with `reuse`: B*'s `confirm-base`
+    (DESIGN §9 *The base confirm worktree is kept across the run's confirms*),
+    the re-drive's `redrive-base` (*The delivery re-drive's base confirm
+    worktree is kept too*) and the base-form check's `base-form-base` (*The
+    base-form check's base confirm worktree is kept too*).
 
     When `wt` holds an install this process recorded (`_KEPT_INSTALLS`) and
     the install key at `tip` is the one that install was made from, the view
@@ -71084,7 +71090,13 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
     of the final form in a held-out sandbox, never on disk, with every
     test-case file the base did not have removed there — on staging's
     committed view, and confirm each failing case under B* against the same
-    base forms on `before` (`_confirm_sized`). A case that fails there
+    base forms on `before` in a `base-form-base` worktree kept for the run and
+    moved to `before` with its install reused when the install key there is
+    unchanged (`reuse=True`, `_reuse_or_rebuild_kept_tree`; DESIGN §9 *The
+    base-form check's base confirm worktree is kept too*): `before` is the
+    run's fixed base for the existing-behaviour and base-form-fixed callers and
+    a round's `pre_sha` for the acceptance ratchet, each covered by the
+    input-keyed move. A case that fails there
     and passed on `before` is behaviour the run's base pinned and the commit
     no longer has (`changed`), the same as any new failure: a deleted case,
     a loosened assertion and a deleted file all still run, and a file that
@@ -71161,7 +71173,7 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
         deps_log="base form", run_prefix=f"{label}-base-form",
         confirm_label=f"{label} base form", files_default=run,
         replace=over, remove_base=removed[before],
-        remove_final=removed[after])
+        remove_final=removed[after], reuse=True)
     out["verdict"] = {k: verdict.get(k) for k in (
         "candidates", "new", "pre_existing", "no_verdict",
         "resource_affected", "budget_short", "budget_short_unsettled",
