@@ -6870,6 +6870,9 @@ _STORE_VARS: dict[str, str] = {
     "GOMODCACHE": "go-mod",
     "GOCACHE": "go-build",
     "BUNDLE_PATH": "bundle",
+    # The run-wide download/compile cache of an install (bundler's gem
+    # cache): shared like every cache here, never keyed.
+    "BUNDLE_USER_CACHE": "bundle-cache",
     "COMPOSER_CACHE_DIR": "composer",
     "NUGET_PACKAGES": "nuget",
     # Where a browser-suite runner's own browser download lands (DESIGN §8 *A
@@ -6915,12 +6918,31 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
 # store is there (DESIGN §6 *A tree's stores are the tree's, whoever writes
 # it*).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
-    "UV_CACHE_DIR", "BUNDLE_PATH", "NUGET_PACKAGES", "GOCACHE",
+    "UV_CACHE_DIR", "NUGET_PACKAGES", "GOCACHE",
     "npm_config_cache_dir",
     # A browser-suite runner's browser, which the tree's install fetches:
     # a worker started in the tree runs that browser (DESIGN §8 *A
     # repository's browser suite is a channel the run provisions*).
     "PLAYWRIGHT_BROWSERS_PATH"})
+
+
+# An install's output outside the tree (bundler's BUNDLE_PATH) is a store
+# keyed by the install inputs (DESIGN §8 *An install's output outside the
+# tree is a store keyed by the install inputs*), not a per-tree one: trees
+# with the same `_install_key` share `<run-dir>/worktrees/.stores/stores/
+# keyed/<key>/<name>`, trees with different keys never do. No package
+# manager is a special case.
+_KEYED_STORE_VARS: frozenset[str] = frozenset({"BUNDLE_PATH"})
+# The install key of each run tree leerie installed for, by realpath, set
+# where the install is recorded; a tree with none has no keyed store yet and
+# gets its own (the per-tree location), never another key's.
+_TREE_INSTALL_KEYS: dict[str, str] = {}
+
+
+def _keyed_store(run_dir: Path, key: str, var: str) -> Path:
+    """The store of `var` for install key `key`."""
+    return (_stores_home(run_dir) / RUN_STORES_DIRNAME / "keyed" / key
+            / _STORE_VARS[var])
 
 
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
@@ -6959,7 +6981,7 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     In a tree a worker writes (`_tree_cache`), every `_STORE_VARS` variable
     of `env` at that side's worker cache set, as the worker's own spawn has
     them (`_cache_vars`). In any other run tree (`_tree_stores_dir`), its
-    `_TREE_STORE_VARS` at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
+    `_TREE_STORE_VARS` (and `_KEYED_STORE_VARS` without a key) at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
     <name>`, made here
     0700 (`_mkdir_private`), like every directory leerie makes for a
     measurement, and the rest left as they are (the run's, `_leerie_stores`).
@@ -6975,8 +6997,11 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
                     if k != "XDG_CACHE_HOME"})
         return
     root = found[1]
-    for var in _TREE_STORE_VARS:
+    key = _TREE_INSTALL_KEYS.get(os.path.realpath(found[0]))
+    for var in sorted(_TREE_STORE_VARS | _KEYED_STORE_VARS):
         dst = root / _STORE_VARS[var]
+        if var in _KEYED_STORE_VARS and key:
+            dst = _keyed_store(found[0].parent.parent, key, var)
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
