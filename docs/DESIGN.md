@@ -23188,8 +23188,11 @@ everything untracked but the install's outputs; under those, `_install_intact`
 removes every entry the install did not make (a tool's cache under
 `node_modules`, a generated client) and refuses — tearing the tree down and
 installing afresh — a tree where an entry the install made was changed; and the
-move gives the tree a new measurement id, so its stores and measurement
-directory start empty. What every use then runs on is the commit's pristine
+move gives the tree a new measurement id, so its measurement directory
+starts empty, while its stores (`_TREE_STORE_VARS`) are carried over: the move
+runs only when the install's inputs are unchanged, so what the install put in
+them (bundler's gems) is still its result and no install is repeated; a move
+that fails remakes the tree, whose stores start empty. What every use then runs on is the commit's pristine
 checkout with an install a fresh install would reproduce, and it does what a
 fresh tree did: the recipe runs again (finding its output in place), every
 prerequisite runs again, and `ci-confirm-base`'s set-up checks run again from

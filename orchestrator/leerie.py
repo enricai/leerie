@@ -50053,13 +50053,16 @@ def _move_view(repo: Path, wt: Path, tip: str,
         except OSError:
             return False
     else:
-        # A moved view is a new tree to every measurement: with its id gone,
-        # `_measure_dir_at` gives it a fresh measurement directory and empty
-        # stores of its own (`_TREE_STORE_VARS`), as a replaced view gets, so
+        # A moved view is a new tree to every measurement: with a new id,
+        # `_measure_dir_at` gives it a fresh measurement directory, so
         # nothing one commit's code left there reaches the next commit's
-        # measurement; the install, run again, fills the stores anew.
+        # measurement. Its stores (`_TREE_STORE_VARS`) are kept: the move
+        # runs only when the install's inputs are unchanged, so they hold the
+        # install's result (bundler's gems). A valid id, unlike none, is not
+        # read as a new tree whose stores start empty.
         try:
-            (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
+            (admin / _MEASURE_ID_FILE).write_text(
+                uuid.uuid4().hex[:16] + "\n")
         except OSError:
             return False
         try:
