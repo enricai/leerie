@@ -6939,6 +6939,30 @@ _KEYED_STORE_VARS: frozenset[str] = frozenset({"BUNDLE_PATH"})
 _TREE_INSTALL_KEYS: dict[str, str] = {}
 
 
+# The files a tree's bundler install reads that name its gems; a tree with
+# none of them has no content key.
+_CONTENT_KEY_FILES = ("Gemfile", "Gemfile.lock", "gems.rb", "gems.locked",
+                      ".ruby-version", ".tool-versions")
+
+
+def _content_install_key(tree: str | Path) -> str | None:
+    """The key of the install inputs `tree` holds on disk, for a tree leerie
+    has not installed in: equal files, equal key, whatever the tree (DESIGN
+    §8 *An install's output outside the tree is a store keyed by the install
+    inputs*). None when the tree has none of `_CONTENT_KEY_FILES`."""
+    h = hashlib.sha256()
+    found = False
+    for name in _CONTENT_KEY_FILES:
+        try:
+            data = (Path(tree) / name).read_bytes()
+        except OSError:
+            h.update(b"-\0")
+            continue
+        found = True
+        h.update(os.fsencode(name) + b"\0" + data + b"\0")
+    return "c-" + h.hexdigest() if found else None
+
+
 def _keyed_store(run_dir: Path, key: str, var: str) -> Path:
     """The store of `var` for install key `key`."""
     return (_stores_home(run_dir) / RUN_STORES_DIRNAME / "keyed" / key
@@ -6955,8 +6979,14 @@ def _adopt_install_store(tree: str, key: str) -> None:
     if found is None:
         return
     run_dir = found[0].parent.parent
+    ckey = _content_install_key(found[0])
     for var in sorted(_KEYED_STORE_VARS):
         src = found[1] / _STORE_VARS[var]
+        if ckey and ckey != key:
+            csrc = _keyed_store(run_dir, ckey, var)
+            with contextlib.suppress(OSError):
+                if csrc.is_dir() and any(csrc.iterdir()):
+                    src = csrc
         dst = _keyed_store(run_dir, key, var)
         with contextlib.suppress(OSError):
             if not src.is_dir() or not any(src.iterdir()):
@@ -7022,7 +7052,8 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
                     if k != "XDG_CACHE_HOME"})
         return
     root = found[1]
-    key = _TREE_INSTALL_KEYS.get(os.path.realpath(found[0]))
+    key = (_TREE_INSTALL_KEYS.get(os.path.realpath(found[0]))
+           or _content_install_key(found[0]))
     for var in sorted(_TREE_STORE_VARS | _KEYED_STORE_VARS):
         dst = root / _STORE_VARS[var]
         if var in _KEYED_STORE_VARS and key:
