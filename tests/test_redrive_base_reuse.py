@@ -147,7 +147,7 @@ def _commit(leerie, staging, path, text, msg) -> str:
 
 
 def test_reuse_keeps_the_base_install_across_redrive_confirms(
-        leerie, env, observed):
+        pin, leerie, env, observed):
     """Two re-drive confirms against the same start commit keep one worktree
     with one install: the dep is the same file, the costly reinstall never
     runs again (mtime unchanged, count incremental, not reset), and the
@@ -158,14 +158,14 @@ def test_reuse_keeps_the_base_install_across_redrive_confirms(
     v1 = _redrive(leerie, st, caps, base, staging)
     assert v1["new"] == ["t_new"]              # base passes it, final fails it
     assert wt.is_dir()                         # kept, not torn down
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
     mtime1 = os.stat(_dep(wt)).st_mtime_ns
     count1 = _count(wt)
 
     v2 = _redrive(leerie, st, caps, base, staging)
     assert v2["new"] == ["t_new"]              # same verdict (outcome-identity)
     assert wt.is_dir()                         # still kept
-    assert os.stat(_dep(wt)).st_ino == ino1    # same install, reused in place
+    assert same()                              # same install, reused in place
     assert os.stat(_dep(wt)).st_mtime_ns == mtime1   # the reinstall didn't run
     assert _count(wt) == count1 + 1            # incremental, never a cold reset
 
@@ -173,7 +173,8 @@ def test_reuse_keeps_the_base_install_across_redrive_confirms(
     assert all(o["head"] == base for o in observed)
 
 
-def test_a_moved_pre_sha_with_unchanged_inputs_reuses(leerie, env, observed):
+def test_a_moved_pre_sha_with_unchanged_inputs_reuses(
+        pin, leerie, env, observed):
     """The redrive-specific case: a later group starts at a *different* commit
     (a prior group committed) but the install inputs are unchanged, so the
     kept install is reused — the move just checks the tree out at the new
@@ -185,7 +186,7 @@ def test_a_moved_pre_sha_with_unchanged_inputs_reuses(leerie, env, observed):
 
     v1 = _redrive(leerie, st, caps, base, staging)
     assert v1["new"] == ["t_new"]
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
     count1 = _count(wt)
 
     # A second start commit: code changed, package.json (the install input)
@@ -196,7 +197,7 @@ def test_a_moved_pre_sha_with_unchanged_inputs_reuses(leerie, env, observed):
     observed.clear()
     v2 = _redrive(leerie, st, caps, base2, staging)
     assert v2["new"] == ["t_new"]              # outcome-identity on moved base
-    assert os.stat(_dep(wt)).st_ino == ino1    # same install, reused in place
+    assert same()                              # same install, reused in place
     assert _count(wt) == count1 + 1            # incremental, not a cold reset
     # The base side ran on the new commit's checkout with a correct install.
     assert observed and all(o["install_ok"] for o in observed)
@@ -205,7 +206,7 @@ def test_a_moved_pre_sha_with_unchanged_inputs_reuses(leerie, env, observed):
 
 
 def test_a_moved_pre_sha_with_a_changed_manifest_reinstalls(
-        leerie, env, observed):
+        pin, leerie, env, observed):
     """The install-key guard still holds for a moved base: a start commit
     whose manifest the install reads changed is a different key, so the kept
     tree is remade and the deps installed afresh — reuse never serves a stale
@@ -213,12 +214,12 @@ def test_a_moved_pre_sha_with_a_changed_manifest_reinstalls(
     st, staging, base, caps = env
     wt = leerie._helper_worktree_path(st, "redrive-base")
     _redrive(leerie, st, caps, base, staging)
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     base2 = _commit(leerie, staging, "package.json", '{"name": "y"}\n', "bump")
 
     _redrive(leerie, st, caps, base2, staging)
-    assert os.stat(_dep(wt)).st_ino != ino1    # a fresh install, not reused
+    assert not same()                          # a fresh install, not reused
     assert _count(wt) == 1                      # cold: the counter reset
     assert _dep(wt).read_text() == '{"name": "y"}\n'
 

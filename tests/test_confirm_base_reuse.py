@@ -133,7 +133,7 @@ def _confirm(leerie, st, caps, base_sha, staging, *, worktree="confirm-base",
 
 
 def test_reuse_keeps_the_base_install_across_confirms(
-        leerie, env, observed):
+        pin, leerie, env, observed):
     """Two confirms against the same base keep one worktree with one install:
     the dep is the same file, the costly reinstall never runs again
     (mtime unchanged, count incremental, not reset), and the verdict is
@@ -144,14 +144,14 @@ def test_reuse_keeps_the_base_install_across_confirms(
     v1 = _confirm(leerie, st, caps, base, staging)
     assert v1["new"] == ["t_new"]              # base passes it, final fails it
     assert wt.is_dir()                         # kept, not torn down
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
     mtime1 = os.stat(_dep(wt)).st_mtime_ns
     count1 = _count(wt)
 
     v2 = _confirm(leerie, st, caps, base, staging)
     assert v2["new"] == ["t_new"]              # same verdict (outcome-identity)
     assert wt.is_dir()                         # still kept
-    assert os.stat(_dep(wt)).st_ino == ino1    # same install, reused in place
+    assert same()                              # same install, reused in place
     assert os.stat(_dep(wt)).st_mtime_ns == mtime1   # the reinstall didn't run
     assert _count(wt) == count1 + 1            # incremental, never a cold reset
 
@@ -160,14 +160,14 @@ def test_reuse_keeps_the_base_install_across_confirms(
     assert all(o["head"] == base for o in observed)
 
 
-def test_a_changed_base_manifest_reinstalls(leerie, env, observed):
+def test_a_changed_base_manifest_reinstalls(pin, leerie, env, observed):
     """A confirm against a different base whose manifest differs changes the
     install key, so the kept tree is remade and the deps installed afresh —
     the guard against reusing a stale install for a different base."""
     st, staging, base, caps = env
     wt = leerie._helper_worktree_path(st, "confirm-base")
     _confirm(leerie, st, caps, base, staging)
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     # A second base commit with a different manifest the install reads.
     (staging / "package.json").write_text('{"name": "y"}\n')
@@ -178,7 +178,7 @@ def test_a_changed_base_manifest_reinstalls(leerie, env, observed):
     base2 = _git(staging, "rev-parse", "HEAD")
 
     _confirm(leerie, st, caps, base2, staging)
-    assert os.stat(_dep(wt)).st_ino != ino1    # a fresh install, not reused
+    assert not same()                          # a fresh install, not reused
     assert _count(wt) == 1                      # cold: the counter reset
     assert _dep(wt).read_text() == '{"name": "y"}\n'
 

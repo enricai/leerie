@@ -849,6 +849,24 @@ def _split_response(parent_id: str, n: int) -> dict:
     }
 
 
+@pytest.fixture()
+def pin():
+    """`pin(p)()` is True while `p` is still the file it was when pinned.
+    The file is held open until the test ends, so its inode cannot be given
+    to a file made after it is removed: a bare `st_ino` comparison across a
+    remove-and-remake can match the new file to the old one's freed inode
+    (`tests/test_redrive_base_reuse.py` went red on CI that way)."""
+    fds: list[int] = []
+
+    def _pin(p: Path) -> Callable[[], bool]:
+        fd = os.open(p, os.O_RDONLY)
+        fds.append(fd)
+        return lambda: os.path.samestat(os.fstat(fd), os.stat(p))
+    yield _pin
+    for fd in fds:
+        os.close(fd)
+
+
 def fake_claude_on_path(tmp_path: Path, monkeypatch) -> Path:
     """Put a stub `claude` binary on PATH and return it.
 
