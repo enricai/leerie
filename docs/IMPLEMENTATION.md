@@ -13011,8 +13011,10 @@ each tool writes:
   different keys never do. A tree leerie has no recorded install for is keyed
   by `_content_install_key`, one structural rule (its root declaration files:
   no suffix or a config-format suffix, not prose), not a per-manager table;
-  a tree with no such file keeps the run's store (`_tree_is_bare`) and an
-  otherwise keyless tree its per-tree one.
+  a tree with no install key keeps a value that already names a shared
+  store of the run (the run's store, its side's worker cache;
+  `_is_shared_run_store`), and any other value (an image's path, none)
+  becomes its per-tree store.
 
 ### Worker-driven install
 
