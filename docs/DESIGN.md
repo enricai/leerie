@@ -16424,10 +16424,12 @@ it:
   (measured on click, uv; *designed 2026-11-19*, lane S9-R8);
 - when the key at the new tip is the key recorded, the view's `.git` is
   pointed back at its own administrative directory, found from the run
-  repository's side; its measurement id there is removed, so to every
-  measurement it is a new tree — a fresh measurement directory and empty
-  stores of its own (DESIGN §6 *Leerie's runs of the repository's commands
-  are confined too*), as a replaced view gets; it is checked out at the new
+  repository's side; it is given a new measurement id, so to every
+  measurement it is a new tree — a fresh measurement directory (DESIGN §6
+  *Leerie's runs of the repository's commands are confined too*) — while
+  its stores are kept: the move runs only when the install's inputs are
+  unchanged, so they hold the install's result (bundler's gems, in the
+  keyed store its install key names); it is checked out at the new
   tip (`checkout --detach --force`); everything untracked but the outputs
   is removed (`clean -x`);
   under the outputs, every entry the install did not make (a tool's cache, a
