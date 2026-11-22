@@ -6952,13 +6952,17 @@ _PROSE_STEMS = frozenset({"readme", "license", "licence", "changelog",
 _CONTENT_KEY_MAX_BYTES = 1 << 20
 
 
-def _tree_is_bare(tree: str | Path) -> bool:
-    """True when `tree` holds no regular file at its root but its `.git`."""
-    try:
-        return not any(n != ".git" and (Path(tree) / n).is_file()
-                       for n in os.listdir(tree))
-    except OSError:
+def _is_shared_run_store(value: str | None, run_dir: Path) -> bool:
+    """True when `value` names a store of the run that is no tree's own:
+    beneath `<run-dir>/worktrees/.stores` (the run's stores, a side's worker
+    cache) and outside `tree-stores/`. A keyless tree's keyed variable that
+    names one stands (`_tree_store_env`); an image's path or none does not."""
+    if not value:
         return False
+    home = _stores_home(run_dir)
+    p = Path(os.path.abspath(value))
+    return p.is_relative_to(home) and not p.is_relative_to(
+        home / TREE_STORES_DIRNAME)
 
 
 def _content_install_key(tree: str | Path) -> str | None:
@@ -7062,10 +7066,12 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     In a tree a worker writes (`_tree_cache`), every `_STORE_VARS` variable
     of `env` at that side's worker cache set, as the worker's own spawn has
     them (`_cache_vars`). In any other run tree (`_tree_stores_dir`), its
-    `_TREE_STORE_VARS` (and `_KEYED_STORE_VARS` without a key) at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
-    <name>`, made here
-    0700 (`_mkdir_private`), like every directory leerie makes for a
-    measurement, and the rest left as they are (the run's, `_leerie_stores`).
+    `_TREE_STORE_VARS` at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
+    <name>`, made here 0700 (`_mkdir_private`), like every directory leerie
+    makes for a measurement; its `_KEYED_STORE_VARS` at the keyed store of
+    its install key (`_keyed_store`), or, with no key, left when they name
+    a shared store of the run (`_is_shared_run_store`) and otherwise at the
+    tree's own; and the rest left as they are (the run's, `_leerie_stores`).
     A `cwd` outside every run tree leaves `env` as it is. Leerie's commands
     there (`_run_streaming`) and a worker started there (`_invoke`) both get
     it."""
@@ -7084,12 +7090,12 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
         dst = root / _STORE_VARS[var]
         if var in _KEYED_STORE_VARS and key:
             dst = _keyed_store(found[0].parent.parent, key, var)
-        elif (var in _KEYED_STORE_VARS and not _TREE_INSTALL_KEYS
-              and _tree_is_bare(found[0]) and env.get(var) == str(
-                  _stores_home(found[0].parent.parent) / RUN_STORES_DIRNAME
-                  / _STORE_VARS[var])):
-            # No install is recorded and the tree holds no files to key
-            # by: the run's store the command already has stands.
+        elif var in _KEYED_STORE_VARS and _is_shared_run_store(
+                env.get(var), found[0].parent.parent):
+            # A tree with no install inputs to key by has nothing of its own
+            # to keep apart: the run's store the command already has (the
+            # run's, or its side's worker cache) stands. A value outside the
+            # run (an image's path) or none is the tree's own store.
             continue
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)

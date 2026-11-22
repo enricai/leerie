@@ -283,7 +283,7 @@ def test_a_tree_no_worker_writes_keeps_the_runs_stores(leerie, run,
     tree = leerie._stores_home(run["run_dir"]) / leerie.TREE_STORES_DIRNAME \
         / view.name
     for var in leerie._STORE_VARS:
-        if var in (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS):
+        if var in leerie._TREE_STORE_VARS:
             assert Path(env[var]).parent == tree, var
         else:
             assert env[var] == stores_env[var], var

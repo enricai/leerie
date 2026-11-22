@@ -126,13 +126,13 @@ def test_a_reader_and_the_install_name_the_same_tree_stores(
     wenv = _worker_env(leerie, run, tree, g)
     install_env = leerie._tree_stores_for(os.environ, tree)
     cache = leerie._granted_cache_dir(g, run["run_dir"])
-    for var in (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS):
+    for var in leerie._TREE_STORE_VARS:
         # The install's value, and not the worker cache's: the two sources
         # disagree by construction.
         assert wenv[var] == install_env[var], var
         assert Path(wenv[var]).is_relative_to(stores), var
     # Every other store stays the worker's side cache, never leerie's.
-    for var in (set(leerie._STORE_VARS) - leerie._TREE_STORE_VARS - leerie._KEYED_STORE_VARS):
+    for var in (set(leerie._STORE_VARS) - leerie._TREE_STORE_VARS):
         assert Path(wenv[var]).is_relative_to(cache), var
     _home_layer_on_top(leerie, run, tree, "set_auditor",
                        leerie.SATISFIED_PROBE_TOOLS, stores)
@@ -194,7 +194,7 @@ def test_a_tree_leerie_never_installed_for_keeps_the_worker_cache(
     assert stores not in {os.path.realpath(p) for p in (*g.rw, *g.ro)}
     wenv = _worker_env(leerie, run, lane, g)
     cache = leerie._granted_cache_dir(g, run["run_dir"])
-    for var in (leerie._TREE_STORE_VARS | leerie._KEYED_STORE_VARS):
+    for var in leerie._TREE_STORE_VARS:
         assert Path(wenv[var]).is_relative_to(cache), var
 
 
