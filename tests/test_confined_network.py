@@ -301,24 +301,111 @@ def test_the_strict_output_proxy_port_is_relayed(leerie, proxy, monkeypatch):
     port = lst.getsockname()[1]
     monkeypatch.setattr(leerie, "_STRICT_PROXY",
                         type("P", (), {"port": port})())
-    o = _opts(leerie._confined_argv(
-        leerie.WorkerGrants(("/dev/null",), ("/",), egress=True), ["true"]))
+    g = leerie.WorkerGrants(("/dev/null",), ("/",), egress=True)
+    o = _opts(leerie._confined_argv(g, ["true"], cli=True))
     fwd = o[o.index("--forward") + 1]
     assert fwd == f"{port}={proxy.dir}/fwd-{port}.sock"
+    # A repository command's grant has egress too, but the relay serves
+    # the CLI: no port of it inside a command's namespace.
+    o = _opts(leerie._confined_argv(g, ["true"]))
+    assert "--egress" in o and "--forward" not in o
     lst.close()
 
 
-def test_kinds_that_fetch_get_egress_and_a_measurement_does_not(leerie, run):
+def test_every_repository_command_gets_egress_and_a_held_out_run_does_not(
+        leerie, run):
+    """DESIGN §6 *A measurement reaches its inputs too*: the kinds differ by
+    what they write, never by network; a held-out evaluation keeps none."""
     st = _St(run["user"], run["run_dir"])
-    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
-    got = {k: leerie._measurement_grants(st, view, k).egress
-           for k in leerie.MEASUREMENT_KINDS}
-    assert got == {leerie.MEASURE_KIND: False, leerie.INSTALL_KIND: True,
-                   leerie.SETUP_HOOK_KIND: True,
-                   leerie.TOOLCHAIN_KIND: True}
-    assert leerie._heldout_grants(st, view).egress is False
+    for tree in (run["wts"][f"{run['run_dir'].name}-view-staging"],
+                 run["wts"]["wt-a"]):
+        got = {k: leerie._measurement_grants(st, tree, k).egress
+               for k in leerie.MEASUREMENT_KINDS}
+        assert got == {leerie.MEASURE_KIND: True, leerie.INSTALL_KIND: True,
+                       leerie.SETUP_HOOK_KIND: True,
+                       leerie.TOOLCHAIN_KIND: True}
+        assert leerie._heldout_grants(st, tree).egress is False
     for key in ("implementer", "classifier", "integrator"):
         assert _grants(leerie, run, schema_key=key).egress is True
+
+
+def test_what_a_held_out_probe_imports_is_handed_on_offline_and_sandboxed():
+    """The coupling check is handed a symbol a falsifier's probe imports
+    and runs the tree's own `typescript`: it gets the held-out grant (no
+    egress) and a sandbox, never a measurement's grant (DESIGN §6 *Why the
+    held-out set stays safe*). The call, read off the source; what the
+    sandbox does to its writes is executed below."""
+    import ast
+    src = (Path(__file__).resolve().parents[1] / "orchestrator"
+           / "leerie.py").read_text()
+    calls = [c for c in ast.walk(ast.parse(src))
+             if isinstance(c, ast.Call) and any(
+                 isinstance(a, ast.Name) and a.id == "_falsifier_coupling"
+                 for a in c.args)]
+    assert len(calls) == 1, len(calls)
+    kw = {k.arg: k.value for k in calls[0].keywords}
+    assert isinstance(kw["grants"], ast.Call)
+    assert kw["grants"].func.id == "_heldout_grants"
+    assert isinstance(kw.get("sandbox"), ast.Call)
+    assert kw["sandbox"].func.id == "HeldOutSandbox"
+
+
+@needs_isolation
+@pytest.mark.real_heldout_sandbox
+@pytest.mark.skipif(not __import__("shutil").which("node"), reason="no node")
+def test_the_coupling_checks_writes_die_with_its_sandbox(leerie, run,
+                                                         monkeypatch):
+    """The tree's own `typescript` — code a worker can shape — is handed
+    the symbol and writes it into the tree. Sandboxed, the write dies with
+    the run, so no later measurement (which has egress) finds it; the same
+    call unsandboxed leaves it, which is what the sandbox is for."""
+    import subprocess as sp
+    monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
+    st = _St(run["user"], run["run_dir"])
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    (view / "src").mkdir()
+    (view / "src" / "a.ts").write_text("export function heldSym() {}\n")
+    (view / "src" / "b.ts").write_text(
+        "import { heldSym } from './a';\nheldSym();\n")
+    sp.run(["git", "-C", str(view), "add", "src"], check=True)
+    sp.run(["git", "-C", str(view), "-c", "user.email=t@x", "-c",
+            "user.name=t", "commit", "-qm", "src"], check=True)
+    sha = sp.run(["git", "-C", str(view), "rev-parse", "HEAD"], check=True,
+                 capture_output=True, text=True).stdout.strip()
+    ts = view / "node_modules" / "typescript"
+    ts.mkdir(parents=True)
+    (ts / "package.json").write_text('{"name":"typescript","main":"i.js"}')
+    leak = view / "leak.txt"
+    (ts / "i.js").write_text(
+        "require('fs').writeFileSync(" + repr(str(leak)).replace("'", '"')
+        + ", process.argv.join(' '));\nmodule.exports = {};\n")
+
+    async def check(sandbox):
+        async with leerie._exec_lock().shared():
+            return await asyncio.to_thread(
+                leerie._coupling_referenced_elsewhere, "heldSym", "src/a.ts",
+                run["repo"], sha, tree=view,
+                grants=leerie._heldout_grants(st, view), sandbox=sandbox)
+    asyncio.run(check(leerie.HeldOutSandbox(view=str(view))))
+    assert not leak.exists()
+    asyncio.run(check(None))
+    assert "heldSym" in leak.read_text()
+
+
+@pytest.mark.real_heldout_sandbox
+def test_a_held_out_sandbox_never_names_the_proxy(leerie, proxy,
+                                                  monkeypatch):
+    """Even a grant with egress: the sandbox branch carries no relay, so an
+    evaluation reaches only its own loopback whatever grant it is given."""
+    monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
+    g = leerie.WorkerGrants(("/dev/null",), ("/",), egress=True)
+    o = _opts(leerie._confined_argv(
+        g, ["true"], sandbox=leerie.HeldOutSandbox(view="/v"),
+        report_fd=None))
+    assert o[o.index("--sandbox") + 1:o.index("--sandbox") + 3] == [
+        "--view", "/v"]
+    assert "--egress" not in o and "--isolate" not in o
+    assert str(proxy.socket_path) not in o
 
 
 # --- the shim's options ------------------------------------------------------
@@ -624,3 +711,75 @@ def test_r6_the_emulator_refuses_a_linked_directory_too(tmp_path):
          "true"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 126 and "tests/held.sh" in r.stderr
     assert list(out.iterdir()) == []
+
+
+@needs_isolation
+def test_a_measurement_reaches_the_outside_and_a_held_out_run_does_not(
+        leerie, run, proxy, monkeypatch):
+    """DESIGN §6 *A measurement reaches its inputs too*, through the real
+    `_run_streaming` and `_run_acceptance_file`. A build that fetches its
+    inputs (funeralworks' `next build`, its Google fonts) reached nothing
+    from a measurement, so it was red on every tree for leerie's reason.
+    Now a measurement's command reaches an outside destination through the
+    relay and the proxy, and is still refused one inside the container; a
+    held-out run, in its sandbox, has no proxy and reaches nothing."""
+    from tests.test_heldout_isolation import _held_out
+    monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
+    _allow_loopback(leerie, monkeypatch)
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(4)
+    lst.settimeout(60)
+    port = lst.getsockname()[1]
+    seen: list[bytes] = []
+
+    def serve():
+        try:
+            while True:
+                c, _ = lst.accept()
+                got = c.recv(20)
+                seen.append(got)
+                c.sendall(b"OUTER:" + got)
+                c.close()
+        except OSError:
+            pass
+    threading.Thread(target=serve, daemon=True).start()
+    st = _St(run["user"], run["run_dir"])
+    view = run["wts"][f"{run['run_dir'].name}-view-staging"]
+    probe = textwrap.dedent(f"""\
+        import os, socket
+        def ask(host):
+            h, p = os.environ["HTTPS_PROXY"].rsplit("/", 1)[1].split(":")
+            c = socket.create_connection((h, int(p)), 10)
+            c.sendall(f"CONNECT {{host}}:{port} HTTP/1.1\\r\\n\\r\\n".encode())
+            head = c.recv(200).split(b"\\r\\n")[0].decode()
+            if " 200 " in head:
+                c.sendall(b"measure")
+                head += " " + c.recv(50).decode()
+            return head
+        print("OUTSIDE", ask("127.0.0.1"))
+        print("INSIDE", ask("127.0.0.2"))
+        """)
+    try:
+        rc, tail = asyncio.run(leerie._run_streaming(
+            [sys.executable, "-I", "-c", probe],
+            grants=leerie._measurement_grants(st, view), cwd=str(view),
+            timeout=60, verbosity="quiet"))
+        assert rc == 0, tail
+        assert "OUTSIDE HTTP/1.1 200 Connection Established OUTER:measure" \
+            in tail, tail
+        assert "INSIDE HTTP/1.1 403 Forbidden" in tail, tail
+        assert seen == [b"measure"]
+        # The held-out run: no proxy variable, and the stand-in, reached
+        # directly, is its own loopback's, where nothing listens.
+        v = _held_out(leerie, run, textwrap.dedent(f"""\
+            [ -n "$HTTPS_PROXY$https_proxy$ALL_PROXY" ] && exit 0
+            exec 3<>/dev/tcp/127.0.0.1/{port} && exit 0
+            exit 1
+            """), monkeypatch)
+        assert v is False
+        assert seen == [b"measure"]
+        # Anti-vacuity: the same harness passes a set that needs nothing.
+        assert _held_out(leerie, run, "exit 0\n", monkeypatch) is True
+    finally:
+        lst.close()

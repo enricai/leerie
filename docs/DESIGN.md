@@ -4449,7 +4449,7 @@ its `home/`, every store variable there naming the side's cache); its
 | the run layer | `<run-dir>/run-layer/` once the setup hook has published it: `home/` a lower layer of the home, `mise/` a read-only layer over `MISE_DATA_DIR`, every kind but the toolchain and setup-hook kinds (*The setup hook writes the run layer, never the host's toolchains*) | read |
 | *setup-hook kind* | also `MISE_DATA_DIR` and its home, each an overlay whose upper is `<run-dir>/run-layer.new/` (`mise/`, `home/`); no host directory | write |
 | *toolchain kind* (`mise install`, `mise ls`) | also `MISE_DATA_DIR` and the toolchain home layer `/leerie-toolchains/home`, which is its `HOME`; no store variable in its environment; `mise-state/` emptied first | write |
-| *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk; the outside network through the egress proxy (*A confined process has its own network*, *An install reaches its inputs*) | — |
+| *install kind* (every install leerie runs: a recipe's `install` entries, CI parity's prerequisites, `_install_settles`) | nothing more on disk (*An install reaches its inputs*) | — |
 
 Nothing else is granted: not `state.json`, `acceptance/`, `logs/`,
 `workers/`, `repo-settings/`, another tree's repository in `tree-repos/`,
@@ -4619,9 +4619,9 @@ install and setup-hook kinds:
   mount the entry copies from, lies outside the state root, which every
   confined process reads.
 
-An install, a toolchain install and the setup hook have the outside
-network (*A confined process has its own network*), so a `postinstall`
-could send the login out. The defect is not a missing name on a deny
+Every repository command but a held-out run has the outside network
+(*A confined process has its own network*, *A measurement reaches its
+inputs too*), so a `postinstall` or a test could send the login out. The defect is not a missing name on a deny
 list: what a command started with was derived from what leerie itself
 was given, and leerie is given secrets.
 
@@ -5633,8 +5633,8 @@ including a fixed `/tmp/<name>`, and what it leaves there is gone when its
 process tree ends. Two concurrent measurements' fixed paths (funeralworks'
 `/tmp/leerie-test-pgdata`) no longer collide. The network namespace is the
 process's own too, loopback only (*A confined process has its own
-network*): a worker and every kind that fetches reach the outside through
-leerie's egress proxy alone. Leerie's grants never name `/tmp` or
+network*): a worker and every repository command but a held-out run reach
+the outside through leerie's egress proxy alone. Leerie's grants never name `/tmp` or
 `/dev/shm` themselves: a grant of either names the process's own.
 
 What this replaces:
@@ -6096,13 +6096,15 @@ so it is the command's own too. A process that needs the outside network
 gets it from its grant (`WorkerGrants.egress`):
 
 - **Who.** Every worker (the API, WebFetch, the fetches its shell runs),
-  and the kinds that fetch: every install leerie runs on a repository's
-  code (`INSTALL_KIND`, *An install reaches its inputs*, below), the setup
-  hook and the toolchain install (`SETUP_HOOK_KIND`, `TOOLCHAIN_KIND`).
-  A measurement (`MEASURE_KIND`:
-  build, lint, tests, a recipe's `build` entry, verify, CI parity's
-  checks, coverage, the AST scripts) and a held-out evaluation reach
-  nothing beyond their own loopback.
+  and every repository command leerie runs outside a held-out sandbox:
+  every install (`INSTALL_KIND`, *An install reaches its inputs*, below),
+  the setup hook and the toolchain install (`SETUP_HOOK_KIND`,
+  `TOOLCHAIN_KIND`), and every measurement (`MEASURE_KIND`: build, lint,
+  tests, a recipe's `build` entry, verify, CI parity's checks, coverage,
+  the AST scripts; *A measurement reaches its inputs too*, below). A
+  held-out evaluation reaches nothing beyond its own loopback: the shim
+  never carries the proxy into a sandbox (`--sandbox` takes no
+  `--egress`).
 - **How.** The orchestrator runs an egress proxy (`_EgressProxy`, on its
   own thread and event loop, so a synchronous spawn never stalls it) on a
   unix socket in a 0700 directory it owns under `/tmp/l/`. The directory is
@@ -6114,7 +6116,7 @@ gets it from its grant (`WorkerGrants.egress`):
   socket. The container's
   `/tmp` is no confined process's, so the socket exists in a namespace
   only when the shim carries its directory in (`--egress SOCK`): a
-  measurement never sees it. Inside, the shim forks a relay — a child of
+  held-out sandbox never sees it. Inside, the shim forks a relay — a child of
   the shim, ended with the command (*A confined command's processes end
   with it*) — listening on the namespace's `127.0.0.1:<port>` and
   forwarding each connection to the socket, and sets `HTTPS_PROXY`,
@@ -6136,13 +6138,19 @@ gets it from its grant (`WorkerGrants.egress`):
   loopback and `ANTHROPIC_BASE_URL` names its port. The egress proxy adds
   a socket that pipes to that port (`_EgressProxy.forward`), and the shim
   relays the same port inside the namespace to it (`--forward
-  PORT=SOCK`), so the variable is unchanged.
+  PORT=SOCK`), so the variable is unchanged. Only a worker's CLI and its
+  commands get the relay on that port: it serves the CLI, and a
+  repository command, whose grant has egress too, is not given a port it
+  does not use. The `fwd-<port>.sock` itself is in the proxy's directory,
+  which the shim carries whole with `--egress`, so a repository command
+  can name it; it reaches only the strict-output proxy, which adds no
+  credential.
 
 **What a tool that ignores the proxy variables loses.** Direct egress, by
 design: inside the namespace there is no route and no resolver. The
-measured list is in IMPLEMENTATION *The egress proxy*. A repository whose
-tests reach the internet fails in a measurement as it would on an offline
-CI runner; a measurement measures the committed view, not the network.
+measured list is in IMPLEMENTATION *The egress proxy*. A tool that honours
+them reaches the internet from a measurement as it does from the
+repository's own CI runner.
 
 **An install reaches its inputs.** *Found 2026-11-01 (review round 22,
 execution H3); decided the same day.* When the network namespaces above
@@ -6171,9 +6179,98 @@ writer's, the surrogate's and the falsifier's checkouts, CI parity's
 tree, the re-drive's and integration trees), CI parity's prerequisites
 (the setup steps its checks depend on: a code generator, a browser or a
 sub-directory install), and a `settle_by: install` gap's re-install
-(`_install_settles`). What is measured keeps no network: a recipe's
-`build` entry, the build, lint and test commands, CI parity's checks,
-coverage, `verify`, the AST scripts and every held-out run.
+(`_install_settles`). Measurements, once kept off the network, reach it
+too (next).
+
+**A measurement reaches its inputs too.** *Found 2026-11-22 (funeralworks
+on 0.85.0, an Azure VM); decided the same day.* A measurement kept only
+its own loopback, on the reasoning that a measurement measures the
+committed view, not the network, and that a repository reaching the
+internet would fail as on an offline CI runner. The repository's own CI
+runner is not offline. funeralworks' `next build` fetches its
+`next/font/google` fonts at build time; in leerie's measurement the fetch
+had no route (reproduced: a Node `fetch` in an isolated command without
+the proxy fails `EAI_AGAIN`, with it returns 200; a Next 16 Turbopack app
+using `next/font/google` fails "Failed to fetch `Inter` from Google Fonts"
+without the proxy and compiles through it, 86 proxy connections). So the
+base build was red at the baseline for a reason that was leerie's, every
+later build red for the same one, and the build axis read every failure
+as pre-existing, while CI parity dropped the repository's own build check
+as red at the baseline: a change that broke the build was measured by
+nothing and could ship. The implementers, which reach the internet,
+built the same tree green. **Root cause:** whether a command could reach
+its inputs depended on which kind leerie labelled it, the class *An
+install reaches its inputs* closed for installs only. **Invariant: every
+repository command leerie runs outside a held-out sandbox reaches the
+outside through the egress proxy, as the repository's own CI does; a
+held-out evaluation reaches only its own loopback.** The kinds differ by
+what they write, never by network.
+
+*Why the held-out set stays safe.* The threat is code a worker wrote,
+run by a leerie measurement, reading what no worker can and sending it
+out. Nothing a measurement reads is held-out material a worker cannot
+read (checked when this was decided; probed under the real grant of the
+measurement and install kinds, which this rule gave egress, by
+`test_no_measurement_kind_reads_what_a_held_out_set_or_a_worker_keeps`):
+- its grant names, under the state root, only its tree, its measurement
+  directory, the run's stores, the tree's own stores, the run
+  repository's git metadata, the run's tools file and the run layer —
+  never `acceptance/` (its probes included), `selfcheck/`, the settled
+  bars, `logs/`, `notes/`, `subtasks/`, `workers/`, `state.json`, the CLI
+  configuration, another tree's repository or another run; everything
+  else it reads is outside the state root, as a worker's reads are;
+- a held-out file is run only in a sandbox's overlay, never from a tree on
+  disk (I3, *A held-out evaluation runs alone*). Set or probe source is on
+  disk outside a sandbox only in a worker's own checkout, written by that
+  worker or shown to it — the writer's (and a rewrite writer's, which is
+  given the first set), a falsifier's lane, the re-drive's self-check of
+  the shown sets — where every command that runs is code that already ran
+  with that worker's egress;
+- what leerie reads from a held-out file and hands a command (the symbol a
+  falsifier's probe imports, to the coupling check) is handed to a
+  command run as a held-out run is: the held-out grant, without egress
+  (`_heldout_grants`), in a sandbox whose writes die with it;
+- a held-out run writes every grant through an overlay that dies with it
+  and returns its report through a descriptor, so no measurement
+  directory or store holds anything of it; and no set byte enters the
+  run repository's objects (§8 *No set byte enters the repository's
+  object store*).
+So a measurement with egress can send out nothing its tree's worker could
+not already send. The held-out sandbox keeps no egress, and the proxy
+keeps refusing every address inside the container.
+
+*What stays.* Two residuals, both of this rule's own making. A held-out
+case whose code fetches its inputs still fails for leerie's reason: I3
+keeps the sandbox to its own loopback, and that is the price. And a
+measurement now carries the proxy variables, which the repository's CI
+does not set: a proxy-aware client sending a request to a local server
+named other than `NO_PROXY` names it (`0.0.0.0`, `127.0.0.2`,
+`*.localhost`) goes to the proxy, which refuses it — an axis red at the
+baseline for leerie's reason again, on a different set of repositories.
+Workers had both variables already; widening `NO_PROXY` for every
+confined process is its own change. Two more are not this rule's but are
+left by it. An existing test run in its base or start form (§8 *What an
+existing test pins on the base holds on the tree that ships*, the
+re-drive's dropped cases) runs in a held-out sandbox, so offline, while
+its own form now runs online: a case that needs the network never passes
+in its base form, as before, and so is never reported changed. And a run
+whose baseline was taken before this rule keeps it on resume (the
+baseline is taken once per run): its build stays red at the baseline
+until the task runs again.
+
+*Flakiness.* A measurement now depends on the network as the
+repository's CI does, and no retry is added for it. A transient fetch
+failure at the baseline makes an advisory axis red or keeps a merge check
+from gating (§9 *Base-tree health baseline*, *CI parity*): a check lost
+for the run. Later, the build, lint and test axes are advisory, and every
+verdict that decides — the failing-test-ID diff, CI parity, the base form
+— is confirmed by B\*, whose attribution checks decide a shortfall only
+on finished reruns, base and candidate interleaved. A blip during a
+confirm's candidate reruns alone does not stand; an outage that spans
+them and not the base's can still read as new; and one that spans the
+base's reruns reads the case `pre_existing`, a base verdict kept for the
+rest of the run (§9 *A settled base verdict is reused*), so a later regression
+in that case is not confirmed — a check lost, as at the baseline.
 
 **What it replaces.** The socket-only test database (*No database server
 leerie starts is ever unconfined*): it listened on no TCP address because
@@ -6626,10 +6723,10 @@ services for confined processes on purpose, and only the processes they
 serve can name them: every confined process has a `/tmp` of its own, and
 the shim carries the proxy's directory, read-only, into a process only when
 its grant has `egress` (`_confined_argv`'s `--egress`/`--forward`, the
-shim's `isolate(…, sockets=)`) — every worker, and the install, toolchain,
-setup-hook kinds of a repository command. A measurement
-(`MEASURE_KIND`) and a held-out sandbox get no egress, so neither can name
-them. The strict-output proxy listens on the orchestrator's loopback TCP,
+shim's `isolate(…, sockets=)`) — every worker, and every kind of a
+repository command (*A measurement reaches its inputs too*); the relay
+onto a forwarded port only into a worker's CLI and its commands. A
+held-out sandbox gets no egress, so it cannot name them. The strict-output proxy listens on the orchestrator's loopback TCP,
 outside every confined process's network namespace; a worker reaches it
 only through its `fwd-<port>.sock`, relayed onto the same port inside the
 worker's namespace. The `ssh-agent` socket the launcher makes for Fly is on

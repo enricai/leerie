@@ -11940,7 +11940,7 @@ async def _run_streaming(
     line_prefix: str = "  | ",
     tail_lines: int = 40,
     cgroup_sid: str | None = None,
-    sandbox: "HeldOutSandbox | None" = None,
+    sandbox: HeldOutSandbox | None = None,
     report_into: bytearray | None = None,
 ) -> tuple[int, str]:
     """Run a subprocess with stdout+stderr streamed live, persisted to a
@@ -26055,9 +26055,10 @@ class WorkerGrants(NamedTuple):
     never named here but as devices: an isolated process's own are added by
     the shim (DESIGN §6 *Every confined process has its own `/tmp`,
     `/dev/shm` and IPC*). `egress`: the process reaches the outside network,
-    through leerie's egress proxy only (a worker, an install kind); without
-    it an isolated process has its own loopback and nothing else (DESIGN §6
-    *A confined process has its own network*). `link`: the run's trees
+    through leerie's egress proxy only (a worker, every repository
+    command); without it (a held-out run) an isolated process has its own
+    loopback and nothing else (DESIGN §6 *A confined process has its own
+    network*). `link`: the run's trees
     directory (`<run-dir>/worktrees`), whose write grants the shim binds as
     one mount so a tree links from its store; empty, every grant is bound
     apart (DESIGN §6 *The write grants on one mount are one mount*)."""
@@ -26913,8 +26914,9 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
     (`_isolated()`, DESIGN §6 *Every confined process has its own
     `/tmp`, `/dev/shm` and IPC*), in a network namespace of its own: with
     an `egress` grant, the outside reached through the run's egress proxy
-    (`_egress_server`), and the strict-output proxy's port relayed when it
-    is live (DESIGN §6 *A confined process has its own network*). Where
+    (`_egress_server`), and, for a worker's CLI (`cli`), the strict-output
+    proxy's port relayed when it is live (DESIGN §6 *A confined process has
+    its own network*). Where
     the image has a worker root (`_worker_root`) and the command is
     isolated, it runs in the worker view (`--worker-root`); a worker's CLI
     (`cli`) stays in leerie's root and its commands run there instead
@@ -26953,9 +26955,11 @@ def _confined_argv(grants: WorkerGrants, cmd: list[str], *,
         if grants.egress:
             proxy = _egress_server()
             argv += ["--egress", str(proxy.socket_path)]
-            if _STRICT_PROXY is not None and _STRICT_PROXY.port:
+            if cli and _STRICT_PROXY is not None and _STRICT_PROXY.port:
                 # `ANTHROPIC_BASE_URL` names it on the orchestrator's
-                # loopback: the same port in the namespace, relayed.
+                # loopback: the same port in the namespace, relayed — to
+                # the CLI, which it serves, never to a repository command
+                # (DESIGN §6 *Other services*).
                 argv += ["--forward", f"{_STRICT_PROXY.port}="
                          f"{proxy.forward(_STRICT_PROXY.port)}"]
         if wr is not None:
@@ -26986,9 +26990,8 @@ TOOLCHAIN_KIND = "toolchain"
 MISE_CACHE_NAME = "cache"
 # Every install leerie runs on a repository's code (a recipe's `install`
 # entries, CI parity's prerequisites, `_install_settles`): a measurement's
-# grant on disk, with the outside network through the egress proxy, so
-# whatever manager the recipe names reaches its inputs (DESIGN §6 *An
-# install reaches its inputs*).
+# grant, whose home keeps what the install writes beneath it
+# (`TREE_HOME_WRITERS`; DESIGN §6 *An install reaches its inputs*).
 INSTALL_KIND = "install"
 MEASUREMENT_KINDS = (MEASURE_KIND, INSTALL_KIND, SETUP_HOOK_KIND,
                      TOOLCHAIN_KIND)
@@ -27732,7 +27735,9 @@ def _measurement_grants(st: "State", tree: str | Path,
     stores a view installs from are leerie's*, *Which stores an install may
     share*); read its git metadata (`_measured_git_reads`), the run's mise
     overrides and everything outside the state root.
-    `INSTALL_KIND` is `MEASURE_KIND` with egress.
+    `INSTALL_KIND` is `MEASURE_KIND` whose home keeps what it writes.
+    Every kind reaches the outside through the egress proxy (DESIGN §6
+    *A measurement reaches its inputs too*).
     `SETUP_HOOK_KIND` also writes `MISE_DATA_DIR` and its home, each
     through an overlay whose upper is the run layer being made
     (`RUN_LAYER_NEW_NAME`; DESIGN §6 *The setup hook writes the run layer,
@@ -27877,15 +27882,17 @@ def _measurement_grants(st: "State", tree: str | Path,
     # Nothing the launcher handed leerie for itself (DESIGN §6 *A repository
     # command gets nothing the operator handed leerie for itself*).
     drop = (*drop, *_launcher_env_names())
-    # A measurement reaches nothing outside its own loopback; the kinds
-    # that fetch (an install, a toolchain, the setup hook) reach the outside
-    # through the egress proxy (DESIGN §6 *A confined process has its own network*, *An install reaches its
-    # inputs*).
+    # Every kind reaches the outside through the egress proxy, as the
+    # repository's own CI reaches it: a build that fetches its inputs (a
+    # font, a schema) would otherwise be red on every tree for leerie's
+    # reason, and the axis measure nothing (DESIGN §6 *A measurement
+    # reaches its inputs too*). A held-out run keeps none
+    # (`_heldout_grants`).
     return WorkerGrants(
         tuple(dict.fromkeys(_apart(rw, state_root))),
         tuple(dict.fromkeys(_reads_outside(state_root, tmp=False)
                             + _apart(ro, state_root))),
-        tuple(env.items()), egress=kind != MEASURE_KIND,
+        tuple(env.items()), egress=True,
         link=str(run_dir.resolve() / TREES_DIRNAME), drop=drop,
         overlays=_grant_overlays(own_home, layers, upper, run_mise,
                                  layer_uppers, base=_command_home()))
@@ -27893,11 +27900,15 @@ def _measurement_grants(st: "State", tree: str | Path,
 
 def _heldout_grants(st: "State", tree: str | Path) -> WorkerGrants:
     """The grant of a held-out file's run in `tree` (DESIGN §6 *A held-out
-    evaluation runs alone*): `_measurement_grants`. It runs only in a
-    sandbox, which lays an overlay over every write grant — the run's
+    evaluation runs alone*), and of any command leerie hands what it read
+    from one (the coupling check's symbol a probe imports):
+    `_measurement_grants` without egress, so neither can send it out (DESIGN
+    §6 *Why the held-out set stays safe*). Either runs only in a sandbox,
+    which lays an overlay over every write grant — the run's
     stores among them — so whatever the evaluation writes there vanishes
-    with it and reaches no later command."""
-    return _measurement_grants(st, tree)
+    with it and reaches no later command; the sandbox never carries the
+    proxy in either."""
+    return _measurement_grants(st, tree)._replace(egress=False)
 
 
 def _argv_outside_grant(argv: list[str],
@@ -48713,9 +48724,9 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # goes; installed dependencies, being ignored, stay.
     # Confined to the tree and its own temp and caches (DESIGN §6 *Leerie's
     # runs of the repository's commands are confined too*), each kind's
-    # derived at the first entry of that kind: an `install` entry reaches
-    # its inputs through the egress proxy, a `build` entry is measured and
-    # reaches nothing (DESIGN §6 *An install reaches its inputs*).
+    # derived at the first entry of that kind; both reach the outside
+    # through the egress proxy (DESIGN §6 *An install reaches its inputs*,
+    # *A measurement reaches its inputs too*).
     entry_grants: dict[str, WorkerGrants] = {}
     async with _leaves_tree_as_found(tree, "install/build", log_prefix):
         for e in recipe:
@@ -66254,13 +66265,17 @@ def _ts_script_env() -> dict[str, str]:
 
 def _ts_script_run(argv: list[str], *, tree: str | Path,
                    grants: WorkerGrants, timeout: float,
-                   text: bool = False) -> subprocess.CompletedProcess:
+                   text: bool = False,
+                   sandbox: HeldOutSandbox | None = None
+                   ) -> subprocess.CompletedProcess:
     """A node run of an AST script in `tree`, confined to `grants`: it loads
     the tree's own `typescript` first, which is the tree's code (DESIGN §6
     *Leerie's runs of the repository's commands are confined too*).
     Synchronous, so it cannot wait for the execution lock: its caller holds
     it shared, and a call without it stops the run (DESIGN §6 *A held-out
-    evaluation runs alone*, the time half)."""
+    evaluation runs alone*, the time half). With `sandbox` (a script handed
+    what was read from a held-out file), in a held-out sandbox: what it
+    writes dies with it."""
     if not _exec_lock_held():
         die("invariant: an AST script was about to run on a tree's code "
             "without the execution lock — it could run beside a held-out "
@@ -66274,7 +66289,8 @@ def _ts_script_run(argv: list[str], *, tree: str | Path,
             "are confined too*). Report this.")
     with _shim_refusals(" ".join(argv)) as refusal_fd:
         return subprocess.run(
-            _confined_argv(grants, argv, refusal_fd=refusal_fd),
+            _confined_argv(grants, argv, refusal_fd=refusal_fd,
+                           sandbox=sandbox),
             cwd=str(tree), stdin=subprocess.DEVNULL, capture_output=True,
             text=text, timeout=timeout, check=False, pass_fds=(refusal_fd,),
             # The tree's stores, as every command leerie runs there
@@ -66364,7 +66380,9 @@ async def _probe_case_facts_placed(st: "State", tree: str | Path, src: str,
 
 def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
                                    sha: str, *, tree: str | Path,
-                                   grants: WorkerGrants) -> bool | None:
+                                   grants: WorkerGrants,
+                                   sandbox: HeldOutSandbox | None = None
+                                   ) -> bool | None:
     """True when production code uses `name` outside its own declaration
     (DESIGN §8 *Delivery detection*: "no symbol only tests use"). The
     candidates are the tracked non-harness files that name it at `sha`
@@ -66390,7 +66408,7 @@ def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
     try:
         q = _ts_script_run(["node", str(SYMBOL_REFERENCES), name, module,
                             *code], tree=tree, grants=grants, timeout=120,
-                           text=True)
+                           text=True, sandbox=sandbox)
         got = json.loads(q.stdout)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -66402,7 +66420,8 @@ def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
 
 def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
                         sha: str, item_text: str, *, tree: str | Path,
-                        grants: WorkerGrants) -> dict:
+                        grants: WorkerGrants,
+                        sandbox: HeldOutSandbox | None = None) -> dict:
     """The AST coupling check on one failing probe case (bench n2d, frozen):
     `{"coupled": bool | None, "reasons": [...]}` — None when the facts could
     not be read. Coupled when its reachable code reads a source or document
@@ -66477,7 +66496,8 @@ def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
                      item_text or ""):
             continue          # the item itself names the symbol
         used = _coupling_referenced_elsewhere(name, mod, repo, sha,
-                                              tree=tree, grants=grants)
+                                              tree=tree, grants=grants,
+                                              sandbox=sandbox)
         if used is None:
             return {"coupled": None, "reasons": reasons,
                     "error": "facts_failed: symbol references"}
@@ -67006,7 +67026,11 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                 cp = await asyncio.to_thread(
                     _falsifier_coupling, facts, rel, _run_repo(st), sha,
                     item_text, tree=confirm_tree,
-                    grants=_measurement_grants(st, confirm_tree))
+                    # Handed a symbol the probe imports: what is read from
+                    # a held-out file runs as a held-out run does, offline
+                    # and in a sandbox whose writes die with it.
+                    grants=_heldout_grants(st, confirm_tree),
+                    sandbox=HeldOutSandbox(view=str(confirm_tree)))
             if str(cp.get("error") or "").startswith("facts_failed"):
                 # The symbol-use script did not run: the same miss as the
                 # facts read's, never a coupling verdict.

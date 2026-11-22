@@ -186,7 +186,9 @@ def test_f1_a_commands_database_runs_nothing_outside_its_grant(
     its confinement, so `COPY … TO PROGRAM` cannot read `acceptance/` any
     more than the command can, and it listens only on the loopback of the
     command's own network namespace (DESIGN §6 *A confined process has its
-    own network*): `127.0.0.1:5432` there, nothing on the orchestrator's."""
+    own network*): `127.0.0.1:5432` there, beside the egress relay every
+    repository command has (*A measurement reaches its inputs too*), and
+    nothing on the orchestrator's."""
     st, view = _st(run), _view(run)
     held = run["run_dir"] / "acceptance" / "set-1" / "test_held.py"
     pkg = view / "node_modules" / ".bin"
@@ -200,7 +202,8 @@ def test_f1_a_commands_database_runs_nothing_outside_its_grant(
         f"{psql} \"$DATABASE_URL\" -c \"COPY (SELECT 1) TO PROGRAM "
         f"'cat {held} > {leak}'\"; "
         "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"0A\" "
-        "{print \"LISTEN\", $2}'; echo NETNS $(readlink /proc/self/ns/net)")
+        "{print \"LISTEN\", $2}'; echo NETNS $(readlink /proc/self/ns/net); "
+        "echo RELAY ${HTTPS_PROXY##*:}")
     g = leerie._measurement_grants(st, view)
     rc, tail = asyncio.run(leerie._run_streaming(
         ["bash", str(leerie.SANDBOX_DB_SCRIPT), str(view), name, "--",
@@ -209,7 +212,8 @@ def test_f1_a_commands_database_runs_nothing_outside_its_grant(
     assert not leak.exists() or "held" not in leak.read_text(), tail
     inside = sorted(ln.split()[1] for ln in tail.splitlines()
                     if ln.startswith("LISTEN "))
-    assert inside == ["0100007F:1538"], tail
+    relay = int(tail.split("RELAY ")[1].split()[0])
+    assert inside == sorted(["0100007F:1538", f"0100007F:{relay:04X}"]), tail
     # Listeners of a namespace that is not the orchestrator's.
     netns = tail.split("NETNS ")[1].split()[0]
     assert netns.startswith("net:[") and netns != os.readlink(

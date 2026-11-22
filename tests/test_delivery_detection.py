@@ -1668,13 +1668,21 @@ class TestFalsifierGates:
         the confirm checkout, where production code is read."""
         seen = {}
 
-        def coupling(facts, rel, repo, sha, item, *, tree, grants):
-            seen["tree"] = tree
+        def coupling(facts, rel, repo, sha, item, *, tree, grants,
+                     sandbox=None):
+            seen["tree"], seen["grants"] = tree, grants
+            seen["sandbox"] = sandbox
             return {"coupled": None, "reasons": [],
                     "error": "facts_failed: symbol references"}
         monkeypatch.setattr(leerie, "_falsifier_coupling", coupling)
         out = _gates(leerie, gate_env, _claim())
         assert seen["tree"] == gate_env.confirm
+        # Handed a symbol the probe imports: run as a held-out run is,
+        # offline and sandboxed over the confirm checkout (DESIGN §6 *Why
+        # the held-out set stays safe*).
+        assert seen["grants"].egress is False
+        assert seen["sandbox"] == leerie.HeldOutSandbox(
+            view=str(gate_env.confirm))
         assert out["confirmed"] is False
         assert out["gates"] == {
             "new_file": True, "not_a_lead": True, "runnable": True,

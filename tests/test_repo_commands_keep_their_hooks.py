@@ -232,5 +232,7 @@ def test_leeries_scripts_that_load_tree_code_are_confined():
     assert bad == []
     funcs = {f.name: f for f in ast.walk(tree)
              if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assert "_confined_argv(grants, argv, refusal_fd=refusal_fd)" in ast.unparse(
-        funcs["_ts_script_run"])
+    # Confined, and in a held-out sandbox when handed what was read from a
+    # held-out file (DESIGN §6 *Why the held-out set stays safe*).
+    assert ("_confined_argv(grants, argv, refusal_fd=refusal_fd, "
+            "sandbox=sandbox)") in ast.unparse(funcs["_ts_script_run"])
