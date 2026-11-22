@@ -1,6 +1,7 @@
-"""Every install leerie runs on a repository's code reaches its inputs; what
-it measures reaches nothing (DESIGN §6 *A confined process has its own
-network*, *An install reaches its inputs*).
+"""Every install leerie runs on a repository's code reaches its inputs, and
+so does every measurement (DESIGN §6 *A confined process has its own
+network*, *An install reaches its inputs*, *A measurement reaches its inputs
+too*).
 
 Review round 22's execution H3: once every confined process had its own
 network namespace, the install a view runs was granted as a measurement
@@ -11,11 +12,19 @@ repository's `pip install` failed name resolution in every view, nothing was
 measured, and a real run ended `unconverged`. An install is now its own
 kind, `INSTALL_KIND`: the measurement grant on disk, with egress.
 
+The same class came back for measurements (2026-11-22): funeralworks'
+`next build` fetches its Google fonts at build time, had no route from a
+measurement, and was red on every tree for leerie's reason, so the build
+axis and CI parity's build check measured nothing. Every kind now reaches
+the outside; `INSTALL_KIND` differs only in keeping what it writes beneath
+its home.
+
 Three layers here:
-- the grant: `INSTALL_KIND` is `MEASURE_KIND` plus egress, nothing more;
-- the consumers, executed: `_ensure_worktree_deps`, `_ci_prepare`/`_ci_run`
-  and `_install_settles` hand an install an egress grant and a build or
-  check a grant without one;
+- the grant: `INSTALL_KIND` and `MEASURE_KIND` have the same paths, env and
+  egress;
+- the consumers, executed: `_ensure_worktree_deps`, `_ci_prepare`/`_ci_run`,
+  `_install_settles` and coverage hand an install, a build and a check an
+  egress grant alike;
 - a rule over `leerie.py`: every function that runs a recipe's `install`
   entry or a CI prerequisite names `INSTALL_KIND`, and nothing else does.
 
@@ -56,18 +65,18 @@ def _view(run) -> Path:
 # --- the grant ---------------------------------------------------------------
 
 
-def test_an_install_is_a_measurement_with_egress_and_nothing_more(leerie,
+def test_an_install_and_a_measurement_share_paths_env_and_egress(leerie,
                                                                   run):
     """Same paths, same env (the tree's stores and its own tree stores
     written, as a measurement's are: the run's in a tree no worker writes,
-    the fixers' cache in a subtask's tree); only `egress` differs."""
+    the fixers' cache in a subtask's tree), and both reach the outside."""
     st = _St(run["user"], run["run_dir"])
     home = run["run_dir"] / "worktrees" / ".stores"
     for tree, stores in ((_view(run), home / "stores"),
                          (run["wts"]["wt-a"], home / "cache")):
         m = leerie._measurement_grants(st, tree, leerie.MEASURE_KIND)
         i = leerie._measurement_grants(st, tree, leerie.INSTALL_KIND)
-        assert (m.egress, i.egress) == (False, True)
+        assert (m.egress, i.egress) == (True, True)
         me, ie = dict(m.env), dict(i.env)
         assert (i.rw, i.ro, ie) == (m.rw, m.ro, me)
         assert str(stores) in i.rw and str(stores) not in i.ro
@@ -106,7 +115,7 @@ def _egress_by_tag(got) -> dict[str, bool]:
             if argv[:3] == ["python3", "-c", "pass"]}
 
 
-def test_a_recipe_install_gets_egress_and_its_build_does_not(
+def test_a_recipe_install_and_its_build_both_get_egress(
         leerie, repo, spawned):  # noqa: F811
     st = _gate_st(leerie, repo)
     st.data["provision"] = {"recipe": [
@@ -119,11 +128,11 @@ def test_a_recipe_install_gets_egress_and_its_build_does_not(
     assert ok is True
     assert [a[-1] for a, _e in spawned] == ["install-1", "build",
                                             "install-2"]
-    assert _egress_by_tag(spawned) == {"install-1": True, "build": False,
+    assert _egress_by_tag(spawned) == {"install-1": True, "build": True,
                                        "install-2": True}
 
 
-def test_ci_parity_sets_up_with_egress_and_checks_without(
+def test_ci_parity_sets_up_and_checks_with_egress(
         leerie, repo, spawned):  # noqa: F811
     st = _gate_st(leerie, repo)
     st.data["provision"] = {"recipe": [
@@ -140,10 +149,10 @@ def test_ci_parity_sets_up_with_egress_and_checks_without(
     out = asyncio.run(go())
     assert out["rc"] == 0
     assert _egress_by_tag(spawned) == {"recipe-install": True,
-                                       "prerequisite": True, "check": False}
+                                       "prerequisite": True, "check": True}
 
 
-def test_an_install_gap_reinstalls_with_egress_and_coverage_has_none(
+def test_an_install_gap_reinstalls_and_coverage_runs_with_egress(
         leerie, repo, spawned):  # noqa: F811
     st = _gate_st(leerie, repo)
     st.data["provision"] = {"recipe": [
@@ -156,7 +165,7 @@ def test_an_install_gap_reinstalls_with_egress_and_coverage_has_none(
         tag="t"))
     assert out["rc"] == 0
     assert _egress_by_tag(spawned) == {"settle-install": True,
-                                       "coverage": False}
+                                       "coverage": True}
 
 
 # --- the rule ----------------------------------------------------------------
@@ -225,8 +234,8 @@ def test_every_install_leerie_runs_uses_the_install_kind():
 
 def test_nothing_but_an_install_uses_the_install_kind():
     """The converse: a measurement, a held-out run or a check handed
-    `INSTALL_KIND` would reach the network the committed view is measured
-    without."""
+    `INSTALL_KIND` would keep what it writes beneath its home in the tree
+    home layer every later command in the tree reads."""
     tree = ast.parse(SRC.read_text())
     users = {fn.name for fn in _functions(tree)
              if _names(fn, "INSTALL_KIND")}
@@ -269,11 +278,12 @@ PIP = ["python3", "-m", "pip", "--disable-pip-version-check",
 
 
 @needs_isolation
-def test_a_pip_install_in_a_view_reaches_pypi_and_its_build_does_not(
+def test_a_pip_install_its_build_and_a_measurement_all_reach_pypi(
         leerie, run, proxy, monkeypatch):  # noqa: F811
     """The review's shape: a pip repository's recipe in a committed view.
-    Its install reaches PyPI through leerie's egress proxy; a `build` entry
-    running the same download, and a plain measurement, reach nothing."""
+    Its install reaches PyPI through leerie's egress proxy, and so do a
+    `build` entry running the same download and a plain measurement (the
+    funeralworks shape: a build that fetches what it builds from)."""
     if not _online():
         pytest.skip("the runtime itself has no network to reach PyPI with")
     monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
@@ -296,15 +306,12 @@ def test_a_pip_install_in_a_view_reaches_pypi_and_its_build_does_not(
     assert ok is True, text
     assert (view / ".deps" / "iniconfig" / "__init__.py").is_file(), text
     assert "Successfully installed iniconfig" in text, text
-    # pip makes the directory before it fails: what matters is no wheel.
-    assert not list((view / ".dl").glob("*.whl")), text
-    build = text.split("download --no-deps -d .dl", 1)[1]
-    assert "No matching distribution found" in build, text
-    # A measurement of the same view: no resolver, no route, no proxy.
+    assert list((view / ".dl").glob("*.whl")), text
+    # A measurement of the same view: through the proxy too.
     m_log = run["run_dir"] / "logs" / "view-measure.log"
     rc, tail = asyncio.run(leerie._run_streaming(
         PIP + ["download", "--no-deps", "-d", ".dl2", PIN],
         grants=leerie._measurement_grants(st, view), cwd=str(view),
         timeout=180, log_path=m_log, label="measure", verbosity="quiet"))
-    assert rc != 0, tail
-    assert not list((view / ".dl2").glob("*.whl")), tail
+    assert rc == 0, tail
+    assert list((view / ".dl2").glob("*.whl")), tail

@@ -142,3 +142,48 @@ def test_an_installs_git_config_write_is_refused_and_says_so(leerie, run):
     assert r.stdout.splitlines() == ["rc=255", "0"], (r.stdout, r.stderr)
     assert f"could not lock config file {cfg.resolve()}" in r.stderr, r.stderr
     assert cfg.read_bytes() == before
+
+
+def test_no_measurement_kind_reads_what_a_held_out_set_or_a_worker_keeps(
+        leerie, run):
+    """DESIGN §6 *A measurement reaches its inputs too*, *Why the held-out
+    set stays safe*: every kind of repository command reaches the outside
+    through the egress proxy, so none may read the held-out sets (a run's,
+    its falsifier probes, the shown sets' self-check copies, the settled
+    bars every run of the task shares), the run's notes and specs, its logs,
+    the workers' CLI configuration, another tree's repository or another
+    run — what a measurement can read it can now send out. Probed under the
+    real Landlock grant of each kind, in a view and in a worker's tree, not
+    read off the grant's list."""
+    rd, root = run["run_dir"], run["state_root"]
+    w = run["wts"]
+    secrets = [rd / n / "secret.txt" for n in (
+        leerie.NOTES_DIRNAME, "logs", leerie.CLAUDE_CONFIG_TEMPLATE,
+        leerie.SYSPROMPT_DIRNAME, leerie.TASK_FILES_DIRNAME,
+        "acceptance/probes", "selfcheck/g1")]
+    secrets += [root / leerie.SETTLED_BARS_DIRNAME / "k" / "secret.txt",
+                root / "runs" / "another-run" / "acceptance" / "secret.txt"]
+    for f in secrets:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("kept\n")
+    lines = "\n".join(f"read {f.relative_to(root)}|cat {f}" for f in secrets)
+    for tree in (w[f"{rd.name}-view-staging"], w["wt-a"]):
+        for kind in (leerie.MEASURE_KIND, leerie.INSTALL_KIND):
+            g = _measure(leerie, run, tree, kind)
+            assert g.egress is True, kind
+            got = _probe(leerie, g, f"""
+{lines}
+read held-out set|cat {rd}/acceptance/set-1/test_held.py
+list held-out sets|ls {rd}/acceptance
+read subtask specs|cat {rd}/subtasks/wt-a.json
+read task|cat {rd}/task.md
+read state|cat {rd}/state.json
+read a worker dir|ls {rd}/{leerie.WORKERS_DIR}/wt-a
+read sibling tree|cat {w['wt-b']}/secret.py
+list another tree repo|ls {rd}/tree-repos/wt-b
+read its own tree|cat {tree}/app.py
+""", dict(g.env))
+            # The probe can succeed: its own tree is read.
+            assert got.pop("read its own tree") is True, (tree, kind)
+            assert not any(got.values()), (tree, kind, {
+                k: v for k, v in got.items() if v})

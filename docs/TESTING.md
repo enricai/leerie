@@ -7379,8 +7379,16 @@ sample's probe never counts for the next.
   which has no default; `_run_streaming`'s one spawn is the confined argv;
   the self-check is the one raw spawn; `node` and `mise` are never spawned
   directly.
-- `tests/test_measurement_confinement.py` (5 tests, DESIGN §6 *Leerie's
-  runs of the repository's commands are confined too*): a real child
+- `tests/test_measurement_confinement.py` (6 tests, DESIGN §6 *Leerie's
+  runs of the repository's commands are confined too*, *Why the held-out
+  set stays safe*): the measurement and install kinds, which have egress,
+  probed under their real Landlock grant in a view and in a worker's tree:
+  refused the held-out sets and probes, the shown sets' self-check copies,
+  the settled bars, notes, specs, task files, logs, the CLI configuration
+  and system prompts, state, worker directories, a sibling tree, another
+  tree's repository and another run (live-falsified: the settled bars, or
+  `selfcheck/`, or `acceptance/` and `notes/`, added to a measurement's
+  reads each turned it red); a real child
   confined with `_measurement_grants` writes its view and measurement
   directory and is refused the run's state (the held-out sets,
   `state.json`, the worker cache, leerie's store, the run repository's
@@ -7683,7 +7691,7 @@ sample's probe never counts for the next.
   a time (no read-only remount, no private tmpfs, no IPC namespace, no
   seccomp, no overlay): each turned its own tests red. The keyring join is
   not separately observable: seccomp refuses `add_key` first.
-- `tests/test_confined_network.py` (22 test functions, 34 cases; DESIGN
+- `tests/test_confined_network.py` (26 test functions, 38 cases; DESIGN
   §6 *A confined process has its own network; the outside is reached only
   through leerie's proxy*; review round 21 execution H2 and isolation
   R6). Anywhere: `_egress_refusal` over
@@ -7695,8 +7703,12 @@ sample's probe never counts for the next.
   else, and `forward` piping to the orchestrator's port; its 0700
   directory, a new one per proxy, so a second proxy in one process leaves
   the first one's socket serving (review r22 L1); `_confined_argv` naming the proxy only for an `egress` grant
-  when isolated, and relaying the strict-output proxy's port; which kinds
-  and workers carry `egress`; the shim's `--egress`/`--forward` parsing
+  when isolated, relaying the strict-output proxy's port to a worker's CLI
+  (`cli`) and to nothing else, and never naming the proxy in a held-out
+  sandbox, whatever the grant; every repository-command kind and worker
+  carries `egress`, a held-out run's grant none (DESIGN §6 *A measurement
+  reaches its inputs too*); the falsifier's coupling check called with the
+  held-out grant and a sandbox; the shim's `--egress`/`--forward` parsing
   and `proxy_env`; `_require_egress_relay` naming each failure. In a
   runtime that can isolate: H2 turned round (a measurement's loopback
   server, which writes with its grant, unreachable from a worker directly
@@ -7706,28 +7718,33 @@ sample's probe never counts for the next.
   real probe of the confinement check every entry runs
   (`_require_confinement`) passes and fails closed on a shared network; and
   R6 turned round (a placement through a linked directory refused, the
-  worker's tree untouched). Live-falsified in the container, one mechanism
+  worker's tree untouched); a measurement through the real `_run_streaming`
+  reaching an outside stand-in through the relay and refused 127.0.0.2,
+  while a held-out run through `_run_acceptance_file` has no proxy and
+  reaches nothing; the coupling check's writes into the tree dying with its
+  sandbox (and staying without one). Live-falsified in the container, one mechanism
   at a time: no network namespace, the proxy refusing nothing, placement
   following links before the read-only remount.
 - `tests/test_install_reaches_inputs.py` (9 test functions; DESIGN §6 *An
-  install reaches its inputs*; review round 22 execution H3). Anywhere:
-  `INSTALL_KIND` is `MEASURE_KIND`'s grant with `egress` and nothing else
+  install reaches its inputs*, *A measurement reaches its inputs too*;
+  review round 22 execution H3; funeralworks 2026-11-22). Anywhere:
+  `INSTALL_KIND` and `MEASURE_KIND` have the same paths, env and egress
   (the measurement grant's stores written: the run's, or in a tree a
   worker writes that side's cache); the consumers executed — a
-  recipe's `install` entries get egress and its `build` entry none
-  (`_ensure_worktree_deps`), CI parity's recipe install and prerequisites
-  get it and its check none (`_ci_prepare`, `_ci_run`), a `settle_by:
-  install` re-install gets it and a coverage run none (`_install_settles`,
+  recipe's `install` and `build` entries both get egress
+  (`_ensure_worktree_deps`), CI parity's recipe install, prerequisites and
+  check get it (`_ci_prepare`, `_ci_run`), a `settle_by: install`
+  re-install and a coverage run get it (`_install_settles`,
   `_cov_contained`); a rule over `leerie.py`: every function that reads a
   recipe's install entries or a check's prerequisites and spawns names
   `INSTALL_KIND`, and no other function
   names it, with the rule checked on a synthetic module. In a runtime
   that can isolate: a pip recipe in a committed view installs from PyPI
-  through leerie's real egress proxy, while its `build` entry and a plain
-  measurement of the same view, running the same download, reach nothing.
-  Live-falsified on the host and in the container (rootless): the install
-  entry back on `MEASURE_KIND`, the prerequisite without `INSTALL_KIND`,
-  and every kind given egress, each turned its own tests red.
+  through leerie's real egress proxy, and so do its `build` entry and a
+  plain measurement of the same view, running the same download. On
+  origin/main before the funeralworks change (measurements offline), the
+  four egress-table tests and the PyPI test were red, the build download
+  failing name resolution.
 - `tests/test_user_scripts_on_path.py` (7 test functions; DESIGN §6
   *Which stores an install may share*, a moved user base's scripts on
   `PATH`): `_with_user_scripts` appending `<base>/bin` last in place of the

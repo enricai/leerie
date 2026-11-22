@@ -5080,8 +5080,10 @@ DESIGN §6 *A worker writes only where it is granted (I5)*.
   kinds `MEASURE_KIND = "measure"`, `SETUP_HOOK_KIND = "setup_hook"`,
   `TOOLCHAIN_KIND = "toolchain"`, `INSTALL_KIND = "install"` (every
   install leerie runs on a repository's code: `MEASURE_KIND`'s paths and
-  `env` unchanged, with `egress` True; DESIGN §6 *An install reaches its
-  inputs*); no grant's `env` holds a store variable (they are
+  `env` unchanged, its home's upper the tree home layer,
+  `TREE_HOME_WRITERS`; DESIGN §6 *An install reaches its inputs*); every
+  kind has `egress` True (DESIGN §6 *A measurement reaches its inputs
+  too*); no grant's `env` holds a store variable (they are
   `_leerie_stores`' and `_tree_store_env`'s), and `rw` names the run's
   stores, or in a tree a worker writes that side's worker cache set
   (`_tree_cache`); `MEASUREMENT_KINDS` is the four, the only `kind`
@@ -5880,9 +5882,9 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
 
 - `WorkerGrants.egress: bool = False` (the fourth field): `True` from
   `_worker_grants` (every worker) and from `_measurement_grants` for
-  every kind but `MEASURE_KIND` (`INSTALL_KIND`, `SETUP_HOOK_KIND`,
-  `TOOLCHAIN_KIND`); `_heldout_grants` keeps
-  `_measurement_grants(st, tree)`'s `False`.
+  every kind (`MEASUREMENT_KINDS`; DESIGN §6 *A measurement reaches its
+  inputs too*); `False` from `_heldout_grants`. `_confined_argv` names
+  `--egress` only on its `--isolate` branch, never with `sandbox`.
 - `ISOLATE_ENV = "LEERIE_ISOLATED"`. `_require_heldout_sandbox(run_dir)` sets
   `os.environ[ISOLATE_ENV] = "1"` after its checks pass, so every later
   confined spawn in this process and its children (`worker-guard.py`)
@@ -5901,8 +5903,8 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   `--remove REL` per `remove` path, and `--report <report> --report-fd <report_fd>` (both
   or neither) when `sandbox` is given, else `--isolate` when `_isolated()`
   — followed, when `grants.egress`, by `--egress
-  <_egress_server().socket_path>` and, while `_STRICT_PROXY` is live,
-  `--forward <its port>=<_egress_server().forward(its port)>`; with
+  <_egress_server().socket_path>` and, with `cli` while `_STRICT_PROXY`
+  is live, `--forward <its port>=<_egress_server().forward(its port)>`; with
   `worker_root` True and `_worker_root()` a path, `--worker-root <path>`
   (after the sandbox options, or after the isolation ones when isolated;
   plus `--cli` when `cli`); `_overlay_argv(grants)` (sandboxed or isolated);
@@ -5920,8 +5922,12 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   command exits copies the file's content to `sandbox.report`'s path
   outside (the caller's report path, which no other process wrote; an
   empty file writes nothing). The evaluation's grant is
-  `_heldout_grants(st, tree)`: `_measurement_grants(st, tree)` unchanged
-  (the sandbox overlays every `rw` path, the run's stores among them, so
+  `_heldout_grants(st, tree)`: `_measurement_grants(st, tree)` with
+  `egress` False, also the grant of the delivery falsifier's coupling
+  check (`_falsifier_coupling`, handed a symbol the probe imports, which
+  `_ts_script_run(…, sandbox=HeldOutSandbox(view=<confirm tree>))` runs
+  in a sandbox) (the
+  sandbox overlays every `rw` path, the run's stores among them, so
   the evaluation's writes there vanish with it). Callers passing it, each through `_run_acceptance_file(…,
   place=)`, the parse probe, `_capture_failing_test_ids(…, place=)` (the
   falsifier's confirm runs) or `_probe_case_facts_placed`:

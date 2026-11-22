@@ -1742,7 +1742,8 @@ def isolation_error() -> str | None:
 # DESIGN §6 *A confined process has its own network; the outside is reached
 # only through leerie's proxy*. A loopback listener one confined process starts is in its own
 # network namespace: no other confined process reaches it. A process that
-# needs the outside network (a worker, an install) reaches it only through
+# needs the outside network (a worker, any repository command but a held-out
+# run) reaches it only through
 # the proxy leerie holds, on a unix socket: the relay below listens on the
 # namespace's loopback and forwards each connection to that socket.
 
