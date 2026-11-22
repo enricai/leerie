@@ -22851,6 +22851,43 @@ install would reproduce. Like B\*'s base it reruns the run's own test IDs, never
 a hidden set, so it carries no I3 obligation; and it is reaped with the run's
 worktrees the same way.
 
+**The base-form check's base confirm worktree is kept too.** The base-form
+regression check — the existing test-case files the base had and the tree that
+ships modified or deleted, run in their *base form* and confirmed under B\*
+against a base commit (*What an existing test pins on the base holds*, §8) —
+confirms through the same `_confirm_against_base`, in the one remaining
+disposable base worktree, named `base-form-base`. Three callers share it: the
+phase-5 existing-behaviour check and the re-drive's base-form-fixed check
+confirm against the run's fixed base commit (like B\*'s base), while the
+acceptance ratchet's committing rounds confirm against the round's *start*
+commit `pre_sha` (like the re-drive's base). It was built, installed and torn
+down on every one — measured across the replayed-run corpus, 72 cold installs
+over 17 runs, 4.2 per run and up to 8 in the heaviest, every one a reinstall at
+the one `base-form-base` path. So it joins the kept-tree mechanism as the fourth
+consumer, the same `_reuse_or_rebuild_kept_tree` move the committed view, the
+evaluation tree, B\*'s base and the re-drive's base use — no new machinery, and
+the last of the four base worktrees to stay disposable is now kept.
+
+Its two base-commit shapes are exactly the two the mechanism already covers: the
+fixed-base callers are B\*'s case (the install key matches across the run, so
+only the first installs cold), and the `pre_sha` caller is the re-drive's case
+(a start commit whose dependency inputs are unchanged reuses the install, one
+whose lockfile or manifest changed reinstalls — the key is the inputs, not the
+commit). In the corpus the three callers' installs collapse to roughly one cold
+install per run, the same shape #441 measured for confirm-base (70 of 113) and
+#443 for redrive-base (56 of 74). Outcome-identity holds for the identical
+reason: `_install_intact` re-verifies the kept install entry-for-entry and the
+move `clean`s the tree before every confirm. The base-form check places each
+base form into the tree (an in-place substitution of the base's own content,
+with the base's then-absent test files removed) only during the rerun itself,
+inside `_leaves_tree_as_found`, which restores every tracked substitution and
+removes every untracked file the rerun left; the install always runs on the
+pristine base checkout, never on a placed base form, so the install key is the
+base's own and no base form a prior confirm placed reaches the install or the
+next confirm. Like the other three it reruns the run's own test IDs, never a
+hidden set, so it carries no I3 obligation, and it is reaped with the run's
+worktrees.
+
 **An intermittent failure the run introduced is evidence, not a verdict.**
 B\* calls an ID new only when it fails on every final rerun, so a test the
 run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):

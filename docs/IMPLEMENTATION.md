@@ -7776,7 +7776,7 @@ ships*. Measured, never read: no prompt, judge or text rule.
 | `_base_form_files(repo, base, head, globs)` | `(files, unsupported)` from `git diff --name-status --no-renames base head`: each `_is_test_file` path present at `base` (status not `A`) that `head` modified or deleted; `unsupported` those whose extension is in `_BASE_FORM_NO_REPORT_EXT` (`.java .kt .kts .scala .groovy .cs .fs .ex .exs .php .swift`: no runner leerie reads a report from, `_RUNNER_REPORTS`), `files` the rest that `_base_form_case` accepts. |
 | `_base_form_writable(repo, rev, rel)` | Whether `rel` at `rev` may be written or removed without following a link, read with one `git ls-tree -z rev -- <each directory on the way> rel`: no directory on the way is a row of its own (a directory pathspec lists its contents; anything else is a row), and `rel` is absent or mode `100644`/`100755`. |
 | `_base_form_place(st, repo, base, files, trees)` | `(pairs, taken, removed)`: each file's `base` blob written to `<run-dir>/base-form/<base[:12]>/<path>` and paired with its own path, which it replaces; a JS file's base `__snapshots__/<name>.snap` paired the same way when the base had it. A file is `taken`, and never placed, when it or its snapshot is not `_base_form_writable` at one of `trees`. `removed` maps each tree to the paths removed there: every `_base_form_case` file `git diff --name-status base <tree>` shows added (`A`) and writable, and a non-taken JS file's snapshot the tree has and the base did not. |
-| `_base_form_regressions(st, caps, staging, before, *, label, log_path, reach_of=None)` | Base `_diff_base(st)`, after staging's branch head. `reach_of` (a round's start): files narrowed to those `reach_of..after` touched or `_change_reach` reaches, all of them when its reach is unknown. One `_capture_failing_test_ids(staging, test cmd, files=<the files not taken>, replace=<pairs>, remove=removed[after], serial=True)` on staging's committed view, in a held-out sandbox (the base form is never on disk). No failing ID: done. Else a `base-form-base` helper worktree at `before` with `_ensure_worktree_deps`, and B\* over the failing IDs, every run of either side with all the pairs and that side's `removed`, whichever files it runs (`_confirm_sized` when every ID has a file, else `_confirm_new_failures` over all of them; a failed checkout or install gives every candidate `no_verdict`). Returns `{base, before, after, files, unsupported, changed: [{id, file, message}], unmeasured: [file], unsettled: [id], verdict, unmeasured_reason?}`: `changed` is B\*'s `new`, IDs as the report names them (the file runs at its own path), `unmeasured` the taken files (`unmeasured_reason` "the base form's path is a link or not a file"), every file when no test or scoped command resolves or the first run gave no report, and the files of `no_verdict` IDs; `unsettled` the `budget_short_unsettled` IDs. A load failure (`<file> :: (file failed to load)`) is a case like any other. |
+| `_base_form_regressions(st, caps, staging, before, *, label, log_path, reach_of=None)` | Base `_diff_base(st)`, after staging's branch head. `reach_of` (a round's start): files narrowed to those `reach_of..after` touched or `_change_reach` reaches, all of them when its reach is unknown. One `_capture_failing_test_ids(staging, test cmd, files=<the files not taken>, replace=<pairs>, remove=removed[after], serial=True)` on staging's committed view, in a held-out sandbox (the base form is never on disk). No failing ID: done. Else a `base-form-base` helper worktree at `before` with `_ensure_worktree_deps` (kept for the run and moved to `before` with its install reused when the install key is unchanged, `reuse=True`; DESIGN §9 *The base-form check's base confirm worktree is kept too*), and B\* over the failing IDs, every run of either side with all the pairs and that side's `removed`, whichever files it runs (`_confirm_sized` when every ID has a file, else `_confirm_new_failures` over all of them; a failed checkout or install gives every candidate `no_verdict`). Returns `{base, before, after, files, unsupported, changed: [{id, file, message}], unmeasured: [file], unsettled: [id], verdict, unmeasured_reason?}`: `changed` is B\*'s `new`, IDs as the report names them (the file runs at its own path), `unmeasured` the taken files (`unmeasured_reason` "the base form's path is a link or not a file"), every file when no test or scoped command resolves or the first run gave no report, and the files of `no_verdict` IDs; `unsettled` the `budget_short_unsettled` IDs. A load failure (`<file> :: (file failed to load)`) is a case like any other. |
 | `_base_form_reason(changed)` | `"N case(s) an existing test pinned on the base fail when the base's own test file is run against this tree (existing_behaviour_changed): …"`, at most `_BASE_FORM_SHOWN` (5) IDs, each prefixed by its file when the ID does not name it, and `(+k more)`. |
 | `_check_existing_behaviour(leerie_dir, st, caps, models, efforts)` | Run before the delivery re-drive and as phase 5's last step before `phase_finalize`, after the final `_refresh_shipping_test_id_diff`: `_base_form_regressions(staging, before=_diff_base(st))` stored as `existing_behaviour` with `tree_sha` (`_view_tree_sha`); when the record has `changed` and no `error`, `_base_form_classify(...)` then `_base_form_questions(..., models, efforts)` (a raise of either is logged; a cause already found stays, its question open); then `_apply_base_form_rulings`, `_existing_behaviour_task_required`, and, without `error`, `literal_restored` = `_base_form_literals_restored(st, rec)`. Reused when that tree is recorded without `error`: the rulings, `_existing_behaviour_task_required` and `literal_restored` are applied again and saved (an answer given since applies). A raise of the measurement is stored as `{error, changed: [], …}`. Then `_set_base_form_gap`. |
 | `_redrive_base_form_notes(st, staging)` | The re-drive's `base_form_case` notes, from `existing_behaviour` when its `tree_sha` is staging's `_view_tree_sha` and it has no `error`: one per file of `changed` less the cases in `cause_open` and `cause_unkept`, `{kind, key: "base-form:<file>", file, base, cases[], messages[] (ANSI stripped, ≤ `_REDRIVE_BASE_FORM_MESSAGE` = 300 chars), exercised: [file]}`; `[]` otherwise. Computed once per pass into `delivery_redrive.base_form_open`. |
@@ -9275,7 +9275,8 @@ than re-running once.
   say_unavailable=False, reuse=False) -> dict` — the side-A worktree around
   one paired test confirm, shared by the final diff
   (`worktree="confirm-base"`, `reuse=True`), the re-drive
-  (`"redrive-base"`) and the base form (`"base-form-base"`): it
+  (`"redrive-base"`, `reuse=True`) and the base form
+  (`"base-form-base"`, `reuse=True`): it
   removes what an earlier one left at `_helper_worktree_path(st,
   worktree)`, adds it detached at `base_sha` (none when `base_sha` is
   empty) and installs its deps (`_ensure_worktree_deps(label_prefix=
@@ -9293,8 +9294,9 @@ than re-running once.
   _rerun_cost_or_default(st)`); otherwise one unsized pass. The engine is
   labelled `confirm_label`, `"pair"`, `intermittent` passed through. With
   `reuse=False` the worktree is removed on every exit; with `reuse=True`
-  (the `confirm-base` caller and the `redrive-base` caller
-  `_redrive_new_failures`) it is instead kept for the run and moved to
+  (the `confirm-base` caller, the `redrive-base` caller
+  `_redrive_new_failures`, and the `base-form-base` caller
+  `_base_form_regressions`) it is instead kept for the run and moved to
   `base_sha` via `_reuse_or_rebuild_kept_tree` (§8 *kept tree*), so the base
   install is reinstalled only when the install key at `base_sha` differs. For
   `confirm-base` the base commit is fixed for a confirm key, so only the first
@@ -9303,7 +9305,11 @@ than re-running once.
   group's or round's start `pre_sha`, which moves as groups commit, so a start
   whose install inputs are unchanged still reuses the install and one whose
   lockfile or manifest changed reinstalls (DESIGN §9 *The delivery re-drive's
-  base confirm worktree is kept too*). Before any of that it consults the
+  base confirm worktree is kept too*); `base-form-base` has both shapes —
+  `base_sha` is the run's fixed base for the existing-behaviour and
+  base-form-fixed callers and a round's `pre_sha` for the acceptance ratchet,
+  each already covered by the input-keyed move (DESIGN §9 *The base-form
+  check's base confirm worktree is kept too*). Before any of that it consults the
   base-verdict memo (DESIGN §9 *A settled base verdict is reused, never
   recomputed*): `memo_key = _base_verdict_memo_key(base_sha, cmd, replace,
   remove_base)` (hex SHA-256 of a canonical JSON of those four), and any
@@ -9600,11 +9606,13 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     "worktree_failed" on a non-`None` non-zero add, else runs
     `_ensure_worktree_deps(str(wt), …, label_prefix="acceptance-<label>",
     log_prefix="acceptance")` ("deps_failed" when False, else "ok"); and
-    `_confirm_against_base`'s `_dispatch` (only with `reuse=True`, the
-    `confirm-base` caller) calls it for the base worktree in place of the
-    teardown-and-add it does when `reuse` is False, and skips the per-call
-    teardown so the tree is kept. Pinned by `tests/test_eval_tree_reuse.py`
-    and `tests/test_confirm_base_reuse.py`.
+    `_confirm_against_base`'s `_dispatch` (only with `reuse=True`: the
+    `confirm-base`, `redrive-base` and `base-form-base` callers) calls it for
+    the base worktree in place of the teardown-and-add it does when `reuse` is
+    False, and skips the per-call teardown so the tree is kept. Pinned by
+    `tests/test_eval_tree_reuse.py`, `tests/test_confirm_base_reuse.py`,
+    `tests/test_redrive_base_reuse.py` and
+    `tests/test_base_form_base_reuse.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
