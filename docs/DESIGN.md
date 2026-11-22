@@ -16387,7 +16387,23 @@ it:
   done, before any build runs, leerie records every entry under those paths
   with its state: a file's or link's inode, size, mode and change time — a
   time its owner cannot set back, moved by every write, rename, chmod or
-  link — and a directory's inode and mode. It records them once the
+  link — and a directory's inode and mode. A file with more than one link
+  is the one exception: it shares its inode with a store the install
+  linked it from (pnpm's content-addressable store, uv's cache, bun's),
+  and every other tree's install or removal of that package links or
+  unlinks the inode and moves its change time, which is no change to this
+  tree. Recorded by change time, a pnpm install in any sibling tree on the
+  run's shared store refused every kept tree's move (measured on barnacle:
+  34,564 of its 36,328 installed files are such links, and one sibling
+  install or removal refused the move). It is recorded by its
+  modification time in place of the change time: any write moves it; a
+  write whose time is then set back wrote the store's file, which a fresh
+  install links too, so the kept tree is what a fresh one would be; and a
+  file made with one link that gains another is recorded in the other
+  form, a change. An install that hard-links files within its own
+  outputs (yarn's `nmMode: hardlinks-local`) is read the same way, where a
+  fresh install would write the file anew: a write to one whose time is
+  then deliberately set back goes unseen there. It records them once the
   removal of the tree's earlier stores has finished, which leerie runs
   off the event loop when a moved view starts empty stores. A store's file
   can be a hard link of the install's output (uv links its cache into the

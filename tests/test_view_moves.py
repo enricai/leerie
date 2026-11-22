@@ -194,6 +194,80 @@ def test_an_install_a_measurement_changed_is_not_kept(leerie, env, hold):
     assert (v2 / "node_modules/dep/index.js").read_text() == text
 
 
+# A store's file linked into the install's output, as pnpm links its
+# content-addressable store into `node_modules` (and uv and bun their
+# caches): one inode, two links.
+STORE_LINKED = (
+    "import os, pathlib\n"
+    "s = pathlib.Path('node_modules/.store/dep.js')\n"
+    "s.parent.mkdir(parents=True, exist_ok=True)\n"
+    "s.exists() or s.write_text('linked')\n"
+    "t = pathlib.Path('node_modules/linked/dep.js')\n"
+    "t.parent.mkdir(parents=True, exist_ok=True)\n"
+    "t.exists() or os.link(s, t)\n")
+
+
+def _with_linked_install(st) -> None:
+    st.data["provision"]["recipe"].insert(1, {
+        "kind": "install", "command": [sys.executable, "-c", STORE_LINKED],
+        "working_dir": "."})
+
+
+def test_a_sibling_linking_the_same_store_file_keeps_the_install(
+        leerie, env, hold, tmp_path):
+    """Another tree's install linking the same store file (or its removal
+    unlinking it) moves that file's change time: no change to this view,
+    which still moves with its install kept."""
+    st, staging, caps, _count = env
+    _with_linked_install(st)
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    linked = v1 / "node_modules" / "linked" / "dep.js"
+    assert os.stat(linked).st_nlink == 2
+    held = hold(linked)
+    # A sibling's install, then its removal.
+    os.link(linked, tmp_path / "sibling.js")
+    os.unlink(tmp_path / "sibling.js")
+    _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert _is_held(held, v2 / "node_modules" / "linked" / "dep.js")
+    assert _count(v2) == 2                    # moved, the install kept
+
+
+def test_a_write_to_a_linked_store_file_is_not_kept(leerie, env, hold):
+    """A file linked from a store is still told changed by a write that
+    keeps its size: its modification time moves."""
+    st, staging, caps, _count = env
+    _with_linked_install(st)
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    linked = v1 / "node_modules" / "linked" / "dep.js"
+    held = hold(linked)
+    time.sleep(0.01)
+    with open(linked, "r+") as f:
+        f.write("L")                          # same size, new time
+    _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert not _is_held(held, v2 / "node_modules" / "linked" / "dep.js")
+    assert _count(v2) == 1                    # installed afresh
+
+
+def test_a_file_made_with_one_link_that_gains_another_is_not_kept(
+        leerie, env, hold, tmp_path):
+    """A file the install made with one link is still known by its change
+    time: a link added to it later is a change."""
+    st, staging, caps, _count = env
+    _commit(leerie, staging, {"src/a.txt": "2"})
+    v1 = _measure(leerie, st, staging, caps)
+    dep = v1 / "node_modules" / "dep" / "index.js"
+    assert os.stat(dep).st_nlink == 1
+    held = hold(dep)
+    os.link(dep, tmp_path / "kept.js")
+    _commit(leerie, staging, {"src/a.txt": "3"})
+    v2 = _measure(leerie, st, staging, caps)
+    assert not _is_held(held, v2 / "node_modules" / "dep" / "index.js")
+
+
 def test_a_rewritten_dot_git_is_pointed_back(leerie, env, tmp_path):
     """A measurement that points the view's `.git` at another repository
     moves nothing there: the view is pointed back at its own."""
