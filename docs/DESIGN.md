@@ -16441,6 +16441,23 @@ it:
   `prepare`, a `postinstall` generating from the sources) run against the
   new tip's files as they would in a fresh view. Builds are never reused.
 
+*An install's output outside the tree is a store keyed by the install
+inputs* (store model). A package manager whose install output lies outside
+the tree (bundler's `BUNDLE_PATH`, a tool's environment directory) has that
+output in a store, not in the tree, and the store belongs to the install
+inputs, not to a path: (1) its result is keyed by the install key (the
+recipe's `install` entries and what they read at the tip), so it is shared
+run-wide by those inputs: trees with the same key use one store and the run
+does not repeat a full install for them; (2) it is kept when a view moves to
+a tip whose key is unchanged, as the in-tree outputs are, where a moved view
+once started it empty; (3) it is visible to a worker in a tree leerie did not
+install for (a subtask's tree), so the repository's commit hooks and tools
+run there against an installed environment. Per-tree isolation stays,
+because it is carried by the key: trees whose keys differ never share a
+store, so two trees at two commits with different inputs never share an
+environment. No package manager is a special case: the rule holds for every
+install output outside the tree.
+
 So what a moved view holds is what a fresh view would: the install's output
 reused is one leerie produced, under the same confinement as any repository
 command it runs, from inputs identical at both tips, and verified untouched

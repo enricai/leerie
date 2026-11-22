@@ -9540,6 +9540,12 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_VIEW_INSTALLS`/`_DEPS_INSTALLED`/`_DEPS_FAILED` entries dropped, and
     `_worktree_add_detached_async(st, _helper_worktree_path(st,
     "view-<basename>"), <tip>, repo=<run repo>)`.
+    Store model (DESIGN §8 *An install's output outside the tree is a store
+    keyed by the install inputs*): an install output outside the tree is a
+    store keyed by `_install_key`, shared run-wide by trees with equal keys,
+    kept (not emptied) by `_move_view` when the key at the new tip is
+    unchanged, and visible to a worker in a tree leerie did not install for;
+    trees with different keys never share one. Not per package manager.
     Nothing is shared in from `tree`. An unreadable branch or a failed add
     `die()`s ("the committed view of <tree> cannot be made: …").
     `_drop_view(leerie_dir, tree) -> None` (DESIGN §8 *A view lives no
