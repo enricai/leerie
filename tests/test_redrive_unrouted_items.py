@@ -52,11 +52,36 @@ def test_an_unconverged_claimer_is_driven(leerie, tmp_path, monkeypatch):
     assert "unrouted_items" not in w.st.data["delivery_redrive"]
 
 
-def test_a_spent_claimer_leaves_a_typed_unrouted_item(
+def test_a_rounds_spent_claimer_still_swings_at_a_never_handed_item(
         leerie, tmp_path, monkeypatch):
+    """DESIGN §8 rule 8: a claimer whose shared re-drive rounds are spent is
+    still admitted for one swing when it holds a drivable evidence key no
+    worker was handed, bounded only by the wall clock. Edit (b): the member
+    gate admits the group (`extra_swing`) rather than stranding the item on
+    `budget` when a round could have attempted it."""
     w = _world(leerie, tmp_path, monkeypatch, "unconverged")
     cap = int(w.caps["subtask_redrive_rounds"])
-    w.st.data["redrive_rounds"] = {"s1": cap}
+    w.st.data["redrive_rounds"] = {"s1": cap}   # rounds spent; time remains
+    w.edits = [lambda w: w.write("export const a = 1; // tried\n")]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0"]
+    assert w.calls[0]["prompt"].startswith("Execute subtask `s1`.")
+    assert rec["rounds"][0]["groups"][0].get("extra_swing") is True
+    assert rec["items_driven"] == [0]
+    assert rec["evidence_handed"] == ["0:judge"]
+    # Driven, so it reached a worker and is never recorded unrouted.
+    assert "unrouted_items" not in rec
+
+
+def test_a_time_spent_claimer_leaves_a_typed_unrouted_item(
+        leerie, tmp_path, monkeypatch):
+    """The genuine `budget` case after the fix: the wall clock, not the round
+    count, is the limiter. With `redrive_budget_sec` spent on entry, no swing
+    is taken and the never-handed item is recorded `budget`."""
+    w = _world(leerie, tmp_path, monkeypatch, "unconverged")
+    w.st.data["redrive_rounds"] = {"s1": int(w.caps["subtask_redrive_rounds"])}
+    w.st.data["redrive_spent_sec"] = float(w.caps["redrive_budget_sec"])
     w.run()
     assert w.calls == []
     rec = w.st.data["delivery_redrive"]
@@ -65,6 +90,98 @@ def test_a_spent_claimer_leaves_a_typed_unrouted_item(
     assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
     assert any("unrouted_item" in r and "item 0 (budget)" in r
                for r in w.st.data["outcome_reasons"])
+
+
+def test_the_round_ceiling_is_non_binding_for_never_handed_work(
+        leerie, tmp_path, monkeypatch):
+    """Edit (c): `rnd > max_rounds` does not stop a first attempt at a
+    never-handed drivable key. With the round counter spent and one round
+    already recorded, the first new round exceeds the ceiling, but the item
+    still gets its swing — the budget check remains the real stop."""
+    w = _world(leerie, tmp_path, monkeypatch, "unconverged")
+    w.caps["subtask_redrive_rounds"] = 0        # max_rounds = 0 * 2 + 1 = 1
+    # One round already on record, so the first new round is rnd = 2 > 1.
+    w.st.data["delivery_redrive"] = {"rounds": [{"round": 1, "groups": []}]}
+    w.st.save()
+    w.edits = [lambda w: w.write("export const a = 1; // tried\n")]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r2-g0"]
+    assert rec["rounds"][-1]["groups"][0].get("extra_swing") is True
+    assert rec["items_driven"] == [0]
+
+
+def test_wall_clock_is_the_only_backstop_against_a_fresh_key_each_check(
+        leerie, tmp_path, monkeypatch):
+    """Termination rests solely on `redrive_budget_sec`. A non-deterministic
+    falsifier minting a fresh evidence key every re-check keeps
+    `_redrive_never_handed` True forever, so the round count never stops the
+    loop; only the wall clock does, after one charged swing. With the budget
+    all but spent on entry, exactly one swing runs, then the budget check
+    breaks — never a runaway."""
+    w = _world(leerie, tmp_path, monkeypatch, "unconverged")
+    w.st.data["redrive_rounds"] = {"s1": int(w.caps["subtask_redrive_rounds"])}
+    n = {"k": 0}
+
+    def fresh_notes(unmet_final, claims, n_items, rows, **kw):
+        n["k"] += 1
+        key = f"judge-{n['k']}"       # a new key every call: never handed
+        return ([{"kind": "unmet_item", "key": "item-0", "item_index": 0,
+                  "item": "a does X", "evidence": "x", "by": ["judge"],
+                  "claimed_by": ["s1"], "evidence_keys": [key], "keys": [key],
+                  "undriven": {"reason": "no_code_target", "probed": ""}}], [])
+    monkeypatch.setattr(leerie, "_redrive_item_notes", fresh_notes)
+    budget = float(w.caps["redrive_budget_sec"])
+    w.st.data["redrive_spent_sec"] = budget - 0.001
+    w.st.save()
+    w.edits = [lambda w: w.write("export const a = 1; // tried\n")]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert len(w.calls) == 1
+    assert float(w.st.data["redrive_spent_sec"]) >= budget
+    # Still a never-handed key at the end: the budget stopped it, not a
+    # handed-key fixpoint.
+    assert [u["reason"] for u in rec["unrouted_items"]] == ["budget"]
+
+
+def test_an_already_handed_key_gets_no_extra_swing(
+        leerie, tmp_path, monkeypatch):
+    """The structural exclusion of the barnacle `budget` cases: a key already
+    in `evidence_handed` (a fix that did not pass) grants no further swing.
+    The member gate's `_redrive_never_handed` is False, so the group still
+    falls through to `skipped = "budget"` — the fix leaves it untouched."""
+    w = _world(leerie, tmp_path, monkeypatch, "unconverged")
+    w.st.data["redrive_rounds"] = {"s1": int(w.caps["subtask_redrive_rounds"])}
+    w.st.data["delivery_redrive"] = {"evidence_handed": ["0:judge"]}
+    w.st.save()
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert w.calls == []
+    g = rec["rounds"][0]["groups"][0]
+    assert "extra_swing" not in g and g["skipped"] == "budget"
+    assert rec["items_budget_skipped"] == [0]
+
+
+def test_resume_does_not_re_grant_a_swing_for_a_handed_key(
+        leerie, tmp_path, monkeypatch):
+    """`evidence_handed` is persisted, so a resume after a swing recorded a
+    key does not hand that key a second swing (DESIGN §8 rule 8: the handed
+    set only grows, each key swings at most once)."""
+    w = _world(leerie, tmp_path, monkeypatch, "unconverged")
+    w.st.data["redrive_rounds"] = {"s1": int(w.caps["subtask_redrive_rounds"])}
+    w.edits = [lambda w: w.write("export const a = 1; // tried\n")]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert len(w.calls) == 1 and rec["evidence_handed"] == ["0:judge"]
+    assert rec["items_driven"] == [0]
+    # Resume: the record persists and `done` is re-opened as a crash would
+    # leave it; the handed key is not re-granted a swing.
+    rec.pop("done")
+    w.st.save()
+    w.calls.clear()
+    w.run()
+    assert w.calls == []
+    assert w.st.data["delivery_redrive"]["evidence_handed"] == ["0:judge"]
 
 
 def test_a_blocked_only_claimer_is_no_owner(leerie, tmp_path, monkeypatch):
@@ -323,3 +440,42 @@ def test_a_forced_falsifier_note_is_raised_never_driven(
     with pytest.raises(RuntimeError, match="item-0"):
         w.run()
     assert w.calls == []
+
+
+def test_a_set_only_round_still_swings_at_an_item_falsified_on_the_final_tree(
+        leerie, tmp_path, monkeypatch):
+    """DESIGN §8 rule 8 — the non-item-regressor shape. Round 1 drives ONLY a
+    failing held-out set (no item evidence key is handed), then the re-check
+    of the tree that ships falsifies a previously-met item. The re-entry must
+    still swing at that never-handed item: the progress guard is "a drive
+    happened this pass" (which charged the budget), not "the handed set grew"
+    — the latter would strand the item `after_last_round` with budget left,
+    the exact waste this change removes."""
+    items = [{"item": "a does X", "span": "S1", "verifiability": "tree"}]
+    w = World(leerie, tmp_path, n_sets=1, items=items, unmet=[],
+              claims={"s1": [{"item_index": 0, "kind": "deliverable"}]})
+    # item 0 reported met going in → round 1 has no item work, only the
+    # failing DEFECT set; its met row makes it a `_redrive_met_unread`
+    # candidate on the final tree.
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": 0, "item": "a does X", "verdict": "met",
+         "by": ["judge"]}]
+    w.st.save()
+    w.install(monkeypatch)
+    w.edits = [lambda w: w.write("export const a = 1; // FIXED\n")]
+
+    async def recheck(leerie_dir, st, caps, models, efforts, staging,
+                      indices):
+        # The previously-met item flips to unmet on the shipping tree.
+        return {i: {"unmet": True, "by": ["judge"], "evidence": "regressed"}
+                for i in indices}
+    monkeypatch.setattr(leerie, "_redrive_recheck_items", recheck)
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    # Round 1 drove the set only; the re-entry drove the falsified item.
+    assert 0 in rec["items_driven"], (
+        "item falsified after a set-only round was never swung at")
+    assert rec["evidence_handed"] == ["0:judge"]
+    # It reached a worker, so it is never stranded `after_last_round`.
+    assert not any(u.get("reason") == "after_last_round"
+                   for u in rec.get("unrouted_items") or [])

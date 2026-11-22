@@ -69010,6 +69010,24 @@ def _redrive_unrouted_items(open_items: list[dict], handed: Iterable[str],
     return out
 
 
+def _redrive_never_handed(notes: Iterable[dict], handed: Iterable[str]
+                          ) -> bool:
+    """Whether any `unmet_item` note carries a drivable evidence key never
+    handed to a worker (`"<item_index>:<key>"` ∉ `handed`): a first attempt
+    at something no re-drive worker has seen. This is the one basis, with
+    `redrive_budget_sec`, for the swing a drivable-but-never-handed item
+    gets before a run is declared `unconverged` — never a round count, which
+    would only re-create the stop-short waste (DESIGN §8 *Delivery re-drive*
+    rule 8). A note's `evidence_keys` are exactly the drivable keys it
+    carries, so an already-handed key (a fix that did not pass) grants no
+    further swing: the handed set only grows and each `(item, key)` swings
+    at most once."""
+    h = set(handed)
+    return any(f"{n.get('item_index')}:{k}" not in h
+               for n in notes if n.get("kind") == "unmet_item"
+               for k in n.get("evidence_keys") or ())
+
+
 # How much of a saved probe's source its evidence key reads.
 _REDRIVE_PROBE_KEY_MAX = 1 << 20
 
@@ -74960,16 +74978,25 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         return True
 
     while True:
+        # Whether any group drove this pass: the outer re-entry below re-enters
+        # only after real work (a drive always charges the budget), so a pass
+        # that drives nothing — a conflict, a failed rollback, a head it could
+        # not read, every group skipped — cannot spin here.
+        drove_this_pass = False
         while not rec.get("conflict") and not rec.get("rollback_failed"):
             if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
                 log("  delivery re-drive: redrive_budget_sec spent — stopping")
                 stopped_on_budget = True
                 break
             rnd += 1
-            if rnd > max_rounds:
+            if rnd > max_rounds and not _redrive_never_handed(
+                    open_items(), rec["evidence_handed"]):
                 # Every driven round spends a member's counter, so this never
                 # binds while the budget check holds; it keeps a broken one
-                # from spinning.
+                # from spinning. A drivable item whose evidence no worker was
+                # handed is the exception (DESIGN §8 rule 8): it takes its
+                # swing whatever the count, bounded only by the budget check
+                # above — the count must not stop a first attempt.
                 log("  delivery re-drive: round ceiling reached — stopping")
                 break
             held_mode = False
@@ -75071,6 +75098,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     continue
                 members = [m for m in g["members"]
                            if _redrive_allowed(st, caps, m)]
+                if (not members and _redrive_time_left(st, caps)
+                        and _redrive_never_handed(live, rec["evidence_handed"])):
+                    # Its owners' shared counters are spent, but it still
+                    # holds a drivable evidence key no worker was handed: one
+                    # swing before the run is declared unconverged, bounded
+                    # only by the wall clock (DESIGN §8 rule 8). Without it the
+                    # item is deferred to a whole new run when one more round
+                    # could have attempted it. The swing draws past the cap
+                    # like any other round; the driven key then joins
+                    # `evidence_handed` and never re-grants a swing.
+                    members = list(g["members"])
+                    ge["extra_swing"] = True
                 if not members:
                     ge["skipped"] = "budget"
                     rec["items_budget_skipped"] = sorted(
@@ -75092,6 +75131,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     break
                 ge["pre_sha"] = pre_sha
                 rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
+                drove_this_pass = True   # a drive is committed; it charges time
                 for m in members:
                     _consume_redrive(st, m)
                 bf_live = [n for n in live if n["kind"] == "base_form_case"]
@@ -75693,6 +75733,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 st.data["delivery_gate"] = {**dg, "final_sha": final,
                                             "final_tree": _shipping_tree(st)}
                 st.save()
+        # The re-check of the tree that ships may have surfaced a drivable
+        # evidence key no worker was handed (the `after_last_round` case) —
+        # whether a kept group that drove an item, a set, a check or a defect
+        # left it unmet. Give it its swing rather than end the run with work a
+        # round could have attempted (DESIGN §8 rule 8). Re-enter only with wall
+        # time left, when this pass drove work (progress: a drive charged the
+        # budget, so re-entry is bounded by it; a pass that drove nothing cannot
+        # spin here) and a never-handed drivable key remains. Else stop.
+        if (_redrive_time_left(st, caps) and drove_this_pass
+                and _redrive_never_handed(open_items(), rec["evidence_handed"])):
+            reread = True
+            continue
         break
     rec["final_sha"] = final
     record_unrouted()
