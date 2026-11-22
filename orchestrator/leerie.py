@@ -7068,6 +7068,51 @@ def _installed_tree_stores(cwd: str | Path | None) -> Path | None:
     return found[1]
 
 
+# The recipe and reads of each install key leerie recorded an install for
+# (`_record_view_install`): what `_visible_keyed_stores` keys another tree of
+# the run by, so a tree leerie did not install for finds the keyed stores
+# existing for its own install inputs.
+_KEYED_INPUTS: dict[str, tuple[list, "InstallReads"]] = {}
+
+
+def _visible_keyed_stores(cwd: str | Path | None) -> dict[str, Path]:
+    """The keyed stores (`_KEYED_STORE_VARS`) that exist for the install
+    inputs of the run tree `cwd` lies in, when leerie did not install in
+    that tree (a subtask's worktree): its install key is computed from its
+    HEAD as `_record_view_install` computed the recorded ones, so a worker
+    there sees the install result trees with the same inputs share (DESIGN
+    §8 *An install's output outside the tree is a store keyed by the
+    install inputs*). Empty for an installed tree (its own stores serve), a
+    tree outside every run, or inputs no install was recorded for."""
+    found = _tree_stores_dir(cwd)
+    if found is None or not _KEYED_INPUTS:
+        return {}
+    tree = found[0]
+    if os.path.realpath(tree) in _DEPS_INSTALLED:
+        return {}
+    try:
+        r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
+                            "HEAD"], capture_output=True, text=True,
+                           check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    head = r.stdout.strip()
+    if r.returncode != 0 or not head:
+        return {}
+    run_dir = tree.parent.parent
+    seen: set[str] = set()
+    for recipe, reads in list(_KEYED_INPUTS.values()):
+        key = _install_key(tree, head, recipe, reads)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out = {v: d for v in sorted(_KEYED_STORE_VARS)
+               if (d := _keyed_store(run_dir, key, v)).is_dir()}
+        if out:
+            return out
+    return {}
+
+
 TREE_HOME_NAME = "home"
 
 
@@ -26804,6 +26849,11 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     if tree_stores is not None:
         _mkdir_private(tree_stores, run_dir)
         (rw if str(cwd_r) in rw else ro).append(str(tree_stores))
+    # A tree leerie did not install for reads the keyed stores existing for
+    # its install inputs, never writes them.
+    for d in _visible_keyed_stores(cwd_r).values():
+        if str(d) not in ro:
+            ro.append(str(d))
     # No grant ever covers the state root whole, whatever a variable names
     # (`_reads_outside` never does, by construction: it is not re-checked,
     # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
@@ -28208,6 +28258,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # runs on that tree's stores*; review round 23 exec M1).
     if _tree_cache(cwd) is not None or _granted_tree_stores(grants, cwd):
         _tree_store_env(worker_env, cwd)
+    # A tree leerie did not install for: the keyed stores existing for its
+    # install inputs (BUNDLE_PATH), so its hooks find the dependencies.
+    for var, d in (await asyncio.to_thread(_visible_keyed_stores, cwd)
+                   ).items():
+        worker_env[var] = str(d)
     # Every command and hook of a confined worker runs in a domain nested in
     # its CLI's, so none can write into the stream this reads (DESIGN §6 *A
     # worker's commands cannot reach its CLI*). `claude_p` also puts it in
@@ -50485,6 +50540,8 @@ async def _record_view_install(st: "State", view_key: str,
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
             _KEPT_INSTALLS[view_key] = (ikey, snap, reads)
+            _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _TREE_INSTALL_KEYS[view_key] = ikey
         return
     for tree_key, (tip, path) in list(_VIEWS.items()):
         if os.path.realpath(path) != view_key:
@@ -50497,6 +50554,8 @@ async def _record_view_install(st: "State", view_key: str,
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
             _VIEW_INSTALLS[view_key] = (ikey, snap, reads)
+            _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _TREE_INSTALL_KEYS[view_key] = ikey
         return
 
 
