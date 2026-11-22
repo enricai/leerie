@@ -127,8 +127,8 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(
     """The view moves: the install's own output stays (the same file), the
     install runs again over it, the builds run again, and nothing else of
     the old tip — a measurement's report, a tool's cache under
-    `node_modules`, a build's output, its own stores, its measurement
-    directory — is left."""
+    `node_modules`, a build's output, its measurement directory — is left;
+    its stores (the install's result) are kept."""
     st, staging, caps, count = env
     a = _commit(leerie, staging, {"src/a.txt": "2"})
     v1 = _measure(leerie, st, staging, caps)
@@ -156,7 +156,7 @@ def test_a_new_tip_with_the_same_inputs_keeps_the_install(
     for gone in ("report.txt", "dist/stale.txt", "node_modules/.cache",
                  "node_modules/.gen"):             # a build's is not kept
         assert not os.path.lexists(v2 / gone), gone
-    assert not poison.exists()                     # its own stores go too
+    assert poison.read_text() == "old"   # its stores stay: inputs unchanged
     assert leerie._measure_dir(st, v2) != measured  # and its measurement dir
     assert not (leerie._measure_dir(st, v2) / "reports" / "old").exists()
     assert _git(v2, "status", "--porcelain") == ""

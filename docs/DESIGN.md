@@ -16424,10 +16424,12 @@ it:
   (measured on click, uv; *designed 2026-11-19*, lane S9-R8);
 - when the key at the new tip is the key recorded, the view's `.git` is
   pointed back at its own administrative directory, found from the run
-  repository's side; its measurement id there is removed, so to every
-  measurement it is a new tree — a fresh measurement directory and empty
-  stores of its own (DESIGN §6 *Leerie's runs of the repository's commands
-  are confined too*), as a replaced view gets; it is checked out at the new
+  repository's side; it is given a new measurement id, so to every
+  measurement it is a new tree — a fresh measurement directory (DESIGN §6
+  *Leerie's runs of the repository's commands are confined too*) — while
+  its stores are kept: the move runs only when the install's inputs are
+  unchanged, so they hold the install's result (bundler's gems, in the
+  keyed store its install key names); it is checked out at the new
   tip (`checkout --detach --force`); everything untracked but the outputs
   is removed (`clean -x`);
   under the outputs, every entry the install did not make (a tool's cache, a
@@ -16440,6 +16442,23 @@ it:
   what the tip needs, and the repository's own lifecycle scripts (a
   `prepare`, a `postinstall` generating from the sources) run against the
   new tip's files as they would in a fresh view. Builds are never reused.
+
+*An install's output outside the tree is a store keyed by the install
+inputs* (store model). A package manager whose install output lies outside
+the tree (bundler's `BUNDLE_PATH`, a tool's environment directory) has that
+output in a store, not in the tree, and the store belongs to the install
+inputs, not to a path: (1) its result is keyed by the install key (the
+recipe's `install` entries and what they read at the tip), so it is shared
+run-wide by those inputs: trees with the same key use one store and the run
+does not repeat a full install for them; (2) it is kept when a view moves to
+a tip whose key is unchanged, as the in-tree outputs are, where a moved view
+once started it empty; (3) it is visible to a worker in a tree leerie did not
+install for (a subtask's tree), so the repository's commit hooks and tools
+run there against an installed environment. Per-tree isolation stays,
+because it is carried by the key: trees whose keys differ never share a
+store, so two trees at two commits with different inputs never share an
+environment. No package manager is a special case: the rule holds for every
+install output outside the tree.
 
 So what a moved view holds is what a fresh view would: the install's output
 reused is one leerie produced, under the same confinement as any repository
@@ -23171,8 +23190,11 @@ everything untracked but the install's outputs; under those, `_install_intact`
 removes every entry the install did not make (a tool's cache under
 `node_modules`, a generated client) and refuses — tearing the tree down and
 installing afresh — a tree where an entry the install made was changed; and the
-move gives the tree a new measurement id, so its stores and measurement
-directory start empty. What every use then runs on is the commit's pristine
+move gives the tree a new measurement id, so its measurement directory
+starts empty, while its stores (`_TREE_STORE_VARS`) are carried over: the move
+runs only when the install's inputs are unchanged, so what the install put in
+them (bundler's gems) is still its result and no install is repeated; a move
+that fails remakes the tree, whose stores start empty. What every use then runs on is the commit's pristine
 checkout with an install a fresh install would reproduce, and it does what a
 fresh tree did: the recipe runs again (finding its output in place), every
 prerequisite runs again, and `ci-confirm-base`'s set-up checks run again from

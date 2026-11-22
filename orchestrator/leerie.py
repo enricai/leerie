@@ -6870,6 +6870,9 @@ _STORE_VARS: dict[str, str] = {
     "GOMODCACHE": "go-mod",
     "GOCACHE": "go-build",
     "BUNDLE_PATH": "bundle",
+    # The run-wide download/compile cache of an install (bundler's gem
+    # cache): shared like every cache here, never keyed.
+    "BUNDLE_USER_CACHE": "bundle-cache",
     "COMPOSER_CACHE_DIR": "composer",
     "NUGET_PACKAGES": "nuget",
     # Where a browser-suite runner's own browser download lands (DESIGN §8 *A
@@ -6915,12 +6918,116 @@ def _with_pnpm_spellings(env: MutableMapping[str, str]) -> None:
 # store is there (DESIGN §6 *A tree's stores are the tree's, whoever writes
 # it*).
 _TREE_STORE_VARS: frozenset[str] = frozenset({
-    "UV_CACHE_DIR", "BUNDLE_PATH", "NUGET_PACKAGES", "GOCACHE",
+    "UV_CACHE_DIR", "NUGET_PACKAGES", "GOCACHE",
     "npm_config_cache_dir",
     # A browser-suite runner's browser, which the tree's install fetches:
     # a worker started in the tree runs that browser (DESIGN §8 *A
     # repository's browser suite is a channel the run provisions*).
     "PLAYWRIGHT_BROWSERS_PATH"})
+
+
+# An install's output outside the tree (bundler's BUNDLE_PATH) is a store
+# keyed by the install inputs (DESIGN §8 *An install's output outside the
+# tree is a store keyed by the install inputs*), not a per-tree one: trees
+# with the same `_install_key` share `<run-dir>/worktrees/.stores/stores/
+# keyed/<key>/<name>`, trees with different keys never do. No package
+# manager is a special case.
+_KEYED_STORE_VARS: frozenset[str] = frozenset({"BUNDLE_PATH"})
+# The install key of each run tree leerie installed for, by realpath, set
+# where the install is recorded; a tree with none has no keyed store yet and
+# gets its own (the per-tree location), never another key's.
+_TREE_INSTALL_KEYS: dict[str, str] = {}
+
+
+# A tree with no recorded install has no `_install_key`; its key is taken from
+# its root files by one structural rule, naming no package manager or
+# language: the regular root files that are declarations, not code or prose
+# (no suffix, or a config-format suffix) and not large. A manifest, a lock
+# or a toolchain pin is such a file; a README or a source edit does not move
+# the key.
+_DECLARATION_SUFFIXES = frozenset({"", ".lock", ".toml", ".json", ".yaml",
+                                   ".yml", ".txt", ".cfg", ".ini", ".gemspec"})
+_PROSE_STEMS = frozenset({"readme", "license", "licence", "changelog",
+                          "copying", "notice", "authors", "contributing"})
+_CONTENT_KEY_MAX_BYTES = 1 << 20
+
+
+def _is_shared_run_store(value: str | None, run_dir: Path) -> bool:
+    """True when `value` names a store of the run that is no tree's own:
+    beneath `<run-dir>/worktrees/.stores` (the run's stores, a side's worker
+    cache) and outside `tree-stores/`. A keyless tree's keyed variable that
+    names one stands (`_tree_store_env`); an image's path or none does not."""
+    if not value:
+        return False
+    home = _stores_home(run_dir)
+    p = Path(os.path.abspath(value))
+    return p.is_relative_to(home) and not p.is_relative_to(
+        home / TREE_STORES_DIRNAME)
+
+
+def _content_install_key(tree: str | Path) -> str | None:
+    """The key of the install inputs `tree` holds on disk, for a tree leerie
+    has not installed in: equal root files, equal key, whatever the tree
+    (DESIGN §8 *An install's output outside the tree is a store keyed by the
+    install inputs*). None when the tree has no such file."""
+    h = hashlib.sha256()
+    found = False
+    try:
+        names = sorted(os.listdir(tree))
+    except OSError:
+        return None
+    for name in names:
+        if name == ".git" or Path(name).suffix.lower() not in _DECLARATION_SUFFIXES \
+                or Path(name).stem.lower() in _PROSE_STEMS:
+            continue
+        f = Path(tree) / name
+        try:
+            if f.is_symlink() or not f.is_file() \
+                    or f.stat().st_size > _CONTENT_KEY_MAX_BYTES:
+                continue
+            data = f.read_bytes()
+        except OSError:
+            continue
+        found = True
+        h.update(os.fsencode(name) + b"\0" + data + b"\0")
+    return "c-" + h.hexdigest() if found else None
+
+
+def _keyed_store(run_dir: Path, key: str, var: str) -> Path:
+    """The store of `var` for install key `key`."""
+    return (_stores_home(run_dir) / RUN_STORES_DIRNAME / "keyed" / key
+            / _STORE_VARS[var])
+
+
+def _adopt_install_store(tree: str, key: str) -> None:
+    """Make the keyed stores of install key `key` hold what the install in
+    `tree` just wrote to its own stores (bundler's gems): the install ran
+    before the tree had a key, so its output sits in the tree's store. Moved
+    when the keyed store is absent or empty; otherwise left (a sibling with
+    the same key filled it)."""
+    found = _tree_stores_dir(tree)
+    if found is None:
+        return
+    run_dir = found[0].parent.parent
+    ckey = _content_install_key(found[0])
+    for var in sorted(_KEYED_STORE_VARS):
+        src = found[1] / _STORE_VARS[var]
+        if ckey and ckey != key:
+            csrc = _keyed_store(run_dir, ckey, var)
+            with contextlib.suppress(OSError):
+                if csrc.is_dir() and any(csrc.iterdir()):
+                    src = csrc
+        dst = _keyed_store(run_dir, key, var)
+        with contextlib.suppress(OSError):
+            if not src.is_dir() or not any(src.iterdir()):
+                continue
+            if dst.is_dir() and any(dst.iterdir()):
+                continue
+            if dst.is_dir():
+                dst.rmdir()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dst)
+            _mkdir_private(src, run_dir)
 
 
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
@@ -6960,9 +7067,11 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
     of `env` at that side's worker cache set, as the worker's own spawn has
     them (`_cache_vars`). In any other run tree (`_tree_stores_dir`), its
     `_TREE_STORE_VARS` at `<run-dir>/worktrees/.stores/tree-stores/<tree>/
-    <name>`, made here
-    0700 (`_mkdir_private`), like every directory leerie makes for a
-    measurement, and the rest left as they are (the run's, `_leerie_stores`).
+    <name>`, made here 0700 (`_mkdir_private`), like every directory leerie
+    makes for a measurement; its `_KEYED_STORE_VARS` at the keyed store of
+    its install key (`_keyed_store`), or, with no key, left when they name
+    a shared store of the run (`_is_shared_run_store`) and otherwise at the
+    tree's own; and the rest left as they are (the run's, `_leerie_stores`).
     A `cwd` outside every run tree leaves `env` as it is. Leerie's commands
     there (`_run_streaming`) and a worker started there (`_invoke`) both get
     it."""
@@ -6975,8 +7084,19 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
                     if k != "XDG_CACHE_HOME"})
         return
     root = found[1]
-    for var in _TREE_STORE_VARS:
+    key = (_TREE_INSTALL_KEYS.get(os.path.realpath(found[0]))
+           or _content_install_key(found[0]))
+    for var in sorted(_TREE_STORE_VARS | _KEYED_STORE_VARS):
         dst = root / _STORE_VARS[var]
+        if var in _KEYED_STORE_VARS and key:
+            dst = _keyed_store(found[0].parent.parent, key, var)
+        elif var in _KEYED_STORE_VARS and _is_shared_run_store(
+                env.get(var), found[0].parent.parent):
+            # A tree with no install inputs to key by has nothing of its own
+            # to keep apart: the run's store the command already has (the
+            # run's, or its side's worker cache) stands. A value outside the
+            # run (an image's path) or none is the tree's own store.
+            continue
         with contextlib.suppress(OSError):
             _mkdir_private(dst, found[0].parent.parent)
         env[var] = str(dst)
@@ -7041,6 +7161,51 @@ def _installed_tree_stores(cwd: str | Path | None) -> Path | None:
     if found is None or os.path.realpath(found[0]) not in _DEPS_INSTALLED:
         return None
     return found[1]
+
+
+# The recipe and reads of each install key leerie recorded an install for
+# (`_record_view_install`): what `_visible_keyed_stores` keys another tree of
+# the run by, so a tree leerie did not install for finds the keyed stores
+# existing for its own install inputs.
+_KEYED_INPUTS: dict[str, tuple[list, "InstallReads"]] = {}
+
+
+def _visible_keyed_stores(cwd: str | Path | None) -> dict[str, Path]:
+    """The keyed stores (`_KEYED_STORE_VARS`) that exist for the install
+    inputs of the run tree `cwd` lies in, when leerie did not install in
+    that tree (a subtask's worktree): its install key is computed from its
+    HEAD as `_record_view_install` computed the recorded ones, so a worker
+    there sees the install result trees with the same inputs share (DESIGN
+    §8 *An install's output outside the tree is a store keyed by the
+    install inputs*). Empty for an installed tree (its own stores serve), a
+    tree outside every run, or inputs no install was recorded for."""
+    found = _tree_stores_dir(cwd)
+    if found is None or not _KEYED_INPUTS:
+        return {}
+    tree = found[0]
+    if os.path.realpath(tree) in _DEPS_INSTALLED:
+        return {}
+    try:
+        r = subprocess.run(["git", *_tree_git_args(tree), "rev-parse",
+                            "HEAD"], capture_output=True, text=True,
+                           check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    head = r.stdout.strip()
+    if r.returncode != 0 or not head:
+        return {}
+    run_dir = tree.parent.parent
+    seen: set[str] = set()
+    for recipe, reads in list(_KEYED_INPUTS.values()):
+        key = _install_key(tree, head, recipe, reads)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out = {v: d for v in sorted(_KEYED_STORE_VARS)
+               if (d := _keyed_store(run_dir, key, v)).is_dir()}
+        if out:
+            return out
+    return {}
 
 
 TREE_HOME_NAME = "home"
@@ -26779,6 +26944,11 @@ def _worker_grants(*, run_dir: str | Path, state: Mapping, schema_key: str,
     if tree_stores is not None:
         _mkdir_private(tree_stores, run_dir)
         (rw if str(cwd_r) in rw else ro).append(str(tree_stores))
+    # A tree leerie did not install for reads the keyed stores existing for
+    # its install inputs, never writes them.
+    for d in _visible_keyed_stores(cwd_r).values():
+        if str(d) not in ro:
+            ro.append(str(d))
     # No grant ever covers the state root whole, whatever a variable names
     # (`_reads_outside` never does, by construction: it is not re-checked,
     # which cost 0.3 s a call against a 2,000-entry `/tmp`, measured). Nor
@@ -28183,6 +28353,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # runs on that tree's stores*; review round 23 exec M1).
     if _tree_cache(cwd) is not None or _granted_tree_stores(grants, cwd):
         _tree_store_env(worker_env, cwd)
+    # A tree leerie did not install for: the keyed stores existing for its
+    # install inputs (BUNDLE_PATH), so its hooks find the dependencies.
+    for var, d in (await asyncio.to_thread(_visible_keyed_stores, cwd)
+                   ).items():
+        worker_env[var] = str(d)
     # Every command and hook of a confined worker runs in a domain nested in
     # its CLI's, so none can write into the stream this reads (DESIGN §6 *A
     # worker's commands cannot reach its CLI*). `claude_p` also puts it in
@@ -50028,13 +50203,16 @@ def _move_view(repo: Path, wt: Path, tip: str,
         except OSError:
             return False
     else:
-        # A moved view is a new tree to every measurement: with its id gone,
-        # `_measure_dir_at` gives it a fresh measurement directory and empty
-        # stores of its own (`_TREE_STORE_VARS`), as a replaced view gets, so
+        # A moved view is a new tree to every measurement: with a new id,
+        # `_measure_dir_at` gives it a fresh measurement directory, so
         # nothing one commit's code left there reaches the next commit's
-        # measurement; the install, run again, fills the stores anew.
+        # measurement. Its stores (`_TREE_STORE_VARS`) are kept: the move
+        # runs only when the install's inputs are unchanged, so they hold the
+        # install's result (bundler's gems). A valid id, unlike none, is not
+        # read as a new tree whose stores start empty.
         try:
-            (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
+            (admin / _MEASURE_ID_FILE).write_text(
+                uuid.uuid4().hex[:16] + "\n")
         except OSError:
             return False
         try:
@@ -50457,6 +50635,9 @@ async def _record_view_install(st: "State", view_key: str,
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
             _KEPT_INSTALLS[view_key] = (ikey, snap, reads)
+            _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _adopt_install_store(view_key, ikey)
+            _TREE_INSTALL_KEYS[view_key] = ikey
         return
     for tree_key, (tip, path) in list(_VIEWS.items()):
         if os.path.realpath(path) != view_key:
@@ -50469,6 +50650,9 @@ async def _record_view_install(st: "State", view_key: str,
         snap = _INSTALL_OUTPUTS.get(view_key)
         if ikey is not None and snap is not None:
             _VIEW_INSTALLS[view_key] = (ikey, snap, reads)
+            _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _adopt_install_store(view_key, ikey)
+            _TREE_INSTALL_KEYS[view_key] = ikey
         return
 
 
