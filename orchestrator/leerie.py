@@ -49889,9 +49889,18 @@ def _output_state(s: os.stat_result) -> str:
     be set back by its owner; with the inode it tells a rewrite or a
     replacement. A directory's moves whenever an entry is added under it, so
     a directory keeps only its inode and mode: an entry added is told by the
-    listing, one removed by the digest."""
+    listing, one removed by the digest. A regular file with more than one
+    link shares its inode with a store the install linked it from (pnpm's,
+    uv's, bun's): every other tree's install or removal of that package
+    moves its change time, which is no change to this tree, and any fresh
+    install links that same inode. So it keeps its modification time in
+    place of the change time (DESIGN §8 *A view moves to the next tip when
+    the install's inputs are unchanged*): a write moves it, and a file made
+    with one link that gains another has the other form, a change."""
     if stat.S_ISDIR(s.st_mode):
         return f"d{s.st_mode:o}:{s.st_ino}"
+    if stat.S_ISREG(s.st_mode) and s.st_nlink > 1:
+        return f"{s.st_mode:o}:{s.st_ino}:{s.st_size}:m{s.st_mtime_ns}"
     return f"{s.st_mode:o}:{s.st_ino}:{s.st_size}:{s.st_ctime_ns}"
 
 

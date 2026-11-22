@@ -9600,7 +9600,8 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     entries first. `_output_entries(tree, outputs, known=None)`: every
     entry at or under the outputs, links never followed, as `(path,
     _output_state(lstat))` — a file's or link's `mode:ino:size:ctime_ns`,
-    a directory's `d<mode>:ino` — sorted; with `known`, an entry not in it
+    a regular file with `st_nlink > 1` `mode:ino:size:m<mtime_ns>`, a
+    directory's `d<mode>:ino` — sorted; with `known`, an entry not in it
     is `_rmtree_owned` and left out; None on an unreadable or unremovable
     entry. `_install_intact(tree, snap) -> bool`: `_output_entries` with
     the snapshot's listing as `known`, its `_entries_digest` equal to the
