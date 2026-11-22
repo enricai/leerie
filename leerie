@@ -6750,8 +6750,11 @@ fi
 #     fails inside the container. Linked worktree: git-dir != common-dir
 #     (equal for plain clones and submodules).
 #     Local runtime only: fly/ec2 seed /work from a bundle/clone, which works.
-_wt_gitdir="$(cd "$USER_REPO" && cd "$(git rev-parse --git-dir)" 2>/dev/null && pwd -P)"
-_wt_common="$(cd "$USER_REPO" && cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P)"
+#     Addressed with `-C`, never `cd`: no host script makes a checkout its
+#     cwd (tests/test_host_python_is_isolated.py). Both paths come from the
+#     same git discovery, so they compare equal unless they truly differ.
+_wt_gitdir="$(git -C "$USER_REPO" rev-parse --path-format=absolute --git-dir 2>/dev/null)"
+_wt_common="$(git -C "$USER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 if [ "$RUNTIME" = "local" ] && [ -n "$_wt_gitdir" ] && [ -n "$_wt_common" ] && [ "$_wt_gitdir" != "$_wt_common" ]; then
   remote_log "error: $USER_REPO is a linked git worktree; its gitdir is not mounted in the container"
   echo "  Run leerie from a standalone clone (\`git clone <repo> <dir>\`) or the" >&2
