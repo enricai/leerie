@@ -197,3 +197,76 @@ def test_trees_with_equal_install_keys_share_the_keyed_store(leerie, tmp_path):
         for tree in (t, t2, t3):
             leerie._TREE_INSTALL_KEYS.pop(os.path.realpath(tree), None)
     assert envs[0] == envs[1] != envs[2]
+
+
+def _git_tree(run: Path, name: str, files: dict[str, str]) -> Path:
+    t = run / "worktrees" / name
+    t.mkdir(parents=True)
+    _git(t, "init", "-q")
+    for rel, text in files.items():
+        (t / rel).write_text(text)
+    _git(t, "add", "-A")
+    _git(t, "-c", "user.name=w", "-c", "user.email=w@w", "commit", "-qm", "c")
+    return t
+
+
+def test_trees_with_unequal_install_keys_never_share_and_a_keyless_tree_is_its_own(
+        leerie, tmp_path):
+    """Equal keys share one store under `keyed/<key>`; a different key gets
+    another; a tree with no recorded install gets its per-tree store, never
+    a keyed one."""
+    run, a = _tree(tmp_path)
+    b, c = (run / "worktrees" / n for n in ("r1-view-b", "r1-view-c"))
+    for d in (b, c):
+        d.mkdir(parents=True)
+        (d / ".git").write_text("gitdir: x\n")
+    leerie._TREE_INSTALL_KEYS[os.path.realpath(a)] = "k1"
+    leerie._TREE_INSTALL_KEYS[os.path.realpath(b)] = "k2"
+    try:
+        got = {}
+        for tree in (a, b, c):
+            e: dict[str, str] = {}
+            leerie._tree_store_env(e, tree)
+            got[tree] = e["BUNDLE_PATH"]
+    finally:
+        leerie._TREE_INSTALL_KEYS.clear()
+    stores = run / "worktrees" / ".stores"
+    assert got[a] == str(stores / "stores" / "keyed" / "k1" / "bundle")
+    assert got[b] == str(stores / "stores" / "keyed" / "k2" / "bundle")
+    assert got[c] == str(stores / "tree-stores" / c.name / "bundle")
+    # The non-keyed per-tree stores stay per tree for every tree.
+    for tree in (a, b):
+        e = {}
+        leerie._tree_store_env(e, tree)
+        assert e["UV_CACHE_DIR"] == str(stores / "tree-stores" / tree.name / "uv")
+
+
+def test_a_worker_tree_sees_the_keyed_store_of_its_install_inputs(
+        leerie, tmp_path, monkeypatch):
+    """A tree leerie did not install for (a subtask's worktree) is given the
+    keyed store existing for its own install inputs (`_visible_keyed_stores`),
+    and only when its inputs equal the recorded ones."""
+    run = tmp_path / "runs" / "r1"
+    files = {"Gemfile": "gem 'rack'\n"}
+    installed = _git_tree(run, "r1-view-installed", files)
+    same = _git_tree(run, "r1-view-same", files)
+    other = _git_tree(run, "r1-view-other", {"Gemfile": "gem 'rails'\n"})
+    for t in (installed, same, other):
+        monkeypatch.setattr(leerie, "_tree_git_args",
+                            lambda tree: ["-C", str(tree)])
+    reads = ({"Gemfile"}, set())
+    recipe = [{"kind": "install", "working_dir": ".",
+               "command": ["bundle", "install"]}]
+    head = _git(installed, "rev-parse", "HEAD")
+    key = leerie._install_key(installed, head, recipe, reads)
+    assert key
+    store = leerie._keyed_store(run, key, "BUNDLE_PATH")
+    store.mkdir(parents=True)
+    monkeypatch.setattr(leerie, "_KEYED_INPUTS", {key: (recipe, reads)})
+    monkeypatch.setattr(leerie, "_DEPS_INSTALLED", {})
+    assert leerie._visible_keyed_stores(same) == {"BUNDLE_PATH": store}
+    assert leerie._visible_keyed_stores(other) == {}        # inputs differ
+    monkeypatch.setattr(leerie, "_DEPS_INSTALLED",
+                        {os.path.realpath(same): True})
+    assert leerie._visible_keyed_stores(same) == {}         # installed: own
+    assert leerie._visible_keyed_stores(tmp_path) == {}     # no run tree
