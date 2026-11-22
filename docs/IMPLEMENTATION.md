@@ -6346,6 +6346,8 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `resolve_runtime()` at startup | invalid value in `LEERIE_RUNTIME` or `--runtime` — caught before any worker spawns |
 | `resolve_models()` at startup | invalid model alias in `leerie.toml`, any `LEERIE_MODEL[_*]` env var, or any `--model[-*]` CLI flag — caught before any worker spawns |
 | `git user.email` / `user.name` set | commits would fail silently without identity |
+| `git config` failure classified by git's verdict (same check) | rc=128 or "not a git repository" means `/work` is not a usable repository (e.g. a linked worktree whose `.git` file points at a gitdir not mounted in the container) and is reported as such, never as a missing identity; only rc=1 / empty output is "not configured" |
+| linked-worktree refusal (launcher bash, before container) | `git rev-parse --git-dir` differs from `--git-common-dir`: refused early with guidance to run from a standalone clone, since the container mounts only the checkout and cannot reach the worktree's gitdir |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
 | `claude --version` ≥ `MIN_CLAUDE_CLI_STRICT_OUTPUT` (currently `(2, 1, 289)`), only when `--dangerously-force-strict-output` is on | a CLI on which strict decoding turns leaked tool-call markup into a schema-valid payload with its fields emptied (DESIGN §7) |

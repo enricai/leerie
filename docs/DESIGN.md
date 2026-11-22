@@ -11158,6 +11158,17 @@ boundary as backstop. Because the subreaper reparents orphans to the
 orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter
 accepts `ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected.
 
+**An unusable checkout is not a missing identity.** Preflight's identity
+check classifies a failed `git config user.email` by git's own verdict. rc=128
+or "not a git repository" means the checkout at `/work` is not a usable
+repository (typically a linked worktree whose `.git` file points at a host
+gitdir the container does not mount) and is reported as that. Only rc=1 or an
+empty value is "git user.email is not configured". Reporting the former as the
+latter sent users to fix an identity that was fine. The host launcher also
+refuses a linked worktree early, before starting the container: when
+`git rev-parse --git-dir` and `--git-common-dir` differ it dies with guidance
+to run from a standalone clone.
+
 **What a cgroup teardown kills, it also reaps.** The broker's `destroy`
 (`cgroup.kill` on v2) SIGKILLs every process still in the cgroup,
 including one that left the command's session on purpose, such as a test
