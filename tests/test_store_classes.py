@@ -270,3 +270,67 @@ def test_a_worker_tree_sees_the_keyed_store_of_its_install_inputs(
                         {os.path.realpath(same): True})
     assert leerie._visible_keyed_stores(same) == {}         # installed: own
     assert leerie._visible_keyed_stores(tmp_path) == {}     # no run tree
+
+
+def test_a_content_key_reads_no_link_the_tree_holds(leerie, tmp_path):
+    """A tree's root is confined code's to shape: a link at a declaration
+    file's name, to a file outside the tree, moves no key, and a regular
+    file at that name does (DESIGN §6 *Leerie never reads through a link a
+    repository holds*)."""
+    outside = tmp_path / "outside"
+    outside.write_text("secret\n")
+    t = tmp_path / "tree"
+    t.mkdir()
+    (t / "Gemfile").write_text("gem 'rack'\n")
+    base = leerie._content_install_key(t)
+    assert base
+    (t / "Gemfile.lock").symlink_to(outside)
+    assert leerie._content_install_key(t) == base
+    outside.write_text("changed\n")
+    assert leerie._content_install_key(t) == base
+    (t / "Gemfile.lock").unlink()
+    (t / "Gemfile.lock").write_text("secret\n")
+    assert leerie._content_install_key(t) != base
+
+
+def _installed_tree(leerie, tmp_path) -> tuple[Path, Path, Path]:
+    run, t = _tree(tmp_path)
+    src = (run / "worktrees" / ".stores" / "tree-stores" / t.name
+           / leerie._STORE_VARS["BUNDLE_PATH"])
+    src.mkdir(parents=True)
+    (src / "gem").write_text("installed\n")
+    return run, t, src
+
+
+def test_an_adopted_install_moves_into_the_keyed_store(leerie, tmp_path):
+    run, t, src = _installed_tree(leerie, tmp_path)
+    dst = leerie._keyed_store(run, "k1", "BUNDLE_PATH")
+    dst.mkdir(parents=True)                           # empty: replaced
+    leerie._adopt_install_store(str(t), "k1")
+    assert (dst / "gem").read_text() == "installed\n"
+    assert src.is_dir() and not any(src.iterdir())    # made again, empty
+
+
+def test_an_adopted_install_is_never_moved_through_a_link(leerie, tmp_path):
+    """A confined install writes the run's stores: a link it left at the
+    keyed store, or on the way to it, never carries the tree's install out
+    of the run (DESIGN §6 *Leerie never writes through a path confined code
+    shaped*)."""
+    run, t, src = _installed_tree(leerie, tmp_path)
+    away = tmp_path / "away"
+    away.mkdir()
+    dst = leerie._keyed_store(run, "k1", "BUNDLE_PATH")
+    dst.parent.mkdir(parents=True)
+    dst.symlink_to(away)                              # at the destination
+    leerie._adopt_install_store(str(t), "k1")
+    assert not any(away.iterdir())
+    assert not dst.is_symlink() and (dst / "gem").is_file()
+
+    run, t, src = _installed_tree(leerie, tmp_path / "b")
+    dst = leerie._keyed_store(run, "k2", "BUNDLE_PATH")
+    dst.parent.parent.mkdir(parents=True)
+    dst.parent.symlink_to(away)                       # on the way
+    leerie._adopt_install_store(str(t), "k2")
+    assert not any(away.iterdir())
+    # Leerie's own layout: the link is replaced by the directory it names.
+    assert not dst.parent.is_symlink() and (dst / "gem").is_file()

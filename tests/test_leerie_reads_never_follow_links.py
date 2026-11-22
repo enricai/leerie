@@ -627,7 +627,8 @@ def test_the_converted_sites_read_only_beneath():
                "_introduced_conflict_markers", "_restore_git_pointer",
                "_admin_dir_of", "_run_tree_location",
                "_stage_worktree_extras", "_copy_task_references",
-               "_verify_set_audit_case"):
+               "_verify_set_audit_case", "_content_install_key",
+               "_adopt_install_store"):
         assert fn not in found, (fn, found.get(fn))
         if fn not in _EXISTENCE_ONLY:
             assert fn not in probes, (fn, probes.get(fn))
