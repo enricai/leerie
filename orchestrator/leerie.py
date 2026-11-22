@@ -6974,6 +6974,9 @@ def _content_install_key(tree: str | Path) -> str | None:
     # it): each file is read beneath the tree, so a link, a FIFO or a file
     # over the limit is skipped, never read through (DESIGN §6 *Leerie never
     # reads through a link a repository holds*, *No read is unbounded*).
+    # Only a regular file is opened: this runs while an install's reads are
+    # watched, and opening a directory there (`src/`) would make it one of
+    # the install's inputs, so every commit beneath it moved the key.
     root = Path(tree)
     h = hashlib.sha256()
     found = False
@@ -6984,6 +6987,8 @@ def _content_install_key(tree: str | Path) -> str | None:
     for name in names:
         if name == ".git" or Path(name).suffix.lower() not in _DECLARATION_SUFFIXES \
                 or Path(name).stem.lower() in _PROSE_STEMS:
+            continue
+        if not _regular_file_beneath(root, root / name):
             continue
         try:
             data = _read_beneath(root, root / name,
