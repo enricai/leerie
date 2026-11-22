@@ -16,6 +16,7 @@ import shutil
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -94,7 +95,8 @@ class TestPreflightDiskCheck:
         with mock.patch.object(leerie.shutil, "disk_usage",
                                 return_value=_fake_usage(0.01)):
             with pytest.raises(SystemExit):
-                asyncio.run(leerie.preflight(tmp_path, skip_smoke=True))
+                asyncio.run(leerie.preflight(tmp_path, skip_smoke=True,
+                                             st=SimpleNamespace(data={}), caps={}))
         assert not called
 
     def test_healthy_disk_is_a_noop_at_preflight(self, tmp_path, monkeypatch):
@@ -120,7 +122,8 @@ class TestPreflightDiskCheck:
                                 return_value=_fake_usage(0.90)):
             # skip_smoke=True skips the live claude -p call; no SystemExit
             # anywhere means every check, including the disk gate, passed.
-            asyncio.run(leerie.preflight(tmp_path, skip_smoke=True))
+            asyncio.run(leerie.preflight(tmp_path, skip_smoke=True,
+                                         st=SimpleNamespace(data={}), caps={}))
 
 
 class TestPhaseExecuteDiskLowSpace:

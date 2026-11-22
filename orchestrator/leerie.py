@@ -1153,8 +1153,9 @@ STATE_FIELDS = (
     # active_oauth_token: the raw CLAUDE_CODE_OAUTH_TOKEN value currently
     # selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token
     # rotation*). Set by the start-of-run probe/ranking sweep when
-    # CLAUDE_CODE_OAUTH_TOKENS is present, and mutated by claude_p's
-    # mid-run failover on a rate-limited active token. Absent/None when
+    # CLAUDE_CODE_OAUTH_TOKENS is present, and mutated by the mid-run
+    # failover (`_spawn_with_token_rotation`: every worker's spawn and the
+    # preflight smoke test's) on a rate-limited active token. Absent/None when
     # only the singular CLAUDE_CODE_OAUTH_TOKEN is in play (no rotation).
     # NEVER written to calls.ndjson, run.json, or any log line — only its
     # fingerprint (_token_fingerprint) is ever surfaced outside state.json.
@@ -14331,8 +14332,13 @@ def _reap_launcher_logs(state_root: Path,
 
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False,
-                    model: str = MODEL_DEFAULT) -> None:
-    """Hard checks before any LLM work. Fails fast rather than wasting workers."""
+                    model: str = MODEL_DEFAULT, *,
+                    st: "State", caps: dict) -> None:
+    """Hard checks before any LLM work. Fails fast rather than wasting workers.
+
+    `st` and `caps` are the run's: the smoke test spawns with the run's
+    active token and rotates as every worker does (DESIGN §6 *Multi-token
+    rotation*)."""
 
     # 0. subprocess machinery must be able to report exit statuses at all.
     # Under SIGCHLD=SIG_IGN the kernel auto-reaps our children, so every
@@ -14482,17 +14488,26 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             die(f"the smoke-test working directory {smoke_cwd} is a symlink "
                 f"(to {os.path.realpath(smoke_cwd)}); refusing to run the "
                 "smoke test in it. Remove it and re-run.")
+        grants = _worker_grants(run_dir=leerie_dir, state={},
+                                schema_key="smoke", cwd=smoke_cwd,
+                                allowed_tools=SMOKE_TOOLS,
+                                env={**os.environ, **smoke_env})
+
+        async def _smoke_spawn() -> dict:
+            # The active token is read on every spawn, as `claude_p`'s
+            # `_spawn` does, so a rotation below takes effect on its retry.
+            return await _invoke(cmd, cwd=smoke_cwd, timeout=90,
+                                 sid="smoke", leerie_dir=leerie_dir,
+                                 verbosity=verbosity, env_extra=smoke_env,
+                                 active_token=st.data.get(
+                                     "active_oauth_token"),
+                                 grants=grants)
         try:
-            envelope = await _invoke(cmd, cwd=smoke_cwd, timeout=90,
-                                     sid="smoke",
-                                     leerie_dir=leerie_dir,
-                                     verbosity=verbosity,
-                                     env_extra=smoke_env,
-                                     grants=_worker_grants(
-                                         run_dir=leerie_dir, state={},
-                                         schema_key="smoke", cwd=smoke_cwd,
-                                         allowed_tools=SMOKE_TOOLS,
-                                         env={**os.environ, **smoke_env}))
+            # The rotation a worker's call has: a rate limit on the token
+            # the smoke test used pauses the run only when every
+            # configured token is limited.
+            envelope = await _spawn_with_token_rotation(st, caps,
+                                                        _smoke_spawn)
         except subprocess.TimeoutExpired:
             die("claude -p smoke test timed out — auth issue or network problem")
         except WorkerError as e:
@@ -25221,30 +25236,42 @@ def _parse_oauth_token_list(raw: str | None) -> list[str]:
 async def _rotate_oauth_token_or_raise(
         st: "State", caps: dict, *, known_reset_at: datetime | None,
         raw_message: str, retry_fn: Callable[[], Awaitable[dict]],
+        limit_type: str | None = None,
 ) -> dict | None:
-    """Shared mid-run rotation logic for BOTH surfaces the active token's
-    rate-limit condition can reach `claude_p` through (DESIGN §6
-    *Multi-token rotation*):
-      (a) an envelope-level failure (`_is_auth_or_quota_failure`), and
+    """The run's one token-rotation decision (DESIGN §6 *Multi-token
+    rotation*), for BOTH surfaces the active token's rate-limit condition
+    can reach a `claude -p` call through, both by way of
+    `_spawn_with_token_rotation`, which every spawn the orchestrator
+    process makes goes through (`claude_p`'s and `preflight`'s smoke
+    test's):
+      (a) an envelope-level failure (`_is_auth_or_quota_failure`, a 529
+          overload excepted), and
       (b) a `RateLimitedExit` raised out of `_invoke`'s streaming loop for
-          the protocol-level `rate_limit_event` (the two are otherwise
-          independent code paths that both need identical rotation
-          behavior — factored here so it is written and tested once).
+          the protocol-level `rate_limit_event`.
 
-    If more than one token is configured: probes/ranks the OTHER tokens
-    (excluding the active one); if one has runway, switches
-    `active_oauth_token` and calls `retry_fn()` to get a fresh envelope
-    — returns that envelope. If every token is currently rate-limited (or
-    unprobeable), raises `RateLimitedExit` with whichever reset is
-    soonest across `known_reset_at` (the caller's own live signal, e.g. a
-    just-caught exception's `reset_at`, preferred over — but combined
-    with — any fresher cached probe data) and the cached probe data for
-    every configured token, including the active one.
+    If more than one token is configured: probes/ranks the tokens not yet
+    seen limited by this call (the active one is); if one has runway,
+    switches `active_oauth_token` and calls `retry_fn()`. A retry that is
+    itself refused by a protocol-level `RateLimitedExit` marks that token
+    limited, with its live reset, and the next token with runway is tried
+    — a stale probe of the token rotated to does not end the search. Any
+    other outcome of the retry (an envelope, whatever
+    it holds, or another exception) is the caller's. When no token left
+    has runway (or is probeable), raises `RateLimitedExit` with whichever
+    reset is soonest across every configured token: a live signal seen
+    by this call that carries a reset (`known_reset_at` for the token
+    active on entry, a retry's `reset_at` for each token it tried)
+    preferred over that token's cached probe data. The raised exception
+    carries the soonest token's own refusal when this call saw one — a
+    retry's message and window (`limit_type`), or the caller's
+    `raw_message`/`limit_type` for the token active on entry — else the
+    caller's `raw_message` and no window.
 
     Returns `None` (no exception, no rotation) when 0 or 1 tokens are
-    configured, or when no probe data exists for ANY token — the caller
-    falls through to its own existing behavior in either case (never
-    raises purely on a probe failure)."""
+    configured, or when no token has a reset to offer (no probe data, no
+    live signal carrying one) — the caller falls through to its own
+    existing behavior in either case (never raises purely on a probe
+    failure)."""
     oauth_tokens = _parse_oauth_token_list(
         os.environ.get("CLAUDE_CODE_OAUTH_TOKENS"))
     if len(oauth_tokens) <= 1:
@@ -25252,43 +25279,60 @@ async def _rotate_oauth_token_or_raise(
 
     cache_sec = caps.get("token_probe_cache_sec",
                           DEFAULT_CAPS["token_probe_cache_sec"])
-    active = st.data.get("active_oauth_token")
-    others = [t for t in oauth_tokens if t != active]
-    ranked = await asyncio.to_thread(_rank_tokens, others, cache_sec)
-    winner = ranked[0] if ranked else None
-    winner_probe = (_TOKEN_PROBE_CACHE.get(
-        _token_fingerprint(winner), (None, 0.0))[0]
-        if winner is not None else None)
-
-    if winner_probe is not None and min(
-            1.0 - winner_probe["five_hour_util"],
-            1.0 - winner_probe["seven_day_util"]) > 0:
+    # token -> its live reset (None when the refusal carried none). The
+    # token active on entry is the one the caller just saw refused.
+    entry = st.data.get("active_oauth_token")
+    limited: dict[str | None, datetime | None] = {entry: known_reset_at}
+    # A refused retry's own exception, by token, so a pause at that token's
+    # reset reports its message and window rather than the entry's.
+    refusals: dict[str, RateLimitedExit] = {}
+    while True:
+        others = [t for t in oauth_tokens if t not in limited]
+        ranked = await asyncio.to_thread(_rank_tokens, others, cache_sec)
+        winner = ranked[0] if ranked else None
+        winner_probe = (_TOKEN_PROBE_CACHE.get(
+            _token_fingerprint(winner), (None, 0.0))[0]
+            if winner is not None else None)
+        if winner_probe is None or min(
+                1.0 - winner_probe["five_hour_util"],
+                1.0 - winner_probe["seven_day_util"]) <= 0:
+            break
         # Rotate and retry immediately — no re-exec, no container restart.
         log(f"  token-probe: active token rate-limited — "
             f"rotating to {_token_fingerprint(winner)}")
         st.data["active_oauth_token"] = winner
         st.save()
-        return await retry_fn()
+        try:
+            return await retry_fn()
+        except RateLimitedExit as rle:
+            if rle.out_of_credits:
+                raise
+            limited[winner] = rle.reset_at
+            refusals[winner] = rle
 
     # Every token is currently rate-limited (or unprobeable). Pick
-    # whichever resets soonest — including the active token itself, whose
-    # own reset time prefers a live signal (known_reset_at, e.g. a
-    # just-caught exception's reset_at) over its possibly-stale-or-absent
-    # cache entry, since the active token is deliberately excluded from
-    # the fresh probe/rank call above.
+    # whichever resets soonest — a token's own live signal from this call
+    # preferred over its possibly-stale-or-absent cache entry.
+    active = st.data.get("active_oauth_token")
     candidates: list[tuple[str, datetime]] = []
-    if known_reset_at is not None and active is not None:
-        candidates.append((active, known_reset_at))
-    for t in oauth_tokens:
-        if t == active and known_reset_at is not None:
-            continue  # already have a live signal for the active token
+    # The entry token first: it may no longer be listed (a resume under a
+    # changed CLAUDE_CODE_OAUTH_TOKENS), and its live reset still counts.
+    for t in dict.fromkeys([*limited, *oauth_tokens]):
+        if t is None:
+            continue
+        live = limited.get(t)
+        if live is not None:
+            candidates.append((t, live))
+            continue
         cached = _TOKEN_PROBE_CACHE.get(_token_fingerprint(t), (None, 0.0))[0]
         if cached is not None and cached.get("resets_at") is not None:
             candidates.append((t, cached["resets_at"]))
 
     if not candidates:
         # No probe data for any token, no live signal either — fall
-        # through unchanged to the caller's own existing behavior.
+        # through unchanged to the caller's own existing behavior. Within
+        # this call, never after a rotation: a token is rotated to only on
+        # probe data, and every probe result carries a reset.
         return None
 
     soonest_token, soonest_reset = min(candidates, key=lambda pair: pair[1])
@@ -25297,7 +25341,56 @@ async def _rotate_oauth_token_or_raise(
             f"soonest-reset token {_token_fingerprint(soonest_token)}")
         st.data["active_oauth_token"] = soonest_token
         st.save()
-    raise RateLimitedExit(reset_at=soonest_reset, raw_message=raw_message)
+    refusal = refusals.get(soonest_token)
+    raise RateLimitedExit(
+        reset_at=soonest_reset,
+        raw_message=refusal.raw_message if refusal else raw_message,
+        limit_type=(refusal.limit_type if refusal
+                    else limit_type if soonest_token == entry else None))
+
+
+async def _spawn_with_token_rotation(
+        st: "State", caps: dict,
+        spawn: Callable[[], Awaitable[dict]]) -> dict:
+    """Run `spawn()` — one `claude -p` call — under the run's rotation
+    decision on both surfaces a rate-limited token reaches it through
+    (DESIGN §6 *Multi-token rotation*): the protocol-level
+    `RateLimitedExit` (b) and a completed envelope the gateway rejected for
+    this token, 401/429/auth-message (a). Every spawn the orchestrator process
+    makes goes through this — `claude_p`'s each attempt, its backoff
+    loop's included, and `preflight`'s smoke test — so one exhausted token
+    never pauses or fails a run another token could carry.
+
+    `out_of_credits` is account-level, not per-token: re-raised as is. A
+    terminal-auth envelope (a dead credential) and a 529 (the gateway's
+    overload) are never rotated. When no
+    rotation is possible (`_rotate_oauth_token_or_raise` returns None) the
+    original exception or envelope stands; when every token is limited,
+    `RateLimitedExit` at the soonest reset."""
+    try:
+        envelope = await spawn()
+    except RateLimitedExit as rle:
+        if rle.out_of_credits:
+            raise
+        rotated = await _rotate_oauth_token_or_raise(
+            st, caps, known_reset_at=rle.reset_at,
+            raw_message=rle.raw_message, retry_fn=spawn,
+            limit_type=rle.limit_type)
+        if rotated is None:
+            raise
+        return rotated
+    # A 529 is the gateway's overload, not this token's limit: another
+    # token meets the same gateway, and counting it limited would pause
+    # the run until some token's reset instead of backing off.
+    if (not _is_auth_or_quota_failure(envelope)
+            or _is_terminal_auth_failure(envelope)
+            or _api_error_category(envelope.get("api_error_status"))
+            == "overload"):
+        return envelope
+    rotated = await _rotate_oauth_token_or_raise(
+        st, caps, known_reset_at=None,
+        raw_message=str(envelope.get("result") or ""), retry_fn=spawn)
+    return envelope if rotated is None else rotated
 
 
 async def _select_active_oauth_token(st: "State", caps: dict) -> None:
@@ -33067,29 +33160,21 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # Multi-token mid-run failover (DESIGN §6 *Multi-token
             # rotation*) covers BOTH surfaces a rate-limited active token
             # can reach this loop through:
-            #   (a) an envelope-level failure (`_is_auth_or_quota_failure`,
-            #       below, once `_spawn` returns a completed `result`), and
+            #   (a) an envelope-level failure (`_is_auth_or_quota_failure`
+            #       but not a 529 overload: a completed `result` the gateway
+            #       rejected for this token), and
             #   (b) a `RateLimitedExit` raised directly out of `_invoke`'s
             #       streaming loop for the protocol-level `rate_limit_event`
             #       (never reaches an envelope at all — `_spawn` raises
-            #       instead of returning). Caught here, BEFORE it can
-            #       propagate to main()'s single-token pause/auto-resume,
-            #       so this path gets the same rotation chance as (a).
+            #       instead of returning). Caught BEFORE it can propagate
+            #       to main()'s single-token pause/auto-resume.
+            # Both are tried BEFORE any of the tenacity backoff budget
+            # below is spent on a token already known to be exhausted.
             # out_of_credits is an account-level exhaustion, not a
             # per-token rate limit — rotating tokens would not help, so it
             # re-raises immediately, unaffected by this feature.
-            try:
-                envelope = await _spawn(retry_note)
-            except RateLimitedExit as _rle:
-                if _rle.out_of_credits:
-                    raise
-                _rotated = await _rotate_oauth_token_or_raise(
-                    st, caps, known_reset_at=_rle.reset_at,
-                    raw_message=_rle.raw_message,
-                    retry_fn=lambda: _spawn(retry_note))
-                if _rotated is None:
-                    raise  # no rotation possible — original exception stands
-                envelope = _rotated
+            envelope = await _spawn_with_token_rotation(
+                st, caps, lambda: _spawn(retry_note))
 
             # Terminal auth failure (expired/absent OAuth session): checked
             # BEFORE the auth/quota backoff below, and raised immediately —
@@ -33108,21 +33193,6 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # instead, before any retry, so the operator sees the real cause.
             if _is_context_overflow(envelope):
                 raise ContextOverflow(str(envelope.get("result") or ""))
-
-            # Envelope-level rotation (surface (a) above): the ACTIVE
-            # token is rate-limited (not a transport disconnect, not
-            # terminal-auth — a real 401/429/529/auth-message on the token
-            # currently in use). Try rotating BEFORE spending any of the
-            # tenacity backoff budget below on a token already known to be
-            # exhausted. Never raises on a probe failure — falls through
-            # unchanged to the existing backoff/pause behavior.
-            if _is_auth_or_quota_failure(envelope):
-                _rotated = await _rotate_oauth_token_or_raise(
-                    st, caps, known_reset_at=None,
-                    raw_message=str(envelope.get("result") or ""),
-                    retry_fn=lambda: _spawn(retry_note))
-                if _rotated is not None:
-                    envelope = _rotated
 
             # Backoff (not immediate corrective retry) is needed for two
             # envelope classes that share the same remedy — a fresh session
@@ -33183,7 +33253,10 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                         retry=retry_if_result(_needs_backoff),
                         reraise=False,
                         before_sleep=_log_before_sleep,
-                    )(_spawn, retry_note)
+                    # Each attempt is a `claude -p` call like the first: a
+                    # stream refusal on one rotates rather than pausing.
+                    )(_spawn_with_token_rotation, st, caps,
+                      lambda: _spawn(retry_note))
                 except RetryError as e:
                     # Budget exhausted with the envelope still in a backoff
                     # class. Surface the last attempt's envelope so the
@@ -82854,6 +82927,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # recorded key.
         _enforce_and_record_cgroup_containment(
             st, args.dangerously_allow_uncapped)
+        # Start-of-run multi-token selection (DESIGN §6 *Multi-token
+        # rotation*) comes first — a no-op when CLAUDE_CODE_OAUTH_TOKENS is
+        # unset. The smoke test is the run's first `claude -p` call, so it
+        # spawns with the selected token and rotates like any worker: run
+        # after it, the smoke test used the launcher's seed (the list's
+        # first token) and paused a run for 33 hours on that token's limit
+        # while another token had runway. Fresh-run only: on resume,
+        # active_oauth_token (if any) is already persisted in st.data.
+        await _select_active_oauth_token(st, caps)
         # The smoke test bills the tier the run's FIRST worker actually
         # spawns with (phase_classify is unconditional), rather than letting
         # the CLI pick its own default — measured, that default resolved to
@@ -82863,12 +82945,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
                         no_push=getattr(args, "no_push", False),
-                        model=models["classifier"])
-        # Start-of-run multi-token selection (DESIGN §6 *Multi-token
-        # rotation*) — a no-op when CLAUDE_CODE_OAUTH_TOKENS is unset.
-        # Fresh-run only: on resume, active_oauth_token (if any) is
-        # already persisted in st.data from the original run.
-        await _select_active_oauth_token(st, caps)
+                        model=models["classifier"], st=st, caps=caps)
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
 

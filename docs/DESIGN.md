@@ -9259,8 +9259,9 @@ mid-run even though the token itself never expires. `leerie` supports
   `user:inference`-scoped tokens such as a `claude setup-token` mint, to
   reading the `anthropic-ratelimit-unified-*` headers off a minimal
   `/v1/messages` call. The token with the most runway is selected before
-  any worker spawns — not round-robin, which would burn a nearly-exhausted
-  token at the same rate as a fresh one.
+  the run's first `claude -p` call, the preflight smoke test included —
+  not round-robin, which would burn a nearly-exhausted token at the same
+  rate as a fresh one.
 - **Mid-run failover.** If the active token gets rate-limited mid-run,
   leerie rotates to another token with runway and **continues in the same
   container** — no re-exec, no restart — by threading the active token
@@ -9268,9 +9269,25 @@ mid-run even though the token itself never expires. `leerie` supports
   leerie picks the one whose window resets soonest and falls through to the
   existing reset-wait auto-resume path. This covers both surfaces a rate
   limit can reach `claude_p` through: a completed envelope carrying a
-  401/429/529/auth-message, and the protocol-level `rate_limit_event`
+  401/429/auth-message, and the protocol-level `rate_limit_event`
   stream event that raises `RateLimitedExit` directly out of the streaming
-  loop before any envelope is produced.
+  loop before any envelope is produced. A 529 is not one of them: it is
+  the gateway's overload, which every token meets alike, so it backs off
+  on the token in use rather than counting that token limited.
+- **Every model-calling `claude -p` call the orchestrator process makes
+  rotates, not only a worker's.** A run is to pause on a rate limit only when every
+  configured token is limited, at the soonest reset among them. A call
+  that spawns with another credential, or that lets a limit reach the
+  pause without the rotation decision, breaks that for the whole run: the
+  preflight smoke test once ran before the selection, on the list's first
+  token, and outside both surfaces, so one token's weekly limit paused a
+  run for 33 hours while another token had runway — the `dep_capture`
+  worker leerie runs on pausing rotated to it two seconds later. For the same
+  reason a token rotated to whose own call the stream refuses
+  (`rate_limit_event`; its probe was as stale as the first one's) does
+  not end the search: the next token with runway is tried. (The Fly
+  remote integrator runs `claude -p` from its own script on the remote
+  machine and does not rotate.)
 
 **This is deliberately structured data in, deterministic Python out — no
 LLM worker** (§12). Ranking is `min(1 − 5h_utilization, 1 −
