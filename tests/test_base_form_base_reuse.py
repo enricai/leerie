@@ -168,7 +168,7 @@ def _changed(rec: dict) -> list[str]:
 
 
 def test_reuse_keeps_the_base_install_across_base_form_confirms(
-        leerie, env, observed):
+        pin, leerie, env, observed):
     """Two base-form confirms against the same base keep one worktree with one
     install: the dep is the same file, the costly reinstall never runs again
     (mtime unchanged, count incremental, not reset), and the verdict is
@@ -179,14 +179,14 @@ def test_reuse_keeps_the_base_install_across_base_form_confirms(
     r1 = _baseform(leerie, st, caps, staging, base)
     assert _changed(r1) == ["t_pin"]           # base passes it, final fails it
     assert wt.is_dir()                         # kept, not torn down
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
     mtime1 = os.stat(_dep(wt)).st_mtime_ns
     count1 = _count(wt)
 
     r2 = _baseform(leerie, st, caps, staging, base)
     assert _changed(r2) == ["t_pin"]           # same verdict (outcome-identity)
     assert wt.is_dir()                         # still kept
-    assert os.stat(_dep(wt)).st_ino == ino1    # same install, reused in place
+    assert same()                              # same install, reused in place
     assert os.stat(_dep(wt)).st_mtime_ns == mtime1   # the reinstall didn't run
     assert _count(wt) == count1 + 1            # incremental, never a cold reset
 
@@ -194,7 +194,8 @@ def test_reuse_keeps_the_base_install_across_base_form_confirms(
     assert all(o["head"] == base for o in observed)
 
 
-def test_a_moved_before_with_unchanged_inputs_reuses(leerie, env, observed):
+def test_a_moved_before_with_unchanged_inputs_reuses(
+        pin, leerie, env, observed):
     """The acceptance-ratchet shape: the confirm's base is a round's start
     commit (`before`), which moves as groups commit, not the run's fixed base.
     When its install inputs are unchanged the kept install is reused — the move
@@ -205,7 +206,7 @@ def test_a_moved_before_with_unchanged_inputs_reuses(leerie, env, observed):
 
     r1 = _baseform(leerie, st, caps, staging, base)
     assert _changed(r1) == ["t_pin"]
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
     count1 = _count(wt)
 
     # A round start between base and the run's commit: existing code changed
@@ -220,7 +221,7 @@ def test_a_moved_before_with_unchanged_inputs_reuses(leerie, env, observed):
     observed.clear()
     r2 = _baseform(leerie, st, caps, staging, start, reach_of=start)
     assert _changed(r2) == ["t_pin"]           # outcome-identity on moved base
-    assert os.stat(_dep(wt)).st_ino == ino1    # same install, reused in place
+    assert same()                              # same install, reused in place
     assert _count(wt) == count1 + 1            # incremental, not a cold reset
     # The base side ran on the moved start's checkout with a correct install.
     assert observed and all(o["install_ok"] for o in observed)
@@ -228,7 +229,7 @@ def test_a_moved_before_with_unchanged_inputs_reuses(leerie, env, observed):
 
 
 def test_a_moved_before_with_a_changed_manifest_reinstalls(
-        leerie, env, observed):
+        pin, leerie, env, observed):
     """The install-key guard still holds for a moved base: a start commit
     whose manifest the install reads changed is a different key, so the kept
     tree is remade and the deps installed afresh — reuse never serves a stale
@@ -236,7 +237,7 @@ def test_a_moved_before_with_a_changed_manifest_reinstalls(
     st, staging, base, after, caps = env
     wt = leerie._helper_worktree_path(st, "base-form-base")
     _baseform(leerie, st, caps, staging, base)
-    ino1 = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     # The round start changed the manifest; a later commit modifies the pinned
     # test so `start..after` still reaches it.
@@ -244,7 +245,7 @@ def test_a_moved_before_with_a_changed_manifest_reinstalls(
     _commit(leerie, staging, "tests/test_pin.py", PIN_FINAL + "# r2\n", "refix")
 
     _baseform(leerie, st, caps, staging, start, reach_of=start)
-    assert os.stat(_dep(wt)).st_ino != ino1    # a fresh install, not reused
+    assert not same()                          # a fresh install, not reused
     assert _count(wt) == 1                      # cold: the counter reset
     assert _dep(wt).read_text() == '{"name": "y"}\n'
 
