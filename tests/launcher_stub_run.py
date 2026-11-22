@@ -52,6 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 SLEEP = shutil.which("sleep") or "/bin/sleep"
 CAT = shutil.which("cat") or "/bin/cat"
+MV = shutil.which("mv") or "/bin/mv"
 PROFILE = REPO_ROOT / "scripts" / "apparmor" / "leerie-container"
 
 
@@ -171,7 +172,10 @@ case "$1" in
       rc=$?
     else
       "__SLEEP__" "${STUB_RUN_SECONDS:-0}" &
-      printf '%s\n' "$!" > "$w/container.pid"
+      # Written whole and renamed in, so a reader that sees the file
+      # sees the pid: the tests poll for its existence.
+      printf '%s\n' "$!" > "$w/container.pid.tmp"
+      "__MV__" -f "$w/container.pid.tmp" "$w/container.pid"
       [ -z "$cid" ] || printf 'stubcid\n' > "$cid"
       wait "$!"
       rc=$?
@@ -272,8 +276,9 @@ if init == 0:
         os.replace(tmp, e["STUB_END_FILE"])
     time.sleep(float(e.get("STUB_LINGER", "0")))
     os._exit(int(e.get("STUB_INIT_RC", "0")))
-with open("__WORLD__/container.pid", "w") as f:
+with open("__WORLD__/container.pid.tmp", "w") as f:
     f.write(f"{init}\n")
+os.replace("__WORLD__/container.pid.tmp", "__WORLD__/container.pid")
 if e.get("STUB_SHIM_HANG") == "1":
     if e.get("STUB_SHIM_REAP", "1") == "1":
         os.waitpid(init, 0)
@@ -335,7 +340,8 @@ def make_world(tmp_path: Path, *, apparmor: str = "current") -> dict:
                    check=True)
     stub = bindir / "nerdctl"
     stub.write_text(_STUB.replace("__WORLD__", str(world))
-                    .replace("__SLEEP__", SLEEP))
+                    .replace("__SLEEP__", SLEEP)
+                    .replace("__MV__", MV))
     stub.chmod(0o755)
     _kernel(world, bindir, apparmor)
     _shim(world)
