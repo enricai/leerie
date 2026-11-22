@@ -19,6 +19,8 @@ import pytest
 
 from tests.conftest import _run, measured_tmp_files, relocate_into_run_repo
 from tests.conftest import run_git_out  # noqa: E402
+from tests.test_confined_network import (  # noqa: F401
+    _allow_loopback, needs_isolation, proxy)
 
 WORKFLOW = """\
 name: ci
@@ -181,6 +183,7 @@ def test_selection_is_code(leerie, env):
         _check("e2e", [PY, "build.py"], kind="other",
                requires=("browser",)),
         _check("db", [PY, "build.py"], kind="build", requires=("database",)),
+        _check("net", [PY, "flaky.py"], kind="build", requires=("network",)),
         _check("invented", [PY, "lint.py", "--fix"]),
         _check("matrix", [PY, "${{ matrix.v }}"]),
         _check("hook", [PY, "build.py"], kind="build",
@@ -191,6 +194,9 @@ def test_selection_is_code(leerie, env):
     assert recs["lint"]["selected"] and recs["hook"]["selected"]
     # `database` is not an external resource (bench n6 scored it eligible).
     assert recs["db"]["selected"]
+    # Nor is the network: a measurement reaches it through the egress proxy
+    # (DESIGN §9 *A merge check that needs the network runs*).
+    assert recs["net"]["selected"] and "reason" not in recs["net"]
     assert recs["tests"]["reason"] == "left_to_test_axis"
     assert recs["deploy"]["reason"] == "not_merge_gating"
     assert recs["e2e"]["reason"] == "external_resource"
@@ -568,6 +574,23 @@ def test_a_hook_running_what_a_ci_step_runs_runs_once(leerie, env):
     assert recs["build"]["trigger"] == ["pull_request"]
 
 
+def test_a_hook_running_what_a_network_ci_step_runs_runs_once(leerie, env):
+    """The worker tags the workflow's step `network` and not the hook's:
+    the same command, reaching the network the same way, so it runs once
+    (DESIGN §9 *A merge check that needs the network runs*)."""
+    _commit(env, {".husky/pre-push": HOOK})
+    env["checks"][:] = [
+        _check("build", [PY, "build.py"], kind="build",
+               requires=("network",)),
+        _hook_check("hook-build", [PY, "build.py"], kind="build"),
+    ]
+    recs = _baseline(env)
+    assert recs["build"]["gate"] == "plain"
+    assert recs["hook-build"].get("reason") == "duplicate"
+    assert recs["hook-build"].get("duplicate_of") == "build"
+    assert not _ran_at_baseline(env, "hook-build")
+
+
 def test_a_hook_running_the_same_tool_another_way_is_its_own_check(
         leerie, env):
     # The CI step runs the linter under an environment of its own; the hook
@@ -615,6 +638,13 @@ def test_the_run_key_reads_what_runs_and_nothing_else(leerie):
     # The strict form only adds to the plain check: not what it runs.
     c = dict(a, strict_argv=[PY, "lint.py", "src", "--strict"])
     assert leerie._ci_run_key(c) == leerie._ci_run_key(a)
+    # Nor does the network: a check reaches it the same way whether the
+    # worker tagged it or not (DESIGN §9 *A merge check that needs the
+    # network runs*). A database is what runs: the check gets its own.
+    c = dict(a, requires=["network"])
+    assert leerie._ci_run_key(c) == leerie._ci_run_key(a)
+    assert (leerie._ci_run_key(dict(a, requires=["network", "database"]))
+            == leerie._ci_run_key(dict(a, requires=["database"])))
 
 
 def test_the_kept_twin_takes_the_strict_form_only_its_twin_could_trace(
@@ -955,3 +985,93 @@ def test_the_baseline_runs_each_prerequisite_in_its_rootless_form(
     # `part` ran without the word that asks for root (with it, it fails and
     # leaves nothing — what the CI's form did here); `all` never ran.
     assert ran == {"NONE", "PART"}
+
+
+# ---- a check that needs the network ---------------------------------------
+
+# A build that fetches an input at build time through the proxy variables a
+# standard client honours (funeralworks' `next build` and its
+# `next/font/google` fonts): green only when the fetch returns the input.
+FETCH = r'''
+import pathlib, sys, urllib.request
+url = pathlib.Path(sys.argv[1]).read_text().strip()
+try:
+    body = urllib.request.urlopen(url, timeout=20).read()
+except Exception as e:
+    print("fetch failed:", e)
+    sys.exit(1)
+sys.exit(0 if body == b"FONT" else 1)
+'''
+
+
+@needs_isolation
+def test_a_check_that_needs_the_network_gates_through_the_proxy(
+        leerie, env, proxy, monkeypatch):
+    """DESIGN §9 *A merge check that needs the network runs*, through the
+    real baseline and final halves, confined and isolated. A build the
+    worker tags `requires: network` was skipped as an external resource,
+    so a change that broke it was measured by nothing. Now it is selected,
+    green at the baseline through the egress proxy (a direct connection
+    reaches only the command's own loopback), and a change that breaks its
+    fetch is a confirmed red on the final tree. A network check whose host
+    the proxy refuses is red at the baseline and does not gate."""
+    import http.server
+    import threading
+    monkeypatch.setenv(leerie.ISOLATE_ENV, "1")
+    _allow_loopback(leerie, monkeypatch)
+    hits: list[str] = []
+
+    class Fonts(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            ok = self.path in ("/fonts.css", "/inside.css")
+            self.send_response(200 if ok else 404)
+            self.end_headers()
+            self.wfile.write(b"FONT" if ok else b"no such font")
+
+        def log_message(self, *a):
+            pass
+    # Every IPv4 address of the host's, so only the refusal keeps the
+    # inside check from it.
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Fonts)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        # `127.1` is the stand-in outside host: not in `NO_PROXY`, so the
+        # client asks the proxy, which resolves it to the allowed address.
+        (env["staging"] / ".github" / "workflows" / "ci.yml").write_text(
+            WORKFLOW + "      - run: python3 fetch.py FONT_URL\n"
+            "      - run: python3 fetch.py INSIDE_URL\n")
+        _commit(env, {"fetch.py": FETCH,
+                      "FONT_URL": f"http://127.1:{port}/fonts.css\n",
+                      "INSIDE_URL": f"http://127.0.0.2:{port}/inside.css\n"})
+        env["checks"][:] = [
+            _check("build", [PY, "fetch.py", "FONT_URL"], kind="build",
+                   requires=("network",)),
+            _check("inside", [PY, "fetch.py", "INSIDE_URL"], kind="build",
+                   requires=("network",))]
+        recs = _baseline(env)
+        assert recs["build"]["selected"], recs["build"]
+        assert recs["build"].get("gate") == "plain", recs["build"]
+        assert recs["build"]["base"]["rc"] == 0, recs["build"]
+        assert "/fonts.css" in hits
+        # Refused by the proxy (inside the container): red at the baseline,
+        # never a gate; nothing reached the stand-in for it.
+        assert recs["inside"].get("reason") == "red_at_baseline", \
+            recs["inside"]
+        assert not recs["inside"].get("gate")
+        assert proxy.refusals >= 1
+        assert "/inside.css" not in hits
+        n = len(hits)
+        # A change that breaks the build's fetch is a confirmed red.
+        _commit(env, {"FONT_URL": f"http://127.1:{port}/fonts-v2.css\n"})
+        unmet = _final(env)
+        assert [(u["id"], u["why"]) for u in unmet] == [("build", "red")]
+        assert env["st"].data["ci_parity"]["final"]["b_star"]["new"] == [
+            "build"]
+        # The confirm's base reruns fetched again, through the proxy.
+        assert hits[n:].count("/fonts.css") >= 1
+        assert "/fonts-v2.css" in hits[n:]
+    finally:
+        srv.shutdown()
+        srv.server_close()

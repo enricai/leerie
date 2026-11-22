@@ -23173,12 +23173,14 @@ on the final tree:
    root*, below).
 2. *Selection is code.* A check runs only when one of its triggers is a pull
    request or a blocking hook (pre-push / pre-commit) and `requires` names no
-   external resource (`browser`, `network`, `secrets`, `cloud_credentials`,
-   `gpu`; a `database` is not external — on a Prisma repository with a
-   PostgreSQL datasource such a check runs against a throwaway database of
-   its own (§8 *Prisma repositories get a real database*); elsewhere a check
-   without one goes red at the baseline and drops out). Test-kind checks are left to the test axis (§9
-   *Which failures are new*), which already runs the suite with failing-ID
+   external resource (`browser`, `secrets`, `cloud_credentials`, `gpu`; a
+   `database` is not external — on a Prisma repository with a PostgreSQL
+   datasource such a check runs against a throwaway database of its own
+   (§8 *Prisma repositories get a real database*); elsewhere a check
+   without one goes red at the baseline and drops out). Nor is the
+   `network` (*A merge check that needs the network runs*, below).
+   Test-kind checks are left to the test axis (§9 *Which failures are
+   new*), which already runs the suite with failing-ID
    diffs — except as an observation channel: a browser suite the test
    command does not run is the run's browser channel once it ran here (§8
    *A repository's browser suite is a channel the run provisions*).
@@ -23244,6 +23246,63 @@ on the final tree:
    database, each distinct prerequisite once, and each gating check
    recorded up to the last red one once (*A merge check's rerun sees what
    its measurement saw*, below).
+
+**A merge check that needs the network runs.** *Decided 2026-11-22, with
+*A measurement reaches its inputs too* (§6), from reading the rule; no run
+is recorded skipping a check for it.* Selection skipped every
+check the `ci_checks` worker tagged `requires: network` (one that downloads
+a tool at run time or calls a live URL), alongside `browser`, `secrets`,
+`cloud_credentials` and `gpu`. The rule was written when no command leerie
+ran could reach the internet, so a network check could only fail for
+leerie's reason. Since every measurement reaches the outside through the
+egress proxy, as the repository's CI runner does, the skip dropped a check
+leerie can run: a build that fetches its inputs (funeralworks' `next
+build` fetches its `next/font/google` fonts), had the worker tagged it
+`network`, would never have been a gate, so a change that broke it would
+have been measured by nothing. **Root cause:** the rule encoded the absence of a route, not
+anything about the check. **Invariant: a merge check is skipped for what
+it needs only when leerie cannot supply it (a browser outside the browser
+channel, secrets, cloud credentials, a GPU); the network it can.** A check
+tagged `network` is selected like any other and runs with the measurement
+grant every check has (`_measurement_grants`; its prerequisites the install
+grant), so it is exposed to nothing a selected check was not already: the
+held-out argument of §6 *Why the held-out set stays safe* covers it as it
+stands. What it can do outside is bounded as an unauthenticated
+client's: no secret reaches a check. The repository's CI secrets do not,
+since an env value or argv token that is a CI expression placeholder, or
+is not in the CI file, fails provenance (step 1); nor does anything the
+operator handed leerie for itself, its subscription token included, which
+every repository command's environment drops (§6 *A repository command
+gets nothing the operator handed leerie for itself*). So a deploy, publish or authenticated call fails at the
+baseline, and the worker's `secrets` tag and its excluded `deploy` and
+`external_action` jobs skip such checks before that. A tokenless call
+still runs, on code not yet pushed and once per measurement and B\*
+rerun, as the repository's own CI runs it on every pull request. No
+network case stays excluded on network grounds:
+- a check whose host the proxy refuses (an address inside the container)
+  or cannot reach goes red at the baseline and is not a gate, as a check
+  without its database is; one that also needs credentials is skipped for
+  `secrets` or `cloud_credentials`;
+- a check CI parity selects never runs in a held-out sandbox, the one
+  place leerie keeps commands offline (I3). The one CI command that does
+  is the repository's browser suite, which a held-out set may run through
+  (§8 *A repository's browser suite is a channel the run provisions*):
+  CI parity never selects it (`browser`, and it is a test-kind check), and
+  in the sandbox it is offline whatever it needs, by I3;
+- a fetch that fails now and then is a flaky check: red at the baseline
+  it does not gate for the run; a gate red on the final tree is a verdict
+  only once B\* confirms it against interleaved base reruns (step 5;
+  *Flakiness* in §6 *A measurement reaches its inputs too* gives the cases
+  B\* does not absorb). The ratchets are not confirmed (step 4): a coverage
+  check whose tests call a live URL and lose coverage to a failed fetch
+  can fire on one run, as one whose tests fetched untagged already could.
+  No retry is added.
+The worker still records `network`, as it records `database`: a fact about
+the check that decides neither whether it runs nor how, so it is not part
+of what makes two checks the same (*A check is the command its file
+runs*, below; only `database`, which adds the throwaway database, is). A
+run whose baseline was taken before this rule keeps it on resume (the
+baseline is taken once per run), its network checks still skipped.
 
 **A merge check's rerun sees what its measurement saw.** *Built 2026-11-10
 (lane B38; found by lane CK).* **Invariant:** every B\* rerun of a merge
@@ -23350,7 +23409,8 @@ and a coverage check's thresholds.
 
 Merging is code's, and literal. Two selected checks that run the same
 thing — the same `kind`, `argv`, `cwd`, `env`, prerequisites as they run
-(one that needs only root runs nothing and is left out), `requires` and
+(one that needs only root runs nothing and is left out), whether it needs
+a database (the one `requires` value that changes what runs) and
 coverage — run once: the later one is not selected,
 `reason: "duplicate"`, `duplicate_of` the first one's id. The strict form
 is not part of what is compared: it only ever adds to the plain check, so
