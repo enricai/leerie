@@ -155,7 +155,7 @@ def test_ci_base_stays_disposable(leerie, ci):
         leerie._KEPT_TREES
 
 
-def test_rounds_keep_the_ci_round_install(leerie, ci):
+def test_rounds_keep_the_ci_round_install(pin, leerie, ci):
     """Two kept rounds whose commits change code, not the install's inputs:
     one `ci-round` tree, one install — the second round reuses it in place
     (same dep, the count incremental, never reset) — and each round's check
@@ -168,19 +168,19 @@ def test_rounds_keep_the_ci_round_install(leerie, ci):
     wt = _wt(leerie, ci, "ci-round")
     assert out1["broke"] == [], out1
     assert wt.is_dir()                              # kept, not torn down
-    ino, count = os.stat(_dep(wt)).st_ino, _count(wt)
+    same, count = pin(_dep(wt)), _count(wt)
 
     _commit(ci, {"src/c.txt": "fine\n"})
     c2 = _head(ci)
     out2 = _round(leerie, ci, c1, c2, "r2")
     assert out2["broke"] == out1["broke"] == []     # outcome-identity
-    assert os.stat(_dep(wt)).st_ino == ino          # the same install
+    assert same()          # the same install
     assert _count(wt) == count + 1                  # incremental, not cold
     assert _git(wt, "rev-parse", "HEAD") == c2
     assert _obs(ci, "r2-post-check") == ["OBS ok=1 leak=0 broken=0"]
 
 
-def test_a_round_whose_manifest_changed_reinstalls(leerie, ci):
+def test_a_round_whose_manifest_changed_reinstalls(pin, leerie, ci):
     """The install-key guard: a round commit that changed what the install
     read is a different key, so the kept tree is remade and the deps
     installed afresh — never a stale install for changed inputs."""
@@ -189,18 +189,18 @@ def test_a_round_whose_manifest_changed_reinstalls(leerie, ci):
     c1 = _head(ci)
     _round(leerie, ci, base, c1, "r1")
     wt = _wt(leerie, ci, "ci-round")
-    ino = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     _commit(ci, {"package.json": '{"name": "y"}\n'})
     c2 = _head(ci)
     out = _round(leerie, ci, c1, c2, "r2")
     assert out["broke"] == [], out
-    assert os.stat(_dep(wt)).st_ino != ino          # a fresh install
+    assert not same()          # a fresh install
     assert _count(wt) == 1                          # cold: the count reset
     assert _dep(wt).read_text() == '{"name": "y"}\n'
 
 
-def test_a_red_round_confirms_on_a_kept_base(leerie, ci):
+def test_a_red_round_confirms_on_a_kept_base(pin, leerie, ci):
     """A gate red on a round's commit is confirmed under B* against its start
     in `ci-confirm-base`; a second round's confirm reuses that tree's install
     and reaches the same verdict — its base reruns see a pristine checkout,
@@ -212,14 +212,14 @@ def test_a_red_round_confirms_on_a_kept_base(leerie, ci):
     assert [b["id"] for b in out1["broke"]] == ["check"], out1
     cb = _wt(leerie, ci, "ci-confirm-base")
     assert cb.is_dir()                              # kept
-    ino, count = os.stat(_dep(cb)).st_ino, _count(cb)
+    same, count = pin(_dep(cb)), _count(cb)
 
     _commit(ci, {"src/BROKEN": "2\n"})
     bad2 = _head(ci)
     out2 = _round(leerie, ci, base, bad2, "r2")
     assert [b["id"] for b in out2["broke"]] == ["check"], out2
     assert out2["pre_existing"] == out1["pre_existing"] == []
-    assert os.stat(_dep(cb)).st_ino == ino          # the same install
+    assert same()          # the same install
     assert _count(cb) == count + 1                  # incremental, not cold
     # The base tree's first check run in this confirm (its set-up) found
     # nothing the first confirm's runs left; its reruns passed (no BROKEN).
@@ -228,7 +228,7 @@ def test_a_red_round_confirms_on_a_kept_base(leerie, ci):
     assert _git(cb, "rev-parse", "HEAD") == base
 
 
-def test_round_starts_never_measured_keep_ci_round_pre(leerie, ci):
+def test_round_starts_never_measured_keep_ci_round_pre(pin, leerie, ci):
     """A round whose start no kept round measured measures its ratchets in
     `ci-round-pre`; a second such round reuses that tree's install."""
     base = _head(ci)
@@ -237,7 +237,7 @@ def test_round_starts_never_measured_keep_ci_round_pre(leerie, ci):
     _round(leerie, ci, base, c1, "r1")
     pre = _wt(leerie, ci, "ci-round-pre")
     assert pre.is_dir()                             # measured there, kept
-    ino, count = os.stat(_dep(pre)).st_ino, _count(pre)
+    same, count = pin(_dep(pre)), _count(pre)
 
     _commit(ci, {"src/c.txt": "fine\n"})
     c2 = _head(ci)
@@ -245,13 +245,13 @@ def test_round_starts_never_measured_keep_ci_round_pre(leerie, ci):
     c3 = _head(ci)
     out = _round(leerie, ci, c2, c3, "r2")          # c2: never measured
     assert out["broke"] == [] and "ratchets_unmeasured" not in out, out
-    assert os.stat(_dep(pre)).st_ino == ino
+    assert same()
     assert _count(pre) == count + 1
     assert _git(pre, "rev-parse", "HEAD") == c2
     assert _obs(ci, "r2-pre-lint") == ["OBS ok=1 leak=0 broken=0"]
 
 
-def test_final_passes_keep_ci_final(leerie, ci):
+def test_final_passes_keep_ci_final(pin, leerie, ci):
     """Two final passes at different commits (the pass reruns after a later
     commit) share one `ci-final` install, with the same verdict."""
     _commit(ci, {"src/b.txt": "fine\n"})
@@ -259,19 +259,19 @@ def test_final_passes_keep_ci_final(leerie, ci):
         ci["run_dir"], ci["st"], ci["caps"])) == []
     wt = _wt(leerie, ci, "ci-final")
     assert wt.is_dir()                              # kept
-    ino, count = os.stat(_dep(wt)).st_ino, _count(wt)
+    same, count = pin(_dep(wt)), _count(wt)
 
     _commit(ci, {"src/c.txt": "fine\n"})
     assert _run(leerie._run_ci_parity_final(
         ci["run_dir"], ci["st"], ci["caps"])) == []
-    assert os.stat(_dep(wt)).st_ino == ino
+    assert same()
     assert _count(wt) == count + 1
     assert _git(wt, "rev-parse", "HEAD") == _head(ci)
     assert _obs(ci, "final-check") == ["OBS ok=1 leak=0 broken=0"]
 
 
 def test_a_check_that_changed_the_install_makes_the_next_use_reinstall(
-        leerie, ci):
+        pin, leerie, ci):
     """A check that rewrote a file the install made leaves a tree no use may
     trust: the next round's move refuses it (`_install_intact`) and installs
     afresh, with the same verdict."""
@@ -280,14 +280,14 @@ def test_a_check_that_changed_the_install_makes_the_next_use_reinstall(
     c1 = _head(ci)
     out1 = _round(leerie, ci, base, c1, "r1")
     wt = _wt(leerie, ci, "ci-round")
-    ino = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     _git(ci["staging"], "rm", "-q", "src/MUTATE")
     _git(ci["staging"], "commit", "-qm", "no mutate")
     c2 = _head(ci)
     out2 = _round(leerie, ci, c1, c2, "r2")
     assert out2["broke"] == out1["broke"] == []     # outcome-identity
-    assert os.stat(_dep(wt)).st_ino != ino          # not the changed install
+    assert not same()          # not the changed install
     assert _count(wt) == 1                          # cold: installed afresh
     assert _obs(ci, "r2-post-check") == ["OBS ok=1 leak=0 broken=0"]
 
@@ -302,7 +302,7 @@ _STEPS = {"checkout": ("checkout", "--detach", "--force"),
 
 
 @pytest.mark.parametrize("step", sorted(_STEPS))
-def test_a_move_that_times_out_remakes_the_tree(leerie, ci, monkeypatch,
+def test_a_move_that_times_out_remakes_the_tree(pin, leerie, ci, monkeypatch,
                                                 step):
     """The move's git commands are bounded (`git clean` in `_move_view`, the
     tip's listing in `_install_key`): one that times out is a difference
@@ -319,7 +319,7 @@ def test_a_move_that_times_out_remakes_the_tree(leerie, ci, monkeypatch,
     _commit(ci, {"src/x.txt": "fine\n"})       # a final no round measured
     _run(leerie._run_ci_parity_final(ci["run_dir"], ci["st"], ci["caps"]))
     wt = _wt(leerie, ci, "ci-final")
-    ino = os.stat(_dep(wt)).st_ino
+    same = pin(_dep(wt))
 
     real = subprocess.run
 
@@ -337,8 +337,8 @@ def test_a_move_that_times_out_remakes_the_tree(leerie, ci, monkeypatch,
         # The move needs no listing of its own: the tree is reused, and
         # with its reads or outputs unknown nothing is recorded, so the next
         # use remakes it rather than trust an install it could not see.
-        assert os.stat(_dep(wt)).st_ino == ino
+        assert same()
         assert os.path.realpath(wt) not in leerie._KEPT_INSTALLS
     else:
-        assert os.stat(_dep(wt)).st_ino != ino      # remade, installed afresh
+        assert not same()      # remade, installed afresh
         assert _count(wt) == 1
