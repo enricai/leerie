@@ -117,7 +117,10 @@ def test_a_criterion_the_base_fails_keeps_the_subtask(
     assert Path(saved["dir"], saved["file"]).read_text() == PROBE_SRC
     assert not (st.run_dir / "acceptance" / "probes").exists()
     assert "delivery_gate" not in st.data
-    assert not list((st.run_dir / "worktrees").glob("*falsifier-*"))
+    # Its checkouts are kept for the run's next falsifier call (DESIGN §8
+    # *The falsifier's checkouts are kept too*).
+    assert all(leerie._helper_worktree_path(st, n).is_dir()
+               for n in ("falsifier-confirm", "falsifier-lane0"))
 
 
 def test_the_payload_is_the_subtasks_words_on_the_runs_start(

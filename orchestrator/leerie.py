@@ -75,7 +75,7 @@ from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
                              Iterator, Mapping, MutableMapping)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NamedTuple, TextIO
+from typing import NamedTuple, NoReturn, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # tenacity is imported lazily inside claude_p() (its sole use site), not at
@@ -6988,6 +6988,13 @@ def _tree_store_env(env: MutableMapping[str, str], cwd: str | Path | None
 # this process only, as the clones are, and dropped when leerie removes one
 # (`_remove_acceptance_checkout`). Leerie's own record, never the tree's.
 _CLONE_CACHES: dict[str, Path] = {}
+# Each ref-less clone leerie keeps (`_reuse_or_rebuild_kept_tree`), by its
+# realpath: the modification time (ns) of each of its regular tracked files
+# just after leerie last wrote it, before any worker or install ran there
+# (`_record_clone_times`). What a
+# kept clone's files its commit does not change are given back when it moves
+# (`_keep_unchanged_times`). Leerie's own record, as `_CLONE_CACHES` is.
+_CLONE_TIMES: dict[str, dict[str, int]] = {}
 
 
 def _tree_cache(cwd: str | Path | None) -> Path | None:
@@ -13909,7 +13916,8 @@ _OWNED_RUN_DIRS: dict[str, tuple[Callable[[], object] | None, int]] = {}
 
 def _run_scratch_names() -> tuple[str, ...]:
     # The ref-less clones' git directories (`CLONE_GITS_NAME`) too: each
-    # belongs to a disposable checkout a later process makes again.
+    # belongs to a checkout a later process makes again (the falsifier's
+    # are kept, but only within one process: `_KEPT_TREES`).
     # The run's stores too: a resumed process installs again, cold, rather
     # than every finished run keeping a store until it is pruned (DESIGN §6
     # *The stores a view installs from are leerie's*).
@@ -48686,8 +48694,8 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # A committed view, or a kept helper tree opted in the same way
     # (`_KEPT_TREES`: every `_reuse_or_rebuild_kept_tree` consumer — the
     # held-out evaluation tree, the base confirm worktrees, the CI-parity
-    # trees): either records the install's snapshot and reads so it
-    # can be moved to the next commit with the install kept (DESIGN §8 *A view
+    # trees, the falsifier's checkouts): either records the install's
+    # snapshot and reads so it can be moved to the next commit with the install kept (DESIGN §8 *A view
     # moves to the next tip when the install's inputs are unchanged*, *The
     # evaluation tree is kept across a run's evaluations*; §9 *The base
     # confirm worktree is kept across the run's confirms*).
@@ -49959,49 +49967,439 @@ def _move_view(repo: Path, wt: Path, tip: str,
     a new measurement id, check it out at `tip`, remove everything untracked
     but the install's outputs and, under them, everything the install did
     not make. True when the view is `tip` exactly, with the install as it
-    made it."""
+    made it.
+
+    A ref-less clone of `repo` (a writer's checkout kept for the run,
+    `_acceptance_writer_checkout`; DESIGN §8 *The falsifier's checkouts are
+    kept too*) moves the same way: its `.git`, which its worker wrote, is
+    removed, its leerie-owned git directory is made again at `tip`
+    (`_make_clone_git_dir`, its measurement id gone with the old one), what
+    its worker left that git would read or pass over is undone before any
+    git command reads the tree (`_unshape_clone`), the owner's bits are
+    given back (`_restore_write_bits`), the same checkout, clean and checks
+    run through it with its tracked files written anew after the clean
+    (`_rewrite_clone_files`), since a worker wrote it, and only then is its
+    `.git` made again at `tip` (`_ref_less_clone(keep=True)`), so the next
+    worker finds the checkout a fresh clone would be. Any tree's move
+    fails where a submodule's path holds anything: neither the checkout
+    nor the clean enters one, and its status never runs inside one."""
     admin = _admin_dir_of(repo, wt)
-    if admin is None or not _rmtree_owned(wt / ".git"):
+    loc = _run_tree_location(wt) if admin is None else None
+    clone = (isinstance(loc, tuple) and loc[0] == loc[1]
+             and loc[1].parent.name == CLONE_GITS_NAME)
+    if admin is None and not clone:
         return False
-    # A moved view is a new tree to every measurement: with its id gone,
-    # `_measure_dir_at` gives it a fresh measurement directory and empty
-    # stores of its own (`_TREE_STORE_VARS`), as a replaced view gets, so
-    # nothing one commit's code left there reaches the next commit's
-    # measurement; the install, run again, fills the stores anew.
-    try:
-        (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
-    except OSError:
+    # Read before the `.git` goes: a move that stops with none leaves a
+    # worktree git can no longer remove to remake it.
+    entries = _tree_entries(repo, tip)
+    if entries is None:
         return False
-    try:
-        _write_beneath(wt, wt / ".git", f"gitdir: {admin}\n".encode(),
-                       mode=0o644)
-    except OSError:
+    # The commit the clone was at, from leerie's own git directory for it,
+    # before that is made again.
+    old = _clone_head(wt) if clone else None
+    if not _rmtree_owned(wt / ".git"):
         return False
-    keep = [x for o in snap[0] for x in ("-e", "/" + o.lstrip("/"))]
+    if clone:
+        try:
+            if not (_make_clone_git_dir(repo, wt, tip, refresh=False)
+                    and _unshape_clone(wt, entries)):
+                return False
+            # An untracked, not ignored directory its worker left without
+            # write or search bits would stop the clean (an ignored one, or
+            # one without its read bit, still does: no move, the checkout is
+            # made afresh).
+            _restore_write_bits(wt)
+        except OSError:
+            return False
+    else:
+        # A moved view is a new tree to every measurement: with its id gone,
+        # `_measure_dir_at` gives it a fresh measurement directory and empty
+        # stores of its own (`_TREE_STORE_VARS`), as a replaced view gets, so
+        # nothing one commit's code left there reaches the next commit's
+        # measurement; the install, run again, fills the stores anew.
+        try:
+            (admin / _MEASURE_ID_FILE).unlink(missing_ok=True)
+        except OSError:
+            return False
+        try:
+            _write_beneath(wt, wt / ".git", f"gitdir: {admin}\n".encode(),
+                           mode=0o644)
+        except OSError:
+            return False
+    # Literal patterns: an output named `out?` keeps only itself, not a
+    # sibling it would match.
+    keep = [x for o in snap[0]
+            for x in ("-e", "/" + _gitignore_escape(o.lstrip("/")))]
     try:
-        co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q",
-                             "--detach", "--force", tip],
+        co = subprocess.run(["git", *_tree_git_args(wt), *_NO_SUBMODULES,
+                             "checkout", "-q", "--detach", "--force", tip],
                             capture_output=True, check=False, timeout=300)
         if co.returncode != 0:
             return False
-        cl = subprocess.run(["git", *_tree_git_args(wt), "clean", "-ffdqx",
-                             *keep], capture_output=True, check=False,
-                            timeout=300)
-    except subprocess.TimeoutExpired:
+        cl = subprocess.run(["git", *_tree_git_args(wt), *_NO_SUBMODULES,
+                             "clean", "-ffdqx", *keep], capture_output=True,
+                            check=False, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
         # A move that could not finish is no move: the caller remakes the
         # tree (a timed-out step is a difference like any other).
         return False
     if cl.returncode != 0 or not _install_intact(wt, snap):
         return False
-    head = subprocess.run(["git", *_tree_git_args(wt), "rev-parse", "HEAD"],
-                          capture_output=True, text=True, check=False)
-    # A tracked path under an output (removed above as not the install's)
-    # shows here.
-    changed = subprocess.run(["git", *_tree_git_args(wt), "status", "--porcelain",
-                              "-z", "--untracked-files=no"],
-                             capture_output=True, check=False)
-    return (head.stdout.strip() == tip and changed.returncode == 0
-            and not changed.stdout)
+    if clone and not (_strip_output_xattrs(wt, snap[0])
+                      and _rewrite_clone_files(wt, tip)
+                      and _keep_unchanged_times(repo, wt, old, tip)):
+        return False
+    try:
+        # Before the status, which would read a populated submodule's HEAD.
+        if any(_listdir_beneath(wt, wt / p) for p in entries[1]):
+            return False
+        head = subprocess.run(["git", *_tree_git_args(wt), "rev-parse",
+                               "HEAD"], capture_output=True, text=True,
+                              check=False, timeout=60)
+        # A tracked path under an output (removed above as not the
+        # install's) shows here, and a submodule whose HEAD is not `tip`'s
+        # gitlink; but never a status inside a submodule's checkout, whose
+        # configuration is no commit's (`dirty`: its HEAD is read, nothing
+        # in it is run).
+        changed = subprocess.run(["git", *_tree_git_args(wt), "status",
+                                  "--porcelain", "-z",
+                                  "--untracked-files=no",
+                                  "--ignore-submodules=dirty"],
+                                 capture_output=True, check=False,
+                                 timeout=300)
+        if not (head.stdout.strip() == tip and changed.returncode == 0
+                and not changed.stdout):
+            return False
+        return not clone or not _ref_less_clone(repo, wt, tip, keep=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# A move's checkout and clean never recurse into a submodule, whatever the
+# configuration leerie's git inherits says.
+_NO_SUBMODULES = ("-c", "submodule.recurse=false")
+
+
+def _tree_entries(repo: Path, tip: str
+                  ) -> tuple[list[str], list[str]] | None:
+    """`tip`'s tracked directories (`""`, the root, first, each before
+    those in it) and its submodules' paths (gitlinks), from its objects
+    alone (`ls-tree -r -t -z`, 120 s, in the run repository `repo`):
+    nothing in a tree is read. None when git fails or times out."""
+    try:
+        r = subprocess.run(["git", "--git-dir", str(repo), *_GIT_VIEW_PINS,
+                            "ls-tree", "-r", "-t", "-z", tip],
+                           capture_output=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    dirs, links = [""], []
+    # `<mode> <type> <object>\t<path>`: a tree is a tracked directory, a
+    # commit a submodule's path.
+    for entry in r.stdout.split(b"\0"):
+        meta, _, path = entry.partition(b"\t")
+        kind = meta.split(b" ")[1:2]
+        if kind == [b"tree"]:
+            dirs.append(os.fsdecode(path))
+        elif kind == [b"commit"]:
+            links.append(os.fsdecode(path))
+    return dirs, links
+
+
+def _unshape_clone(wt: Path, entries: tuple[list[str], list[str]]) -> bool:
+    """Undo, in the moved clone `wt`, what its worker could leave that git
+    would read or pass over (DESIGN §8 *The falsifier's checkouts are kept
+    too*), before any git command reads the tree: whatever is at a
+    submodule's path (a gitlink, which neither checkout nor clean enters),
+    any `.git` in a tracked directory (git lists no path named `.git` as
+    untracked, so no clean reaches one), and each tracked directory made as
+    a fresh checkout makes it (`_reset_tracked_dir`). `entries` is
+    `_tree_entries`'. False when anything is left."""
+    dirs, links = entries
+    # Directories first: each one's bits given back, so a submodule's path
+    # below one its worker made unsearchable can be reached.
+    # One gone, or a link or a file now, is the checkout's to make again,
+    # nothing in it read.
+    for d in dirs:
+        if not _reset_tracked_dir(wt, d):
+            return False
+        if d and _dir_beneath_exists(wt, wt / d):
+            _remove_beneath(wt, wt / d / ".git")
+            if _lexists_beneath(wt, wt / d / ".git"):
+                return False
+    for p in links:
+        if not _dir_beneath_exists(wt, (wt / p).parent):
+            continue
+        _remove_beneath(wt, wt / p)
+        if _lexists_beneath(wt, wt / p):
+            return False
+    return True
+
+
+def _raise(e: OSError) -> NoReturn:
+    """An `os.walk`/`os.fwalk` `onerror` that stops the walk: a directory
+    it could not read is not one it passed over."""
+    raise e
+
+
+def _worker_xattrs(fd: int) -> list[str]:
+    """The extended attributes of the entry open at `fd` that its owner can
+    set: an ACL (`system.posix_acl_*`) and the `user.` namespace. The rest
+    (`security.`, `trusted.`) need a privilege no worker has, and a
+    security label (SELinux) can never be removed, by anyone."""
+    try:
+        names = os.listxattr(fd)
+    except OSError as e:
+        # A file system that keeps no attributes has none to remove.
+        if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            return []
+        raise
+    return [a for a in names if a.startswith(("user.", "system.posix_acl_"))]
+
+
+def _strip_dir_xattrs(dfd: int) -> None:
+    """Remove every extended attribute its owner could set (`_worker_xattrs`)
+    from the directory open at `dfd`; one that cannot be removed is left to
+    the caller."""
+    for attr in _worker_xattrs(dfd):
+        with contextlib.suppress(OSError):
+            os.removexattr(dfd, attr)
+
+
+def _strip_output_xattrs(wt: Path, outputs: Iterable[str]) -> bool:
+    """Remove every extended attribute its worker could set
+    (`_worker_xattrs`) from each directory at, above or under one of the
+    install's `outputs` in the moved clone `wt` (DESIGN §8 *The falsifier's
+    checkouts are kept too*): a default ACL its worker set on one moves
+    neither its mode nor its inode, all `_install_intact` compares for a
+    directory, yet it decides the mode of everything made under it later.
+    Walked without following a link; an output that is gone or not a
+    directory has none to strip. False when one is left."""
+    def strip(dfd: int) -> bool:
+        _strip_dir_xattrs(dfd)
+        return not _worker_xattrs(dfd)
+    try:
+        for out in outputs:
+            parts = Path(out.strip("/")).parts
+            for i in range(1, len(parts) + 1):
+                try:
+                    with _dir_beneath(wt, wt.joinpath(*parts[:i])) as dfd:
+                        if not strip(dfd):
+                            return False
+                        if i < len(parts):
+                            continue
+                        for _, _, _, sub in os.fwalk(
+                                dir_fd=dfd, follow_symlinks=False,
+                                onerror=_raise):
+                            if not strip(sub):
+                                return False
+                except (FileNotFoundError, NotADirectoryError):
+                    break
+    except OSError:
+        return False
+    return True
+
+
+def _rewrite_clone_files(wt: Path, tip: str) -> bool:
+    """Write every tracked file of the moved clone `wt` anew from `tip`, as
+    a fresh checkout writes it (DESIGN §8 *The falsifier's checkouts are
+    kept too*): a file git reads as unchanged only through attributes its
+    worker set (a `working-tree-encoding`, an `eol`), or with the modes or
+    links its worker gave it, is `tip`'s again. With the attributes now
+    `tip`'s own (after the clean), the index is read anew from `tip` with no
+    stat data and every file written again (`checkout-index -f -a -u`, with
+    git's default stat check, unlinks each and writes it; a submodule's
+    path is the empty directory a fresh checkout makes). False when a step
+    fails or times out (no move: the caller remakes it)."""
+    at = [*_tree_git_args(wt), "-c", "core.checkStat=default"]
+    try:
+        # `read-tree` with no `-m` replaces the index whole: no entry
+        # keeps the stat data that vouched for a file.
+        if subprocess.run(["git", *at, "read-tree", tip],
+                          capture_output=True, check=False,
+                          timeout=300).returncode != 0:
+            return False
+        if subprocess.run(["git", *at, "checkout-index", "-f", "-a", "-u"],
+                          capture_output=True, check=False,
+                          timeout=300).returncode != 0:
+            return False
+        subprocess.run(["git", *at, "update-index", "-q", "--refresh"],
+                       capture_output=True, check=False, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def _clone_head(wt: Path) -> str | None:
+    """The commit the clone `wt` was last made or moved to, read from
+    leerie's own git directory for it (`rev-parse HEAD`, 60 s); None when it
+    cannot be read."""
+    try:
+        r = subprocess.run(["git", *_tree_git_args(wt), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, check=False,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _blob_paths(repo: Path, tip: str) -> list[str] | None:
+    """`tip`'s regular files (`100644`/`100755` blobs: no link, no
+    submodule), from its objects alone (`ls-tree -r -z`, 120 s, in `repo`);
+    None when git fails or times out."""
+    try:
+        r = subprocess.run(["git", "--git-dir", str(repo), *_GIT_VIEW_PINS,
+                            "ls-tree", "-r", "-z", tip],
+                           capture_output=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    # `<mode> <type> <object>\t<path>`.
+    for entry in r.stdout.split(b"\0"):
+        meta, _, raw = entry.partition(b"\t")
+        if meta.split(b" ")[:2] in ([b"100644", b"blob"],
+                                    [b"100755", b"blob"]):
+            out.append(os.fsdecode(raw))
+    return out
+
+
+def _by_dir(paths: Iterable[str]) -> dict[str, list[str]]:
+    """`paths` grouped by their directory, each name relative to it."""
+    out: dict[str, list[str]] = {}
+    for p in paths:
+        d, _, n = p.rpartition("/")
+        out.setdefault(d, []).append(n)
+    return out
+
+
+def _record_clone_times(repo: Path, wt: Path, tip: str) -> bool:
+    """Record, as leerie's own, the modification time of each of `tip`'s
+    regular files in the clone `wt` just after leerie wrote it
+    (`_CLONE_TIMES`), each read without following a link: the times a move
+    gives back to the files its commit does not change
+    (`_keep_unchanged_times`). False, and no record, when one cannot be
+    read."""
+    key = os.path.realpath(wt)
+    _CLONE_TIMES.pop(key, None)
+    paths = _blob_paths(repo, tip)
+    if paths is None:
+        return False
+    times: dict[str, int] = {}
+    try:
+        for d, names in _by_dir(paths).items():
+            with _dir_beneath(wt, wt / d) as dfd:
+                for n in names:
+                    times[f"{d}/{n}" if d else n] = os.stat(
+                        n, dir_fd=dfd, follow_symlinks=False).st_mtime_ns
+    except OSError:
+        return False
+    _CLONE_TIMES[key] = times
+    return True
+
+
+def _keep_unchanged_times(repo: Path, wt: Path, old: str | None,
+                          tip: str) -> bool:
+    """Give each regular file of the moved clone `wt` that is the same in
+    `old`, the commit it was at, and `tip` the modification time it had
+    when leerie last wrote it (`_CLONE_TIMES`), then record `tip`'s (DESIGN
+    §8 *The falsifier's checkouts are kept too*). `_rewrite_clone_files`
+    wrote every file anew: so a file the commit did not change has exactly
+    the time it had before, older than the outputs installed from it, as
+    after a fresh clone and install, and one it changed has a new time, so
+    a tool that compares times, or caches a file by its size and time,
+    rebuilds or rereads what it should. Which files is decided from the
+    commits' objects alone (`diff-tree`, 120 s, in `repo`): nothing a
+    worker wrote is read, and no time it set is kept. Without both commits
+    or a record, every file keeps the time it was written (a rebuild at
+    most). False when a step fails or times out."""
+    before = _CLONE_TIMES.pop(os.path.realpath(wt), None)
+    if old is not None and before is not None:
+        try:
+            diff = subprocess.run(
+                ["git", "--git-dir", str(repo), *_GIT_VIEW_PINS, "diff-tree",
+                 "-r", "-z", "--name-only", "--no-renames", old, tip],
+                capture_output=True, check=False, timeout=120)
+            if diff.returncode != 0:
+                return False
+            changed = {os.fsdecode(p) for p in diff.stdout.split(b"\0") if p}
+            paths = _blob_paths(repo, tip)
+            if paths is None:
+                return False
+            # Attributes the commit changed can write a file its commit did
+            # not change as other bytes (an encoding, line ends, a filter):
+            # then no file keeps its time.
+            same = not any(p.rpartition("/")[2] == ".gitattributes"
+                           for p in changed)
+            keep = [p for p in paths
+                    if same and p not in changed and p in before]
+            for d, names in _by_dir(keep).items():
+                with _dir_beneath(wt, wt / d) as dfd:
+                    for n in names:
+                        t = before[f"{d}/{n}" if d else n]
+                        os.utime(n, ns=(t, t), dir_fd=dfd,
+                                 follow_symlinks=False)
+            # The index's stat data again, for the times given back.
+            subprocess.run(["git", *_tree_git_args(wt), "update-index", "-q",
+                            "--refresh"], capture_output=True, check=False,
+                           timeout=300)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return _record_clone_times(repo, wt, tip)
+
+
+def _checkout_dir_mode() -> int:
+    """The mode a checkout gives a directory it makes: 0o777 less the
+    process's umask, read from `/proc` (setting the umask to read it would
+    race every other thread's file creation); 0o755 where it cannot be
+    read."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return 0o777 & ~int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0o755
+
+
+def _reset_tracked_dir(wt: Path, rel: str) -> bool:
+    """Make the tracked directory `rel` of the moved clone `wt` as a fresh
+    checkout makes it (DESIGN §8 *The falsifier's checkouts are kept too*):
+    its mode exactly the checkout's (no bit its worker added or took away:
+    a group or other write bit, setgid, sticky, the owner's read), no
+    extended attribute (an ACL included) and no entry git neither tracks
+    nor cleans — a FIFO, a socket, a device, which `git clean` passes over
+    in a tracked directory and git would block reading as a `.gitignore`.
+    Reached without following a link; one gone, or no longer a directory,
+    is the checkout's to make. False when it cannot be made so."""
+    try:
+        # Read and search first, through its parents, so one its worker left
+        # with neither can be opened at all.
+        _add_dir_bits_beneath(wt, Path(rel), 0o700)
+        with _dir_beneath(wt, wt / rel) as dfd:
+            os.fchmod(dfd, _checkout_dir_mode())
+            _strip_dir_xattrs(dfd)
+            if _worker_xattrs(dfd):
+                return False
+            names = os.listdir(dfd)
+            odd = [n for n in names if not stat.S_ISREG(m := os.stat(
+                n, dir_fd=dfd, follow_symlinks=False).st_mode)
+                and not stat.S_ISDIR(m) and not stat.S_ISLNK(m)]
+        for n in odd:
+            _unlink_beneath(wt, wt / rel / n)
+            if _lexists_beneath(wt, wt / rel / n):
+                return False
+    except (FileNotFoundError, NotADirectoryError):
+        # A link opened as a directory without following it is
+        # `ENOTDIR` too.
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _view_repo(st: "State", tree: str | Path) -> Path | None:
@@ -50031,8 +50429,8 @@ async def _record_view_install(st: "State", view_key: str,
     found from the worker tree the view shows, never from the view.
     A kept helper tree (a `_reuse_or_rebuild_kept_tree` consumer: the
     held-out evaluation tree, the base confirm worktrees, the CI-parity
-    trees) records the same way into `_KEPT_INSTALLS`, but its run
-    repository and tip are its own `_KEPT_TREES` entry's — it shows no worker
+    trees, the falsifier's checkouts) records the same way into
+    `_KEPT_INSTALLS`, but its run repository and tip are its own `_KEPT_TREES` entry's — it shows no worker
     tree (DESIGN §8 *The evaluation tree is kept across a run's evaluations*;
     §9 *The base confirm worktree is kept across the run's confirms*)."""
     kept_entry = _KEPT_TREES.get(view_key)
@@ -59867,11 +60265,17 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     return out
 
 
-def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
+def _ref_less_clone(src: Path, wt: Path, rev: str, *,
+                    keep: bool = False) -> str:
     """A checkout of `rev` at `wt` in a clone sharing `src`'s objects with
     every ref and the remote deleted, so the only commits reachable are
     `rev` and its history. "" on success, else why not (`wt` is then
-    removed). Mechanical git plumbing."""
+    removed). With `keep`, `wt` already holds `rev`'s files (a kept clone
+    `_move_view` moved there, its leerie-owned git directory made at `rev`):
+    only the clone's own `.git` is made again, beside them and untouched by
+    them — the one its last worker wrote is gone — with HEAD `rev` detached
+    and `rev`'s index; on failure nothing is removed (the caller tears the
+    tree down). Mechanical git plumbing."""
     def _git(*args: str, cwd: Path | None = None
              ) -> subprocess.CompletedProcess:
         # The clone's own `.git` is named explicitly while leerie makes it:
@@ -59879,15 +60283,39 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
         # read goes through `_clone_git_dir` (`_run_tree_location`).
         at = (["-C", str(cwd), "--git-dir", str(Path(cwd) / ".git"),
                "--work-tree", str(cwd), *_GIT_VIEW_PINS] if cwd else [])
+        # A kept clone's move is bounded like the rest of it
+        # (`_move_view`): a timeout there is no move.
         return subprocess.run(["git", *at, *args],
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False,
+                              timeout=300 if keep else None)
 
-    clone = _git("clone", "--quiet", "--shared", "--no-checkout",
-                 "--no-tags", str(src), str(wt))
-    ok = clone.returncode == 0
-    if ok:
-        ok = _git("checkout", "--quiet", "--detach", rev,
-                  cwd=wt).returncode == 0
+    if keep:
+        # Cloned beside, in leerie's own directory, then moved in: `git
+        # clone` makes no clone into a directory that holds files.
+        tmp = _clone_git_dir(wt).parent / f".reclone-{Path(wt).name}"
+        _rmtree_owned(tmp)
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        clone = _git("clone", "--quiet", "--shared", "--no-checkout",
+                     "--no-tags", str(src), str(tmp))
+        ok = clone.returncode == 0 and _rmtree_owned(Path(wt) / ".git")
+        if ok:
+            try:
+                os.rename(tmp / ".git", Path(wt) / ".git")
+            except OSError:
+                ok = False
+        _rmtree_owned(tmp)
+        ok = ok and _git("update-ref", "--no-deref", "HEAD", rev,
+                         cwd=wt).returncode == 0
+        ok = ok and _git("read-tree", rev, cwd=wt).returncode == 0
+        if ok:
+            _git("update-index", "-q", "--refresh", cwd=wt)
+    else:
+        clone = _git("clone", "--quiet", "--shared", "--no-checkout",
+                     "--no-tags", str(src), str(wt))
+        ok = clone.returncode == 0
+        if ok:
+            ok = _git("checkout", "--quiet", "--detach", rev,
+                      cwd=wt).returncode == 0
     if ok:
         refs = _git("for-each-ref", "--format=%(refname)", cwd=wt)
         ok = refs.returncode == 0
@@ -59899,6 +60327,9 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
         _git("reflog", "expire", "--expire=now", "--all", cwd=wt)
         left = _git("for-each-ref", "--format=%(refname)", cwd=wt)
         ok = ok and left.returncode == 0 and not left.stdout.strip()
+    if keep:
+        return "" if ok else (clone.stderr.strip()
+                              or "the clone's .git could not be made")[:200]
     if ok and Path(os.path.realpath(wt)).parent.name == "worktrees":
         # The run's own clone: leerie's reads of it go through a git
         # directory leerie alone writes (`CLONE_GITS_NAME`), made before
@@ -59911,19 +60342,28 @@ def _ref_less_clone(src: Path, wt: Path, rev: str) -> str:
     return (clone.stderr.strip() or "a ref could not be removed")[:200]
 
 
-def _make_clone_git_dir(src: Path, wt: Path, rev: str) -> bool:
+def _make_clone_git_dir(src: Path, wt: Path, rev: str, *,
+                        refresh: bool = True) -> bool:
     """Make `_clone_git_dir(wt)`: a git directory whose objects are `src`'s
     (an `alternates` entry), whose HEAD is `rev` detached and whose index is
-    `rev`'s tree, refreshed against `wt`. Every command names it and `wt`
-    explicitly; nothing of `wt`'s own `.git` is read."""
+    `rev`'s tree, refreshed against `wt` unless not `refresh` (a moved
+    clone, whose files its worker shaped and the move writes anew before
+    anything reads them: `_rewrite_clone_files`). Every command names it and
+    `wt` explicitly; nothing of `wt`'s own `.git` is read."""
     gd = _clone_git_dir(wt)
     _rmtree_owned(gd)
     gd.parent.mkdir(parents=True, exist_ok=True)
     at = ["--git-dir", str(gd), "--work-tree", str(wt), *_GIT_VIEW_PINS]
 
     def _g(*args: str) -> bool:
-        return subprocess.run(["git", *at, *args], capture_output=True,
-                              text=True, check=False).returncode == 0
+        # Bounded in a move, as the rest of it is (`_move_view`).
+        try:
+            return subprocess.run(["git", *at, *args], capture_output=True,
+                                  text=True, check=False,
+                                  timeout=None if refresh else 300
+                                  ).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
     if not _g("init", "-q"):
         return False
     common = Path(src)
@@ -59935,7 +60375,8 @@ def _make_clone_git_dir(src: Path, wt: Path, rev: str) -> bool:
     (gd / "HEAD").write_text(rev + "\n")
     if not _g("read-tree", rev):
         return False
-    _g("update-index", "-q", "--refresh")      # stat info; dirt is fine
+    if refresh:
+        _g("update-index", "-q", "--refresh")      # stat info; dirt is fine
     return True
 
 
@@ -59953,6 +60394,7 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str, *,
     for a checkout only leerie uses (DESIGN §6 *A tree's stores are the
     tree's, whoever writes it*)."""
     _CLONE_CACHES.pop(os.path.realpath(wt), None)
+    _CLONE_TIMES.pop(os.path.realpath(wt), None)
     kind = _writer_checkout(st, wt, base)
     if writer is not None and not kind.startswith("failed"):
         _CLONE_CACHES[os.path.realpath(wt)] = _worker_cache_dir(st.run_dir,
@@ -60058,6 +60500,7 @@ def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
     _rmtree_owned(_clone_git_dir(wt))
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
     _CLONE_CACHES.pop(os.path.realpath(wt), None)
+    _CLONE_TIMES.pop(os.path.realpath(wt), None)
 
 
 async def phase_acceptance_write(task: str, st: "State", caps: dict,
@@ -60193,7 +60636,9 @@ def _kept_teardown(repo: Path, wt: Path) -> None:
 
 
 async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
-                                      tip: str
+                                      tip: str, *,
+                                      writer_checkout: bool = False,
+                                      writer: str | None = None
                                       ) -> "subprocess.CompletedProcess | None":
     """Put the kept helper worktree `wt` at `tip`, reusing its recorded
     install in place when the install key at `tip` is the one that install
@@ -60205,10 +60650,17 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
     (DESIGN §9 *The base confirm worktree is kept across the run's confirms*),
     the re-drive's `redrive-base` (*The delivery re-drive's base confirm
     worktree is kept too*) and the base-form check's `base-form-base` (*The
-    base-form check's base confirm worktree is kept too*) — and the CI-parity
+    base-form check's base confirm worktree is kept too*) — the CI-parity
     trees `_ci_worktree` makes with `reuse`: `ci-round`, `ci-round-pre`,
     `ci-final` and `ci-confirm-base` (*The merge checks' trees are kept
-    too*).
+    too*) — and, with `writer_checkout`, the falsifier's checkouts
+    (`falsifier-confirm`, `falsifier-lane<n>`; DESIGN §8 *The falsifier's
+    checkouts are kept too*): a writer's checkout of `tip`
+    (`_acceptance_writer_checkout`, a ref-less clone, `writer` the worker
+    that writes it or None), torn down as one (`_remove_acceptance_checkout`)
+    and moved by the same `_move_view`, which makes a clone's git
+    directories again at `tip`; one whose recorded worker cache set
+    (`_CLONE_CACHES`) is not `writer`'s is never reused.
 
     When `wt` holds an install this process recorded (`_KEPT_INSTALLS`) and
     the install key at `tip` is the one that install was made from, the view
@@ -60217,8 +60669,11 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
     a confirm or a crash left changed) — returns None. Any difference tears
     the tree down (`_kept_teardown`) and adds it detached at `tip`, returning
     the add (a non-zero `returncode` is the add having failed; the caller
-    maps that to its own "no evidence"/`no_verdict`). Either way the tree is
-    opted into the view snapshot/key recording (`_KEPT_TREES`, read by
+    maps that to its own "no evidence"/`no_verdict`); a writer's checkout is
+    removed as one (`_remove_acceptance_checkout`) and made again
+    (`_acceptance_writer_checkout`), returned as a `CompletedProcess` whose
+    `returncode` is 1 for a failed kind and whose `stderr` is the kind.
+    Either way the tree is opted into the view snapshot/key recording (`_KEPT_TREES`, read by
     `is_view` in `_ensure_worktree_deps` and by `_record_view_install`) —
     but on a failed add it is not, so nothing records an install for a tree
     that is not there. The caller still runs `_ensure_worktree_deps` in `wt`:
@@ -60226,6 +60681,18 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
     needs."""
     key = os.path.realpath(wt)
     made = _KEPT_INSTALLS.get(key)
+    # A writer's checkout installed on one side's cache set is not the
+    # checkout another writer (or leerie alone) would get fresh: what the
+    # install linked from that cache is that side's (DESIGN §8 *The
+    # falsifier's checkouts are kept too*).
+    cache = (_worker_cache_dir(st.run_dir, writer)
+             if writer_checkout and writer is not None else None)
+    # Nor is a writer's checkout that fell back to a worktree
+    # (`_acceptance_writer_checkout`): only a clone's move undoes what its
+    # worker left.
+    if writer_checkout and (_CLONE_CACHES.get(key) != cache
+                            or _admin_dir_of(repo, wt) is not None):
+        made = None
     if wt.is_dir() and made is not None:
         recipe = (st.data.get("provision") or {}).get("recipe") or []
         now_key = await asyncio.to_thread(_install_key, repo, tip, recipe,
@@ -60237,6 +60704,20 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
             _DEPS_KEPT[key] = made[1][0]
             _KEPT_TREES[key] = (repo, tip)
             return None
+    if writer_checkout:
+        await asyncio.to_thread(_remove_acceptance_checkout, st, wt)
+        _forget_installs(wt)
+        kind = await asyncio.to_thread(_acceptance_writer_checkout, st, wt,
+                                       tip, writer=writer)
+        failed = kind.startswith("failed")
+        if kind == "clone":
+            # Before any install or worker: the times its next move gives
+            # back (`_keep_unchanged_times`). None recorded costs a rebuild.
+            await asyncio.to_thread(_record_clone_times, repo, wt, tip)
+        if not failed:
+            _KEPT_TREES[key] = (repo, tip)
+        return subprocess.CompletedProcess(["checkout"], int(failed), "",
+                                           kind)
     await asyncio.to_thread(_kept_teardown, repo, wt)
     # Add through the default repository (the run's own, which `repo` already
     # is for a kept tree), not `repo=repo`: the default path keeps the
@@ -66668,6 +67149,23 @@ def _falsifier_checkout(st: "State", name: str, sha: str, *,
     return wt
 
 
+async def _falsifier_kept_checkout(st: "State", name: str, sha: str, *,
+                                   writer: str | None) -> Path | None:
+    """`_falsifier_checkout`'s checkout, kept for the run: the one at its
+    path moved to `sha` with its install reused when the install key there
+    is unchanged, else made afresh (`_reuse_or_rebuild_kept_tree(
+    writer_checkout=True)`; DESIGN §8 *The falsifier's checkouts are kept
+    too*). None, logged, when it could not be made (a move that could not
+    finish is no move: the checkout is made afresh)."""
+    wt = _helper_worktree_path(st, name)
+    r = await _reuse_or_rebuild_kept_tree(
+        st, _run_repo(st), wt, sha, writer_checkout=True, writer=writer)
+    if r is not None and r.returncode != 0:
+        log(f"  delivery detection: no {name} checkout ({r.stderr})")
+        return None
+    return wt
+
+
 # A linked worktree's `info/exclude` is the repository's SHARED one (git
 # resolves `--git-path info/exclude` to the common dir), so a file leerie
 # places in a checkout is kept out of `git status`/`git add -A` by a
@@ -67265,189 +67763,181 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         return {"enabled": True}
     log_path = st.run_dir / "logs" / "falsifier-setup.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
-    trees: list[Path] = []
-    confirm_tree = await asyncio.to_thread(
-        _falsifier_checkout, st, "falsifier-confirm", sha, writer=None)
-    try:
-        if confirm_tree is None:
-            return {"enabled": False, "skipped": "no checkout of the final "
-                    "commit"}
-        trees.append(confirm_tree)
+    confirm_tree = await _falsifier_kept_checkout(
+        st, "falsifier-confirm", sha, writer=None)
+    # The checkouts are kept for the run and moved by the next call
+    # (`_falsifier_kept_checkout`), never removed here: reaped with the
+    # run's worktrees.
+    if confirm_tree is None:
+        return {"enabled": False, "skipped": "no checkout of the final "
+                "commit"}
+    if not await _ensure_worktree_deps(
+            str(confirm_tree), st, caps, log_path=log_path,
+            verbosity=verbosity, label_prefix="falsifier-confirm",
+            log_prefix="delivery detection"):
+        return {"enabled": False, "skipped": "dependency install failed"}
+    async with _exec_lock().shared():
+        ts_ok = _ts_resolvable(
+            confirm_tree, grants=_measurement_grants(st, confirm_tree))
+    if not ts_ok:
+        # The AST coupling check is JS/TS-only, as benched: without it
+        # no sample could ever be confirmed, so none is spawned.
+        return {"enabled": False, "skipped": "AST coupling check "
+                "unavailable (no typescript compiler API from the tree "
+                "or the bundled copy)"}
+    # The run's browser channel, when the repository's browser suite ran
+    # here: its prerequisites (a code generator, the runner's browser)
+    # set up every checkout a probe runs in (DESIGN §8 *A repository's
+    # browser suite is a channel the run provisions*).
+    suite = _browser_suite(st)
+    if suite is not None:
+        await _ci_prepare(confirm_tree, [_browser_suite_rec(suite)], st,
+                          caps, "falsifier-confirm")
+    sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
+                          or []) if isinstance(s_, dict)]
+    acc_paths = {rel for s_ in sets
+                 for rel in ((s_.get("defect_files") or [])
+                             + (s_.get("control_files") or [])
+                             + (s_.get("support_files") or []))}
+    task = st.data.get("task", "")
+    own = None if base_claim else _acceptance_own_start(st)
+    n_lanes = max(1, min(int(caps.get("max_parallel") or 1), len(todo)))
+    lanes: asyncio.Queue = asyncio.Queue()
+    for n in range(n_lanes):
+        lane = await _falsifier_kept_checkout(
+            st, f"falsifier-lane{n}", sha, writer="falsifier")
+        if lane is None:
+            continue
         if not await _ensure_worktree_deps(
-                str(confirm_tree), st, caps, log_path=log_path,
-                verbosity=verbosity, label_prefix="falsifier-confirm",
+                str(lane), st, caps, log_path=log_path,
+                verbosity=verbosity, label_prefix=f"falsifier-lane{n}",
                 log_prefix="delivery detection"):
-            return {"enabled": False, "skipped": "dependency install failed"}
-        async with _exec_lock().shared():
-            ts_ok = _ts_resolvable(
-                confirm_tree, grants=_measurement_grants(st, confirm_tree))
-        if not ts_ok:
-            # The AST coupling check is JS/TS-only, as benched: without it
-            # no sample could ever be confirmed, so none is spawned.
-            return {"enabled": False, "skipped": "AST coupling check "
-                    "unavailable (no typescript compiler API from the tree "
-                    "or the bundled copy)"}
-        # The run's browser channel, when the repository's browser suite ran
-        # here: its prerequisites (a code generator, the runner's browser)
-        # set up every checkout a probe runs in (DESIGN §8 *A repository's
-        # browser suite is a channel the run provisions*).
-        suite = _browser_suite(st)
+            continue
         if suite is not None:
-            await _ci_prepare(confirm_tree, [_browser_suite_rec(suite)], st,
-                              caps, "falsifier-confirm")
-        sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
-                              or []) if isinstance(s_, dict)]
-        acc_paths = {rel for s_ in sets
-                     for rel in ((s_.get("defect_files") or [])
-                                 + (s_.get("control_files") or [])
-                                 + (s_.get("support_files") or []))}
-        task = st.data.get("task", "")
-        own = None if base_claim else _acceptance_own_start(st)
-        n_lanes = max(1, min(int(caps.get("max_parallel") or 1), len(todo)))
-        lanes: asyncio.Queue = asyncio.Queue()
-        for n in range(n_lanes):
-            lane = await asyncio.to_thread(
-                _falsifier_checkout, st, f"falsifier-lane{n}", sha,
-                writer="falsifier")
-            if lane is None:
-                continue
-            trees.append(lane)
-            if not await _ensure_worktree_deps(
-                    str(lane), st, caps, log_path=log_path,
-                    verbosity=verbosity, label_prefix=f"falsifier-lane{n}",
-                    log_prefix="delivery detection"):
-                continue
-            if suite is not None:
-                await _ci_prepare(lane, [_browser_suite_rec(suite)], st,
-                                  caps, f"falsifier-lane{n}")
-            lanes.put_nowait(lane)
-        if lanes.empty():
-            return {"enabled": False, "skipped": "no falsifier checkout "
-                    "could be prepared"}
-        stat = ""
-        if own:
-            stat = subprocess.run(
-                ["git", "--git-dir", str(_run_repo(st)), "diff", "--stat=160",
-                 f"{own}..{sha}"], capture_output=True, text=True,
-                check=False).stdout
-        def _name(i: int) -> str:
-            return (names or {}).get(i) or f"i{i}"
+            await _ci_prepare(lane, [_browser_suite_rec(suite)], st,
+                              caps, f"falsifier-lane{n}")
+        lanes.put_nowait(lane)
+    if lanes.empty():
+        return {"enabled": False, "skipped": "no falsifier checkout "
+                "could be prepared"}
+    stat = ""
+    if own:
+        stat = subprocess.run(
+            ["git", "--git-dir", str(_run_repo(st)), "diff", "--stat=160",
+             f"{own}..{sha}"], capture_output=True, text=True,
+            check=False).stdout
+    def _name(i: int) -> str:
+        return (names or {}).get(i) or f"i{i}"
 
-        async def _sample(i: int, n: int, lane: Path) -> dict:
-            item = normalized[i]
-            # Back to the pristine final commit between samples. Each
-            # sample's worker has a database of its own (`claude_p(db=True)`
-            # in a Prisma/PostgreSQL repo), gone with its process, so one
-            # sample's rows never reach the next.
-            await _restore_tree(lane, sha, where="falsifier checkout reset",
-                                branch=None)
-            return await _sample_in(i, n, lane, item)
+    async def _sample(i: int, n: int, lane: Path) -> dict:
+        item = normalized[i]
+        # Back to the pristine final commit between samples. Each
+        # sample's worker has a database of its own (`claude_p(db=True)`
+        # in a Prisma/PostgreSQL repo), gone with its process, so one
+        # sample's rows never reach the next.
+        await _restore_tree(lane, sha, where="falsifier checkout reset",
+                            branch=None)
+        return await _sample_in(i, n, lane, item)
 
-        async def _sample_in(i: int, n: int, lane: Path,
-                             item: dict) -> dict:
-            ctx, refs = _falsifier_place_leads(st, lane, sets, task)
-            user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
-                                          parts_by_idx.get(i) or [],
-                                          suite=suite, base_claim=base_claim)
-            sid = f"falsifier-{_name(i)}-s{n}"
-            common = dict(system_prompt=_load_prompt("falsifier"),
-                          schema_key="falsifier", cwd=str(lane),
-                          allowed_tools=ACT_TOOLS,
-                          max_turns=FALSIFIER_MAX_TURNS, autonomous=True,
-                          caps=caps, st=st,
-                          model=models.get("falsifier", MODEL_DEFAULT),
-                          effort=efforts.get("falsifier"), db=True)
-            st.bump_workers(caps)
-            res = await claude_p(user_prompt=user, sid=sid, **common)
-            # The sets this sample read: what makes its probe showable to a
-            # fixer (DESIGN §6 *A falsifier reads only what a fixer may
-            # read*, `_falsifier_shown_probe`).
-            rec: dict = {"sample": n, "reasked": False,
-                         "lead_sets": sorted(
-                             s_["index"] for s_ in
-                             _falsifier_lead_sets(sets))}
-            activity = _falsifier_probe_activity(
-                _worker_log_path(st.run_dir, sid, "falsifier"), lane,
-                st.repo_root)
-            rec["probe_activity"] = activity
-            if _falsifier_needs_reask(res, activity):
-                session = _log_session_id(
-                    _worker_log_path(st.run_dir, sid, "falsifier"))
-                if session:
-                    st.bump_workers(caps)
-                    res = await claude_p(user_prompt=FALSIFIER_REASK_NOTE,
-                                         sid=f"{sid}-reask",
-                                         resume_session=session, **common)
-                    rec["reasked"] = True
-            rec.update({key: res.get(key) for key in (
-                "verdict", "probe_path", "case_name", "assertion_quote",
-                "item_span_quote", "entry_point", "reason")})
-            # A probe the sample ran through the browser suite's runner is
-            # confirmed through it; any other through the test command.
-            via = None
-            if suite is not None and res.get("probe_path"):
-                cmds = [str(inp.get("command") or "") for sid_ in (
-                            sid, f"{sid}-reask")
-                        for _k, inp, _r in _iter_log_tool_use(
-                            _worker_log_path(st.run_dir, sid_, "falsifier"),
-                            kinds=("Bash",))]
-                if _browser_suite_ran_probe(
-                        cmds, _delivery_cite_rel(str(res["probe_path"]),
-                                                 lane), lane, suite):
-                    via = suite
-                    rec["via_browser_suite"] = True
-            # Its confirm queues on the execution lock
-            # (`_falsifier_gates`' section), one at a time.
-            rec.update(await _falsifier_gates(
-                st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
-                sha=sha, item_text=_falsifier_item_text(item),
-                acc_paths=acc_paths, label=f"{_name(i)}-s{n}", suite=via))
+    async def _sample_in(i: int, n: int, lane: Path,
+                         item: dict) -> dict:
+        ctx, refs = _falsifier_place_leads(st, lane, sets, task)
+        user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
+                                      parts_by_idx.get(i) or [],
+                                      suite=suite, base_claim=base_claim)
+        sid = f"falsifier-{_name(i)}-s{n}"
+        common = dict(system_prompt=_load_prompt("falsifier"),
+                      schema_key="falsifier", cwd=str(lane),
+                      allowed_tools=ACT_TOOLS,
+                      max_turns=FALSIFIER_MAX_TURNS, autonomous=True,
+                      caps=caps, st=st,
+                      model=models.get("falsifier", MODEL_DEFAULT),
+                      effort=efforts.get("falsifier"), db=True)
+        st.bump_workers(caps)
+        res = await claude_p(user_prompt=user, sid=sid, **common)
+        # The sets this sample read: what makes its probe showable to a
+        # fixer (DESIGN §6 *A falsifier reads only what a fixer may
+        # read*, `_falsifier_shown_probe`).
+        rec: dict = {"sample": n, "reasked": False,
+                     "lead_sets": sorted(
+                         s_["index"] for s_ in
+                         _falsifier_lead_sets(sets))}
+        activity = _falsifier_probe_activity(
+            _worker_log_path(st.run_dir, sid, "falsifier"), lane,
+            st.repo_root)
+        rec["probe_activity"] = activity
+        if _falsifier_needs_reask(res, activity):
+            session = _log_session_id(
+                _worker_log_path(st.run_dir, sid, "falsifier"))
+            if session:
+                st.bump_workers(caps)
+                res = await claude_p(user_prompt=FALSIFIER_REASK_NOTE,
+                                     sid=f"{sid}-reask",
+                                     resume_session=session, **common)
+                rec["reasked"] = True
+        rec.update({key: res.get(key) for key in (
+            "verdict", "probe_path", "case_name", "assertion_quote",
+            "item_span_quote", "entry_point", "reason")})
+        # A probe the sample ran through the browser suite's runner is
+        # confirmed through it; any other through the test command.
+        via = None
+        if suite is not None and res.get("probe_path"):
+            cmds = [str(inp.get("command") or "") for sid_ in (
+                        sid, f"{sid}-reask")
+                    for _k, inp, _r in _iter_log_tool_use(
+                        _worker_log_path(st.run_dir, sid_, "falsifier"),
+                        kinds=("Bash",))]
+            if _browser_suite_ran_probe(
+                    cmds, _delivery_cite_rel(str(res["probe_path"]),
+                                             lane), lane, suite):
+                via = suite
+                rec["via_browser_suite"] = True
+        # Its confirm queues on the execution lock
+        # (`_falsifier_gates`' section), one at a time.
+        rec.update(await _falsifier_gates(
+            st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
+            sha=sha, item_text=_falsifier_item_text(item),
+            acc_paths=acc_paths, label=f"{_name(i)}-s{n}", suite=via))
+        if rec.get("confirmed"):
+            saved = _falsifier_save_probe(st, lane, i, res,
+                                          name=_name(i),
+                                          root=probes_root)
+            if saved:
+                rec["probe_saved"] = saved
+        return rec
+
+    async def _item(i: int) -> None:
+        samples: list[dict] = []
+        confirmed = False
+        for n in range(k):
+            lane = await lanes.get()
+            try:
+                rec = await _sample(i, n, lane)
+            except (WorkerError, subprocess.TimeoutExpired) as e:
+                rec = {"sample": n, "error": _brief_worker_exc(e),
+                       "confirmed": False}
+            except Exception as e:
+                # One sample's local failure (a copy, a git call) is no
+                # evidence either way; the item's other samples still run.
+                log(f"  delivery detection: falsifier sample "
+                    f"{_name(i)}-s{n} raised {type(e).__name__}: {e}")
+                rec = {"sample": n, "error": f"{type(e).__name__}: {e}",
+                       "confirmed": False}
+            finally:
+                lanes.put_nowait(lane)
+            samples.append(rec)
             if rec.get("confirmed"):
-                saved = _falsifier_save_probe(st, lane, i, res,
-                                              name=_name(i),
-                                              root=probes_root)
-                if saved:
-                    rec["probe_saved"] = saved
-            return rec
-
-        async def _item(i: int) -> None:
-            samples: list[dict] = []
-            confirmed = False
-            for n in range(k):
-                lane = await lanes.get()
-                try:
-                    rec = await _sample(i, n, lane)
-                except (WorkerError, subprocess.TimeoutExpired) as e:
-                    rec = {"sample": n, "error": _brief_worker_exc(e),
-                           "confirmed": False}
-                except Exception as e:
-                    # One sample's local failure (a copy, a git call) is no
-                    # evidence either way; the item's other samples still run.
-                    log(f"  delivery detection: falsifier sample "
-                        f"{_name(i)}-s{n} raised {type(e).__name__}: {e}")
-                    rec = {"sample": n, "error": f"{type(e).__name__}: {e}",
-                           "confirmed": False}
-                finally:
-                    lanes.put_nowait(lane)
-                samples.append(rec)
-                if rec.get("confirmed"):
-                    # Any-of-k: a later sample cannot change the verdict.
-                    confirmed = True
-                    break
-            done[str(i)] = {"item_index": i, "confirmed": confirmed,
-                            "samples": samples}
-            if persist is not None:
-                persist(st, progress)
-        log(f"  delivery detection: falsifier on {len(todo)} item(s), up to "
-            f"{k} sample(s) each, {lanes.qsize()} checkout(s)")
-        await _gather_or_cancel(*[_item(i) for i in todo])
-        return {"enabled": True, "lanes": n_lanes}
-    finally:
-        for wt in trees:
-            # `_rmtree_owned` gives every directory its bits, never
-            # following a link: no chmod of a lead the lane may have made a
-            # link.
-            _remove_acceptance_checkout(st, wt)
+                # Any-of-k: a later sample cannot change the verdict.
+                confirmed = True
+                break
+        done[str(i)] = {"item_index": i, "confirmed": confirmed,
+                        "samples": samples}
+        if persist is not None:
+            persist(st, progress)
+    log(f"  delivery detection: falsifier on {len(todo)} item(s), up to "
+        f"{k} sample(s) each, {lanes.qsize()} checkout(s)")
+    await _gather_or_cancel(*[_item(i) for i in todo])
+    return {"enabled": True, "lanes": n_lanes}
 
 
 # DESIGN §8 *A met is only what the run could observe*. Samples per run (the

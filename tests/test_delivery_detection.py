@@ -1869,8 +1869,10 @@ class TestRunDeliveryDetection:
                 not in p0["user_prompt"])
         assert "EXECUTED COMMANDS RECORD" not in p0["user_prompt"]
         assert p0["allowed_tools"] == leerie.ACT_TOOLS and p0["autonomous"]
-        # Every checkout is gone.
-        assert not list((st.run_dir / "worktrees").glob("falsifier-*"))
+        # Every checkout is kept for the run's next falsifier call (DESIGN
+        # §8 *The falsifier's checkouts are kept too*).
+        assert all(leerie._helper_worktree_path(st, n).is_dir()
+                   for n in ("falsifier-confirm", "falsifier-lane0"))
         # The outcome reads the final verdict.
         assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
         assert "1 required item(s) still unmet" in st.data["outcome_reasons"]

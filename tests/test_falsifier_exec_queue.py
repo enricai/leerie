@@ -44,6 +44,10 @@ def _events_env(leerie, tmp_path, monkeypatch, *, lanes: int,
         return d
     monkeypatch.setattr(leerie, "_falsifier_checkout", checkout)
 
+    async def kept_checkout(st, label, sha, *, writer):
+        return checkout(st, label, sha, writer=writer)
+    monkeypatch.setattr(leerie, "_falsifier_kept_checkout", kept_checkout)
+
     async def deps(*a, **k):
         return True
 
