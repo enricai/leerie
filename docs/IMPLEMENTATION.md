@@ -9552,20 +9552,23 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     in the run repository, the path and `<mode> <type> <sha>` (`-` when
     absent) of each file in `reads[0]`, and the sorted `<name> <mode>` of
     the tracked entries directly in each directory in `reads[1]` or holding
-    a file in `reads[0]`; None when git fails. `InstallReads` is
+    a file in `reads[0]`; None when git fails or the listing times out
+    (60 s). `InstallReads` is
     `(files, directories)`, tree-relative (`""` the tree), each a
     `frozenset[str]`. `_watch_reads(tree) -> _ReadWatch | None`: an inotify
     instance (`inotify_init1(O_NONBLOCK|O_CLOEXEC)`, through `ctypes`)
     watching, for `IN_OPEN` with `IN_ONLYDIR|IN_DONT_FOLLOW`, the tree and
     every directory `git ls-tree -r -d --full-tree HEAD` lists there; None
-    off Linux, when git fails or a watch cannot be added.
+    off Linux, when git fails or its listing times out (120 s), or when a
+    watch cannot be added.
     `_drain_reads(w) -> bool` reads its queued events into `w.files` /
     `w.opened` (`IN_ISDIR`), False on `IN_Q_OVERFLOW` or a read error.
     In a view (`realpath(tree)` among `_VIEWS`' paths),
     `_ensure_worktree_deps` collects the install's outputs — `set(
     _DEPS_KEPT.pop(<view>))` plus, around each `install` entry, the paths
     `_ignored_paths(tree)` (`_untracked_cmd(which="ignored",
-    directory=True)`, None when git fails) lists after it and not before —
+    directory=True)`, None when git fails or the listing times out (120 s))
+    lists after it and not before —
     and, around each `install` entry, what it opened (`_watch_reads`, its
     descriptor drained by `loop.add_reader` while the entry runs and once
     after; a watch not made, a lost event, an `_IN_Q_OVERFLOW`, or an
@@ -9595,15 +9598,19 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_measure_dir_at` gives the view a new measurement directory and moves
     its `tree-stores/<view>` aside), `checkout -q --detach --force <tip>`,
     `clean -ffdqx`
-    with `-e /<output>` per output, `_install_intact`, then True only when
+    with `-e /<output>` per output (each bounded at 300 s; a timeout is
+    False), `_install_intact`, then True only when
     `HEAD` is `tip` and `status --porcelain --untracked-files=no` is empty.
     Pinned by `tests/test_view_moves.py`.
     A *kept tree* reuses the same move machinery (DESIGN §8 *The evaluation
     tree is kept across a run's evaluations*, §9 *The base confirm worktree
     is kept across the run's confirms*, *The delivery re-drive's base confirm
-    worktree is kept too* — one mechanism, three consumers: the held-out
-    evaluation tree, B\*'s base-paired confirm worktree, and the delivery
-    re-drive's `redrive-base` confirm worktree). Two
+    worktree is kept too*, *The base-form check's base confirm worktree is
+    kept too*, *The merge checks' trees are kept too* — one mechanism, its
+    consumers the held-out evaluation tree, B\*'s base-paired confirm
+    worktree, the delivery re-drive's `redrive-base` and the base-form
+    check's `base-form-base` confirm worktrees, and CI parity's `ci-round`,
+    `ci-round-pre`, `ci-final` and `ci-confirm-base`). Two
     process-level dicts, keyed by `realpath(<kept tree>)`: `_KEPT_TREES:
     dict[str, tuple[Path, str]]` — the run repository and the tip of a tree
     opted into snapshot recording — and `_KEPT_INSTALLS: dict[str, tuple[str,
@@ -9630,7 +9637,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     either way" — DESIGN §6 *The run's own repository*, review round 17 H1;
     `tests/test_run_repo_missing_dies.py`) — and it returns that add
     (`_KEPT_TREES` set only when the add succeeded; a non-zero `returncode`
-    means the add failed). Its two callers map the result:
+    means the add failed). Its three callers map the result:
     `async _prepare_eval_tree(st, caps, repo, wt, tip, *, log_path, label)
     -> str` ("ok" | "worktree_failed" | "deps_failed") calls it, returns
     "worktree_failed" on a non-`None` non-zero add, else runs
@@ -9639,10 +9646,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `_confirm_against_base`'s `_dispatch` (only with `reuse=True`: the
     `confirm-base`, `redrive-base` and `base-form-base` callers) calls it for
     the base worktree in place of the teardown-and-add it does when `reuse` is
-    False, and skips the per-call teardown so the tree is kept. Pinned by
+    False, and skips the per-call teardown so the tree is kept; and
+    `_ci_worktree` (only with `reuse=True`: `ci-round`, `ci-round-pre`,
+    `ci-final`, `ci-confirm-base`) calls it in place of its teardown-and-add,
+    returning the tree on `None` or a zero add, and its callers skip
+    `_ci_teardown`. Pinned by
     `tests/test_eval_tree_reuse.py`, `tests/test_confirm_base_reuse.py`,
-    `tests/test_redrive_base_reuse.py` and
-    `tests/test_base_form_base_reuse.py`.
+    `tests/test_redrive_base_reuse.py`,
+    `tests/test_base_form_base_reuse.py` and
+    `tests/test_ci_tree_reuse.py`.
     `async _view_tree_sha(st, tree) -> str | None`: `refs/heads/<ref>^{tree}`
     for a worker tree, else `_committed_tree_sha(tree)`. Used by:
     `_measure_axes` (`_committed_view` first, the memo keyed on it, and its
@@ -11014,7 +11026,16 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   source file or a `CI_STRICT_MANIFESTS` file in the check's cwd or the
   root. The selected checks then
   run in a detached `worktrees/ci-base` worktree at the base sha
-  (`_ci_worktree` / `_ci_teardown`; deps and prerequisites via
+  (`_ci_worktree` / `_ci_teardown`; `async _ci_worktree(st, name, sha, *,
+  reuse=False) -> Path | None`: without `reuse` it `_ci_teardown`s the path
+  and adds it detached at `sha` (`ci-base`, `ci-browser`; their callers tear
+  them down); with `reuse` — `ci-round`, `ci-round-pre`, `ci-final`,
+  `ci-confirm-base` — it is `_reuse_or_rebuild_kept_tree(st, _run_repo(st),
+  wt, sha)` (§8 *kept tree*: moved to `sha` with its install kept when the
+  install key there is unchanged, else torn down and added afresh), and no
+  caller tears it down: it is kept for the run, reaped with its worktrees
+  (DESIGN §9 *The merge checks' trees are kept too*); None, logged, when the
+  add fails; deps and prerequisites via
   `_ci_prepare`, which runs each prerequisite's `_ci_prereq_argv(pre) ->
   list[str] | None` — `argv` for `root: none` or a record without `root`,
   `_ci_rootless_form(pre)` for `part`, nothing for `all` (logged: needs root,
@@ -11124,7 +11145,7 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
 - **Final** — `_run_ci_parity_final(leerie_dir, st, caps) -> list[dict]`,
   called in `_run_phases` after `_run_acceptance_gate` and before
   `phase_finalize`, in a detached `worktrees/ci-final` worktree at the
-  staging HEAD. The checks it runs are `_ci_gating_recs(st)` (selected,
+  staging HEAD (`_ci_worktree(…, reuse=True)`, kept). The checks it runs are `_ci_gating_recs(st)` (selected,
   with a `gate` or a `ratchet`, in recorded order), measured by
   `_ci_measure(st, caps, wt, recs, *, label) -> {id: raw}` — every check
   once, in order, in the one prepared tree; a gate's raw `{rc, passed,
@@ -11139,8 +11160,9 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   `final.reused` names that measurement's label and the ratchets are read
   from it. A gate (`_ci_gate_argv`) that fails is confirmed by
   `_ci_confirm_red(st, caps, base_sha, final_tree, recs, *, durations=None,
-  label="confirm")` — `_confirm_new_failures` with base reruns in a fresh
-  `ci-confirm-base` worktree and final reruns in `ci-final`, with
+  label="confirm")` — `_confirm_new_failures` with base reruns in a
+  `ci-confirm-base` worktree (kept, `reuse=True`) and final reruns in the
+  measured tree (`ci-final`), with
   `observed="pair"`; `label` prefixes the reruns' logs
   (`<label>-base<n>-<id>`, `<label>-final<n>-<id>`) and the base's
   prerequisites (`<label>-base`). The red checks are sized by `_confirm_sized` over
@@ -11163,12 +11185,14 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   `base` is `_ci_confirm_red`'s one `{"sha", "wt", "prepared", "prereqs",
   "upto"}` record
   for the whole sized confirm: the first pass creates `ci-confirm-base`
-  (`_ci_worktree`, tried once; `wt` stays None when that fails, and every pass is then
+  (`_ci_worktree(…, reuse=True)`, tried once; `wt` stays None when that fails, and every pass is then
   `_confirm_new_failures` over no-verdict runners), each pass runs
   `_ci_prepare(…, done=base["prereqs"])` over only the checks (`setup` and the pass's) whose ids are not yet in `prepared`
   (deps install once — `_DEPS_INSTALLED` — and the throwaway database
-  only when the tree has none), and `_ci_confirm_red` tears it down
-  (`_ci_teardown`) when the confirm ends. One rerun runs
+  only when the tree has none); the record starts empty for every
+  `_ci_confirm_red`, so a confirm on the kept tree prepares and sets it up
+  from its first check, and the tree is left, never torn down, when the
+  confirm ends (the next confirm's move cleans it). One rerun runs
   every chosen check serially; each check's
   `_ci_run` gets `_budget_caps(caps, rem)`, `rem` being what is left of the
   `left` the rerun was handed. With `rem <= 0` before a check, or a check
@@ -11229,8 +11253,8 @@ DESIGN §8 *A kept repair keeps the repository's merge checks green*.
 dict`, called by `_delivery_ratchet` (below) for every round it gates,
 first, unless `exec_result` already carries `new` or `base_form_changed`.
 `{}` when `_ci_gating_recs(st)` is empty, either sha is missing, or
-`pre_sha == post_sha`. Otherwise, in a fresh `worktrees/ci-round` at
-`post_sha` (`_ci_worktree`; none → `unmeasured: "no worktree of the
+`pre_sha == post_sha`. Otherwise, in `worktrees/ci-round` at
+`post_sha` (`_ci_worktree(…, reuse=True)`, kept; none → `unmeasured: "no worktree of the
 round's commit"`, nothing broke): `_ci_prepare(…, "<label>-post")`,
 `_ci_measure(…, label="<label>-post")`; the gates not `passed` go to
 `_ci_confirm_red(st, caps, pre_sha, wt, <those>, durations=…,
@@ -11239,7 +11263,7 @@ label="<label>-confirm")`, and each `new` id is broke `{id, kind, why:
 `resource_affected`, `no_verdict`, `budget_short_unsettled` and `b_star`
 are recorded as B\* split them, none a rollback. Ratchets read the start's
 raw values from `_ci_remembered(st, pre_sha, <ratchets>)`, else measure
-them in `worktrees/ci-round-pre` at `pre_sha` (label `<label>-pre`;
+them in `worktrees/ci-round-pre` at `pre_sha` (`reuse=True`, kept; label `<label>-pre`;
 neither → `ratchets_unmeasured[]`): a diagnostic ratchet broke `{…, why:
 "new_diagnostics", argv: strict_argv, diagnostics[≤_CI_DIAG_LIMIT],
 lines}` on `_ci_new_diagnostics(rec, post keys, pre keys,

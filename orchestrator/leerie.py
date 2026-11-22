@@ -48684,8 +48684,9 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     # install's inputs are unchanged*). None in any other tree, and once
     # they cannot be told.
     # A committed view, or a kept helper tree opted in the same way
-    # (`_KEPT_TREES`: the held-out evaluation tree, the base confirm
-    # worktree): either records the install's snapshot and reads so it
+    # (`_KEPT_TREES`: every `_reuse_or_rebuild_kept_tree` consumer — the
+    # held-out evaluation tree, the base confirm worktrees, the CI-parity
+    # trees): either records the install's snapshot and reads so it
     # can be moved to the next commit with the install kept (DESIGN §8 *A view
     # moves to the next tip when the install's inputs are unchanged*, *The
     # evaluation tree is kept across a run's evaluations*; §9 *The base
@@ -49710,7 +49711,8 @@ InstallSnapshot = tuple[tuple[str, ...], bytes, str]
 # moves to the next tip when the install's inputs are unchanged*).
 _VIEW_INSTALLS: dict[str, tuple[str, InstallSnapshot, "InstallReads"]] = {}
 # A kept helper tree, kept across a run and moved to the next commit with its
-# install kept the way a view is: one mechanism, two consumers — the held-out
+# install kept the way a view is: one mechanism (`_reuse_or_rebuild_kept_tree`,
+# whose docstring lists every consumer), first made for two — the held-out
 # evaluation tree (DESIGN §8 *The evaluation tree is kept across a run's
 # evaluations*; §6 *A held-out evaluation runs alone* — the kept install is
 # the sandbox's read-only lower, which no evaluation can mutate) and the
@@ -49757,10 +49759,14 @@ class _ReadWatch(NamedTuple):
 def _watch_reads(tree: str | Path) -> _ReadWatch | None:
     """Watch every directory tracked at `tree`'s HEAD, and the tree itself,
     for opens (`_drain_reads` collects them). None when git cannot list
-    them or one cannot be watched: no read can then be told missing."""
-    r = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r", "-d",
-                        "-z", "--name-only", "--full-tree", "HEAD"],
-                       capture_output=True, check=False, timeout=120)
+    them (a listing that timed out included) or one cannot be watched: no
+    read can then be told missing."""
+    try:
+        r = subprocess.run(["git", *_tree_git_args(tree), "ls-tree", "-r",
+                            "-d", "-z", "--name-only", "--full-tree", "HEAD"],
+                           capture_output=True, check=False, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
     if r.returncode != 0 or not sys.platform.startswith("linux"):
         return None
     try:
@@ -49817,10 +49823,14 @@ def _install_key(repo: Path, tip: str, recipe: list,
     entries (command, working directory, environment) and, read from the
     run repository at `tip`, the entry of each file in `reads` (absent:
     `-`) and the tracked names, with their modes, in each directory in
-    `reads` or holding a file in it. None when git cannot list the tip."""
-    r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-t", "-z",
-                        "--full-tree", tip], capture_output=True,
-                       check=False, timeout=60)
+    `reads` or holding a file in it. None when git cannot list the tip, a
+    listing that timed out included (a key no install can match)."""
+    try:
+        r = subprocess.run(["git", *_git_at(repo), "ls-tree", "-r", "-t",
+                            "-z", "--full-tree", tip], capture_output=True,
+                           check=False, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
     if r.returncode != 0:
         return None
     meta_of: dict[str, bytes] = {}
@@ -49852,10 +49862,14 @@ def _install_key(repo: Path, tip: str, recipe: list,
 
 def _ignored_paths(tree: str | Path) -> set[str] | None:
     """`tree`'s ignored untracked paths, a wholly ignored directory as one
-    `dir/` (the one listing, `_untracked_cmd`); None when git fails."""
+    `dir/` (the one listing, `_untracked_cmd`); None when git fails or the
+    listing times out."""
     args, env = _untracked_cmd(tree, which="ignored", directory=True)
-    r = subprocess.run(["git", *args], capture_output=True, check=False,
-                       env=env, timeout=120)
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, check=False,
+                           env=env, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
     if r.returncode != 0:
         return None
     return {os.fsdecode(p) for p in r.stdout.split(b"\0") if p}
@@ -49963,14 +49977,20 @@ def _move_view(repo: Path, wt: Path, tip: str,
                        mode=0o644)
     except OSError:
         return False
-    co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q", "--detach",
-                         "--force", tip], capture_output=True, check=False,
-                        timeout=300)
-    if co.returncode != 0:
-        return False
     keep = [x for o in snap[0] for x in ("-e", "/" + o.lstrip("/"))]
-    cl = subprocess.run(["git", *_tree_git_args(wt), "clean", "-ffdqx", *keep],
-                        capture_output=True, check=False, timeout=300)
+    try:
+        co = subprocess.run(["git", *_tree_git_args(wt), "checkout", "-q",
+                             "--detach", "--force", tip],
+                            capture_output=True, check=False, timeout=300)
+        if co.returncode != 0:
+            return False
+        cl = subprocess.run(["git", *_tree_git_args(wt), "clean", "-ffdqx",
+                             *keep], capture_output=True, check=False,
+                            timeout=300)
+    except subprocess.TimeoutExpired:
+        # A move that could not finish is no move: the caller remakes the
+        # tree (a timed-out step is a difference like any other).
+        return False
     if cl.returncode != 0 or not _install_intact(wt, snap):
         return False
     head = subprocess.run(["git", *_tree_git_args(wt), "rev-parse", "HEAD"],
@@ -50009,8 +50029,9 @@ async def _record_view_install(st: "State", view_key: str,
     DESIGN §8 *A view moves to the next tip when the install's inputs are
     unchanged*). Nothing for a tree that is no view. The run repository is
     found from the worker tree the view shows, never from the view.
-    A kept helper tree (the held-out evaluation tree, the base confirm
-    worktree) records the same way into `_KEPT_INSTALLS`, but its run
+    A kept helper tree (a `_reuse_or_rebuild_kept_tree` consumer: the
+    held-out evaluation tree, the base confirm worktrees, the CI-parity
+    trees) records the same way into `_KEPT_INSTALLS`, but its run
     repository and tip are its own `_KEPT_TREES` entry's — it shows no worker
     tree (DESIGN §8 *The evaluation tree is kept across a run's evaluations*;
     §9 *The base confirm worktree is kept across the run's confirms*)."""
@@ -53287,10 +53308,24 @@ def _ci_parity_unmet_from(data: dict) -> list[dict]:
             if isinstance(unmet, list) else [])
 
 
-async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
+async def _ci_worktree(st: "State", name: str, sha: str, *,
+                       reuse: bool = False) -> Path | None:
+    """The CI-parity helper worktree `name` at `sha`, or None when it could
+    not be made. Without `reuse` it is made afresh (`ci-base`,
+    `ci-browser`: one use per process) and its caller tears it down. With
+    `reuse` (`ci-round`, `ci-round-pre`, `ci-final`, `ci-confirm-base`) it
+    is a kept tree, moved to `sha` with its install reused when the install
+    key there is unchanged (`_reuse_or_rebuild_kept_tree`; DESIGN §9 *The
+    merge checks' trees are kept too*), and its caller leaves it for the
+    next use; it is reaped with the run's worktrees."""
     wt = _helper_worktree_path(st, name)
-    _ci_teardown(st, wt)
-    r = await _worktree_add_detached_async(st, wt, sha)
+    if reuse:
+        r = await _reuse_or_rebuild_kept_tree(st, _run_repo(st), wt, sha)
+        if r is None:
+            return wt
+    else:
+        _ci_teardown(st, wt)
+        r = await _worktree_add_detached_async(st, wt, sha)
     if r.returncode != 0:
         log(f"  ci parity: could not create the {name} worktree at "
             f"{sha[:12]}: {r.stderr.strip()[:200]}")
@@ -53953,76 +53988,74 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
         log(f"  ci parity: {sha[:12]} was measured by {final['reused']}, "
             "every gate green — reused, not run again")
     else:
-        wt = await _ci_worktree(st, "ci-final", sha)
+        wt = await _ci_worktree(st, "ci-final", sha, reuse=True)
         if wt is None:
             final["skipped"] = "no final worktree"
             ci["final"] = final
             st.save()
             return []
     red: list[str] = []
-    try:
-        if wt is not None:
-            await _ci_prepare(wt, recs, st, caps, "final")
-            raw = await _ci_measure(st, caps, wt, recs, label="final")
-            _ci_remember(st, sha, raw, "the final pass")
-        for r in recs:
-            got = (raw or {}).get(r["id"]) or {}
-            res: dict = {}
-            if r.get("gate"):
-                res.update({k: got.get(k) for k in ("rc", "dirty",
-                                                    "duration_sec")})
-                if not got.get("passed"):
-                    red.append(r["id"])
-            if r.get("ratchet") == "diagnostic":
-                new = _ci_new_diagnostics(
-                    r, got.get("diagnostics") or {},
-                    (r.get("base") or {}).get("diagnostics") or {}, touched)
-                res["strict_rc"] = got.get("strict_rc")
-                res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
-                if new:
-                    final["unmet"].append({
-                        "id": r["id"], "kind": r.get("kind"),
-                        "why": "new_diagnostics",
-                        "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
-                        "diagnostics": new[:_CI_DIAG_LIMIT]})
-            if r.get("ratchet") == "coverage":
-                pcts = got.get("coverage") or {}
-                fired = _ci_coverage_fired(r, pcts, touched, eps)
-                res.update({"rc": got.get("rc"), "coverage": pcts,
-                            "fired": fired})
-                if fired:
-                    final["unmet"].append({
-                        "id": r["id"], "kind": "coverage",
-                        "why": "coverage_ratchet", "argv": r.get("argv"),
-                        "cwd": r.get("cwd"), "thresholds": fired})
-            final["results"][r["id"]] = res
-        if red and wt is not None:
-            verdict = await _ci_confirm_red(
-                st, caps, base_sha, wt,
-                [x for x in recs if x["id"] in red],
-                durations={i: final["results"][i]["duration_sec"]
-                           for i in red if final["results"].get(i, {})
-                           .get("duration_sec") is not None})
-            final["b_star"] = verdict
-            final["budget_short_unsettled"] = list(
-                verdict.get("budget_short_unsettled") or [])
-            if verdict.get("sized_out"):
-                final["sized_out"] = list(verdict["sized_out"])
-            final["resource_affected"] = list(
-                verdict.get("resource_affected") or [])
-            final["pre_existing"] = list(
-                verdict.get("pre_existing") or [])
-            final["no_verdict"] = list(verdict.get("no_verdict") or [])
-            by_id = {x["id"]: x for x in recs}
-            for cid in verdict.get("new") or []:
-                rr = by_id[cid]
+    # `ci-final` is kept for the run and moved by its next use
+    # (`_ci_worktree(reuse=True)`), never torn down here.
+    if wt is not None:
+        await _ci_prepare(wt, recs, st, caps, "final")
+        raw = await _ci_measure(st, caps, wt, recs, label="final")
+        _ci_remember(st, sha, raw, "the final pass")
+    for r in recs:
+        got = (raw or {}).get(r["id"]) or {}
+        res: dict = {}
+        if r.get("gate"):
+            res.update({k: got.get(k) for k in ("rc", "dirty",
+                                                "duration_sec")})
+            if not got.get("passed"):
+                red.append(r["id"])
+        if r.get("ratchet") == "diagnostic":
+            new = _ci_new_diagnostics(
+                r, got.get("diagnostics") or {},
+                (r.get("base") or {}).get("diagnostics") or {}, touched)
+            res["strict_rc"] = got.get("strict_rc")
+            res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
+            if new:
                 final["unmet"].append({
-                    "id": cid, "kind": rr.get("kind"), "why": "red",
-                    "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
-                    "rc": final["results"][cid].get("rc")})
-    finally:
-        if wt is not None:
-            _ci_teardown(st, wt)
+                    "id": r["id"], "kind": r.get("kind"),
+                    "why": "new_diagnostics",
+                    "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
+                    "diagnostics": new[:_CI_DIAG_LIMIT]})
+        if r.get("ratchet") == "coverage":
+            pcts = got.get("coverage") or {}
+            fired = _ci_coverage_fired(r, pcts, touched, eps)
+            res.update({"rc": got.get("rc"), "coverage": pcts,
+                        "fired": fired})
+            if fired:
+                final["unmet"].append({
+                    "id": r["id"], "kind": "coverage",
+                    "why": "coverage_ratchet", "argv": r.get("argv"),
+                    "cwd": r.get("cwd"), "thresholds": fired})
+        final["results"][r["id"]] = res
+    if red and wt is not None:
+        verdict = await _ci_confirm_red(
+            st, caps, base_sha, wt,
+            [x for x in recs if x["id"] in red],
+            durations={i: final["results"][i]["duration_sec"]
+                       for i in red if final["results"].get(i, {})
+                       .get("duration_sec") is not None})
+        final["b_star"] = verdict
+        final["budget_short_unsettled"] = list(
+            verdict.get("budget_short_unsettled") or [])
+        if verdict.get("sized_out"):
+            final["sized_out"] = list(verdict["sized_out"])
+        final["resource_affected"] = list(
+            verdict.get("resource_affected") or [])
+        final["pre_existing"] = list(
+            verdict.get("pre_existing") or [])
+        final["no_verdict"] = list(verdict.get("no_verdict") or [])
+        by_id = {x["id"]: x for x in recs}
+        for cid in verdict.get("new") or []:
+            rr = by_id[cid]
+            final["unmet"].append({
+                "id": cid, "kind": rr.get("kind"), "why": "red",
+                "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
+                "rc": final["results"][cid].get("rc")})
     ci["final"] = final
     st.save()
     _ci_sized = list(final.get("sized_out") or [])
@@ -54088,14 +54121,12 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
                                         [by_id[i] for i in chosen],
                                         prior_gate=gate, label=label,
                                         setup=setup, upto=last, **pairs)
-    try:
-        return await _confirm_sized(
-            {r["id"]: r["id"] for r in recs}, dict(durations or {}),
-            rank={}, caps=caps, overhead=0.0, label="ci parity",
-            confirm=_pass)
-    finally:
-        if base["wt"] is not None:
-            _ci_teardown(st, base["wt"])
+    # `ci-confirm-base` is kept for the run and moved by its next
+    # confirm (`_ci_worktree(reuse=True)`), never torn down here.
+    return await _confirm_sized(
+        {r["id"]: r["id"] for r in recs}, dict(durations or {}),
+        rank={}, caps=caps, overhead=0.0, label="ci parity",
+        confirm=_pass)
 
 
 async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
@@ -54108,15 +54139,18 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
     """`_ci_confirm_red`'s confirm over the checks it chose, in recorded
     order (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`). `base` is
     the sized confirm's one base worktree record `{sha, wt, prepared,
-    prereqs, upto}`: created by the first pass, kept for the rest, torn
-    down by the caller. `setup`: the checks to run once on the base tree,
+    prereqs, upto}`: created (or moved, `_ci_worktree(reuse=True)`) by the
+    first pass and kept for the rest; it starts empty for every
+    `_ci_confirm_red`, and the tree is left for the next confirm, never torn
+    down. `setup`: the checks to run once on the base tree,
     in order, before its reruns (`_ci_measure`, results unread), so it
     holds what the measurement's tree held; `base["upto"]` becomes `upto`
     once they ran."""
     cand = [r["id"] for r in recs]
     if base.get("wt") is None and base.get("sha") and not base.get("tried"):
         base["tried"] = True
-        base["wt"] = await _ci_worktree(st, "ci-confirm-base", base["sha"])
+        base["wt"] = await _ci_worktree(st, "ci-confirm-base", base["sha"],
+                                        reuse=True)
     base_wt = base.get("wt")
 
     async def _none(_t: float) -> set[str] | None:
@@ -54199,8 +54233,9 @@ async def _ci_round_regressions(st: "State", caps: dict, staging: Path,
                                 label: str) -> dict:
     """The repository's merge checks a repair round turned red (DESIGN §8 *A
     kept repair keeps the repository's merge checks green*): every gating
-    check and ratchet runs on the round's commit `post_sha` in a fresh
-    worktree. A gate red there is confirmed under B* against the round's
+    check and ratchet runs on the round's commit `post_sha` in a pristine
+    worktree of it (`ci-round`, kept and moved, `_ci_worktree(reuse=True)`).
+    A gate red there is confirmed under B* against the round's
     start `pre_sha` (`_ci_confirm_red`): only one failing every rerun on
     the commit and passing every rerun on the start is the round's — red on
     the start too is `pre_existing`, not the round's. A diagnostic ratchet
@@ -54221,95 +54256,92 @@ async def _ci_round_regressions(st: "State", caps: dict, staging: Path,
                  "checks": [r["id"] for r in recs], "broke": [],
                  "pre_existing": [], "resource_affected": [],
                  "no_verdict": [], "budget_short_unsettled": []}
-    wt = await _ci_worktree(st, "ci-round", post_sha)
+    wt = await _ci_worktree(st, "ci-round", post_sha, reuse=True)
     if wt is None:
         out["unmeasured"] = "no worktree of the round's commit"
         return out
     by_id = {r["id"]: r for r in recs}
-    try:
-        await _ci_prepare(wt, recs, st, caps, f"{label}-post")
-        raw = await _ci_measure(st, caps, wt, recs, label=f"{label}-post")
-        red = [r["id"] for r in recs
-               if r.get("gate") and not raw[r["id"]].get("passed")]
-        if red:
-            verdict = await _ci_confirm_red(
-                st, caps, pre_sha, wt, [by_id[i] for i in red],
-                durations={i: raw[i]["duration_sec"] for i in red
-                           if raw[i].get("duration_sec") is not None},
-                label=f"{label}-confirm")
-            out["b_star"] = verdict
-            for k in ("pre_existing", "resource_affected", "no_verdict",
-                      "budget_short_unsettled"):
-                out[k] = list(verdict.get(k) or [])
-            for cid in verdict.get("new") or []:
-                r = by_id[cid]
-                out["broke"].append({
-                    "id": cid, "kind": r.get("kind"), "why": "red",
-                    "argv": _ci_gate_argv(r), "cwd": r.get("cwd"),
-                    "rc": raw[cid].get("rc"),
-                    "lines": _ci_first_error_lines(
-                        _ci_log_text(raw[cid]))})
-        ratchets = [r for r in recs if r.get("ratchet")]
-        if ratchets:
-            ref = _ci_remembered(st, pre_sha, ratchets)
-            if ref is None:
-                pwt = await _ci_worktree(st, "ci-round-pre", pre_sha)
-                if pwt is not None:
-                    try:
-                        await _ci_prepare(pwt, ratchets, st, caps,
-                                          f"{label}-pre")
-                        ref = await _ci_measure(st, caps, pwt, ratchets,
-                                                label=f"{label}-pre")
-                    finally:
-                        _ci_teardown(st, pwt)
-            if ref is None:
-                out["ratchets_unmeasured"] = [r["id"] for r in ratchets]
-            else:
-                round_touched = await _ci_touched(staging, pre_sha, post_sha)
-                base_sha = ci.get("base_sha") or ""
-                eps = float(caps.get("ci_coverage_epsilon_pct",
-                                     DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
-                for r in ratchets:
-                    got, was = raw[r["id"]], ref.get(r["id"]) or {}
-                    if r["ratchet"] == "diagnostic":
-                        new = _ci_new_diagnostics(
-                            r, got.get("diagnostics") or {},
-                            was.get("diagnostics") or {}, round_touched)
-                        if new:
-                            out["broke"].append({
-                                "id": r["id"], "kind": r.get("kind"),
-                                "why": "new_diagnostics",
-                                "argv": r.get("strict_argv"),
-                                "cwd": r.get("cwd"),
-                                "diagnostics": new[:_CI_DIAG_LIMIT],
-                                "lines": [k.replace("\t", ": ") for k
-                                          in new[:_CI_ERROR_LINES]]})
-                    else:
-                        now = _ci_coverage_fired(
-                            r, got.get("coverage") or {},
-                            await _ci_touched(staging, base_sha, post_sha),
-                            eps)
-                        then = {(f["glob"], f["metric"]) for f in
-                                _ci_coverage_fired(
-                                    r, was.get("coverage") or {},
-                                    await _ci_touched(staging, base_sha,
-                                                      pre_sha), eps)}
-                        fired = [f for f in now
-                                 if (f["glob"], f["metric"]) not in then]
-                        if fired:
-                            out["broke"].append({
-                                "id": r["id"], "kind": "coverage",
-                                "why": "coverage_ratchet",
-                                "argv": r.get("argv"), "cwd": r.get("cwd"),
-                                "thresholds": fired,
-                                "lines": [f"{f['glob']} {f['metric']}: "
-                                          f"{f['final']}% (min {f['min']}%,"
-                                          f" {f['base']}% at the base)"
-                                          for f in fired[:_CI_ERROR_LINES]]})
-        _ci_remember(st, post_sha, raw, f"repair {label}")
-        st.save()
-    finally:
-        _ci_teardown(st, wt)
+    # `ci-round` (and `ci-round-pre`) are kept for the run and moved
+    # by their next use (`_ci_worktree(reuse=True)`), never torn
+    # down here.
+    await _ci_prepare(wt, recs, st, caps, f"{label}-post")
+    raw = await _ci_measure(st, caps, wt, recs, label=f"{label}-post")
+    red = [r["id"] for r in recs
+           if r.get("gate") and not raw[r["id"]].get("passed")]
+    if red:
+        verdict = await _ci_confirm_red(
+            st, caps, pre_sha, wt, [by_id[i] for i in red],
+            durations={i: raw[i]["duration_sec"] for i in red
+                       if raw[i].get("duration_sec") is not None},
+            label=f"{label}-confirm")
+        out["b_star"] = verdict
+        for k in ("pre_existing", "resource_affected", "no_verdict",
+                  "budget_short_unsettled"):
+            out[k] = list(verdict.get(k) or [])
+        for cid in verdict.get("new") or []:
+            r = by_id[cid]
+            out["broke"].append({
+                "id": cid, "kind": r.get("kind"), "why": "red",
+                "argv": _ci_gate_argv(r), "cwd": r.get("cwd"),
+                "rc": raw[cid].get("rc"),
+                "lines": _ci_first_error_lines(
+                    _ci_log_text(raw[cid]))})
+    ratchets = [r for r in recs if r.get("ratchet")]
+    if ratchets:
+        ref = _ci_remembered(st, pre_sha, ratchets)
+        if ref is None:
+            pwt = await _ci_worktree(st, "ci-round-pre", pre_sha,
+                                     reuse=True)
+            if pwt is not None:
+                await _ci_prepare(pwt, ratchets, st, caps, f"{label}-pre")
+                ref = await _ci_measure(st, caps, pwt, ratchets,
+                                        label=f"{label}-pre")
+        if ref is None:
+            out["ratchets_unmeasured"] = [r["id"] for r in ratchets]
+        else:
+            round_touched = await _ci_touched(staging, pre_sha, post_sha)
+            base_sha = ci.get("base_sha") or ""
+            eps = float(caps.get("ci_coverage_epsilon_pct",
+                                 DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
+            for r in ratchets:
+                got, was = raw[r["id"]], ref.get(r["id"]) or {}
+                if r["ratchet"] == "diagnostic":
+                    new = _ci_new_diagnostics(
+                        r, got.get("diagnostics") or {},
+                        was.get("diagnostics") or {}, round_touched)
+                    if new:
+                        out["broke"].append({
+                            "id": r["id"], "kind": r.get("kind"),
+                            "why": "new_diagnostics",
+                            "argv": r.get("strict_argv"),
+                            "cwd": r.get("cwd"),
+                            "diagnostics": new[:_CI_DIAG_LIMIT],
+                            "lines": [k.replace("\t", ": ") for k
+                                      in new[:_CI_ERROR_LINES]]})
+                else:
+                    now = _ci_coverage_fired(
+                        r, got.get("coverage") or {},
+                        await _ci_touched(staging, base_sha, post_sha),
+                        eps)
+                    then = {(f["glob"], f["metric"]) for f in
+                            _ci_coverage_fired(
+                                r, was.get("coverage") or {},
+                                await _ci_touched(staging, base_sha,
+                                                  pre_sha), eps)}
+                    fired = [f for f in now
+                             if (f["glob"], f["metric"]) not in then]
+                    if fired:
+                        out["broke"].append({
+                            "id": r["id"], "kind": "coverage",
+                            "why": "coverage_ratchet",
+                            "argv": r.get("argv"), "cwd": r.get("cwd"),
+                            "thresholds": fired,
+                            "lines": [f"{f['glob']} {f['metric']}: "
+                                      f"{f['final']}% (min {f['min']}%,"
+                                      f" {f['base']}% at the base)"
+                                      for f in fired[:_CI_ERROR_LINES]]})
+    _ci_remember(st, post_sha, raw, f"repair {label}")
+    st.save()
     if out["broke"]:
         log(f"  {label}: {len(out['broke'])} merge check(s) the round turned "
             "red: " + "; ".join(
@@ -60149,8 +60181,8 @@ async def _record_report_reproduced(st: "State", caps: dict,
 
 
 def _kept_teardown(repo: Path, wt: Path) -> None:
-    """Remove the kept helper worktree `wt` (the held-out evaluation tree, the
-    base confirm worktree) and forget every record this process keeps of its
+    """Remove the kept helper worktree `wt` (a `_reuse_or_rebuild_kept_tree`
+    consumer) and forget every record this process keeps of its
     install: a tree remade at the path installs afresh (`_forget_installs`,
     which drops its `_KEPT_TREES`/`_KEPT_INSTALLS` entries too). Absent ones
     are the idempotent case."""
@@ -60166,14 +60198,17 @@ async def _reuse_or_rebuild_kept_tree(st: "State", repo: Path, wt: Path,
     """Put the kept helper worktree `wt` at `tip`, reusing its recorded
     install in place when the install key at `tip` is the one that install
     was made from and the outputs are intact, else tearing the tree down and
-    adding it afresh. Shared by both kept-tree call sites — the held-out
+    adding it afresh. Shared by every kept tree — the held-out
     evaluation tree (DESIGN §8 *The evaluation tree is kept across a run's
     evaluations*) and the base confirm worktree, which is every base-paired
     confirm `_confirm_against_base` runs with `reuse`: B*'s `confirm-base`
     (DESIGN §9 *The base confirm worktree is kept across the run's confirms*),
     the re-drive's `redrive-base` (*The delivery re-drive's base confirm
     worktree is kept too*) and the base-form check's `base-form-base` (*The
-    base-form check's base confirm worktree is kept too*).
+    base-form check's base confirm worktree is kept too*) — and the CI-parity
+    trees `_ci_worktree` makes with `reuse`: `ci-round`, `ci-round-pre`,
+    `ci-final` and `ci-confirm-base` (*The merge checks' trees are kept
+    too*).
 
     When `wt` holds an install this process recorded (`_KEPT_INSTALLS`) and
     the install key at `tip` is the one that install was made from, the view
