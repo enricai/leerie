@@ -6945,6 +6945,31 @@ def _keyed_store(run_dir: Path, key: str, var: str) -> Path:
             / _STORE_VARS[var])
 
 
+def _adopt_install_store(tree: str, key: str) -> None:
+    """Make the keyed stores of install key `key` hold what the install in
+    `tree` just wrote to its own stores (bundler's gems): the install ran
+    before the tree had a key, so its output sits in the tree's store. Moved
+    when the keyed store is absent or empty; otherwise left (a sibling with
+    the same key filled it)."""
+    found = _tree_stores_dir(tree)
+    if found is None:
+        return
+    run_dir = found[0].parent.parent
+    for var in sorted(_KEYED_STORE_VARS):
+        src = found[1] / _STORE_VARS[var]
+        dst = _keyed_store(run_dir, key, var)
+        with contextlib.suppress(OSError):
+            if not src.is_dir() or not any(src.iterdir()):
+                continue
+            if dst.is_dir() and any(dst.iterdir()):
+                continue
+            if dst.is_dir():
+                dst.rmdir()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dst)
+            _mkdir_private(src, run_dir)
+
+
 def _tree_stores_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
     """`(tree, stores)` for the run tree `cwd` lies in
     (`<run-dir>/worktrees/<tree>`): its own stores are `<run-dir>/
@@ -50541,6 +50566,7 @@ async def _record_view_install(st: "State", view_key: str,
         if ikey is not None and snap is not None:
             _KEPT_INSTALLS[view_key] = (ikey, snap, reads)
             _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _adopt_install_store(view_key, ikey)
             _TREE_INSTALL_KEYS[view_key] = ikey
         return
     for tree_key, (tip, path) in list(_VIEWS.items()):
@@ -50555,6 +50581,7 @@ async def _record_view_install(st: "State", view_key: str,
         if ikey is not None and snap is not None:
             _VIEW_INSTALLS[view_key] = (ikey, snap, reads)
             _KEYED_INPUTS[ikey] = (list(recipe), reads)
+            _adopt_install_store(view_key, ikey)
             _TREE_INSTALL_KEYS[view_key] = ikey
         return
 
