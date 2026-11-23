@@ -73036,11 +73036,12 @@ def _redrive_keep_both_schedule(rec: dict, live: list[dict],
     (DESIGN §8 *A keep-both swing before a reconcilable probe is
     contested*). Reads the verdicts this group's `_redrive_task_required`
     already recorded (`contradiction_verdicts`; a `both_can_hold` is never
-    task-required, so `settled` was empty for it). A single pinned case this
-    item broke that is not `both_can_hold` (unsettled, or a mix) means no
-    clean joint target — it is not scheduled, and contests normally. A pair
-    already given its one swing (`keep_both_driven`) or already open is not
-    scheduled again. Returns the item indices scheduled, which the contest
+    task-required, so `settled` was empty for it). Every pinned case this item
+    broke must carry a `both_can_hold` verdict for it; one that is unsettled or
+    exclusive, or one left unjudged behind `_redrive_task_required`'s
+    short-circuit (no verdict), means no clean joint target — it is not
+    scheduled, and contests normally. A pair already given its one swing
+    (`keep_both_driven`) or already open is not scheduled again. Returns the item indices scheduled, which the contest
     skips this round. The group is still rolled back: a scheduled item is
     re-offered next round as an escalated `keep_both_case` note, never kept
     with a pinned case broken."""
@@ -73060,7 +73061,17 @@ def _redrive_keep_both_schedule(rec: dict, live: list[dict],
         vs = [v for v in verdicts if isinstance(v, dict)
               and v.get("item_index") == i
               and str(v.get("case")) in pinned_ids]
-        if not vs or not all(v.get("status") == "both_can_hold" for v in vs):
+        # EVERY pinned case the group broke must carry a both_can_hold verdict
+        # for this item. One that is unsettled or exclusive, or one left
+        # UNJUDGED behind `_redrive_task_required`'s short-circuit (it returns
+        # at the first case no item is task-required for, so later cases get no
+        # verdict), means no clean joint target: no swing, and it contests
+        # (DESIGN §8 *A keep-both swing before a reconcilable probe is
+        # contested*). Testing only the verdicts that exist would schedule a
+        # swing against a case the judge never cleared.
+        judged = {str(v.get("case")) for v in vs
+                  if v.get("status") == "both_can_hold"}
+        if judged != pinned_ids:
             continue
         key = f"keep_both:{i}"
         if key in driven or key in open_keys:
