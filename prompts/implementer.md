@@ -683,16 +683,28 @@ check out is driven again as `other`, with the reason.
 - `probe_objections` is optional, and only for a delivery re-drive note
   that hands you a falsifier probe (an `unmet_item` with `probe`). Omit it
   otherwise. Make the probe pass by fixing the production code; never
-  edit or weaken an existing test to make room for it. If you think the
-  probe is wrong, name it in `probe_test_file`, give a `kind`
-  (`input_outside_domain`: it asserts on an input this repository's code
-  never gives the entry point it calls; `contradicts_task`: it asserts
-  behaviour the task forbids; `breaks_existing_test`: making it pass
-  breaks an existing test) and say why in `reason`. A person reads it as
-  your unverified words; it exempts nothing. The orchestrator itself
-  re-runs the probe and the existing tests on your commit: a commit that
-  leaves the probe failing is rolled back, and one that makes it pass but
-  breaks a case an existing test pins is rolled back and the conflict
-  recorded for a person.
+  edit or weaken an existing test to make room for it. If making the
+  probe pass breaks an existing test, that is not a reason to stop: make
+  the production change that passes the probe and commit it — do not
+  revert to keep the old test green. Whether that existing test pins
+  behaviour the task requires to change (so it should change) or a real
+  regression is not yours to decide; the orchestrator adjudicates it on
+  your commit. You surface the conflict by committing the change, not by
+  withholding it. You may still record it — name the probe in
+  `probe_test_file`, `kind` `breaks_existing_test`, the case in `reason` —
+  but commit the passing change regardless; the note is your unverified
+  words for a person and exempts nothing. The other two kinds are for a
+  probe you believe is itself wrong, and there you must NOT force it:
+  revert your change and object, because making a wrong probe pass would
+  mark the item met on a meaningless test. `input_outside_domain` (it
+  asserts on an input this repository's code never gives the entry point
+  it calls) or `contradicts_task` (it asserts behaviour the task forbids)
+  — name it in `probe_test_file`, give the `kind`, say why in `reason`; a
+  person reads it as your unverified words; it exempts nothing. The orchestrator itself re-runs the probe
+  and the existing tests on your commit: a commit that leaves the probe
+  failing is rolled back, and one that makes it pass but breaks a case an
+  existing test pins is adjudicated — kept with the test changed where
+  the task requires it, else rolled back and the conflict recorded for a
+  person.
 
 {{include: _confidence.md}}

@@ -14909,7 +14909,13 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
      (`breaks_existing_test`), so nothing reached the check; nothing
      harmful survived
      (a blind sample's change that drops the endorsed fallback for
-     optional selects did). The conflict fired on both shown samples of
+     optional selects did). On a genuine required item that same revert
+     instead hid the conflict from the adjudication below (run-2 b738), so
+     the re-drive fixer is now told to commit the change for a
+     `breaks_existing_test` and object only a probe it believes itself
+     wrong (`input_outside_domain` / `contradicts_task`); a committed
+     change the task does not require is rolled back by the check, not
+     withheld. The conflict fired on both shown samples of
      e0d101e3, a genuine item: each fix was right and still rolled back,
      because the audit table's existing test pins the hardcoded header,
      and each also left one Spanish value identical to English, which an
@@ -15695,11 +15701,22 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    as worse, or as zero progress (below), and the probe stays shown.
 
    Nothing else contests a probe. A fixer may still say why it thinks a
-   probe is wrong (an input the product never gives the entry point, a
-   behaviour the task forbids, a test it could not keep) in
-   `probe_objections[]` (`{probe_test_file, kind: input_outside_domain |
-   contradicts_task | breaks_existing_test, reason}`). Code keeps only an
-   objection naming a probe the group was handed, records it
+   probe is itself wrong — an input the product never gives the entry
+   point (`input_outside_domain`), a behaviour the task forbids
+   (`contradicts_task`) — in `probe_objections[]` (`{probe_test_file,
+   kind, reason}`); for those it need not make the probe pass. A
+   `breaks_existing_test` objection is different: it does not say the
+   probe is wrong, only that passing it breaks an existing test — and
+   that is not a reason to withhold the change. The fixer must still make
+   the production change that passes the probe and commit it (never
+   editing the existing test itself; whether that test pins behaviour the
+   task requires to change, or a regression, is the adjudication below,
+   not the fixer's call); the objection is only its words for a person.
+   Withholding — reverting to keep the old test green, so the commit
+   changes nothing (`post_sha == pre_sha`) and no conflict is measured —
+   is the one way a genuine required item never reaches that adjudication,
+   and the fixer is told not to do it. Code keeps only an objection naming
+   a probe the group was handed, records it
    (`delivery_redrive.probe_objections[]`) and puts it in the PR as the
    fixer's unverified words; it changes no routing and no verdict. The
    first form of this rule (lane XC's branch, never released) accepted a
