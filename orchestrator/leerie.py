@@ -203,6 +203,17 @@ EFFORT_REDRIVE_ESCALATION = "high"
 MODEL_BASE_FORM_ESCALATION = "opus"
 EFFORT_BASE_FORM_ESCALATION = "high"
 
+# The model and effort of the one keep-both swing a required item's probe
+# gets when making it pass broke a pinned case the contradiction judge found
+# reconcilable (`both_can_hold`) and the implementer's own round could not
+# keep both (DESIGN §8 *A keep-both swing before a reconcilable probe is
+# contested*): a per-call override of that one swing, never a worker's
+# default. The same opus/high tier as a base-form escalation — a reconcilable
+# conflict a sonnet round missed is the same lever — kept separate so the two
+# escalation paths stay independently tunable.
+MODEL_KEEP_BOTH_ESCALATION = "opus"
+EFFORT_KEEP_BOTH_ESCALATION = "high"
+
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
@@ -68855,6 +68866,8 @@ _REDRIVE_ROUTES: dict[str, dict] = {
                         "runnable": None},
     "base_form_case": {"owner": "touching", "open": "base_form",
                        "runnable": None},
+    "keep_both_case": {"owner": "claimers", "open": "keep_both",
+                       "runnable": None},
 }
 
 
@@ -68862,15 +68875,18 @@ def _redrive_open_at_start(n: dict, *, failing: Iterable[str],
                            held: Iterable[str], cleared: Iterable[str],
                            closed: Iterable[str],
                            base_forms_open: Iterable[str],
-                           round_bf: Iterable[str]) -> bool:
+                           round_bf: Iterable[str],
+                           keep_both_open: Iterable[str] = (),
+                           round_kb: Iterable[str] = ()) -> bool:
     """Whether a routed note is still open at its group's start, by its
     kind's `open` rule (`_REDRIVE_ROUTES`): a shown set's file still
     failing (`failing`, the keys of F; a control only with a set file), a
     held-back one still failing (`held`, the keys of H), a red check not
     cleared by the start's kept measurement (`cleared`), a solution defect
     no earlier kept group drove (`closed`), a base-form note still open and
-    not yet driven this round (`base_forms_open`, `round_bf`), or always
-    (an item: re-checked after the round)."""
+    not yet driven this round (`base_forms_open`, `round_bf`), a keep-both
+    note still open and not yet driven this round (`keep_both_open`,
+    `round_kb`), or always (an item: re-checked after the round)."""
     rule = (_REDRIVE_ROUTES.get(n["kind"]) or {}).get("open")
     key = n["key"]
     if rule == "failing":
@@ -68887,6 +68903,8 @@ def _redrive_open_at_start(n: dict, *, failing: Iterable[str],
         return key not in closed
     if rule == "base_form":
         return key in base_forms_open and key not in round_bf
+    if rule == "keep_both":
+        return key in keep_both_open and key not in round_kb
     return False
 
 
@@ -69303,10 +69321,15 @@ def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
     """The shown probes a group's notes carry, as self-check sets (DESIGN
     §8 *Delivery re-drive* rule 4): `{index: "probe-i<k>", item_index, dir,
     defect_files: [file], control_files: [], support_files: [],
-    via_browser_suite?}`, one per item."""
+    via_browser_suite?}`, one per item. A `keep_both_case` note carries its
+    item's probe too (DESIGN §8 *A keep-both swing before a reconcilable
+    probe is contested*), so its swing re-runs the probe and reads a
+    `probes_after` verdict — without which a kept swing would read as zero
+    progress."""
     out: dict[int, dict] = {}
     for n in notes:
-        p_ = n.get("probe") if n.get("kind") == "unmet_item" else None
+        p_ = (n.get("probe")
+              if n.get("kind") in ("unmet_item", "keep_both_case") else None)
         i = n.get("item_index")
         if isinstance(p_, dict) and isinstance(i, int) and i not in out:
             out[i] = {"index": f"probe-i{i}", "item_index": i,
@@ -72984,6 +73007,114 @@ def _redrive_base_form_unkept(rec: dict, rnd: int, group: int,
             d["outcome"] = d["attempts"][-1].get("outcome")
 
 
+def _redrive_keep_both_open(rec: dict) -> list[dict]:
+    """The keep-both notes still to drive: an item one escalated keep-both
+    swing has not yet finished (DESIGN §8 *A keep-both swing before a
+    reconcilable probe is contested*). A probe whose made-to-pass form broke
+    only pinned cases the contradiction judge found reconcilable
+    (`both_can_hold`) gets exactly one swing on opus at effort high — the
+    fixer should be able to keep both and did not this round — before the
+    conflict rule contests it. A pair with a finished attempt
+    (`keep_both_driven`) is offered no more: the normal path contests it."""
+    out: list[dict] = []
+    for n in rec.get("keep_both_open") or []:
+        d = (rec.get("keep_both_driven") or {}).get(n["key"]) or {}
+        done = [a for a in d.get("attempts") or []
+                if a.get("outcome") != "interrupted"]
+        if not done:
+            out.append(n)
+    return out
+
+
+def _redrive_keep_both_schedule(rec: dict, live: list[dict],
+                                probe_fixed: Iterable[int],
+                                pinned: list[dict], *, rnd: int,
+                                gi: int) -> set[int]:
+    """Schedule one escalated keep-both swing for each probe item whose
+    made-to-pass probe broke only pinned cases the contradiction judge found
+    `both_can_hold` — reconcilable, so the fixer should be able to keep both
+    (DESIGN §8 *A keep-both swing before a reconcilable probe is
+    contested*). Reads the verdicts this group's `_redrive_task_required`
+    already recorded (`contradiction_verdicts`; a `both_can_hold` is never
+    task-required, so `settled` was empty for it). A single pinned case this
+    item broke that is not `both_can_hold` (unsettled, or a mix) means no
+    clean joint target — it is not scheduled, and contests normally. A pair
+    already given its one swing (`keep_both_driven`) or already open is not
+    scheduled again. Returns the item indices scheduled, which the contest
+    skips this round. The group is still rolled back: a scheduled item is
+    re-offered next round as an escalated `keep_both_case` note, never kept
+    with a pinned case broken."""
+    verdicts = rec.get("contradiction_verdicts") or []
+    by_item = {n["item_index"]: n for n in live
+               if n.get("kind") == "unmet_item"
+               and isinstance(n.get("probe"), dict)
+               and isinstance(n.get("item_index"), int)}
+    pinned_ids = {str(c.get("id")) for c in pinned}
+    driven = rec.get("keep_both_driven") or {}
+    open_keys = {n["key"] for n in rec.get("keep_both_open") or []}
+    scheduled: set[int] = set()
+    for i in probe_fixed:
+        src = by_item.get(i)
+        if src is None:
+            continue
+        vs = [v for v in verdicts if isinstance(v, dict)
+              and v.get("item_index") == i
+              and str(v.get("case")) in pinned_ids]
+        if not vs or not all(v.get("status") == "both_can_hold" for v in vs):
+            continue
+        key = f"keep_both:{i}"
+        if key in driven or key in open_keys:
+            continue
+        rec.setdefault("keep_both_open", []).append({
+            "kind": "keep_both_case", "key": key, "escalation": True,
+            "item_index": i, "item": src.get("item"),
+            "claimed_by": list(src.get("claimed_by") or []),
+            "probe": src["probe"], "evidence": src.get("evidence"),
+            "keep_pinned": sorted({str(v.get("case")) for v in vs}),
+            "round": rnd, "group": gi})
+        scheduled.add(i)
+    return scheduled
+
+
+def _redrive_keep_both_attempt(rec: dict, notes: list[dict], *, rnd: int,
+                               group: int, model: str,
+                               effort: str | None) -> None:
+    """Record an attempt at each keep-both note before it runs, `interrupted`
+    until `_redrive_keep_both_settled`; an interrupted attempt is replaced by
+    the next (mirrors `_redrive_base_form_attempt`)."""
+    for n in notes:
+        d = rec.setdefault("keep_both_driven", {}).setdefault(n["key"], {
+            "item_index": n["item_index"],
+            "keep_pinned": list(n.get("keep_pinned") or []), "attempts": []})
+        if d["attempts"] and d["attempts"][-1].get("outcome") == "interrupted":
+            d["attempts"].pop()
+        d["attempts"].append({
+            "round": rnd, "group": group, "model": model, "effort": effort,
+            "outcome": "interrupted"})
+        d["outcome"] = "interrupted"
+
+
+def _redrive_keep_both_settled(rec: dict, notes: list[dict],
+                               ge: dict) -> None:
+    """What the one keep-both swing came to, bounding the pair to it: `kept`
+    (the probe passed and no pinned case broke — the group was not voided on
+    a conflict), else `not_kept`. Either way the attempt is finished, so the
+    item is offered no keep-both swing again (`_redrive_keep_both_open`); a
+    `not_kept` pair contests on the normal path next time its probe breaks a
+    pinned case."""
+    for n in notes:
+        d = rec.setdefault("keep_both_driven", {}).setdefault(n["key"], {
+            "item_index": n["item_index"],
+            "keep_pinned": list(n.get("keep_pinned") or []),
+            "attempts": [{}]})
+        a = d["attempts"][-1]
+        a["outcome"] = "kept" if not (
+            ge.get("rolled_back") or ge.get("probe_conflict")
+            or ge.get("new_failures") or ge.get("base_form_changed")) else (
+            "not_kept")
+        d["outcome"] = a["outcome"]
+
+
 def _redrive_defects_unkept(rec: dict) -> None:
     """Groups kept and then rolled back with a flip (DESIGN §8 *Delivery
     re-drive* rule 1): a solution defect only they drove is open again —
@@ -73500,6 +73631,14 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
                                       zip(n.get("cases") or [],
                                           n.get("messages") or [])]
                           [:_REDRIVE_CASES_MAX]})
+        elif k == "keep_both_case":
+            p_ = n.get("probe") if isinstance(n.get("probe"), dict) else {}
+            shown.append({"kind": k, "item": n.get("item"),
+                          "probe": {"test_file": p_.get("file"),
+                                    "failing_case": p_.get("case_name"),
+                                    "why_it_fails": p_.get("reason")},
+                          "keep_pinned": list(n.get("keep_pinned") or [])
+                          [:_REDRIVE_CASES_MAX]})
     parts = [
         f"DELIVERY RE-DRIVE (round {rnd} of {rounds}). Your work and your "
         "siblings' work are already integrated on this tree (your cwd). The "
@@ -73524,7 +73663,17 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
         "pass as the original test wrote them while every required item of "
         "the task stays met, restoring the pinned behaviour wherever the "
         "task does not need it changed (restoring an original case in "
-        "the test file is allowed). If no change can keep both, leave that behaviour as it "
+        "the test file is allowed). kind=keep_both_case means a required "
+        "item's probe (shown with the entry) was made to pass on an earlier "
+        "attempt and doing so broke the listed `keep_pinned` case(s) of an "
+        "existing test, and a judge found both CAN hold together: this is "
+        "the escalated swing to deliver both. Make the probe pass by fixing "
+        "the item in the production code AND keep every `keep_pinned` case "
+        "passing exactly as its test already wrote it — an implementation "
+        "that branches on the inputs each case actually supplies can satisfy "
+        "both; never weaken, edit or delete the pinned test to make room, "
+        "and never fit the probe to the test. "
+        "If no change can keep both, leave that behaviour as it "
         "is and say why in your summary; never undo what the task asks "
         "for.",
         json.dumps(shown, indent=1)]
@@ -74694,6 +74843,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("defects_driven", [])
     rec.setdefault("contested_probes", [])
     rec.setdefault("contradiction_verdicts", [])
+    rec.setdefault("keep_both_open", [])
+    rec.setdefault("keep_both_driven", {})
     rec.setdefault("probe_objections", [])
     # The browser suite's prerequisites run in staging once per pass.
     suite_prepared: set[str] = set()
@@ -74845,6 +74996,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     def open_base_forms() -> list[dict]:
         return _redrive_base_form_open(rec)
 
+    def open_keep_both() -> list[dict]:
+        return _redrive_keep_both_open(rec)
+
     async def measure(subset: list[dict], label: str
                       ) -> tuple[dict[str, dict], list]:
         if not subset:
@@ -74869,7 +75023,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("evidence_handed", [])
     stopped_on_budget = False
     if not (F or (held and H_known is None) or H_known or open_items()
-            or open_checks() or open_defects() or open_base_forms()):
+            or open_checks() or open_defects() or open_base_forms()
+            or open_keep_both()):
         # An item no fixer could reproduce is still recorded (rule 4).
         record_unrouted()
         rec["done"] = True
@@ -75023,8 +75178,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             checks_open = open_checks()
             defects_open = open_defects()
             base_forms_open = open_base_forms()
+            keep_both_open = open_keep_both()
             if not held_mode and not (F or items_open or checks_open
-                                      or defects_open or base_forms_open):
+                                      or defects_open or base_forms_open
+                                      or keep_both_open):
                 rnd -= 1
                 break
             if held_mode:
@@ -75035,7 +75192,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                   else "control_regression")
                          for k, v in F.items()]
                 fallback = site_claimers
-            notes += items_open + checks_open + defects_open + base_forms_open
+            notes += (items_open + checks_open + defects_open
+                      + base_forms_open + keep_both_open)
             # The self-check every group is given runs the shown sets: a note
             # it cannot reproduce is a leerie defect, never handed on (DESIGN §8
             # *Delivery re-drive* rule 4).
@@ -75053,6 +75211,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             # A base-form note routed to several groups is driven by the first:
             # its next attempt is the next round's, routed afresh.
             round_bf: set[str] = set()
+            round_kb: set[str] = set()
             routed_items: set[int] = set()
             routed_checks = False
             for gi, g in enumerate(groups):
@@ -75092,9 +75251,11 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         f"defect(s) {', '.join(closed)} driven by an earlier "
                         "kept group — not handed on")
                 bf_open = {x["key"] for x in open_base_forms()}
+                kb_open = {x["key"] for x in open_keep_both()}
                 live = [n for n in g["notes"] if _redrive_open_at_start(
                     n, failing=F, held=H, cleared=cleared, closed=closed,
-                    base_forms_open=bf_open, round_bf=round_bf)]
+                    base_forms_open=bf_open, round_bf=round_bf,
+                    keep_both_open=kb_open, round_kb=round_kb)]
                 # A base-form escalation is driven alone: the model it is
                 # escalated to works on those cases only (DESIGN §8 *A fix that
                 # keeps both, on opus when sonnet could not*).
@@ -75145,6 +75306,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     _consume_redrive(st, m)
                 bf_live = [n for n in live if n["kind"] == "base_form_case"]
                 round_bf |= {n["key"] for n in bf_live}
+                kb_live = [n for n in live if n["kind"] == "keep_both_case"]
+                round_kb |= {n["key"] for n in kb_live}
                 _save()
                 t0 = time.monotonic()
                 # The shown sets' source, for the anti-cheat history check
@@ -75165,10 +75328,19 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     effort = EFFORT_BASE_FORM_ESCALATION
                     drive_models = {**models,
                                     "implementer": MODEL_BASE_FORM_ESCALATION}
+                elif kb_live:
+                    # A keep-both swing runs alone on opus/high (the escalation
+                    # isolation above already narrowed `live` to it).
+                    effort = EFFORT_KEEP_BOTH_ESCALATION
+                    drive_models = {**models,
+                                    "implementer": MODEL_KEEP_BOTH_ESCALATION}
                 # Each attempt at a base-form note is recorded with the model and
-                # effort it ran at before it runs.
+                # effort it ran at before it runs; a keep-both swing likewise.
                 _redrive_base_form_attempt(
                     rec, bf_live, rnd=rnd, group=gi, effort=effort,
+                    model=drive_models.get("implementer", MODEL_DEFAULT))
+                _redrive_keep_both_attempt(
+                    rec, kb_live, rnd=rnd, group=gi, effort=effort,
                     model=drive_models.get("implementer", MODEL_DEFAULT))
                 _save()
                 try:
@@ -75266,6 +75438,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         branch=_compute_run_branch(st.run_id))
                     ge["rolled_back"] = ok
                     _redrive_base_form_settled(rec, bf_live, ge)
+                    _redrive_keep_both_settled(rec, kb_live, ge)
                     drove = True
                     prior_members += [m for m in members
                                       if m not in prior_members]
@@ -75282,8 +75455,13 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     continue
                 drove = True
                 prior_members += [m for m in members if m not in prior_members]
+                # A keep-both swing drives an item too (its probe): its item is
+                # re-checked after the round like an unmet_item's, so a kept
+                # swing credits the item met at once rather than leaving it to
+                # a wasted next round that could disturb the fix.
                 routed_items |= {n["item_index"] for n in live
-                                 if n["kind"] == "unmet_item"}
+                                 if n["kind"] in ("unmet_item",
+                                                  "keep_both_case")}
                 rec["items_driven"] = sorted(set(rec["items_driven"])
                                              | routed_items)
                 routed_checks = routed_checks or any(n["kind"] == "ci_check"
@@ -75452,20 +75630,43 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         and not v["held_fixed_cases"] and not probe_fixed
                         and not ge.get("base_form_fixed"))
                     if pinned:
-                        ge["probe_conflict"] = {
-                            "items": probe_fixed,
-                            "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX]}
-                        by_item = {p_["item_index"]: p_ for p_ in probe_sets}
-                        for i in probe_fixed:
-                            rec["contested_probes"].append({
-                                "item_index": i,
-                                "probe_test_file": by_item[i]["defect_files"][0],
-                                "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX],
-                                "round": rnd, "group": gi})
-                            log(f"  delivery re-drive r{rnd} g{gi}: probe of "
-                                f"item {i} contested — making it pass broke "
-                                f"{len(pinned)} case(s) existing tests pin; "
-                                "rolled back, not driven again")
+                        # A probe whose made-to-pass form broke only pinned
+                        # cases a judge found reconcilable (`both_can_hold`)
+                        # gets one escalated keep-both swing before it is
+                        # contested (DESIGN §8 *A keep-both swing before a
+                        # reconcilable probe is contested*). The group still
+                        # rolls back below; the swing is re-offered next round
+                        # as an escalated `keep_both_case` note on opus/high.
+                        kb_sched = _redrive_keep_both_schedule(
+                            rec, live, probe_fixed, pinned, rnd=rnd, gi=gi)
+                        if kb_sched:
+                            ge["keep_both_scheduled"] = sorted(kb_sched)
+                            _save()
+                            for i in sorted(kb_sched):
+                                log(f"  delivery re-drive r{rnd} g{gi}: probe "
+                                    f"of item {i} broke only reconcilable "
+                                    "(both_can_hold) pinned case(s) — one "
+                                    "keep-both swing scheduled on opus/high, "
+                                    "not contested")
+                        contest = [i for i in probe_fixed if i not in kb_sched]
+                        if contest:
+                            ge["probe_conflict"] = {
+                                "items": contest,
+                                "tests": pinned[:_REDRIVE_CONTEST_TESTS_MAX]}
+                            by_item = {p_["item_index"]: p_
+                                       for p_ in probe_sets}
+                            for i in contest:
+                                rec["contested_probes"].append({
+                                    "item_index": i,
+                                    "probe_test_file":
+                                        by_item[i]["defect_files"][0],
+                                    "tests":
+                                        pinned[:_REDRIVE_CONTEST_TESTS_MAX],
+                                    "round": rnd, "group": gi})
+                                log(f"  delivery re-drive r{rnd} g{gi}: probe "
+                                    f"of item {i} contested — making it pass "
+                                    f"broke {len(pinned)} case(s) existing "
+                                    "tests pin; rolled back, not driven again")
                     # A conflict needs no rule of its own to roll the group
                     # back: each pinned case is a confirmed new failure (worse)
                     # or a base-form change (void).
@@ -75606,6 +75807,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                          "file": f, "round": rnd})
                             log(f"  WARNING: {reason}")
                 _redrive_base_form_settled(rec, bf_live, ge)
+                _redrive_keep_both_settled(rec, kb_live, ge)
                 if not ge.get("rolled_back"):
                     handed = [n["key"] for n in live
                               if n["kind"] == "solution_defect"]
