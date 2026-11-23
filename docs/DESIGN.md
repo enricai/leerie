@@ -15793,6 +15793,28 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    a2a825c2, with every quote verified, which is why this worker is on
    opus.
 
+   A later refinement (2026-11-23, run-2 p04) bounds which joint
+   implementation counts. The judge had ruled `both_can_hold` on a
+   stateless per-request function by positing a per-process memory of the
+   keys it had created — state a fresh request does not carry — so a fix
+   the task required was blocked. The `mutually_exclusive` fact now
+   requires the joint implementation to be one the production code could
+   run as it stands: it may distinguish the two cases only by data the
+   function has when it decides — its arguments and what it reads in that
+   same call — not by state a fresh invocation would not hold (a per-process
+   memory of records it created, a cache a restart would empty), unless the
+   code already persists that state where both cases reach it. Provenance
+   the code does not read — that a record was made earlier, that one input
+   is the newer of two — is no distinction: two inputs equal on every field
+   the deciding branch reads are the same input. The original B3 pair
+   inputs were not reconstructable, so this was re-benched on representative
+   cases (claude -p, opus high, 6 samples per arm): the cross-invocation-state
+   shape judged `exclusive` 6 of 6, and four both-can-hold shapes — a route
+   test mocking the lib against the real lib, an input selecting a different
+   redirect code, two observation times in one render, and a service whose
+   state is persisted in a store both cases reach — gave 0 false `exclusive`
+   of 24.
+
    Fitting a fix to the probe's wording (lane XC's G1: a generic passive
    "is …ed" pattern that made the probe sentence a no-op) is not caught
    by any of this, and no mechanical check is added for it. The candidate

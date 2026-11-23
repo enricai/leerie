@@ -45,11 +45,12 @@ PROMPTS = pathlib.Path(__file__).resolve().parent.parent / "prompts"
 # fixing the prompt over adding a row here.
 ALLOWLIST: dict[str, set[str]] = {
     # The prompt names the field as its section heading, "Evidence." (capital
-    # E, so the word-boundary match misses it) and describes its items. It
-    # ships byte for byte as lane B3 measured it (120 samples, pinned by
-    # tests/test_contradiction_judge.py::test_the_prompt_is_the_benched_one);
-    # a one-word edit would ship an unmeasured prompt (DESIGN §8: what ships
-    # is what was measured).
+    # E, so the word-boundary match misses it) and describes its items. It is
+    # lane B3's prompt plus the 2026-11-23 cross-invocation-state carve-out,
+    # re-benched on representative cases and pinned by
+    # tests/test_contradiction_judge.py::test_the_prompt_is_the_benched_one;
+    # an unreviewed edit would ship an unmeasured prompt (DESIGN §8: what
+    # ships is what was measured).
     "contradiction_judge": {"evidence"},
 }
 
@@ -210,9 +211,10 @@ def test_allowlist_is_empty_and_stays_deliberate(leerie):
 
     Every other required field on every worker is documented in its prompt.
     The one exemption is `contradiction_judge`'s `evidence`, whose prompt
-    must stay byte for byte the one lane B3 measured (see its row). Asserting
-    the exact contents makes adding a row a deliberate, reviewed act that
-    fails this test first — rather than a silent widening nobody sees.
+    (lane B3's plus the 2026-11-23 cross-invocation-state carve-out, re-benched)
+    is pinned by sha256 (see its row). Asserting the exact contents makes
+    adding a row a deliberate, reviewed act that fails this test first —
+    rather than a silent widening nobody sees.
     """
     assert ALLOWLIST == {"contradiction_judge": {"evidence"}}, (
         "an exemption was added to the prompt/schema parity allowlist. That "

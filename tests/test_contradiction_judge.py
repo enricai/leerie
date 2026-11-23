@@ -437,9 +437,16 @@ def test_the_status_rule(leerie):
 
 
 def test_the_prompt_is_the_benched_one(leerie):
-    """What ships is what was measured (lane B3, `h/contradiction_judge.md`,
-    sha256 39b76d30…)."""
+    """What ships is what was measured. Base: lane B3 (sha256 39b76d30…).
+    2026-11-23: the `mutually_exclusive` fact gained the cross-invocation-state
+    carve-out (run-2 p04: a `both_can_hold` built on non-persisted module
+    memory; see test_contradiction_judge_cross_invocation_state). The original
+    lane-B3 pair inputs were not reconstructable, so the carve-out was
+    re-benched on representative cases (claude -p, opus high, 6 samples/arm):
+    the cross-invocation-state shape → `exclusive` 6/6; four both-can-hold
+    shapes (route-mocks-lib, input→redirect-code, observation-timing,
+    persisted-state service) → 0 false `exclusive` of 24 (DESIGN §8 rule 4)."""
     import hashlib
     text = leerie._load_prompt("contradiction_judge")
     assert hashlib.sha256(text.encode()).hexdigest() == (
-        "39b76d30a63adafcf64156d6c9b03ed348f4132438dd6d01e0188b8082a685a0")
+        "541c19c62316e89dd420afa1a037d1ae560671996650955e7b8fe283538ca656")

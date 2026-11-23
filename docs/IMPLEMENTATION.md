@@ -1248,7 +1248,7 @@ leerie/
 │   ├── falsifier.md               tries to prove one required item undelivered with a probe test on the final tree (DESIGN §8 "Delivery detection")
 │   ├── verifiability_classifier.md types each required item in_tree or execution for the delivery ratchet (DESIGN §8 "A repair that regresses met work is rolled back")
 │   ├── observability_judge.md     types how the run can observe each required item's part: reading, test_command or neither (DESIGN §8 "A met is only what the run could observe")
-│   ├── contradiction_judge.md     whether an existing test's pinned case and a required item's probe can both pass (DESIGN §8 "Delivery re-drive" rule 4)
+│   ├── contradiction_judge.md     whether an existing test's pinned case and a required item's probe can both pass under an implementation the production code could run — not one relying on cross-invocation state the code does not persist (DESIGN §8 "Delivery re-drive" rule 4)
 │   ├── forbidden_command_extractor.md re-draws the commands the task forbids running, unioned with the classifier's (DESIGN §9 "A command the task forbids")
 │   ├── delivery_enumerator.md     lists the members of every set a judged item's checklist entry quantifies over, with its searches (DESIGN §8 "An item is judged on its declared parts, and a set it quantifies over is listed before it is judged")
 │   ├── delivery_ratchet.md        addendum to delivery_judge.md: re-verifying met items after a repair, with evidence_files (same section)
@@ -16021,7 +16021,7 @@ ever spawned without one, and no prompt is shared between call types.
 | `falsifier` | `prompts/falsifier.md` | execution-backed delivery detection (DESIGN §8 *Delivery detection*) |
 | `verifiability_classifier` | `prompts/verifiability_classifier.md` | in_tree / execution typing for the delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled back*) |
 | `observability_judge` | `prompts/observability_judge.md` | how the run can observe each required item's part (DESIGN §8 *A met is only what the run could observe*) |
-| `contradiction_judge` | `prompts/contradiction_judge.md` | whether an existing test's pinned case and a required item's probe can both pass (DESIGN §8 *Delivery re-drive* rule 4) — lane B3's prompt, byte for byte |
+| `contradiction_judge` | `prompts/contradiction_judge.md` | whether an existing test's pinned case and a required item's probe can both pass (DESIGN §8 *Delivery re-drive* rule 4) — lane B3's prompt plus the 2026-11-23 cross-invocation-state carve-out (re-benched on representative cases; DESIGN §8 rule 4) |
 | `forbidden_command_extractor` | `prompts/forbidden_command_extractor.md` | re-draws the commands the task forbids running, for the union with the classifier's (DESIGN §9 *A command the task forbids*) |
 | `delivery_ratchet` | `prompts/delivery_ratchet.md` | appended to `prompts/delivery_judge.md`: re-verifying met items after a repair (same section) |
 | `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when the run will be pushed (`not no_push`), or on a resume of a finished run that continues with a push and has no `pushed_at` and no `pr_title` (`_compose_pr_for_a_push_chosen_after_finalize`) |
