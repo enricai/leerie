@@ -97,9 +97,9 @@ GENERIC_PLACEHOLDERS = frozenset({
     # B2 measured: English, not a symbol of any codebase.
     "No.",
     # contradiction_judge.md's generic name for any test framework's
-    # assertion call (beside `expect(...)`), in the prompt lane B3 measured
-    # and that ships byte for byte (DESIGN §8: what ships is what was
-    # measured). Names no codebase's symbol.
+    # assertion call (beside `expect(...)`), in the contradiction_judge prompt
+    # (lane B3's plus the 2026-11-23 cross-invocation-state carve-out,
+    # re-benched; pinned by sha256). Names no codebase's symbol.
     "assert...",
 })
 

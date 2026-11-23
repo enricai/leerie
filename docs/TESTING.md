@@ -8827,8 +8827,13 @@ commit left failing is still a new failure, the next group is told the item
 contradicts it, and the verdict is reused without a second call. Where node
 and typescript are present, the code the two tests reach and the real facts
 script's assertion spans verify a TS verdict (a quoted `expect` passes, a
-quoted setup line of the case does not). The prompt is pinned to lane B3's
-sha256.
+quoted setup line of the case does not). The prompt is pinned by sha256
+(`test_the_prompt_is_the_benched_one`), and
+`tests/test_contradiction_judge_cross_invocation_state.py` pins the 2026-11-23
+cross-invocation-state carve-out *inside* the `mutually_exclusive` fact (a
+substance check on fact 4's load-bearing clauses and its task-blindness),
+re-benched on representative cases (0 false `exclusive` of 24; the
+cross-invocation-state shape `exclusive` 6/6).
 
 ## Every confined process has its own home
 
