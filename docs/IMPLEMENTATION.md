@@ -2941,7 +2941,14 @@ implementer's own model and effort left failing) calls the `implementer` with
 `model=MODEL_BASE_FORM_ESCALATION = "opus"` and
 `effort=EFFORT_BASE_FORM_ESCALATION = "high"`, ignoring `--model`/`--effort`
 and their per-worker forms, for that one round only (DESIGN §8 *A fix that
-keeps both, on opus when sonnet could not*).
+keeps both, on opus when sonnet could not*). A fourth, beside it: the delivery
+re-drive's one keep-both swing for a reconcilable probe (a `keep_both_case`
+note, scheduled when making an item's probe pass broke only pinned cases the
+contradiction judge found `both_can_hold`) calls the `implementer` with
+`model=MODEL_KEEP_BOTH_ESCALATION = "opus"` and
+`effort=EFFORT_KEEP_BOTH_ESCALATION = "high"`, ignoring `--model`/`--effort`
+and their per-worker forms, for that one swing only (DESIGN §8 *A keep-both
+swing before a reconcilable probe is contested*).
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -7892,6 +7899,35 @@ Where it runs:
   `_redrive_note` renders the note as `{kind, test_file, base_form: "git show
   <base>:<file>", failing: [{case, failure}]}`, adds its sentence to the
   kinds paragraph, and a `BASE-FORM CHECK:` paragraph when one is present.
+- **A keep-both swing for a reconcilable probe** (DESIGN §8 *A keep-both
+  swing before a reconcilable probe is contested*) — at the contest point, a
+  probe whose made-to-pass form broke only pinned cases the contradiction
+  judge found `both_can_hold` is not contested at once:
+  `_redrive_keep_both_schedule(rec, live, probe_fixed, pinned, *, rnd, gi)`
+  (pure) reads the verdicts this group's `_redrive_task_required` recorded
+  (`delivery_redrive.contradiction_verdicts`), and for each `probe_fixed`
+  item whose broken pinned cases are **all** `both_can_hold` and not already
+  given its swing (`keep_both_driven`) or open, appends a `keep_both_case`
+  note to `delivery_redrive.keep_both_open` — `{kind, key: "keep_both:<i>",
+  escalation: True, item_index, item, claimed_by, probe, evidence,
+  keep_pinned: [case id,…], round, group}` — and returns the items
+  scheduled, which `ge["keep_both_scheduled"]` records and the contest loop
+  skips (the others still contest). The group is still rolled back; the note
+  is routed next round by `owner="claimers"` and is live while
+  `_redrive_keep_both_open(rec)` offers its key (no finished attempt) and no
+  earlier group of the round drove it (`round_kb`). It is an `escalation`
+  note, so a group holding it drives it alone, with
+  `models["implementer"] = MODEL_KEEP_BOTH_ESCALATION` and
+  `effort = EFFORT_KEEP_BOTH_ESCALATION`. `_redrive_keep_both_attempt`
+  records the attempt `interrupted` before the drive;
+  `_redrive_keep_both_settled` marks it `kept` (no rollback / conflict /
+  new failure / base-form change) or `not_kept` after, bounding the item to
+  one swing — a `not_kept` pair's probe contests on the normal path next
+  time it breaks a pinned case. The swing's item joins `routed_items`, so the
+  round's `_redrive_recheck_items` re-reads it: a kept swing credits the item
+  met in that round rather than leaving it to a wasted next round. `_redrive_
+  note` renders the note as `{kind, item, probe: {test_file, failing_case,
+  why_it_fails}, keep_pinned}` and adds its sentence to the kinds paragraph.
 - **The tree that ships** — `_check_existing_behaviour` (above).
   `_decide_outcome` adds `_base_form_reason(existing_behaviour.changed)` to
   the reasons when it is non-empty, and
@@ -11815,15 +11851,19 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   | `ci_check` | `touching` | `uncleared` | None |
   | `solution_defect` | `touching` | `undriven` | None |
   | `base_form_case` | `touching` | `base_form` | None |
+  | `keep_both_case` | `claimers` | `keep_both` | None |
 
   A kind not in it is never routed and never open.
   `_redrive_open_at_start(n, *, failing, held, cleared, closed,
-  base_forms_open, round_bf) -> bool` (pure) reads `open`: `failing`, the
+  base_forms_open, round_bf, keep_both_open=(), round_kb=()) -> bool` (pure)
+  reads `open`: `failing`, the
   key in `failing` (F's keys); `failing_file`, the note has a `file` and its
   key is in `failing`; `held`, the key in `held` (H's keys); `always`;
   `uncleared`, the key not in `cleared`; `undriven`, not in `closed`;
   `base_form`, in `base_forms_open` (the keys of
-  `_redrive_base_form_open(rec)`) and not in `round_bf`.
+  `_redrive_base_form_open(rec)`) and not in `round_bf`; `keep_both`, in
+  `keep_both_open` (the keys of `_redrive_keep_both_open(rec)`) and not in
+  `round_kb`.
 - **Routing** (`_redrive_route(notes, subfiles, *, fallback, pending)`,
   pure), each note by its kind's `owner`. `subfiles` maps each planned subtask — plan order, status not
   `blocked` / `accepted_external`, not accept-blocked; an `unconverged` one

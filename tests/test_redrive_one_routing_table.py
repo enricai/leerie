@@ -122,7 +122,8 @@ def test_every_kind_a_note_is_built_as_has_a_route(leerie):
     # solution defects, base forms, pending controls): each states its
     # owner and its open rule, and each open rule is one the filter knows.
     built = {"defect", "control_regression", "held_defect", "held_control",
-             "unmet_item", "ci_check", "solution_defect", "base_form_case"}
+             "unmet_item", "ci_check", "solution_defect", "base_form_case",
+             "keep_both_case"}
     assert set(leerie._REDRIVE_ROUTES) == built
     for kind, r in leerie._REDRIVE_ROUTES.items():
         assert r["owner"] in ("defects", "touching", "claimers"), kind
@@ -130,12 +131,15 @@ def test_every_kind_a_note_is_built_as_has_a_route(leerie):
         n = {"kind": kind, "key": "k", "file": "f"}
         assert isinstance(leerie._redrive_open_at_start(
             n, failing={"k"}, held={"k"}, cleared=set(), closed=set(),
-            base_forms_open={"k"}, round_bf=set()), bool)
+            base_forms_open={"k"}, round_bf=set(),
+            keep_both_open={"k"}, round_kb=set()), bool)
         # Open on its own evidence, closed when that evidence says so.
         assert leerie._redrive_open_at_start(
             n, failing={"k"}, held={"k"}, cleared=set(), closed=set(),
-            base_forms_open={"k"}, round_bf=set()), kind
+            base_forms_open={"k"}, round_bf=set(),
+            keep_both_open={"k"}, round_kb=set()), kind
         assert leerie._redrive_open_at_start(
             n, failing=set(), held=set(), cleared={"k"}, closed={"k"},
-            base_forms_open=set(), round_bf={"k"}) is (
+            base_forms_open=set(), round_bf={"k"},
+            keep_both_open=set(), round_kb={"k"}) is (
                 r["open"] == "always"), kind

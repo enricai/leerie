@@ -15872,6 +15872,40 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    what the conflict adds is the record and the end of the retries:
    before it, the rolled-back probe went to the next group again.
 
+   *A keep-both swing before a reconcilable probe is contested.* Contesting
+   ends the retries for every probe that broke a pinned case, including one
+   the judge found reconcilable. But a `both_can_hold` verdict is the judge's
+   finding that an implementation keeping both exists (rule 4): the item's
+   probe can pass while the pinned case still holds. That the implementer's
+   own round did not find it is not evidence that none exists — the same gap
+   a base-form case faces when a sonnet round cannot restore it (*A fix that
+   keeps both, on opus when sonnet could not*). So before a probe that broke
+   only reconcilable cases is contested, its item gets exactly one escalated
+   keep-both swing: a typed `keep_both_case` note driven alone on
+   `MODEL_KEEP_BOTH_ESCALATION` at `EFFORT_KEEP_BOTH_ESCALATION` (opus at
+   effort high, the same tier a base-form escalation uses — a reconcilable
+   conflict a sonnet round missed is the same lever), carrying the item's
+   probe and the `keep_pinned` case(s) to hold, telling the fixer to make the
+   probe pass in the production code while keeping every pinned case exactly
+   as its test wrote it. The group that broke the pinned case is still rolled
+   back; the swing is the *next* group's drive from the rolled-back tree, not
+   a reprieve for the one that failed. A probe whose broken cases are not all
+   reconcilable — one `unsettled`, one `exclusive`, or no verdict (a case the
+   all-or-nothing `_redrive_task_required` left unjudged behind an earlier
+   case's miss) — gets no swing and contests at once, the conservative
+   outcome. The swing is bounded to one per item
+   (`delivery_redrive.keep_both_driven`, keyed by the item): if making the
+   probe pass still breaks a pinned case after it, the probe contests on the
+   normal path, exactly as it would have without the swing — so the swing can
+   only convert a reconcilable conflict the escalation resolves, never add a
+   retry to one it cannot. A swing that is kept and then flipped (*A kept
+   group that turns a met item's confirmed probe from passing to failing is
+   rolled back*) leaves the item unmet; it is not re-offered a keep-both
+   swing (its one is spent) but re-enters the normal unmet-item path. The
+   judge runs only on JS/TS, so this swing, like the conflict rule it rides
+   on, is a JS/TS path; elsewhere no `both_can_hold` verdict is produced and
+   a broken pinned case contests as before.
+
    After each
    group the orchestrator re-runs the sets and the repository's tests — a
    test command the task forbids replaced by the scoped run of the coupled

@@ -192,28 +192,67 @@ def test_an_exclusive_verdict_keeps_the_fix_and_the_test_update(
 
 
 @pytest.mark.usefixtures("pytest_facts")
-@pytest.mark.parametrize("verdict, status", [
-    (BOTH_CAN_HOLD, "both_can_hold"),
-    ({**EXCLUSIVE, "same_input_by_meaning": False}, "unsettled"),
-], ids=["both_can_hold", "exclusive_without_its_facts"])
-def test_a_verdict_that_is_not_exclusive_keeps_the_rollback(
-        leerie, tmp_path, monkeypatch, verdict, status):
-    """Today's rule, unchanged: rolled back, the probe contested and never
-    handed on again, the case a base-form change."""
-    w = Judged(leerie, tmp_path, [verdict])
+def test_an_unsettled_verdict_the_task_denies_keeps_the_rollback(
+        leerie, tmp_path, monkeypatch):
+    """An EXCLUSIVE verdict missing one of its facts is `unsettled`; the
+    intent resolver's `no` leaves today's rule: rolled back, the probe
+    contested and never handed on again, the case a base-form change, and no
+    keep-both swing (only a `both_can_hold` verdict earns one — see
+    `test_a_both_can_hold_verdict_schedules_one_keep_both_swing`)."""
+    w = Judged(leerie, tmp_path,
+               [{**EXCLUSIVE, "same_input_by_meaning": False}])
     w.edits = [_fix_and_update_test]
     rec = w.run(monkeypatch)
     [g] = _groups(rec)
     assert g["rolled_back"] is True and "task_required" not in g
+    assert "keep_both_scheduled" not in g
+    assert rec["keep_both_open"] == []
     assert any(PIN_ID in x for x in g["base_form_changed"])
     [c] = rec["contested_probes"]
     assert c["item_index"] == 0 and PIN_ID in c["tests"][0]["id"]
-    assert [v["status"] for v in rec["contradiction_verdicts"]] == [status]
+    assert [v["status"] for v in rec["contradiction_verdicts"]] == ["unsettled"]
     assert _git(w.staging, "rev-parse", "HEAD") == w.head
     assert len(w.calls) == 1
-    # Only an unsettled verdict is handed to the intent resolver; its `no`
-    # leaves the rule.
-    assert len(w.resolved) == (status == "unsettled")
+    # An unsettled verdict is handed to the intent resolver; its `no` leaves
+    # the rule.
+    assert len(w.resolved) == 1
+
+
+@pytest.mark.usefixtures("pytest_facts")
+def test_a_both_can_hold_verdict_schedules_one_keep_both_swing(
+        leerie, tmp_path, monkeypatch):
+    """A `both_can_hold` verdict no longer contests at once (DESIGN §8 *A
+    keep-both swing before a reconcilable probe is contested*): the item gets
+    one escalated keep-both swing on opus/high before the conflict rule
+    contests it. Here the probe and the pin are in truth exclusive (the
+    verdict is the stub's), so the swing cannot keep both and the probe then
+    contests — which proves the swing is bounded to one, and costs only the
+    one escalated round over the old immediate contest."""
+    w = Judged(leerie, tmp_path, [BOTH_CAN_HOLD])
+    # Round 1 makes the probe pass and breaks the pin; round 2's keep-both
+    # swing makes the probe pass again and still breaks the pin.
+    w.edits = [_fix_and_update_test,
+               lambda w: w.commit({"calc.py": HONEST})]
+    rec = w.run(monkeypatch)
+    g1, g2 = _groups(rec)
+    # Round 1: scheduled on the real both_can_hold verdict, not contested.
+    assert [v["status"] for v in rec["contradiction_verdicts"]] == [
+        "both_can_hold"]
+    assert g1.get("keep_both_scheduled") == [0]
+    # Round 1 scheduled instead of contesting: its own group carries no
+    # conflict (the contest, if any, comes only after the swing).
+    assert "probe_conflict" not in g1 and g1["rolled_back"] is True
+    [n] = rec["keep_both_open"]
+    assert n["item_index"] == 0 and any(PIN_ID in c for c in n["keep_pinned"])
+    # Round 2: the swing ran on opus/high (never the sonnet/low default).
+    d = rec["keep_both_driven"]["keep_both:0"]
+    assert (d["attempts"][-1]["model"], d["attempts"][-1]["effort"]) == (
+        "opus", "high")
+    # It could not keep both (really exclusive): contested now, bounded to one.
+    assert d["attempts"][-1]["outcome"] == "not_kept"
+    assert [c["item_index"] for c in rec["contested_probes"]] == [0]
+    assert g2.get("probe_conflict", {}).get("items") == [0]
+    assert len(w.calls) == 2
 
 
 @pytest.mark.usefixtures("pytest_facts")
