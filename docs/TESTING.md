@@ -8834,6 +8834,14 @@ cross-invocation-state carve-out *inside* the `mutually_exclusive` fact (a
 substance check on fact 4's load-bearing clauses and its task-blindness),
 re-benched on representative cases (0 false `exclusive` of 24; the
 cross-invocation-state shape `exclusive` 6/6).
+`tests/test_keep_both_every_broken_case.py` drives the real
+`_redrive_task_required` and `_redrive_keep_both_schedule` with the judge
+stubbed: when a probe breaks two pinned cases and the first is
+`both_can_hold`, the second is judged and the keep-both swing is scheduled;
+a second case `exclusive`/`unsettled` gets no swing; a first case that is
+neither stops the judging (no added judge calls); the task-required route
+stays all-or-nothing. The first two fail on the pre-fix code (barnacle
+#795 round 5: second case never judged, swing unreachable).
 
 ## Every confined process has its own home
 
