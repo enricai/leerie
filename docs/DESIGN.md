@@ -15900,7 +15900,10 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    Measured (barnacle batch, #795 round 5): a probe broke two pinned cases,
    the first was judged `both_can_hold`, the second was never judged, and the
    item contested — the swing could fire only on a single broken case. The swing is bounded to one per item
-   (`delivery_redrive.keep_both_driven`, keyed by the item): if making the
+   (`delivery_redrive.keep_both_driven`, keyed by the item), and that is its
+   whole budget: it is not drawn from its owners' re-drive rounds, which the
+   round that scheduled it has just spent (rule 8's second exception), only
+   from the re-drive's wall time. If making the
    probe pass still breaks a pinned case after it, the probe contests on the
    normal path, exactly as it would have without the swing — so the swing can
    only convert a reconcilable conflict the escalation resolves, never add a
@@ -16027,6 +16030,25 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `(item, key)` swings at most once, and termination rests solely on the
    wall clock (every swing charges it). A group whose unmet notes are all
    already-handed keys is the `budget` case and still stops there.
+   A second exception, for the same reason: an escalation the re-drive
+   schedules itself — a base-form file's opus attempt (*A fix that keeps
+   both, on opus when sonnet could not*) or an item's keep-both swing (*A
+   keep-both swing before a reconcilable probe is contested*) — is not
+   drawn from its owners' counters either. Each is scheduled only by a
+   round of those owners that failed at the same work, and that round has
+   just drawn their counter; gated on it, an escalation is unreachable
+   whenever that round was an owner's last, which with two rounds per
+   subtask, one of them often spent by the wave-end re-drive, is the
+   usual case. Its own record is its bound — one opus attempt per
+   base-form file's cases, one swing per item, each spent once an attempt
+   finishes — so a group whose live notes are a scheduled escalation is
+   driven while `redrive_budget_sec` has time left, and the round ceiling
+   does not stop one that is still open. Measured (barnacle batch 2, #795,
+   leerie 0.95.0): round 1 scheduled the keep-both swing for item 6 (every
+   pinned case its probe broke judged `both_can_hold`); its only owner had
+   spent both rounds (the wave-end re-drive and round 1), so round 2's
+   group was skipped for `budget` with 822 of the re-drive's seconds spent,
+   the swing never ran, and the run ended `unconverged` on the item.
 
 *One routing table.* Every confirmed finding goes to the owners its kind names, each a worker
 handed evidence it can run or read on its own tree, or it becomes one question to the user, or
@@ -18704,7 +18726,10 @@ after that attempt get exactly one more, on `MODEL_BASE_FORM_ESCALATION`
 (`opus`) at `EFFORT_BASE_FORM_ESCALATION` (`high`), with the same note for
 those cases only, driven alone (no other note in its group), with the same
 checks and rollback. A per-call override of that one round: no worker's
-default model changes. Why opus there and nowhere else: the cases that reach
+default model changes. The opus attempt is bounded by this record alone,
+not by its owners' re-drive rounds, which the first attempt has just drawn
+(§8 *Delivery re-drive* rule 8's second exception): only the re-drive's
+wall time stops it. Why opus there and nowhere else: the cases that reach
 it are the ones sonnet at low effort could not keep, which is where a
 stronger model is worth its cost, and only there — as the delivery re-drive
 raises effort only on its last round (`EFFORT_REDRIVE_ESCALATION`). Measured

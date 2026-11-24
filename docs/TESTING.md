@@ -8851,6 +8851,17 @@ a second case `exclusive`/`unsettled` gets no swing; a first case that is
 neither stops the judging (no added judge calls); the task-required route
 stays all-or-nothing. The first two fail on the pre-fix code (barnacle
 #795 round 5: second case never judged, swing unreachable).
+`tests/test_escalation_own_budget.py` drives the real
+`_run_delivery_redrive` with `subtask_redrive_rounds = 1`, so the round that
+schedules an escalation is its owners' last (DESIGN §8 *Delivery re-drive*
+rule 8's second exception): the keep-both swing still runs on opus/high and
+keeps both; a spent swing is not admitted again (the probe contests, one
+`escalation_swing` group in all); the base-form opus attempt runs and is
+kept; with the re-drive's wall time spent the swing is not driven; and
+`_redrive_escalation_open` reads the `escalation` mark. The first three and
+the unit test fail on the pre-fix code (barnacle batch 2 #795: the swing
+scheduled in round 1 was skipped for `budget`). The existing keep-both and
+base-form tests run with rounds to spare, which is why they never saw it.
 
 ## Every confined process has its own home
 
