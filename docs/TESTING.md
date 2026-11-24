@@ -8861,7 +8861,12 @@ kept; with the re-drive's wall time spent the swing is not driven; and
 `_redrive_escalation_open` reads the `escalation` mark. The first three and
 the unit test fail on the pre-fix code (barnacle batch 2 #795: the swing
 scheduled in round 1 was skipped for `budget`). The existing keep-both and
-base-form tests run with rounds to spare, which is why they never saw it.
+base-form tests run with rounds to spare, which is why they never saw it. Each escalation also leaves the owner's counter at the
+rounds before it (it draws none), and the #748 shape — one owner holding a
+base-form note and an unmet item, two rounds — drives the item in round 3
+after the opus attempt alone in round 2, instead of skipping it for `budget`;
+that test and both counter assertions fail on 0.96.0, which admitted an
+escalation past a spent counter but still drew a round when one was left.
 
 ## Every confined process has its own home
 

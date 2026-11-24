@@ -11,8 +11,15 @@ on that counter makes it unreachable whenever that round was their last.
 These drive the real `_run_delivery_redrive` with the owners' counter set so
 round 1 is their last (`subtask_redrive_rounds = 1`) — the existing keep-both
 and base-form tests run with rounds to spare, which is why they never saw it.
+
+Nor is an escalation drawn from the counter when one is left. Barnacle batch
+2, #748: round 2's base-form opus attempt, driven alone, drew bugfix-001's
+second round, so round 3's unmet items 2 and 5 (the same owner's) were
+skipped for `budget` with wall time left.
 """
 from __future__ import annotations
+
+import json
 
 from tests.conftest import run_git_cwd_first_stdout as _gitc
 from tests.conftest import run_git_out as _git
@@ -47,6 +54,8 @@ def test_keep_both_swing_runs_when_the_round_that_scheduled_it_was_the_last(
     assert w.st.data["delivery_gate"]["unmet_final"] == []
     assert rec["keep_both_driven"]["keep_both:0"]["attempts"][-1][
         "outcome"] == "kept"
+    # The swing drew no round: the owner's counter holds round 1 only.
+    assert list(w.st.data["redrive_rounds"].values()) == [1]
 
 
 def test_a_spent_swing_is_not_admitted_again(leerie, tmp_path, monkeypatch):
@@ -86,6 +95,58 @@ def test_base_form_opus_attempt_runs_when_the_first_was_the_last_round(
     assert [g.get("escalation_swing") for g in groups
             if not g.get("skipped")] == [None, True]
     assert _gitc(w.staging, "rev-parse", "HEAD") != start
+    # The opus attempt drew no round: the counter holds the first only.
+    assert sum(w.st.data["redrive_rounds"].values()) == 1
+
+
+def test_an_escalation_leaves_its_owners_round_to_their_other_work(
+        leerie, tmp_path, monkeypatch):
+    """The #748 shape: one owner holds a base-form note and an unmet item.
+    Round 1 drives both and fixes neither (rolled back); round 2 is the
+    base-form opus attempt, alone, and keeps the case; round 3 still has the
+    owner's second round for the item, and its fix is kept."""
+    w = _world(leerie, tmp_path, monkeypatch)
+    w.caps["subtask_redrive_rounds"] = 2
+    item = "a does X"
+    w.st.data["required_items"] = [{"item": item, "span": "S1",
+                                    "verifiability": "tree"}]
+    w.st.data["delivery_gate"]["unmet_final"] = [
+        {"item_index": 0, "item": item, "evidence": "missing",
+         "by": ["judge"]}]
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": 0, "item": item, "verdict": "unmet", "by": ["judge"]}]
+    plan_p = w.st.run_dir / "plan.json"
+    plan = json.loads(plan_p.read_text())
+    plan["subtasks"]["s1"]["claims"]["items"] = [
+        {"item_index": 0, "kind": "deliverable"}]
+    plan_p.write_text(json.dumps(plan))
+    w.st.save()
+
+    async def judge(task, its, staging, st, caps, models, efforts,
+                    phase_label, **kw):
+        text = _gitc(staging, "show", "HEAD:src/a.ts")
+        return ([] if "DONE" in text else
+                [{"item_index": 0, "item": item, "evidence": "missing"}]
+                ), 1, None
+    monkeypatch.setattr(leerie, "_delivery_judge_unmet", judge)
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+    w.edits = [lambda w: w.write("export const a = 1; // other\n"),
+               lambda w: w.write("export const a = 1; // PINNED\n"),
+               lambda w: w.write("export const a = 1; // PINNED DONE\n")]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    driven = [g for r in rec["rounds"] for g in r["groups"]
+              if not g.get("skipped")]
+    assert [sorted(g["notes"]) for g in driven] == [
+        ["base_form_case", "unmet_item"], ["base_form_case"], ["unmet_item"]]
+    assert w.models == ["sonnet", "opus", "sonnet"]
+    assert not any(g.get("skipped") == "budget" for r in rec["rounds"]
+                   for g in r["groups"])
+    assert w.st.data["redrive_rounds"] == {"s1": 2}
+    assert w.st.data["delivery_gate"]["unmet_final"] == []
+    assert "DONE" in w.a_text("HEAD")
 
 
 def test_wall_time_still_binds_an_escalation(leerie, tmp_path, monkeypatch):

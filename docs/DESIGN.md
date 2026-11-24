@@ -16048,7 +16048,13 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    pinned case its probe broke judged `both_can_hold`); its only owner had
    spent both rounds (the wave-end re-drive and round 1), so round 2's
    group was skipped for `budget` with 822 of the re-drive's seconds spent,
-   the swing never ran, and the run ended `unconverged` on the item.
+   the swing never ran, and the run ended `unconverged` on the item. Nor
+   does an escalation draw a round when its owners have one left: it is
+   driven alone, so a round it drew would be taken from the owners' other
+   work, which needs it. Measured (the same batch, #748): round 2's
+   base-form opus attempt drew bugfix-001's second round, and round 3's
+   unmet items 2 and 5, the same owner's, were skipped for `budget` with
+   wall time left.
 
 *One routing table.* Every confirmed finding goes to the owners its kind names, each a worker
 handed evidence it can run or read on its own tree, or it becomes one question to the user, or
