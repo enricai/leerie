@@ -75362,17 +75362,22 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     ge["skipped"] = "nothing_left"
                     _save()
                     continue
-                members = [m for m in g["members"]
-                           if _redrive_allowed(st, caps, m)]
-                if (not members and _redrive_time_left(st, caps)
-                        and _redrive_escalation_open(live)):
-                    # A scheduled escalation (`live` is narrowed to it above)
-                    # is bounded by its own record, not its owners' counters,
-                    # which the round that scheduled it has just drawn
-                    # (DESIGN §8 rule 8's second exception).
-                    members = list(g["members"])
-                    ge["escalation_swing"] = True
-                elif (not members and _redrive_time_left(st, caps)
+                # A scheduled escalation (`live` is narrowed to it above) is
+                # bounded by its own record and the wall clock, never by its
+                # owners' counters: the round that scheduled it has just drawn
+                # them, and drawing one more would take the round their other
+                # work still needs (DESIGN §8 rule 8's second exception).
+                escalation_group = _redrive_escalation_open(live)
+                if escalation_group:
+                    members = (list(g["members"])
+                               if _redrive_time_left(st, caps) else [])
+                    if members:
+                        ge["escalation_swing"] = True
+                else:
+                    members = [m for m in g["members"]
+                               if _redrive_allowed(st, caps, m)]
+                if (not members and not escalation_group
+                        and _redrive_time_left(st, caps)
                         and _redrive_never_handed(live, rec["evidence_handed"])):
                     # Its owners' shared counters are spent, but it still
                     # holds a drivable evidence key no worker was handed: one
@@ -75406,8 +75411,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["pre_sha"] = pre_sha
                 rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
                 drove_this_pass = True   # a drive is committed; it charges time
-                for m in members:
-                    _consume_redrive(st, m)
+                if not escalation_group:
+                    for m in members:
+                        _consume_redrive(st, m)
                 bf_live = [n for n in live if n["kind"] == "base_form_case"]
                 round_bf |= {n["key"] for n in bf_live}
                 kb_live = [n for n in live if n["kind"] == "keep_both_case"]
