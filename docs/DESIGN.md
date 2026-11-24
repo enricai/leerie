@@ -13890,7 +13890,8 @@ residual recorded, and the failing cases are shown, as tests the reader
 can run, in the run's final log and `run.json` (§6 *What is still unmet
 when the run ends is shown as tests the reader can run*). The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
-With no valid sets the judge's confirmation stands, as before — except
+With no valid sets the judge's confirmation stands, unless the falsifier
+disputes it (below), except
 when every set written was discarded because its defect cases all pass on
 this HEAD after the writer's retry (`fixed_on_head_by_execution`, below).
 That is executed evidence, not the judge's reading: the runner ran the
@@ -13902,6 +13903,31 @@ anything". Measured (barnacle 7cc87f9a, early replay, pass 3): all five
 writers' sets passed at the own start twice and were discarded on that
 reason, yet the run recorded `no valid sets` and its `no_work` read as
 judge-only.
+
+**No work rests on the bar a met item has, so the falsifier is asked
+first.** Sets that pass on HEAD, a discard as `fixed_on_head_by_execution`,
+and no valid set at all show only that the report's own scenarios pass, or
+show nothing. A required item can still be unmet, such as a root-cause item
+that a variant of the scenario breaks. A finished tree reads an item met
+only after the judge and the falsifier on that tree (*A re-check replaces a
+verdict only on a tree that changed*). A dropped subtask stands only when
+the falsifier cannot show its criterion unmet on the base (*A subtask is
+dropped as already satisfied only when the falsifier cannot show its
+criterion unmet on the base*). So before any of these three outcomes ends
+the run as no work, each required item the falsifier can probe is falsified
+on HEAD the same way (`base_claim`, the same samples, gates and B\*
+confirm). A confirmed sample is a dispute, like a failing set: the item and
+the case that shows it become the `no_work_dispute` evidence, it is recorded
+as the run's `acceptance_dispute` and counted by the same bound, and the run
+plans the work. When the previous same-task run already disputed, the run
+ends as no work with the residual recorded, as for a failing set. With no
+confirmed sample, or a falsifier that cannot run, the no work stands as
+before. Measured on barnacle #788 (leerie 0.100.0, run 8978e20f): three
+sets were discarded as fixed on HEAD and two as invalid. The judge said it
+had not run the tests, and the run ended as no work. Yet the probe that
+batch 1's falsifier confirmed (1 of 2 samples) on the tree merged as #808
+still fails on that HEAD (`1ebacc4`): a token-mint GET whose token the
+declared read sends in a header is still emitted as "single-endpoint REST".
 
 A dispute counts only once it is acted on. The run that disputed could
 still end as no work by another exit — its planners return nothing, or

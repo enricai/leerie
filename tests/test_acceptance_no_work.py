@@ -637,7 +637,7 @@ def test_run_phases_wiring(leerie):
     src = inspect.getsource(leerie._run_phases)
     # Settled after the acceptance sets exist, before planning.
     i_write = src.index("await _acceptance_write_or_skip(")
-    i_settle = src.index("await _settle_pending_no_work_failing_open(st, caps)")
+    i_settle = src.index("await _settle_pending_no_work_failing_open(st, caps, models,")
     i_plan = src.index("plans = await phase_plan(")
     assert i_write < i_settle < i_plan
     # A4: the fix-subtask set is taken BEFORE the sweep and re-checked after,
