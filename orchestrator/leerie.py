@@ -1005,6 +1005,11 @@ STATE_FIELDS = (
     # a later base-paired confirm skip reruns whose base outcome is already
     # settled. Absent on a run saved before the memo existed.
     "base_pre_existing_memo",
+    # Run-level memo of completed intermittent discoveries that failed
+    # nothing (DESIGN §9 *A tree already discovered is not discovered
+    # again*): {_discovery_memo_key(tree, base, cmd, reps, budget): result}.
+    # Absent until one is kept.
+    "discovery_memo",
     # Why the tree that ships has no failing-test-ID diff (DESIGN §6 *The
     # run outcome is decided once*, "`done` rests on measurements that
     # ran"); None once it has one.
@@ -52943,6 +52948,34 @@ def _discovery_select(ranked: list[str], durations: dict[str, float],
             if chosen else 0.0}
 
 
+def _discovery_memo_key(tree: str, base_sha: str, cmd: str, reps: int,
+                        budget: float) -> str:
+    """The inputs a discovery's result depends on (DESIGN §9 *A tree already
+    discovered is not discovered again*), as a hex SHA-256."""
+    payload = json.dumps({"tree": tree, "base": base_sha, "cmd": cmd,
+                          "reps": int(reps), "budget": float(budget)},
+                         sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _record_discovery(st: "State", key: str, out: dict) -> None:
+    """Keep `out` under `key` when it is full evidence of its tree: files
+    chosen, every required repeat run, the budget not cut, nothing failed,
+    not deferred. A failure is confirmed with its messages on every call,
+    so a result with one is never kept."""
+    if (not out.get("files") or out.get("deferred") or out.get("skipped")
+            or out.get("budget_exhausted") or out.get("failed_ids")
+            or int(out.get("repeats_run") or 0)
+            != int(out.get("repeats_required") or 0)):
+        return
+    memo = st.data.get("discovery_memo")
+    if not isinstance(memo, dict):
+        memo = {}
+        st.data["discovery_memo"] = memo
+    memo[key] = {k: v for k, v in out.items() if k not in ("_runs", "gate")}
+    st.save()
+
+
 async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                                   cmd: str, base_sha: str, *,
                                   log_path: Path, label: str,
@@ -52966,12 +52999,15 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
     repeats_required, repeats_run, budget_exhausted, failed_ids, fail_counts,
     id_files, selection?, skipped_files?, skipped?, deferred?, _runs}` (`_runs`
     carries each repeat's messages for the caller and is popped before the
-    verdict is stored). Never raises."""
+    verdict is stored). A result with the same inputs already kept
+    (`_record_discovery`) is reused, not rerun (DESIGN §9 *A tree already
+    discovered is not discovered again*). Never raises."""
     out: dict = {"coupled": {}, "files": [], "repeats_required": 0,
                  "repeats_run": 0, "budget_exhausted": False,
                  "failed_ids": [], "fail_counts": {}, "id_files": {},
                  "_runs": []}
     clock = clock or time.monotonic
+    memo_key = ""
     try:
         reps = int(caps.get("confirm_intermittent_repeats",
                             DEFAULT_CAPS["confirm_intermittent_repeats"]))
@@ -52992,6 +53028,21 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             # Without a scoped runner a repeat would run the whole suite.
             out["skipped"] = "no scoped test runner for the coupled files"
             return out
+        tree = await _worktree_tree_sha(staging)
+        if tree:
+            memo_key = _discovery_memo_key(
+                tree, base_sha, cmd, reps,
+                float(caps.get("confirm_budget_sec",
+                               DEFAULT_CAPS["confirm_budget_sec"])))
+            memo = st.data.get("discovery_memo")
+            kept = memo.get(memo_key) if isinstance(memo, dict) else None
+            if isinstance(kept, dict) and (partial_ok
+                                           or not kept.get("skipped_files")):
+                log(f"  B* {label}: discovery reused — this tree's "
+                    f"{len(kept.get('files') or [])} import-coupled test "
+                    f"file(s) already reran {kept.get('repeats_run')}/"
+                    f"{kept.get('repeats_required')} time(s) with no failure")
+                return {**copy.deepcopy(kept), "reused": True, "_runs": []}
 
         def _defer(covers: int) -> dict:
             out.update(deferred=True, repeats_required=0, skipped=(
@@ -53123,6 +53174,8 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                if out["skipped_files"] else "")
             + f"; {len(counts)} ID(s) failed at least once"
             + ("; budget exhausted" if out["budget_exhausted"] else ""))
+        if memo_key:
+            _record_discovery(st, memo_key, out)
     except Exception as e:
         out["skipped"] = f"discovery errored ({type(e).__name__}: {e})"
         log(f"  B* {label}: {out['skipped']}")

@@ -23422,6 +23422,30 @@ adds two steps:
    ten) stays covered where it matters, on the tree that ships, as evidence: if
    a round introduced one, it is reported there rather than rolling that round
    back, which no recorded round's did.
+   *A tree already discovered is not discovered again.* What a discovery
+   runs depends on nothing but its inputs: the tree, the base it couples
+   against, the command, the repeat count and the budget. So a discovery
+   that ran every repeat it required and failed nothing is kept by those
+   inputs, and a later discovery with the same inputs reuses it instead of
+   rerunning. The evidence is of that exact tree, so none of the doubts
+   about carrying test results across a change applies: no import graph has
+   to be trusted to find every dependency, and no test can have turned
+   flaky through something it does not import. The failing-test-ID diff's
+   own memo held only the latest tree, so a re-drive that moved the tree
+   and then rolled back to one already discovered discovered it again in
+   full. Measured on the barnacle held-out batch (leerie 0.93.0, 11 runs,
+   637 discovery minutes): #790's last discovery (80 files × 20, 29.7 min)
+   reran the tree its first had covered, every re-drive round between them
+   having rolled back. A discovery that failed an ID is not kept (its
+   failures are confirmed, with their messages, on every call), nor is one
+   that ran fewer repeats than required or was deferred: a shallower result
+   is not the evidence a full one is. A kept result that skipped files is
+   reused only where a partial discovery is accepted (the tree that ships);
+   off it, the rule above decides as before. Crediting a file whose import
+   closure did not change across two trees was measured too and rejected:
+   on barnacle a one-file production change reaches 636 to 1184 of ~1200
+   test files through hub modules, so what such a rule leaves to run still
+   fills the budget, and it saved no time in the batch.
 2. *Typing.* An ID is typed `intermittent_regression` only when all of
    these hold. Its base was clean: it is not in the baseline's failing IDs
    and failed none of B\*'s base reruns. It failed at least once on the
