@@ -31,7 +31,9 @@ def _test_file(module: str | None, name: str, ok: str = "True") -> str:
 
 class Run:
     """A repository with `hub.py` (reached by two tests), `leaf.py` (by one)
-    and one test that imports nothing, on a staging tree."""
+    and `other.py`, whose one test no change here reaches, on a staging tree.
+    (A test importing nothing of the product would be reached by every
+    change: `tests/test_unreached_test_coupling.py`.)"""
 
     def __init__(self, leerie, tmp_path, monkeypatch, *, forbidden=None,
                  test_other_ok: str = "True"):
@@ -48,6 +50,7 @@ class Run:
         (repo / ".gitignore").write_text(".leerie/\n__pycache__/\n")
         (repo / "hub.py").write_text("H = 1\n")
         (repo / "leaf.py").write_text("L = 1\n")
+        (repo / "other.py").write_text("O = 1\n")
         (repo / "data.json").write_text("{}\n")
         (repo / "tests" / "test_hub_a.py").write_text(
             _test_file("hub", "hub_a"))
@@ -56,7 +59,7 @@ class Run:
         (repo / "tests" / "test_leaf.py").write_text(
             _test_file("leaf", "leaf", "leaf.L == 1"))
         (repo / "tests" / "test_other.py").write_text(
-            _test_file(None, "other", test_other_ok))
+            _test_file("other", "other", test_other_ok))
         run_git_cwd_first_stdout(repo, "add", "-A")
         run_git_cwd_first_stdout(repo, "commit", "-qm", "base")
         base = run_git_cwd_first_stdout(repo, "rev-parse", "HEAD")
@@ -220,7 +223,7 @@ def test_a_changed_hub_reruns_everything_it_reaches_and_no_more(run):
 def test_a_change_reaching_every_test_runs_the_whole_command(run):
     run.measure()
     run.commit(leaf_DOT_py="L = 1\n#\n", hub_DOT_py="H = 2\n",
-               tests__test_other_DOT_py=_test_file(None, "other", "1 == 1"))
+               tests__test_other_DOT_py=_test_file("other", "other", "1 == 1"))
     res = run.measure()
     assert run.ran_whole()
     assert "carried" not in res
@@ -228,7 +231,7 @@ def test_a_change_reaching_every_test_runs_the_whole_command(run):
 
 def test_a_changed_test_file_runs_itself_and_a_new_one_too(run):
     run.measure()
-    run.commit(tests__test_other_DOT_py=_test_file(None, "other", "1 == 1"),
+    run.commit(tests__test_other_DOT_py=_test_file("other", "other", "1 == 1"),
                tests__test_new_DOT_py=_test_file(None, "new"))
     run.measure()
     assert run.ran_files() == {"tests/test_other.py", "tests/test_new.py"}
@@ -283,7 +286,7 @@ def test_a_failure_the_round_fixed_stops_being_rerun(leerie, tmp_path,
                                                      monkeypatch):
     run = Run(leerie, tmp_path, monkeypatch, test_other_ok="False")
     run.measure()
-    run.commit(tests__test_other_DOT_py=_test_file(None, "other", "True"))
+    run.commit(tests__test_other_DOT_py=_test_file("other", "other", "True"))
     assert run.measure()["passed"] is True
     run.commit(leaf_DOT_py="L = 1\n# touched\n")
     assert run.measure()["passed"] is True
@@ -475,11 +478,16 @@ def js(tmp_path):
         "src/read.ts": "export const r = 1;\n",
         "src/hub.test.ts": "import { h } from './hub';\n",
         "src/mid.test.ts": "import { m } from './mid';\n",
-        "src/other.test.ts": "export {};\n",
+        "src/other.ts": "export const o = 1;\n",
+        "src/other.test.ts": "import { o } from './other';\n",
         "src/source-reader.test.ts":
             "const t = readFileSync('src/read.ts');\n",
         "test/helper.ts": "export const k = 1;\n",
-        "src/helped.test.ts": "import { k } from '../test/helper';\n",
+        # Each imports a production file: a test importing nothing of the
+        # product is reached by every change (DESIGN §8 *A change's reach is
+        # never guessed*).
+        "src/helped.test.ts":
+            "import { k } from '../test/helper';\nimport { o } from './other';\n",
         "vitest.config.ts": "export default {};\n",
         "jest.config.ts": "export const c = 1;\n",
         "src/config-reader.test.ts": "import { c } from '../jest.config';\n",

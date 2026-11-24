@@ -57866,6 +57866,8 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
     production file themselves — the import-coupled tests of the
     intermittent-regression rule — and no changed test file on its own
     (on barnacle one module's closure reached 864-956 of ~1,200 test files).
+    Without `direct`, a test file whose imports reach no production file is
+    coupled by its text (`_unreached_test_coupling`).
     Never raises: a graph that cannot be read couples nothing through it."""
     changed = [c for c in changed if isinstance(c, str) and c]
     out: dict[str, set[str]] = {} if direct else {
@@ -57896,7 +57898,52 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
                         out.setdefault(b, set()).add(prod)
                     elif not direct:
                         stack.append(b)
+        if not direct:
+            for t, ps in _unreached_test_coupling(g, prods, globs).items():
+                out.setdefault(t, set()).update(ps)
     return {t: sorted(v) for t, v in sorted(out.items())}
+
+
+def _unreached_test_coupling(g: dict, prods: list[str],
+                             globs: list[str] | None) -> dict[str, set[str]]:
+    """The test case files of graph `g` whose import closure reaches no
+    production file, coupled by their text (DESIGN §9 *A command the task
+    forbids*): test file -> the changed production files (`prods`) whose
+    basename it names, or every one of `prods` when it names no production
+    file's basename at all. Such a test reads the product by a file read, a
+    spawned script or a tree listing, which no import shows."""
+    imp = g.get("imp") or {}
+    src = g.get("src") or {}
+    support = set(g.get("support") or ())
+
+    def test_side(p: str) -> bool:
+        return p in support or _is_test_file(p, globs)
+
+    production = {os.path.basename(p) for p in (g.get("files") or ())
+                  if not test_side(p)}
+    out: dict[str, set[str]] = {}
+    for t in g.get("files") or ():
+        if not _is_test_case_file(t, globs):
+            continue
+        seen, stack, reaches = {t}, [t], False
+        while stack and not reaches:
+            for q in imp.get(stack.pop(), ()):
+                if q in seen:
+                    continue
+                seen.add(q)
+                if not test_side(q):
+                    reaches = True
+                    break
+                stack.append(q)
+        if reaches:
+            continue
+        text = src.get(t) or ""
+        named = {p for p in prods if os.path.basename(p) in text}
+        if named:
+            out[t] = named
+        elif not any(b in text for b in production):
+            out[t] = set(prods)
+    return out
 
 
 def _change_reach(repo: str | Path, rev: str, changed: Iterable[str],
@@ -57956,6 +58003,12 @@ def _change_reach(repo: str | Path, rev: str, changed: Iterable[str],
             reached |= hit
         else:
             unknown.append(c)
+    # A test whose reach nobody can say is reached by every change; it never
+    # makes a changed path's own reach known.
+    prods = [c for c in changed if not _is_test_file(c, globs)]
+    if prods:
+        for g in graphs:
+            reached |= set(_unreached_test_coupling(g, prods, globs))
     return reached, unknown
 
 
