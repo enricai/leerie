@@ -69769,15 +69769,24 @@ async def _redrive_task_required(st: "State", caps: dict, models: dict,
     `_redrive_pinned_breaks`; `probes`, item index -> the probe the group was
     handed) — only when EVERY one is task-required by some item's probe
     (`_contradiction_verdict`, items in order, the first `exclusive` wins);
-    else {}, and the conflict rule stands. More cases than
-    `_REDRIVE_CONTEST_TESTS_MAX` are not judged."""
+    else {}, and the conflict rule stands. A case no item settles ends the
+    task-required route, but while every case judged so far has a
+    `both_can_hold` verdict the rest are judged too: the keep-both swing
+    (`_redrive_keep_both_schedule`) needs a verdict on every broken case, and
+    stopping at the first would leave a second case unjudged and the swing
+    unreachable (DESIGN §8 *A keep-both swing before a reconcilable probe is
+    contested*). More cases than `_REDRIVE_CONTEST_TESTS_MAX` are not
+    judged."""
     base = _diff_base(st) or ""
     if not pinned or not probes or not base or len(
             pinned) > _REDRIVE_CONTEST_TESTS_MAX:
         return {}
     out: dict[str, dict] = {}
+    settled_all = True
+    all_reconcilable = True
     for case in pinned:
         got = None
+        reconcilable = False
         for i in sorted(probes):
             v = await _contradiction_verdict(
                 st, caps, models, efforts, staging, rec, base=base,
@@ -69791,10 +69800,15 @@ async def _redrive_task_required(st: "State", caps: dict, models: dict,
             if _contradiction_rule(v) == "task_required":
                 got = v
                 break
+            reconcilable = reconcilable or v.get("status") == "both_can_hold"
+        all_reconcilable = all_reconcilable and reconcilable
         if got is None:
-            return {}
+            settled_all = False
+            if not all_reconcilable:
+                return {}
+            continue
         out[str(case.get("id"))] = got
-    return out
+    return out if settled_all else {}
 
 
 def _redrive_task_required_detail(v: dict) -> str:
@@ -73062,13 +73076,13 @@ def _redrive_keep_both_schedule(rec: dict, live: list[dict],
               and v.get("item_index") == i
               and str(v.get("case")) in pinned_ids]
         # EVERY pinned case the group broke must carry a both_can_hold verdict
-        # for this item. One that is unsettled or exclusive, or one left
-        # UNJUDGED behind `_redrive_task_required`'s short-circuit (it returns
-        # at the first case no item is task-required for, so later cases get no
-        # verdict), means no clean joint target: no swing, and it contests
-        # (DESIGN §8 *A keep-both swing before a reconcilable probe is
-        # contested*). Testing only the verdicts that exist would schedule a
-        # swing against a case the judge never cleared.
+        # for this item. One that is unsettled or exclusive means no clean
+        # joint target: no swing, and it contests (DESIGN §8 *A keep-both
+        # swing before a reconcilable probe is contested*).
+        # `_redrive_task_required` keeps judging while every case so far is
+        # both_can_hold, so a case is unjudged only behind one that is not;
+        # an unjudged case still blocks — testing only the verdicts that exist
+        # would schedule a swing against a case the judge never cleared.
         judged = {str(v.get("case")) for v in vs
                   if v.get("status") == "both_can_hold"}
         if judged != pinned_ids:

@@ -15890,10 +15890,16 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    as its test wrote it. The group that broke the pinned case is still rolled
    back; the swing is the *next* group's drive from the rolled-back tree, not
    a reprieve for the one that failed. A probe whose broken cases are not all
-   reconcilable — one `unsettled`, one `exclusive`, or no verdict (a case the
-   all-or-nothing `_redrive_task_required` left unjudged behind an earlier
-   case's miss) — gets no swing and contests at once, the conservative
-   outcome. The swing is bounded to one per item
+   reconcilable — one `unsettled` or one `exclusive` — gets no swing and
+   contests at once, the conservative outcome. For that rule to be
+   reachable when a probe broke more than one pinned case, every broken case
+   must carry a verdict: `_redrive_task_required` is all-or-nothing for the
+   task-required route (a case no item settles ends that route), but while
+   every case judged so far is `both_can_hold` it keeps judging the rest, so
+   the swing sees the whole set; it stops at the first case that is neither.
+   Measured (barnacle batch, #795 round 5): a probe broke two pinned cases,
+   the first was judged `both_can_hold`, the second was never judged, and the
+   item contested — the swing could fire only on a single broken case. The swing is bounded to one per item
    (`delivery_redrive.keep_both_driven`, keyed by the item): if making the
    probe pass still breaks a pinned case after it, the probe contests on the
    normal path, exactly as it would have without the swing — so the swing can

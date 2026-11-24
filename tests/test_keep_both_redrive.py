@@ -206,9 +206,8 @@ def test_schedule_only_when_every_broken_case_is_both_can_hold(leerie):
     assert n["kind"] == "keep_both_case" and n["key"] == "keep_both:0"
     assert n["escalation"] is True and n["claimed_by"] == ["s1"]
     assert n["keep_pinned"] == ["f.ts :: a", "f.ts :: b"]
-    # A pinned case left UNJUDGED — no verdict at all, because
-    # `_redrive_task_required` short-circuits at the first case no item is
-    # task-required for, so later cases get none — is not confirmed
+    # A pinned case left UNJUDGED — no verdict at all (it sat behind a case
+    # that was neither task-required nor both_can_hold) — is not confirmed
     # reconcilable: no swing (testing only the verdicts that exist, as the
     # gate did before, would schedule on the lone both_can_hold).
     rec2 = {"contradiction_verdicts": [
