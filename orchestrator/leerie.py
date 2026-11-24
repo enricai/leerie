@@ -56098,29 +56098,36 @@ def _relative_cites(v: dict, cwd: str | Path) -> dict:
         for p in parts]}
 
 
-def _part_held_by_cut_absence(p: object, tree: str | Path, record: str,
-                              cache: dict | None) -> bool:
+# An `ABSENT` claim no search checked: the bound cut its run
+# (`absent_unmeasured`), or `git grep -E` could not read its regex
+# (`bad_regex`). Neither shows the absence, and neither refutes it.
+_ABSENT_UNCHECKED = frozenset({"absent_unmeasured", "bad_regex"})
+
+
+def _part_held_by_unchecked_absence(p: object, tree: str | Path, record: str,
+                                    cache: dict | None) -> bool:
     """A part typed `met` none of whose citations verifies, one of them an
-    `ABSENT` claim whose run the bound cut (`absent_unmeasured`)."""
+    `ABSENT` claim no search checked (`_ABSENT_UNCHECKED`)."""
     if not isinstance(p, dict) or p.get("status") != "met":
         return False
     got = [_verify_delivery_cite(c, tree, record, cache)
            for c in p.get("cites") or [] if isinstance(c, dict)]
-    return ("absent_unmeasured" in got
+    return (any(g in _ABSENT_UNCHECKED for g in got)
             and not any(g in _DELIVERY_CITE_OK for g in got))
 
 
 def _part_is_mechanical_unmet(p: dict, tree: str | Path, record: str,
                               cache: dict | None = None) -> bool:
     """A `met` part a check refutes on the tree: it carries a citation that
-    verifies to a status outside success, a worker's record and a bound-cut
-    absence — a fabricated quote or a wrong line. Its unmet vote is a real
-    refutation a cut elsewhere must not hide; a `record_worker` citation
-    (leerie cannot re-run the worker) and an `absent_unmeasured` one (the
-    bound cut) are not, so a part resting only on those is no refutation."""
+    verifies to a status outside success, a worker's record and an absence
+    no search checked — a fabricated quote or a wrong line. Its unmet vote
+    is a real refutation a cut elsewhere must not hide; a `record_worker`
+    citation (leerie cannot re-run the worker) and an `_ABSENT_UNCHECKED`
+    one (the bound cut the search, or `git grep -E` could not read the
+    regex) are not, so a part resting only on those is no refutation."""
     if not isinstance(p, dict) or p.get("status") != "met":
         return False
-    soft = _DELIVERY_CITE_OK | {"record_worker", "absent_unmeasured"}
+    soft = _DELIVERY_CITE_OK | {"record_worker"} | _ABSENT_UNCHECKED
     return any(isinstance(c, dict)
                and _verify_delivery_cite(c, tree, record, cache) not in soft
                for c in p.get("cites") or [])
@@ -56136,8 +56143,8 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     item index to the checklist its verdict must answer
     (`_delivery_checklist`); a rejection for an unanswered entry is not an
     unmet vote either — `_delivery_uninspected` re-asks it — nor is a met
-    part an absence the bound cut alone holds back
-    (`_part_held_by_cut_absence`): it is typed `not_inspected`."""
+    part an absence no search checked alone holds back
+    (`_part_held_by_unchecked_absence`): it is typed `not_inspected`."""
     out = []
     for v in sample.get("verdicts") or []:
         if not isinstance(v, dict):
@@ -56167,7 +56174,7 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
             # part a check refutes on the tree (`_part_is_mechanical_unmet`)
             # keeps its unmet vote, while a part held only by a worker's
             # record rides to human verification with the cut (round 3 B).
-            held = [_part_held_by_cut_absence(p, tree, record, cache)
+            held = [_part_held_by_unchecked_absence(p, tree, record, cache)
                     for p in v["parts"]]
             if any(held) and not any(
                     _part_is_mechanical_unmet(p, tree, record, cache)

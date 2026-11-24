@@ -10748,13 +10748,14 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   falsifier lead), or an `ABSENT[:<pathspec>]` regex that `git grep -q -E -e
   <quote> HEAD -- <pathspec>` finds nowhere (exit 1; exit 0 is
   `absent_found`, anything else `bad_regex`; a run cut at
-  `DELIVERY_GREP_TIMEOUT_SEC` = 60 s is `absent_unmeasured`, logged, not
-  in `_DELIVERY_CITE_OK`, a met part no other citation verifies is typed
-  `not_inspected` by `_delivery_screen_sample` (`_part_held_by_cut_absence`)
+  `DELIVERY_GREP_TIMEOUT_SEC` = 60 s is `absent_unmeasured`, logged; neither
+  it nor `bad_regex` (no search ran: `_ABSENT_UNCHECKED`) is in
+  `_DELIVERY_CITE_OK`, and a met part no other citation verifies is typed
+  `not_inspected` by `_delivery_screen_sample` (`_part_held_by_unchecked_absence`)
   — but only when no other part of the verdict is a mechanical unmet
   (`_part_is_mechanical_unmet`: a met part with a citation that verifies
-  to a status outside `_DELIVERY_CITE_OK | {record_worker,
-  absent_unmeasured}`, i.e. a fabricated or wrong citation a check refutes
+  to a status outside `_DELIVERY_CITE_OK | {record_worker} |
+  _ABSENT_UNCHECKED`, i.e. a fabricated or wrong citation a check refutes
   on the tree); such a part's unmet vote stands against the cut, while a
   part held only by a `record_worker` citation does not and rides to human
   verification with the cut (round 3 B: otherwise a cut absence beside a

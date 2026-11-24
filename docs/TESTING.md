@@ -8935,3 +8935,18 @@ tool (backticked, or a whole word; a name that is also an English word, such as
 `Read` or `Write`, only where it does not begin a sentence) and what does not
 (`Task-Context`, "Read the file."). Falsified on origin/main
 3f73fd78's prompts: red, naming 12 prompts across 13 (prompt, worker) pairs.
+
+## An absence claim no search checked is no verdict
+
+`tests/test_unchecked_absence_no_verdict.py` (DESIGN §8 *The judge cites, and
+code checks every citation*) runs the real `_verify_delivery_cite`,
+`_delivery_screen_sample`, `_delivery_uninspected` and `_delivery_judge_unmet`
+(only `claude_p` stubbed) over a real git tree: an `ABSENT` regex `git grep -E`
+cannot read (`(?i)…`) or an empty one is `bad_regex`, in
+`_ABSENT_UNCHECKED` with `absent_unmeasured`; a met part only it holds back is
+`not_inspected` and re-asked, never an unmet vote; the #748 pass (three met
+samples, two citing `(?i)`) no longer confirms the item unmet; a made-up quote
+beside it still refutes; an absence a search found still refutes. Four of the
+five fail on the pre-fix code (barnacle batch 2 #748: item 0 confirmed unmet
+on two `(?i)` citations; 13 of 102 absence citations on met parts across both
+batches).

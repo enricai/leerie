@@ -14822,7 +14822,14 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   nothing, so the citation verifies nothing and is no finding against
   the regex either, and a `met` part only such a claim holds back was not
   inspected: it is re-asked and, still unread, unknown — never the unmet
-  vote the next sentence makes of an unverified `met`. The cut yields to
+  vote the next sentence makes of an unverified `met`. So is a regex
+  `git grep -E` cannot read (or an empty one): no search ran, so the
+  absence was neither shown nor refuted — the claim is unchecked, not
+  false. Measured (both barnacle batches): 13 of the 102 absence
+  citations on `met` parts were regexes `git grep -E` rejects, every one
+  a leading `(?i)`; counted as unmet votes, they turned an item the judge
+  found met into an unmet one in #748 (batch 2, item 0, "names no site"),
+  which alone kept that run from converging. The cut yields to
   a real refutation, never hides one: when another `met` part carries a
   citation a check on the tree refutes (a fabricated quote, a wrong line),
   that part's unmet vote stands and the item is unmet, as it would be
