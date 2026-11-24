@@ -69112,6 +69112,28 @@ def _redrive_escalation_open(notes: Iterable[dict]) -> bool:
     exception)."""
     return any(n.get("escalation") for n in notes)
 
+
+def _redrive_passing_rollback(ge: dict, live: Iterable[dict]
+                              ) -> list[tuple[int, list[str]]]:
+    """The items a rolled-back group had fixed: each `unmet_item` note in
+    `live` whose probe read `pass` on the group's commit (`probes_after`),
+    with its `evidence_keys`. A fix that passed is not a fix that did not
+    pass (DESIGN §8 *Delivery re-drive* rule 8): it was undone for harm
+    elsewhere, so its drive does not spend the item's key the first time.
+    An item whose passing probe broke a pinned case keeps its own path —
+    contested (`probe_conflict`) or given a keep-both swing
+    (`keep_both_scheduled`) — and is not one."""
+    after = ge.get("probes_after") or {}
+    own = (set((ge.get("probe_conflict") or {}).get("items") or ())
+           | set(ge.get("keep_both_scheduled") or ()))
+    out: list[tuple[int, list[str]]] = []
+    for n in live:
+        i = n.get("item_index")
+        if (n.get("kind") == "unmet_item" and isinstance(i, int)
+                and after.get(str(i)) == "pass" and i not in own):
+            out.append((i, list(n.get("evidence_keys") or ())))
+    return out
+
 # How much of a saved probe's source its evidence key reads.
 _REDRIVE_PROBE_KEY_MAX = 1 << 20
 
@@ -73696,6 +73718,13 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
             e_ = {"kind": k, "item": n.get("item"),
                   "evidence": str(n.get("evidence") or "")
                   [:_REDRIVE_EVIDENCE_MAX]}
+            pf = n.get("previous_fix")
+            if isinstance(pf, dict):
+                e_["previous_fix"] = {
+                    "made_probe_pass": True,
+                    "read_it": f"git show {pf.get('commit')}",
+                    "rolled_back_because": str(pf.get("reason") or "")
+                    [:_REDRIVE_EVIDENCE_MAX]}
             p_ = n.get("probe")
             if isinstance(p_, dict):
                 # A shown probe (rule 4): its file is in the self-check.
@@ -73768,6 +73797,16 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
         "is and say why in your summary; never undo what the task asks "
         "for.",
         json.dumps(shown, indent=1)]
+    if any(isinstance(n.get("previous_fix"), dict) for n in notes
+           if n["kind"] == "unmet_item"):
+        parts.append(
+            "PREVIOUS FIX: an unmet_item with `previous_fix` was fixed by an "
+            "earlier re-drive attempt — its probe passed on that commit — "
+            "but the commit was rolled back for the harm named in "
+            "`rolled_back_because`. Read that commit with its `read_it` "
+            "command. Keep what made the probe pass, and make the change "
+            "without that harm: the harm is listed among your entries too "
+            "and must stay fixed.")
     if any(isinstance(n.get("probe"), dict) for n in notes
            if n["kind"] == "unmet_item"):
         parts.append(
@@ -75017,7 +75056,16 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).
-        return item_split()[0]
+        notes = item_split()[0]
+        passes = rec.get("rollback_passes") or {}
+        for n in notes:
+            got = [e for k in n.get("evidence_keys") or ()
+                   for e in passes.get(f"{n['item_index']}:{k}") or ()]
+            if got:
+                last = max(got, key=lambda e: (e["round"], e["group"]))
+                n["previous_fix"] = {"commit": last["commit"],
+                                     "reason": last["reason"]}
+        return notes
 
     def unreproducible_items() -> list[dict]:
         return item_split()[1]
@@ -75822,6 +75870,26 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                             where="re-drive rollback",
                             branch=_compute_run_branch(st.run_id))
                         ge["rolled_back"] = ok
+                        passed = (_redrive_passing_rollback(ge, live)
+                                  if ok else [])
+                        if passed:
+                            # It fixed these items and was undone for harm
+                            # elsewhere: the first time, their keys read
+                            # unhanded again, and the next note hands on the
+                            # commit and why (DESIGN §8 rule 8).
+                            ge["rollback_pass"] = [i for i, _k in passed]
+                            rp = rec.setdefault("rollback_passes", {})
+                            handed = set(rec["evidence_handed"])
+                            for i, keys in passed:
+                                for k in keys:
+                                    hk = f"{i}:{k}"
+                                    rp.setdefault(hk, []).append({
+                                        "round": rnd, "group": gi,
+                                        "commit": post_sha,
+                                        "reason": ge["rollback_reason"]})
+                                    if len(rp[hk]) == 1:
+                                        handed.discard(hk)
+                            rec["evidence_handed"] = sorted(handed)
                         if not ok:
                             ge["rollback_failed"] = True
                             log("  WARNING: delivery re-drive: stopping with the "
