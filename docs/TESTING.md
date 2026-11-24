@@ -8973,3 +8973,20 @@ unchanged `pkg/other.py`, and `tests/test_one_measurement_per_change.py`'s
 `Run` and `js` fixtures give `tests/test_other.py`, `src/other.test.ts` and
 `src/helped.test.ts` a production import, since a test importing nothing is
 now coupled to, and reached by, every change.
+
+## No work rests on the bar a met item has
+
+`tests/test_no_work_falsified.py` (DESIGN §8 *No work rests on the bar a met
+item has, so the falsifier is asked first*) runs the real
+`_settle_pending_no_work` (through its fail-open wrapper),
+`_no_work_unless_falsified` and `_falsify_no_work`; the held-out results on
+HEAD and `_falsify_items` (the falsifier worker) are stubbed. With no valid
+set, and with every written set fixed on HEAD (barnacle #788's shape), a
+required item the falsifier shows unmet disputes the no work: it is asked
+with `base_claim` on HEAD over every item but the external one, and its case
+becomes the `no_work_dispute` evidence. Passing sets with nothing shown still
+end as no work, a failing set disputes without asking the falsifier, a prior
+dispute accepts at the bound, a falsifier that cannot run leaves the no work,
+and budget exhaustion inside it stops the run. All 7 fail on the pre-fix code,
+whose settle takes no models or efforts. `tests/test_acceptance_no_work.py`'s
+wiring test now reads the call with them.

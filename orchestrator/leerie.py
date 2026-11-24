@@ -747,6 +747,10 @@ STATE_FIELDS = (
     "no_work_pending",
     "no_work_acceptance",
     "acceptance_dispute",
+    # no_work_falsifier (DESIGN §8 *No work rests on the bar a met item
+    # has*): the falsifier's pass over the required items on HEAD before a
+    # no work without a failing set stands.
+    "no_work_falsifier",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
@@ -65033,10 +65037,113 @@ def _settle_case_names(set_: dict, rel: str,
     return [str(c) for c in (set_.get("cases") or {}).get(rel, [])]
 
 
-async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
+async def _falsify_no_work(st: "State", caps: dict, models: dict,
+                           efforts: dict) -> list[dict]:
+    """The required items the falsifier shows unmet on HEAD (the planning
+    worktree's commit), as `{item_index, item, case, probe, reason}` (DESIGN
+    §8 *No work rests on the bar a met item has, so the falsifier is asked
+    first*): every item `_falsifier_item` admits, falsified with
+    `base_claim` as an already-satisfied drop is. Records
+    `no_work_falsifier: {sha, skipped?, confirmed[]}`. A falsifier that
+    cannot run shows nothing."""
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    todo = [i for i, it in enumerate(normalized) if _falsifier_item(it)]
+    if not todo:
+        return []
+    await _ensure_planning_worktree(st)
+    sha = await _branch_head_sha(str(_judgment_cwd(st)))
+    if not sha:
+        return []
+    log(f"  no work: falsifier on {len(todo)} required item(s) on HEAD "
+        f"{sha[:12]} — no work stands only when no probe shows one unmet "
+        "(DESIGN §8)")
+    progress: dict = {"items": {}}
+    meta = await _falsify_items(
+        st, caps, models, efforts, sha=sha, normalized=normalized,
+        indices=todo, parts_by_idx={}, progress=progress, base_claim=True,
+        names={i: f"no-work-i{i}" for i in todo},
+        probes_root=st.run_dir / "no-work" / "probes", persist=None)
+    shown: list[dict] = []
+    for i in todo:
+        fi = (progress.get("items") or {}).get(str(i))
+        if not (isinstance(fi, dict) and fi.get("confirmed")):
+            continue
+        s_ = next((x for x in fi.get("samples") or []
+                   if isinstance(x, dict) and x.get("confirmed")), {})
+        shown.append({"item_index": i, "item": normalized[i]["item"][:400],
+                      "case": str(s_.get("case_name") or "")[:300],
+                      "probe": str(s_.get("probe_path") or ""),
+                      "reason": str(s_.get("reason") or "")[:600]})
+    st.data["no_work_falsifier"] = {
+        "sha": sha, "confirmed": shown,
+        **({"skipped": meta["skipped"]} if meta.get("skipped") else {})}
+    st.save()
+    if meta.get("skipped"):
+        log(f"  no work: falsifier not run — {meta['skipped']}")
+    return shown
+
+
+async def _no_work_unless_falsified(st: "State", caps: dict, models: dict,
+                                    efforts: dict, record: dict,
+                                    basis: str) -> bool:
+    """End the run as no work on `basis`, recording `record` as its
+    `no_work_acceptance`, unless the falsifier shows a required item unmet
+    on HEAD (`_falsify_no_work`): then a dispute, bounded as a failing
+    set's is (DESIGN §8 *No work rests on the bar a met item has*). Returns
+    True when the run ended as no work."""
+    shown = await _falsify_no_work(st, caps, models, efforts)
+    if not shown:
+        st.data["no_work_acceptance"] = record
+        _finish_no_work_run(st, {"<confirmed already-satisfied>": basis})
+        return True
+    cases = [f"item {d['item_index']}: {d['case'] or d['probe']}"
+             for d in shown][:20]
+    if _prior_acceptance_dispute(st):
+        st.data["no_work_acceptance"] = {
+            **record, "verdict": "accepted after dispute", "falsifier": shown}
+        st.data["acceptance_dispute"] = {
+            "failing_sets": 0, "total_sets": 0, "cases": cases,
+            "falsifier": True, "accepted": True}
+        log("  WARNING: a falsifier probe still shows required item(s) unmet "
+            "on HEAD, but the previous run of this task already disputed — "
+            "accepting no work (the dispute bound). " + "; ".join(cases[:5]))
+        _finish_no_work_run(st, {"<confirmed already-satisfied>": (
+            basis + " — accepted at the acceptance-dispute bound; a "
+            "falsifier probe still shows " + "; ".join(cases[:5]))})
+        return True
+    st.data["no_work_acceptance"] = {
+        **record, "verdict": "falsifier dispute", "falsifier": shown}
+    st.data["acceptance_dispute"] = {
+        "failing_sets": 0, "total_sets": 0, "cases": cases,
+        "falsifier": True}
+    if (_prior_acceptance_dispute_record(st) or {}).get("unacted"):
+        st.data["acceptance_dispute"]["redispute"] = True
+    conf = st.data.get("no_work_confirmation") or {}
+    st.data["no_work_dispute"] = {
+        "classifier_evidence": conf.get("classifier_evidence", ""),
+        "judge_evidence": (
+            "A falsifier probe shows required item(s) unmet on HEAD: "
+            + "; ".join(f"item {d['item_index']} (\"{d['item'][:200]}\"): "
+                        f"{d['case'] or d['probe']} — {d['reason'][:400]}"
+                        for d in shown)),
+        "checked": []}
+    st.data.pop("no_work_pending", None)
+    st.save()
+    log(f"  no-work confirmation DISPUTED by the falsifier on HEAD "
+        f"({len(shown)} required item(s) shown unmet) — planning the work")
+    return False
+
+
+async def _settle_pending_no_work(st: "State", caps: dict,
+                                  models: dict | None = None,
+                                  efforts: dict | None = None) -> bool:
     """Decide a held no-work confirmation on executed evidence (DESIGN §8
     *No work is declared on executed evidence, and a dispute is
-    bounded*). Returns True when the run ended as no work."""
+    bounded*). Every way it ends the run as no work without a failing set
+    first asks the falsifier (`_no_work_unless_falsified`). Returns True
+    when the run ended as no work."""
+    models, efforts = models or {}, efforts or {}
     conf = st.data.get("no_work_confirmation") or {}
     judge_evidence = conf.get("judge_evidence") or ""
     res = await _acceptance_results_on_head(st, caps)
@@ -65045,31 +65152,28 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         # Every set written was discarded because its defect cases pass on
         # this HEAD: executed evidence, not the judge's reading.
         acc = st.data.get("acceptance") or {}
-        st.data["no_work_acceptance"] = {
-            "verdict": "fixed_on_head_by_execution",
-            "discarded": list(acc.get("discarded") or [])}
-        _finish_no_work_run(st, {"<confirmed already-satisfied>":
-                                 judge_evidence + " — and every held-out "
-                                 "acceptance set's defect cases pass on HEAD "
-                                 "(fixed_on_head_by_execution)"})
-        return True
+        return await _no_work_unless_falsified(
+            st, caps, models, efforts,
+            {"verdict": "fixed_on_head_by_execution",
+             "discarded": list(acc.get("discarded") or [])},
+            judge_evidence + " — and every held-out acceptance set's defect "
+            "cases pass on HEAD (fixed_on_head_by_execution)")
     if res is None or not _acceptance_measured(res):
         # No valid sets, or none could be run on HEAD: no evidence either
-        # way, so the judge's confirmation stands (as before this check).
-        st.data["no_work_acceptance"] = {
-            "verdict": "no valid sets" if res is None else "not measurable"}
-        _finish_no_work_run(st, {"<confirmed already-satisfied>":
-                                 judge_evidence})
-        return True
+        # way, so the judge's confirmation stands unless the falsifier shows
+        # an item unmet.
+        return await _no_work_unless_falsified(
+            st, caps, models, efforts,
+            {"verdict": "no valid sets" if res is None else "not measurable"},
+            judge_evidence)
     if not _acceptance_work_fails(
             res, (st.data.get("acceptance") or {}).get("sets") or []):
         # A variant set failing is not work (DESIGN §8 *A task that points
         # at a report is bounded by the report's own scenarios*).
-        st.data["no_work_acceptance"] = {"verdict": "pass", "results": res}
-        _finish_no_work_run(st, {"<confirmed already-satisfied>":
-                                 judge_evidence + " — and the held-out "
-                                 "acceptance sets pass on HEAD"})
-        return True
+        return await _no_work_unless_falsified(
+            st, caps, models, efforts, {"verdict": "pass", "results": res},
+            judge_evidence + " — and the held-out acceptance sets pass on "
+            "HEAD")
     sets = {s_["index"]: s_ for s_ in
             (st.data.get("acceptance") or {}).get("sets") or []}
     # Counts are over measured sets only: an unrunnable set is no evidence.
@@ -65149,13 +65253,17 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     return False
 
 
-async def _settle_pending_no_work_failing_open(st: "State",
-                                              caps: dict) -> bool:
+async def _settle_pending_no_work_failing_open(
+        st: "State", caps: dict, models: dict | None = None,
+        efforts: dict | None = None) -> bool:
     """`_settle_pending_no_work`, failing open toward the judge's
     confirmation on any error, as with no valid sets: the acceptance check
     is evidence, not a gate that may crash the run."""
     try:
-        return await _settle_pending_no_work(st, caps)
+        return await _settle_pending_no_work(st, caps, models, efforts)
+    except WorkerError:
+        # Budget exhaustion is the hard backstop: it stops the run.
+        raise
     except Exception as e:
         log(f"acceptance: settling the held no-work confirmation raised "
             f"{type(e).__name__}: {e} — the judge's confirmation stands")
@@ -84477,7 +84585,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             return
         if (st.data.get("no_work_pending")
                 and "no_work_acceptance" not in st.data):
-            if await _settle_pending_no_work_failing_open(st, caps):
+            if await _settle_pending_no_work_failing_open(st, caps, models,
+                                                          efforts):
                 return
 
         if "plans_after_plan" not in st.data:
