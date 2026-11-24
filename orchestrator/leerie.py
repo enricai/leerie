@@ -69099,6 +69099,19 @@ def _redrive_never_handed(notes: Iterable[dict], handed: Iterable[str]
                for k in n.get("evidence_keys") or ())
 
 
+
+def _redrive_escalation_open(notes: Iterable[dict]) -> bool:
+    """Whether any of `notes` is a scheduled escalation — a base-form file's
+    opus attempt or an item's keep-both swing (`escalation: True`). The open
+    lists that produce them (`_redrive_base_form_open`,
+    `_redrive_keep_both_open`) offer one only until an attempt at it
+    finishes, so that record is its bound. It is never its owners' shared
+    round counter: the failed round that scheduled it has just drawn that
+    counter, so gated on it the escalation could not run whenever that round
+    was an owner's last (DESIGN §8 *Delivery re-drive* rule 8's second
+    exception)."""
+    return any(n.get("escalation") for n in notes)
+
 # How much of a saved probe's source its evidence key reads.
 _REDRIVE_PROBE_KEY_MAX = 1 << 20
 
@@ -75231,14 +75244,19 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 stopped_on_budget = True
                 break
             rnd += 1
-            if rnd > max_rounds and not _redrive_never_handed(
-                    open_items(), rec["evidence_handed"]):
+            if (rnd > max_rounds
+                    and not _redrive_never_handed(open_items(),
+                                                  rec["evidence_handed"])
+                    and not _redrive_escalation_open(open_base_forms()
+                                                     + open_keep_both())):
                 # Every driven round spends a member's counter, so this never
                 # binds while the budget check holds; it keeps a broken one
                 # from spinning. A drivable item whose evidence no worker was
                 # handed is the exception (DESIGN §8 rule 8): it takes its
                 # swing whatever the count, bounded only by the budget check
-                # above — the count must not stop a first attempt.
+                # above — the count must not stop a first attempt. So is a
+                # scheduled escalation not yet attempted (rule 8's second
+                # exception): its own record bounds it.
                 log("  delivery re-drive: round ceiling reached — stopping")
                 break
             held_mode = False
@@ -75347,6 +75365,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 members = [m for m in g["members"]
                            if _redrive_allowed(st, caps, m)]
                 if (not members and _redrive_time_left(st, caps)
+                        and _redrive_escalation_open(live)):
+                    # A scheduled escalation (`live` is narrowed to it above)
+                    # is bounded by its own record, not its owners' counters,
+                    # which the round that scheduled it has just drawn
+                    # (DESIGN §8 rule 8's second exception).
+                    members = list(g["members"])
+                    ge["escalation_swing"] = True
+                elif (not members and _redrive_time_left(st, caps)
                         and _redrive_never_handed(live, rec["evidence_handed"])):
                     # Its owners' shared counters are spent, but it still
                     # holds a drivable evidence key no worker was handed: one
