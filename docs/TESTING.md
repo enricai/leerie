@@ -8950,3 +8950,26 @@ beside it still refutes; an absence a search found still refutes. Four of the
 five fail on the pre-fix code (barnacle batch 2 #748: item 0 confirmed unmet
 on two `(?i)` citations; 13 of 102 absence citations on met parts across both
 batches).
+
+## A test whose imports reach no production file is coupled by its text
+
+`tests/test_unreached_test_coupling.py` (DESIGN §9 *A command the task
+forbids*) runs the real `_coupled_test_files` and `_measure_axes` (only the
+command run stubbed) over a real git tree. A test that imports nothing of the
+product and names no production file (a tree-reading guard, a test of a
+test-support module) is coupled to every change. A test that names a
+production file (an end-to-end test spawning a script, in JS/TS or Python) is
+coupled to that file only. An import-coupled test keeps its import coupling,
+`direct=True` stays imports-only, and a forbidden suite's scoped replacement
+runs the guard. `_change_reach` reaches the import-less, name-less test from
+every change, so the narrowing never carries its pass, and a path no graph
+holds stays unknown. Four of the five fail on the pre-fix code; the `direct`
+one passes on both. Barnacle #800 (0.95.0): the shipped tree's scoped set was the
+666 import-coupled files without the repository's vocabulary guard. With this
+change it is 756 files and includes it. The guard fails on that tree and passes
+on its base. The shared `_coupled_repo` fixture in
+`tests/test_forbidden_commands.py` now has `tests/test_other.py` import the
+unchanged `pkg/other.py`, and `tests/test_one_measurement_per_change.py`'s
+`Run` and `js` fixtures give `tests/test_other.py`, `src/other.test.ts` and
+`src/helped.test.ts` a production import, since a test importing nothing is
+now coupled to, and reached by, every change.

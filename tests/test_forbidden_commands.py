@@ -1012,7 +1012,9 @@ def _coupled_repo(tmp_path):
     `src/lib/rand.test.ts` and through `src/app/loader.ts` by
     `src/app/loader.e2e.test.ts`; `src/other.test.ts` imports neither. A
     Python half: `pkg/core.py` imported by `tests/test_core.py` via
-    `pkg/api.py`."""
+    `pkg/api.py`; `tests/test_other.py` imports the unchanged `pkg/other.py`
+    (a test importing nothing of the product is coupled by its text,
+    `tests/test_unreached_test_coupling.py`)."""
     root = tmp_path / "repo"
     files = {
         ".leerie/config.toml": 'test = "pnpm run test"\n',
@@ -1028,7 +1030,8 @@ def _coupled_repo(tmp_path):
         "pkg/core.py": "X = 1\n",
         "pkg/api.py": "from .core import X\n",
         "tests/test_core.py": "from pkg import api\n",
-        "tests/test_other.py": "import json\n",
+        "pkg/other.py": "Y = 1\n",
+        "tests/test_other.py": "from pkg import other\n",
     }
     for rel, text in files.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)

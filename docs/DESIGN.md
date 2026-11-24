@@ -16817,10 +16817,12 @@ language leerie has no graph for, so a Go or Rust repository keeps running
 whole on every tree that differs — or a runner's configuration, or a file that reaches no test at
 all, since a `conftest.py` or `setupFiles` entry is reached through the runner,
 never an import. A run whose report does not account for its verdict (a red exit
-with no failing case, a failing case with no file) empties the ledger. What this
-cannot see is a test that finds a source file by directory walk without naming
-it: the replay below found none, and the first measurement of the integrated
-tree is whole regardless.
+with no failing case, a failing case with no file) empties the ledger. A test
+that finds source files by a directory walk or a tree listing, without importing
+or naming any production file, has a reach nobody can say. It is reached by every
+change, as it is coupled to every change under a forbidden command (§9 *A command
+the task forbids*). The replay below found none. Barnacle #800 has one: its
+vocabulary guard lists `src/` and reads every file.
 
 **The replay**, mechanical and with no worker call, of the selection over the
 actual commits and failures of the 40 recorded runs with two or more measurements
@@ -22175,6 +22177,19 @@ Three layers follow, each derived from that one list:
   production file. The closure comes from the mechanical import graph:
   JS/TS import specifiers, and Python `import` statements read with
   `ast`. These are *the coupled tests*.
+  A test whose import closure reaches no production file reaches the
+  product some other way: it reads files, spawns a script, or lists the
+  tree. The graph cannot say what it reads, so its text decides. It is
+  coupled to a changed file whose basename it names. When it names no
+  production file at all, it is coupled to every change. An unknown reach
+  is measured, never assumed empty. Measured on barnacle #800 (leerie
+  0.95.0): the run added a comment carrying a word the repository's own
+  vocabulary guard forbids under `src/`. That guard reads every tracked
+  file and imports nothing of the product, so it was not among the 666
+  coupled tests the scoped run measured. The run shipped `done`, and the
+  PR's CI failed on that test. On that repository 97 of 1,442 test files
+  import no production file: 87 name one (most of them end-to-end tests
+  that spawn a script), and 10 name none.
   The baseline has no changes to couple to, so its test axis is recorded
   `skip_kind: scoped_at_final`. For the ID diff, a scoped final result
   starts from an empty base list, and B\* reruns each candidate on the
