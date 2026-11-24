@@ -8867,6 +8867,18 @@ base-form note and an unmet item, two rounds — drives the item in round 3
 after the opus attempt alone in round 2, instead of skipping it for `budget`;
 that test and both counter assertions fail on 0.96.0, which admitted an
 escalation past a spent counter but still drew a round when one was left.
+`tests/test_passing_rollback_not_spent.py` drives the real
+`_run_delivery_redrive` (the shown-probe World with the run's own subtask
+having added the pinning test, so breaking it is a new failure and not a
+pinned conflict) with one round per owner (DESIGN §8 rule 8, *A fix that
+passed is not a fix that did not pass*): a group that made the probe pass
+and was rolled back is driven again, its note carrying the rolled-back
+commit (`git show`) and the reason, and the second drive is kept; a second
+probe-passing rollback spends the key (two drives, the item unmet); a
+rollback whose probe still failed spends it as before; a pinned conflict
+keeps its contest path; `_redrive_passing_rollback` reads typed fields
+only. The first two and the unit test fail on the pre-fix code (both
+barnacle batches: 10 probe-passing rollbacks of 12 items, 11 of them ended unmet).
 
 ## Every confined process has its own home
 

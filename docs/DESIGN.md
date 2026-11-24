@@ -16030,6 +16030,26 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    `(item, key)` swings at most once, and termination rests solely on the
    wall clock (every swing charges it). A group whose unmet notes are all
    already-handed keys is the `budget` case and still stops there.
+   A fix that passed is not a fix that did not pass. A group whose commit
+   made an item's probe pass and was rolled back for harm elsewhere — a
+   test it newly broke, a merge check it turned red, a met item it made
+   unmet, a test closure it changed — did not fail at that item, so its
+   drive does not spend the item's key the first time: the key reads
+   unhanded again (`delivery_redrive.rollback_passes`, the commit and the
+   reason per key), and the item's next note carries that commit, to read
+   with `git show`, and why it was undone, so the next fixer keeps what made
+   the probe pass and avoids the harm. The harm itself is already a
+   pending control (*after each*), so the next round is also held to it. A
+   second probe-passing rollback of the same key spends it, so each key
+   gets at most two drives on this path; a rollback whose probe still
+   failed spends the key as before, and a probe that broke a pinned case
+   keeps its own path (the conflict and the keep-both swing). Measured
+   (both barnacle batches, 0.93.0 and 0.95.0): 10 groups made the probes
+   of 12 items pass and were rolled back — newly failing tests four times,
+   one lint error three times, a pinned case, a met item made unmet, a test
+   closure changed — and 11 of those 12 items ended unmet, in 7 unconverged
+   runs; most were never driven again, skipped for `budget` with wall time
+   left, and no later fixer was told the fix had worked.
    A second exception, for the same reason: an escalation the re-drive
    schedules itself — a base-form file's opus attempt (*A fix that keeps
    both, on opus when sonnet could not*) or an item's keep-both swing (*A
