@@ -10019,6 +10019,19 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   the verdict is stored. `clock` (default `time.monotonic`) is injectable.
   Never raises. `_ratchet_exec` (N5) calls the same function, so each of
   its calls is bounded the same way.
+  *Reuse* (DESIGN §9 *A tree already discovered is not discovered again*):
+  once the coupled files are known, `_discovery_memo_key(tree, base_sha,
+  cmd, reps, budget)` (hex SHA-256 of a canonical JSON of the five; `tree`
+  is `_worktree_tree_sha(staging)`, and when that is None — a dirty tree —
+  nothing is served or stored) looks up
+  `state.data["discovery_memo"]`; an entry is reused when `partial_ok` or
+  it has no `skipped_files`, logging `B* <label>: discovery reused — this
+  tree's <n> import-coupled test file(s) already reran <r>/<r> time(s) with
+  no failure` and returning a copy with `reused: true` and `_runs: []`.
+  `_record_discovery(st, key, out)` keeps a result (without `_runs` and
+  `gate`) only when it chose files, ran `repeats_run ==
+  repeats_required`, has no `budget_exhausted`, no `failed_ids` and no
+  `deferred`/`skipped`.
 - `_runner_report_file_durations(kind, path, tree) -> dict[str, float]` —
   repo-relative test file → seconds, from the same structured reports:
   jest/vitest JSON suite `endTime − startTime` (else `perfStats.runtime`,
@@ -15469,6 +15482,7 @@ command line overrides it.
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
 | `shipping_tests_gap` | dict \| None | written each time `_refresh_test_id_diff` measures (not when it reuses a diff of that tree, or the diff is already marked stale for it): `{"tree_sha", "why", "skip_kind"}` when it could not take a failing-test-ID diff of the tree that ships (`skip_kind` the test axis's, `forbidden_by_task` for a command the task forbids), None when it took one. `_unmeasured_on_shipping_tree` reads it for the outcome's reason (DESIGN §6 *The run outcome is decided once*, "`done` rests on measurements that ran"). |
 | `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every freshly-measured candidate `no_verdict`; a candidate already settled `pre_existing` in the run's base-verdict memo keeps that verdict, DESIGN §9 *A settled base verdict is reused, never recomputed*), `stale_for_tree` (the shipping tree's sha) when staging's tree is not the diff's and the diff could not be measured on it (`_refresh_test_id_diff`: the re-drive's tail and phase 5's own refreshes), `sized_out` / `sized_out_files` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (`passes` when the sized confirm ran more than one) (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
+| `discovery_memo` | dict[str, dict] | run-level memo of completed intermittent discoveries that failed nothing (DESIGN §9 *A tree already discovered is not discovered again*): `{_discovery_memo_key(tree, base_sha, cmd, reps, budget): <discovery result without _runs/gate>}`. Written by `_record_discovery`, read by `_intermittent_discovery`. Absent on a run saved before the memo existed, or with no such discovery — then every discovery runs as before. |
 | `base_pre_existing_memo` | dict[str, list[str]] | run-level memo of the B\* `pre_existing` determination (DESIGN §9 *A settled base verdict is reused, never recomputed*): `{memo_key: [test-id, …]}`, `memo_key` the hex SHA-256 of `(base_sha, cmd, replace, remove_base)` (`_base_verdict_memo_key`). Written by `_record_base_verdict` from each `_confirm_against_base` verdict's `pre_existing` set; read by the same function before dispatch (`_base_verdict_cached`) to skip a candidate's base and final reruns, and to skip building the base worktree entirely when every candidate is already settled. Absent on a run saved before the memo existed — then every confirm recomputes as before. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |

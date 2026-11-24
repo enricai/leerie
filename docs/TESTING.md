@@ -6493,6 +6493,15 @@ no rerun, `_confirm_select`'s ranking and sizing, both empty-base-list
 callers of the final diff (a scoped command, unknown baseline IDs — review
 round 6 D-H3), a file sized out of the final diff, and the as-written retry
 bounded by what is left (review round 6 C1).
+`tests/test_discovery_memo.py` (DESIGN §9 *A tree already discovered is not
+discovered again*) drives the real `_intermittent_discovery` over
+`test_discovery_budget.py`'s `hub` fixture with only the tree identity
+stubbed: a second discovery of the same tree, and a rollback to a tree
+already discovered (barnacle #790's A → B → A), rerun nothing; another
+base or budget runs again; a result that failed an ID or that the budget
+cut is never kept; a partial result is not reused off the tree that ships;
+a dirty tree is neither served nor stored. 4 of its 8 fail on the pre-fix
+code (the other 4 pin where nothing may be reused).
 `tests/test_bstar_one_off_flake_budget.py` is the reviewer's end-to-end
 driver turned regression test: a one-off flake in a file too slow for one
 pair ends `done` with a "could not confirm within the budget" entry in the
