@@ -582,6 +582,43 @@ def test_junit_failing_ids_and_file_mapping(leerie, tmp_path):
             "tests/test_broken.py"}
 
 
+def test_load_failure_carries_the_runners_own_error(leerie, tmp_path):
+    # A file that never loaded is the case whose cause is most often a
+    # production change (a deleted module it imports): its row must carry
+    # the runner's error like any failing case, not an empty message.
+    tree = tmp_path / "tree"
+    jest = json.dumps({"testResults": [
+        # jest: testExecError wins over the suite's summary message.
+        {"name": str(tree / "src/a.test.ts"), "status": "failed",
+         "assertionResults": [], "message": "summary",
+         "testExecError": {"message": "Cannot find module './gone'"}},
+        # vitest: only the suite's message names the load error.
+        {"name": str(tree / "src/b.test.ts"), "status": "failed",
+         "assertionResults": [],
+         "message": "Failed to load url ./twilio (resolved id: ./twilio)"},
+    ]}).encode()
+    rows = {r["id"]: r.get("message")
+            for r in leerie._runner_report_cases("jest-json", jest, str(tree))}
+    assert rows == {
+        "src/a.test.ts :: (file failed to load)": "Cannot find module './gone'",
+        "src/b.test.ts :: (file failed to load)":
+            "Failed to load url ./twilio (resolved id: ./twilio)"}
+
+    junit = (b'<testsuites><testsuite>'
+             b'<testcase classname="" name="tests.test_broken">'
+             b'<error message="collection failure">ImportError: cannot import '
+             b'name \'gone\'</error></testcase></testsuite></testsuites>')
+    (row,) = leerie._runner_report_cases("junit", junit, str(tree))
+    assert row["message"] == "ImportError: cannot import name 'gone'"
+
+    rspec = json.dumps({"examples": [], "messages": [
+        "An error occurred while loading ./spec/a_spec.rb.", "NameError"],
+        "summary": {"errors_outside_of_examples_count": 1}}).encode()
+    (row,) = leerie._runner_report_cases("rspec-json", rspec, str(tree))
+    assert row["message"] == (
+        "An error occurred while loading ./spec/a_spec.rb.\nNameError")
+
+
 def test_report_with_nothing_executed_is_none(leerie, tmp_path):
     rep = tmp_path / "r.json"
     rep.write_text(json.dumps({"testResults": []}))

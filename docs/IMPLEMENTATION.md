@@ -9433,7 +9433,11 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   does not say), from the same structured reports `_parse_runner_report`
   reads (`_RUNNER_REPORTS`: JUnit for pytest, jest-compatible JSON for
   jest/vitest). IDs are `"<file> :: <name>"`; a file that failed to load
-  is `"<file> :: (file failed to load)"`. None when no report is readable
+  is `"<file> :: (file failed to load)"`, whose `_runner_report_cases` row
+  carries the runner's own load error as its `message` like any failing
+  case (jest/vitest: the suite's `testExecError.message`, else its
+  `message`, else `failureMessage`; pytest: the collection error's text;
+  rspec: the report's `messages`). None when no report is readable
   or it executed no test and recorded no load failure.
 - `async _capture_failing_test_ids(tree, cmd, st, caps, *, label, log_path,
   timeout, serial=False, files=None, db=False, place=(), replace=(),

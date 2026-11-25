@@ -59590,7 +59590,10 @@ def _runner_report_cases(kind: str, report: bytes | None,
                        for child in case):
                     f = case.get("file") or name.replace(".", "/") + ".py"
                     _add(f"{_rel(f)} :: (file failed to load)", _rel(f),
-                         "load_error")
+                         "load_error",
+                         "\n".join((child.text or "").strip()
+                                   for child in case
+                                   if child.tag == "error"))
                     continue
                 f = case.get("file")
                 if not f and classname and tree is not None and class_files:
@@ -59614,7 +59617,11 @@ def _runner_report_cases(kind: str, report: bytes | None,
                 # A suite that failed with no assertion run never loaded.
                 if (suite.get("testExecError")
                         or (suite.get("status") == "failed" and not results)):
-                    _add(f"{rel} :: (file failed to load)", rel, "load_error")
+                    err = suite.get("testExecError")
+                    _add(f"{rel} :: (file failed to load)", rel, "load_error",
+                         str((err.get("message") if isinstance(err, dict)
+                              else None) or suite.get("message")
+                             or suite.get("failureMessage") or ""))
                 for r in results:
                     title = r.get("fullName") or r.get("title") or ""
                     st_ = r.get("status")
@@ -59634,7 +59641,8 @@ def _runner_report_cases(kind: str, report: bytes | None,
             if ((data.get("summary") or {}).get(
                     "errors_outside_of_examples_count") or 0) > 0:
                 # A spec file that raised while loading.
-                _add("(rspec) :: (file failed to load)", None, "load_error")
+                _add("(rspec) :: (file failed to load)", None, "load_error",
+                     "\n".join(str(m) for m in data.get("messages") or []))
         elif kind == "minitest-json":
             data = json.loads(report.decode())
             for c in data.get("cases") or []:
