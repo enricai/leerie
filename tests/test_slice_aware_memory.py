@@ -10,7 +10,10 @@ guaranteeing the in-cgroup OOM the cap exists to prevent (measured live:
 4.58 GiB/worker) — and double-counted this run, since `live_siblings` is
 slice-wide and already includes the run's own workers. The two properties
 that kill that whole class are pinned here: the ceiling is **never below
-the build peak** and is **independent of load**.
+the build peak** and is **independent of load**. It is the run's share of
+the slice (`slice_max // max_parallel`, a run constant), paired with the
+CPU share (DESIGN §6 *A worker's share of the CPUs and of the memory is one
+share*; tests/test_cpu_memory_share.py).
 
 Mirrors tests/test_cgroup_helpers.py's stubbed-socket-broker pattern: stub
 `_cgroup_request` (the broker round-trip) rather than a real cgroup tree.
@@ -104,54 +107,61 @@ def test_slice_info_passes_through_unknown_unreclaimable(leerie, monkeypatch):
     assert leerie._cgroup_slice_info() == (58956849152, 3, -1)
 
 
-# ---- _worker_memory_ceiling: a ceiling, not a share ------------------------
+# ---- _worker_memory_ceiling: the run's share, floored at the build peak ----
 
 def test_ceiling_never_below_build_peak(leerie):
-    """THE regression pin. The superseded divisor issued 4.58 GiB/worker
+    """THE regression pin. The superseded live divisor issued 4.58 GiB/worker
     against a 6.3 GiB build peak, guaranteeing an in-cgroup OOM. No slice
-    size — however small or crowded — may produce a sub-peak ceiling."""
+    size and no `max_parallel` — however small or crowded — may produce a
+    sub-peak ceiling."""
     peak = leerie._WORKER_BUILD_PEAK_BYTES
     for slice_max in (0, 1024, 1 * 1024**3, 8 * 1024**3, 16 * 1024**3,
                       _SLICE_54_9_GIB, 512 * 1024**3):
-        assert leerie._worker_memory_ceiling(slice_max) >= peak, slice_max
+        for mp in (1, 5, 64):
+            assert leerie._worker_memory_ceiling(slice_max, mp) >= peak, \
+                (slice_max, mp)
 
 
 def test_ceiling_independent_of_load(leerie):
-    """Kills the double-count AND the frozen-sample class at once: the
-    ceiling is a function of the slice budget alone. Structural, because a
-    load-dependent ceiling could not even be expressed through this
-    signature."""
+    """The ceiling is a function of the slice budget and the run constant
+    `max_parallel` alone: a live sibling count could not even be passed."""
     params = list(inspect.signature(leerie._worker_memory_ceiling)
                   .parameters)
-    assert params == ["slice_max_bytes"], (
-        "ceiling must not accept live_siblings/max_parallel — taking them "
-        "at all is how the reservation semantics crept back in")
-    # And it is genuinely deterministic in that one input.
-    assert (leerie._worker_memory_ceiling(_SLICE_54_9_GIB)
-            == leerie._worker_memory_ceiling(_SLICE_54_9_GIB))
+    assert params == ["slice_max_bytes", "max_parallel"], (
+        "ceiling must not accept live_siblings — taking it is how the "
+        "reservation semantics crept back in")
+    assert (leerie._worker_memory_ceiling(_SLICE_54_9_GIB, 5)
+            == leerie._worker_memory_ceiling(_SLICE_54_9_GIB, 5))
 
 
-def test_ceiling_bounded_by_half_the_slice_when_that_beats_the_peak(leerie):
-    """One worker is never licensed to eat the whole fleet's budget — on a
-    slice big enough for that bound to still clear the build peak."""
-    big = 512 * 1024**3
-    assert leerie._worker_memory_ceiling(big) <= big // 2
+def test_ceiling_is_the_runs_share_of_the_slice(leerie):
+    """On a slice big enough, the ceiling is exactly 1/max_parallel of it —
+    the memory half of the share whose CPU half is 1/max_parallel of the
+    CPUs. The measured host: 275.5 GiB slice, max_parallel 5 → 55.1 GiB,
+    where the superseded fixed ceiling gave 9.45 GiB on any host."""
+    big = 295785652224
+    assert leerie._worker_memory_ceiling(big, 5) == big // 5
+    assert leerie._worker_memory_ceiling(big, 1) == big
+    # Disagreeing inputs: the share follows max_parallel, not a constant.
+    assert (leerie._worker_memory_ceiling(big, 2)
+            > leerie._worker_memory_ceiling(big, 5)
+            > leerie._worker_memory_ceiling(big, 10))
 
 
-def test_ceiling_build_peak_outranks_half_slice_bound(leerie):
+def test_ceiling_build_peak_outranks_the_share(leerie):
     """On a slice too small to honour both, the build peak wins: a
     memory.max above the slice is harmless (the aggregate cap binds first),
     one below the peak guarantees the OOM."""
-    small = 8 * 1024**3          # half = 4 GiB, under the 6.3 GiB peak
-    assert leerie._worker_memory_ceiling(small) == \
+    small = 8 * 1024**3          # share at 5 = 1.6 GiB, under the 6.3 GiB peak
+    assert leerie._worker_memory_ceiling(small, 5) == \
         leerie._WORKER_BUILD_PEAK_BYTES
 
 
 def test_ceiling_on_the_measured_host(leerie):
-    """Sanity against the real host: ~9.4 GiB, comfortably over the peak
-    and in the neighbourhood of the 10.5 GiB legacy value that worked."""
-    got = leerie._worker_memory_ceiling(_SLICE_54_9_GIB)
-    assert 9.0 * 1024**3 < got < 10.0 * 1024**3
+    """The 54.9 GiB host at the default max_parallel 5: 11 GiB."""
+    got = leerie._worker_memory_ceiling(_SLICE_54_9_GIB, 5)
+    assert got == _SLICE_54_9_GIB // 5
+    assert 10.9 * 1024**3 < got < 11.1 * 1024**3
 
 
 # ---- _auto_worker_memory_max: ceiling basis, NOT /proc/meminfo -----------
@@ -169,7 +179,7 @@ def test_auto_memory_max_uses_ceiling_when_slice_available(leerie, monkeypatch):
                             AssertionError("legacy basis must not be used "
                                            "when slice info is available")))
     assert leerie._auto_worker_memory_max(max_parallel=5) == \
-        leerie._worker_memory_ceiling(60 * 1024**3)
+        leerie._worker_memory_ceiling(60 * 1024**3, 5)
 
 
 def test_auto_memory_max_ignores_live_sibling_count(leerie, monkeypatch):
@@ -190,13 +200,15 @@ def test_auto_memory_max_ignores_live_sibling_count(leerie, monkeypatch):
     assert len(set(seen)) == 1, f"cap varied with live siblings: {seen}"
 
 
-def test_auto_memory_max_ignores_max_parallel(leerie, monkeypatch):
-    """Same class, other half of the double-count."""
+def test_auto_memory_max_follows_max_parallel(leerie, monkeypatch):
+    """The run constant is the share's denominator: a run of 1 worker may
+    use the whole slice, one of 12 a twelfth (never below the build peak)."""
     monkeypatch.setattr(leerie, "_cgroup_slice_info",
                         lambda: (_SLICE_54_9_GIB, 3, _UNRECLAIMABLE_ROOMY))
-    caps = {leerie._auto_worker_memory_max(max_parallel=mp)
-            for mp in (1, 5, 12)}
-    assert len(caps) == 1
+    got = [leerie._auto_worker_memory_max(max_parallel=mp)
+           for mp in (1, 5, 12)]
+    assert got == [_SLICE_54_9_GIB, _SLICE_54_9_GIB // 5,
+                   leerie._WORKER_BUILD_PEAK_BYTES]
 
 
 def test_auto_memory_max_falls_back_to_legacy_when_no_slice_info(

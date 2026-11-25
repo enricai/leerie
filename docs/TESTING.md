@@ -9022,3 +9022,23 @@ case failing is counted as fixing nothing, and one that restores
 `lib.helper` as fixing it. A diff of another tree adds no file, and only a
 test-case file the base had and the tree left unchanged is added. All 5 fail
 on the pre-fix code.
+
+## A worker's share of the CPUs and of the memory is one share
+
+`tests/test_cpu_memory_share.py` (DESIGN §6 *A worker's share of the CPUs and
+of the memory is one share*) runs real processes through `_run_contained`
+with only the cgroup broker stubbed. Each process writes the CPU set it reads
+for itself. A capped command reads one slot; an uncapped measurement and a run
+of one worker read every CPU; a refused `sched_setaffinity` is logged and the
+command still runs. Slot taking uses real `flock`s in a temporary host
+directory. Over 16 CPUs at `max_parallel` 4, a slot another process holds is
+never taken, and three takes get the three free slots. When every slot is held,
+a fourth take shares and holds no lock, and a released slot is free again.
+Without a host directory, one process spreads its own takes.
+`_resolve_memory_caps` sets both halves from one `max_parallel` (160 CPUs, a
+275.5 GiB slice and 5 give 32 CPUs and 55.1 GiB). `_invoke` takes and applies
+the share after the enroll and before the gate opens, and frees it after the
+cgroup is destroyed. `tests/test_slice_aware_memory.py` pins the memory half:
+never below the build peak at any slice or `max_parallel`, exactly
+`slice_max // max_parallel` above it, and independent of the live sibling
+count. On the pre-change code 12 of the two files' tests fail and 3 error.

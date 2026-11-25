@@ -10561,21 +10561,55 @@ of this design:
 1. Per-worker ceilings **may safely sum past the slice budget**. Eight
    workers capped at 9.45 GiB do not reserve 75.6 GiB; each promises only
    "kill me before I exceed 9.45". The slice cap still binds.
-2. Therefore the per-worker cap must **never** be derived by dividing the
-   slice budget across a projected worker count — that treats a ceiling
-   as a reservation and manufactures caps *below* the measured build
-   peak, reintroducing the OOM above. A run sized during a busy moment
-   stays handicapped for its whole life, since the cap is resolved once
-   at startup.
+2. Therefore the per-worker cap must **never** fall below the measured
+   build peak, and must never follow *load*: a cap derived from the live
+   worker count manufactured caps below the build peak and reintroduced
+   the OOM above, and a run sized during a busy moment stays handicapped
+   for its whole life, since the cap is resolved once at startup.
 
-The cap is therefore a fixed isolation ceiling —
-`max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
-the host's slice budget and the repo's own declared needs, never of
-*load*. The half-slice bound stops one worker eating the fleet's
-headroom, but the build peak outranks it: on a slice too small to honour
-both, a `memory.max` above the slice is harmless (the aggregate cap binds
-first) while one below the build peak guarantees the OOM. Being
-load-independent is what makes resolving it once, at startup, correct.
+**A worker's share of the CPUs and of the memory is one share.** What a
+worker's tools spawn follows the CPUs they see: a test runner, a build
+tool or a thread pool sizes itself from the CPU count (`nproc`,
+`os.availableParallelism()`, `os.sched_getaffinity`, `GOMAXPROCS`), and
+each process it starts holds memory. A ceiling fixed in bytes while the
+worker sees every CPU of the host therefore OOMs on a large host, and the
+larger the host the surer. Barnacle 0.100.0 on a 160-CPU, 314 GiB host
+(#748, #795, #796): five workers OOM-killed at their 10.1 GiB ceiling, each
+in a test selection; #796's delivery re-drive group holding every unfixed
+defect, the red merge check, the base-form case and the unmet items was
+killed with 9.7 GB of anonymous memory in 113 vitest forks and 20 esbuild
+services (`maxWorkers: 50%` of the 160 CPUs it saw), its work rolled back,
+and the run ended `unconverged`. The repo's own measured peak (*below*)
+could not see it: the task forbade the full suite, so the baseline measured
+only the build (0.9 GB).
+
+So every process leerie gives a memory ceiling — each worker and each
+contained command — gets the same share of the host's CPUs as an affinity
+set, and the ceiling is that same share of the slice: with `n` the run's
+`max_parallel`,
+
+- CPUs: `max(1, ⌊host_cpus / n⌋)`, as one of `⌊host_cpus / width⌋` slots
+  of consecutive CPUs, taken host-wide as an open `flock` on a slot file in
+  the host directory (the build slots' mechanism, *below*), never waited
+  for: when every slot is held, the process shares the slot its name
+  hashes to.
+- Memory: `max(build_peak, ⌊slice_max / n⌋)`.
+
+Both are functions of the host and of a run constant, never of load, so
+resolving them once stays correct; the build peak still outranks the
+share, and the repo's measured peak still raises it. The affinity is set
+on the held process before its gate opens (*Enrollment holds the spawn*),
+so every descendant inherits it. Measured on #796's test selection on the
+same host (barnacle, leerie 0.101.0 image, pre-registered): at the old
+ceiling with every CPU visible, 3 of 3 runs OOM-killed within 2 s; with no
+ceiling, 112 s at a 26.9 GiB peak. Under the share (32 CPUs, 55 GiB): 0 OOM
+kills in 33 runs, 128 s alone (1.14×), and five at once on their own slots
+150 s each (30 runs) at 6.1–6.8 GiB, 31–32 GiB together, against 195 s and
+25–30 GiB each for five at once seeing every CPU. Scale-sensitive tests
+failed beyond the base's own failure in 1 of 30 runs under the share and 4
+of 30 seeing every CPU: the share changes no outcome.
+A first share (CPUs matched to the old fixed ceiling, 4 CPUs) removed the
+OOM at 6.1× the time: the share has to be the run's, not the ceiling's.
 
 **The repo's own build peak, measured, raises the ceiling.** The constant
 above is one Next.js measurement; a repo whose build is heavier OOMs at it
