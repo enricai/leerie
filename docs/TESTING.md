@@ -8990,3 +8990,35 @@ dispute accepts at the bound, a falsifier that cannot run leaves the no work,
 and budget exhaustion inside it stops the run. All 7 fail on the pre-fix code,
 whose settle takes no models or efforts. `tests/test_acceptance_no_work.py`'s
 wiring test now reads the call with them.
+
+## A start with no report is an empty start
+
+`tests/test_ratchet_empty_start.py` (DESIGN §8 *A repair that regresses met
+work is rolled back*, the execution route) runs real git and real pytest.
+Barnacle #748's shape goes through the real acceptance gate: the task forbids
+the whole-suite command, and the round starts at the baseline, where the
+scoped replacement has nothing to run. The round that breaks `test_mul.py` is
+rolled back on a B*-confirmed new failure, and the next round is kept. On the
+`test_near_tests_first.py` harness, `_ratchet_exec` with no start report
+confirms a broken far test new and types a test failing on the start too
+`pre_existing`. The caller's order (near stage, then closure and
+`_ratchet_exec`) rejects a round from an unmeasured start. No report on
+either side is still unmeasured. 5 of the 6 fail on the pre-fix code; the
+no-report-on-either-side test passes on both.
+
+## A file the run left as the base had it is its own base form
+
+`tests/test_unchanged_test_base_form.py` (DESIGN §8 *What an existing test
+pins on the base holds on the tree that ships*) runs the real final ID diff
+(`_refresh_shipping_test_id_diff`), `_check_existing_behaviour`,
+`_redrive_base_form_notes` and `_redrive_base_form_fixed` over real git and a
+real confined pytest on `test_existing_behaviour_base_form.py`'s `World`. A
+change to `lib.helper` breaks `tests/test_export.py`, which the run never
+touched. The diff records the new ID's file (`new_files`). The base-form check
+runs that file and lists its case as `changed`. The re-drive gets a
+`base_form_case` note for it, and the outcome is `unconverged` with
+`existing_behaviour_changed` naming the case. A later commit that leaves the
+case failing is counted as fixing nothing, and one that restores
+`lib.helper` as fixing it. A diff of another tree adds no file, and only a
+test-case file the base had and the tree left unchanged is added. All 5 fail
+on the pre-fix code.

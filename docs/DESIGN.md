@@ -18639,6 +18639,26 @@ failing case of its own (`(file failed to load)`), as it is in every report
 leerie reads. No prompt, judge or text rule takes part: nothing here asks a
 worker or reads an assertion.
 
+*A file the run left as the base had it is its own base form.* Its cases
+pin the base's behaviour just as a changed file's do, and one that the
+failing-test-ID diff confirmed newly failing under B\* is a pinned case
+broken. So where the check runs against the run's base — on the tree the
+delivery re-drive starts from, and on the tree that ships — it also runs
+every test-case file the base had, the tree left unchanged, and the diff
+of that same tree confirmed new failures in (`test_id_diff.new_files`).
+The re-drive's check of whether a note's cases now pass runs the note's
+files too. Such a file's broken cases are then `base_form_case` notes: driven
+once, and once more on opus (*A fix that keeps both, on opus when sonnet
+could not*, below), with everything else that applies to a pinned case.
+Before this, the diff's new failures only made the run `unconverged`, and
+nothing ever drove them: rule 1 of *Delivery re-drive* lists no new failure
+among the work it hands on, and an item typed `test_id_diff` never enters
+`unmet_final`. In barnacle 788868f5 (leerie 0.100.0, issue #748) five tests
+in three files the run never touched were confirmed newly failing on the
+tree the re-drive started from. The re-drive read "0 existing test file(s)
+failing in their base form", drove the failing held-out sets and the unmet item for three rounds,
+and ended with the five still failing.
+
 *Where the base form runs.* In place of the final form, at its own path, in
 a disposable copy of the tree: the held-out sandbox over the committed view
 (§6 *A held-out evaluation runs alone*), an overlay whose writes vanish with
