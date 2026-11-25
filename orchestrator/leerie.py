@@ -71366,6 +71366,21 @@ async def _ratchet_test_ids(st: "State", caps: dict, tree: str, *,
                if res.get("near_stage") else {})}
 
 
+def _ratchet_start(before: dict | None, after: dict | None) -> dict | None:
+    """A round's start as its ID diff reads it (DESIGN §8 *A start with no
+    report is an empty start*): `before` when it reported; with no report
+    and a commit that reported, the empty start — every ID the commit fails
+    is a candidate, and B* against the start types one that fails there too
+    `pre_existing`. The start's IDs only narrow the candidates, never stand
+    for the evidence. None when the commit gave no report either."""
+    if before is not None:
+        return before
+    if after is None:
+        return None
+    return {"ids": [], "files": {}, "command": after.get("command"),
+            "start_unreported": True}
+
+
 async def _near_rejection(st: "State", caps: dict, staging: Path,
                           pre_sha: str, post_sha: str, before: dict | None,
                           *, label: str, log_path: Path,
@@ -71377,14 +71392,14 @@ async def _near_rejection(st: "State", caps: dict, staging: Path,
     then runs only what these did not settle (the ledger holds them). Only
     the round's own tree can reject the round: staging moved past `post_sha`
     (an interrupted attempt committed before a resume) is None."""
-    if (before is None or not pre_sha
-            or await _branch_head_sha(str(staging)) != post_sha):
+    if not pre_sha or await _branch_head_sha(str(staging)) != post_sha:
         return None
     near = await _ratchet_test_ids(st, caps, str(staging),
                                    label=f"{label}-near-ids",
                                    log_path=log_path, near_of=pre_sha,
                                    near_named=named)
-    if (near is None or not near.get("near_stage")
+    before = _ratchet_start(before, near)
+    if (near is None or before is None or not near.get("near_stage")
             or not set(near["ids"]) - set(before.get("ids") or [])):
         return None
     ex = await _ratchet_exec(st, caps, staging, pre_sha, before, near,
@@ -71452,6 +71467,7 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
                 log(f"  {label}: base-form cause classification raised "
                     f"{type(e).__name__}: {e} — every failing case stays "
                     "the round's change")
+    before = _ratchet_start(before, after)
     if before is None or after is None:
         out = {"new": [], "pre_existing": [], "no_verdict": [],
                "resource_affected": [], "unmeasured": True,

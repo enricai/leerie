@@ -19859,7 +19859,23 @@ route:
   under B\* (§9 *Which failures are new*). The test axis therefore always
   runs after a repair: its start is measured before the worker, its tree
   after it. A command the task forbids is replaced by the scoped run of the
-  coupled tests, as at final. The tests that import a file the repair
+  coupled tests, as at final. *A start with no report is an empty start.*
+  The start's failing IDs only narrow which of the commit's failures are
+  candidates; the evidence is B\*, which reruns each candidate on the start
+  and types one that fails there too `pre_existing`. So when the start gave
+  no report and the commit gave one, every ID failing on the commit is a
+  candidate, confirmed against the start, as the gate-wide red-axis check
+  of the held-out repair already reads a start where nothing failed. That
+  includes a round starting at the base, where no test is coupled to the
+  run's changes yet. Before this, such a round was read as if its diff had
+  measured nothing: its execution items were marked unverified and the
+  round was kept. In barnacle 788868f5 (leerie 0.100.0, issue #748) the
+  run's one subtask changed nothing, so acceptance repair round 1 started
+  at the base. Its start ran no test, its commit failed 5 tests that pass
+  on the base, and the round was kept. The final ID diff confirmed all 5
+  new against the base (0 pre-existing, 3 of 3 pairs), and the run ended
+  `unconverged` on them. A commit with no report either is still
+  unmeasured. The tests that import a file the repair
   changed are rerun first, as at final, so an intermittent regression the
   repair introduced is found and typed. Like the final one, it is evidence,
   not a trigger: it goes to the ratchet's judge and to the PR.
