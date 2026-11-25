@@ -52863,6 +52863,11 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         sized_out=verdict.get("sized_out_files") or [])
     verdict["final_candidates"] = cand
     verdict["tree_sha"] = tree_sha
+    # Each new failure's file: the base-form check runs a file the run left
+    # unchanged that holds one (DESIGN §8 *A file the run left as the base
+    # had it is its own base form*).
+    verdict["new_files"] = {c: id_files.get(c)
+                            for c in verdict.get("new") or []}
     verdict["discovery"] = disc
     if ids_unknown:
         verdict["ids_unknown"] = True
@@ -72201,6 +72206,40 @@ def _base_form_files(repo: str | Path, base: str, head: str,
     return sorted(files), sorted(unsupported)
 
 
+def _base_form_unchanged(repo: str | Path, base: str, head: str,
+                         files: Iterable[str],
+                         globs: list[str] | None = None) -> list[str]:
+    """Of `files`, the test-case files present at `base` that `head` leaves
+    as the base had them (`_base_form_case`, a language whose runner leerie
+    reads a report from): each is its own base form (DESIGN §8 *A file the
+    run left as the base had it is its own base form*)."""
+    want = sorted({f for f in files if isinstance(f, str) and f
+                   and _base_form_case(f, globs)
+                   and posixpath.splitext(f)[1] not in _BASE_FORM_NO_REPORT_EXT})
+    if not want:
+        return []
+    changed = set(_redrive_git(repo, "--literal-pathspecs", "diff",
+                               "--name-only", "--no-renames", "-z", base,
+                               head, "--", *want).split("\0"))
+    return [f for f in want if f not in changed
+            and _redrive_exists_at(repo, base, f)]
+
+
+def _unchanged_new_failure_files(st: "State", tree_sha: str) -> list[str]:
+    """The files of the failing-test-ID diff's confirmed new failures, when
+    that diff is of `tree_sha` (`test_id_diff.new_files`): what the
+    base-form check also runs there (`_base_form_regressions(also=)`)."""
+    tid = st.data.get("test_id_diff")
+    if (not isinstance(tid, dict) or not tree_sha
+            or tid.get("tree_sha") != tree_sha):
+        return []
+    nf = tid.get("new_files")
+    if not isinstance(nf, dict):
+        return []
+    return sorted({str(f) for c, f in nf.items()
+                   if f and c in set(tid.get("new") or [])})
+
+
 def _base_form_writable(repo: str | Path, rev: str, rel: str) -> bool:
     """Whether `rel` at `rev` is a path the base form may be written to or
     removed from without following a link: every directory on its way absent
@@ -72273,7 +72312,8 @@ def _base_form_place(st: "State", repo: str | Path, base: str,
 
 async def _base_form_regressions(st: "State", caps: dict, staging: Path,
                                  before: str, *, label: str, log_path: Path,
-                                 reach_of: str | None = None) -> dict:
+                                 reach_of: str | None = None,
+                                 also: Iterable[str] = ()) -> dict:
     """Run every test-case file the run's base had and staging's commit
     modified or deleted IN ITS BASE FORM — the base's own content, in place
     of the final form in a held-out sandbox, never on disk, with every
@@ -72292,8 +72332,11 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
     no longer loads (a removed export it imports) is a failing case of its
     own. `reach_of`: a round's start, whose diff to staging narrows the files
     to those it touched or reaches (`_change_reach`; all of them when its
-    reach is unknown). Never raises past its callers' guards: a run that
-    gives no verdict is `unmeasured`, never a pass."""
+    reach is unknown). `also`: test-case files the base had and the commit
+    left unchanged, each its own base form, run with the rest (DESIGN §8 *A
+    file the run left as the base had it is its own base form*;
+    `_unchanged_new_failure_files`). Never raises past its callers' guards: a
+    run that gives no verdict is `unmeasured`, never a pass."""
     base = _diff_base(st) or ""
     after = await _branch_head_sha(str(staging))
     out: dict = {"base": base, "before": before, "after": after or "",
@@ -72307,6 +72350,10 @@ async def _base_form_regressions(st: "State", caps: dict, staging: Path,
     files, unsupported = await asyncio.to_thread(
         _base_form_files, repo, base, after, globs)
     out["unsupported"] = unsupported
+    kept = await asyncio.to_thread(_base_form_unchanged, repo, base, after,
+                                   [f for f in also if f not in files
+                                    and f not in unsupported], globs)
+    files = sorted(set(files) | set(kept))
     if files and reach_of:
         touched = _redrive_git(repo, "diff", "--name-only", "--no-renames",
                                "-z", reach_of, after).split("\0")
@@ -72452,8 +72499,9 @@ async def _redrive_base_form_fixed(st: "State", caps: dict, staging: Path,
     if not base:
         return []
     try:
-        out = await _base_form_regressions(st, caps, staging, base,
-                                           label=label, log_path=log_path)
+        out = await _base_form_regressions(
+            st, caps, staging, base, label=label, log_path=log_path,
+            also=[str(n.get("file")) for n in notes if n.get("file")])
     except Exception as e:
         log(f"  {label}: base-form check raised {type(e).__name__}: {e} — "
             "no case counted fixed")
@@ -73463,7 +73511,8 @@ async def _check_existing_behaviour(leerie_dir: Path, st: "State",
     try:
         rec = await _base_form_regressions(
             st, caps, staging, base, label="existing-behaviour",
-            log_path=st.run_dir / "logs" / "existing-behaviour.log")
+            log_path=st.run_dir / "logs" / "existing-behaviour.log",
+            also=_unchanged_new_failure_files(st, tree_sha))
     except Exception as e:
         rec = {"error": f"{type(e).__name__}: {e}"[:300], "changed": [],
                "unmeasured": [], "unsupported": []}
