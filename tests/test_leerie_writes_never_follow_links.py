@@ -454,6 +454,9 @@ _LEERIE_ONLY = {
     "run_recapture_deps", "_build_repo_map", "_tree_sitter_extraction_works",
     "_selfcheck_prepare", "_require_heldout_sandbox",
     "_acquire_build_slot", "_mise_install_lock",
+    # A CPU slot's lock file, beside the build slots' in the host
+    # directory, which no grant names for writing.
+    "_take_cpu_share",
     "_sweep_measure_dirs", "_measure_dir_at", "_reap_idle_worktrees",
     "_reap_launcher_logs",
     "_acceptance_parse_probe", "_acceptance_parse_probe_run",
