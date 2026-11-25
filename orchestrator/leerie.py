@@ -10428,16 +10428,13 @@ def _is_node_repo(cwd: str) -> bool:
 # and the aggregate slice cap is the real backstop — so overcommitting
 # ceilings is intended (DESIGN §6 *A per-worker cap is a ceiling, not a
 # reservation*). An earlier revision read that overcommit as the bug and
-# divided the slice across a projected worker count to prevent it, which
-# issued caps BELOW this peak and caused the OOMs it meant to avoid.
+# divided the slice across the LIVE worker count to prevent it, which
+# issued caps BELOW this peak and caused the OOMs it meant to avoid; the
+# ceiling is now the run's share of the slice, floored at this peak (DESIGN
+# §6 *A worker's share of the CPUs and of the memory is one share*).
 _WORKER_BUILD_PEAK_BYTES = int(6.3 * 1024**3)
 _WORKER_MEMORY_ADMISSION_POLL_SEC = 5.0
 _WORKER_MEMORY_ADMISSION_MAX_WAIT_SEC = 600.0
-# Headroom over the measured build peak for the per-worker isolation
-# ceiling. Not a share of anything (see `_worker_memory_ceiling`) — just
-# enough slack above 6.3 GiB that an ordinary heavier-than-measured build
-# is not killed, while a genuine runaway (tens of GiB) still is.
-_WORKER_MEMORY_CEILING_MULTIPLIER = 1.5
 # `_await_worker_memory_admission` reserves one build peak per worker that
 # has been admitted but whose demand cannot yet be visible in the slice's
 # unreclaimable reading. Without that the gate is stateless: `_invoke` runs
@@ -10505,38 +10502,125 @@ def _cgroup_slice_info() -> tuple[int, int, int] | None:
     return (mem_max, siblings, unreclaimable)
 
 
-def _worker_memory_ceiling(slice_max_bytes: int) -> int:
-    """Per-worker `memory.max`: a fixed isolation ceiling, NOT a share of
-    the slice (DESIGN §6 *A per-worker cap is a ceiling, not a
-    reservation*).
+def _worker_memory_ceiling(slice_max_bytes: int, max_parallel: int) -> int:
+    """Per-worker `memory.max`: the run's share of the slice, never below the
+    build peak (DESIGN §6 *A worker's share of the CPUs and of the memory is
+    one share*).
 
-    Writing `memory.max` allocates nothing — it only bounds — and the
-    aggregate `leerie.slice/memory.max` is the real backstop against host
-    exhaustion. So per-worker ceilings may safely sum past the slice budget,
-    and this value depends only on the host's slice size: NOT on
-    `live_siblings`, NOT on `max_parallel`.
+    `max_parallel` is a run constant, so the ceiling is still resolved once
+    and never follows load: NOT `live_siblings`, NOT the wave's degraded
+    concurrency. The superseded live divisor (`slice_max // (live_siblings +
+    max_parallel + 1)`) issued caps *below* `_WORKER_BUILD_PEAK_BYTES` and so
+    guaranteed the in-cgroup OOM the cap exists to prevent — measured live
+    at 4.58 GiB/worker; the build-peak floor keeps that out. The superseded
+    fixed ceiling (1.5 x the build peak, 9.45 GiB on any host) OOMed on a
+    large host instead: a worker sees the CPUs of its share
+    (`_take_cpu_share`), and what its tools spawn follows them.
 
-    The superseded divisor (`slice_max // (live_siblings + max_parallel +
-    1)`) treated the ceiling as a reservation, which issued caps *below*
-    `_WORKER_BUILD_PEAK_BYTES` and so guaranteed the in-cgroup OOM the cap
-    exists to prevent — measured live at 4.58 GiB/worker. It also counted
-    this run twice (`live_siblings` is slice-wide and already includes this
-    run's own workers), so a single run blocked its own third concurrent
-    worker with no other run on the host.
+    `memory.max` allocates nothing, so ceilings may sum past the slice; the
+    aggregate `leerie.slice/memory.max` stays the backstop, and admission
+    (`_await_worker_memory_admission`) handles cross-run contention."""
+    share = int(slice_max_bytes) // max(1, int(max_parallel))
+    return max(_WORKER_BUILD_PEAK_BYTES, share)
 
-    Bounded above by half the slice, so one worker is never licensed to
-    consume the whole fleet's budget — but never at the cost of dropping
-    below the build peak, which is the failure this ceiling exists to
-    prevent. On a slice too small to honour both, the build peak wins: a
-    `memory.max` above the slice budget is harmless (the aggregate slice
-    cap binds first anyway), whereas one below the build peak guarantees
-    the in-cgroup OOM. That ordering is why there is no separate small
-    floor here — `_WORKER_BUILD_PEAK_BYTES` is itself the floor.
 
-    Load-independence is what makes resolving this once, at startup,
-    correct."""
-    want = int(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER)
-    return max(_WORKER_BUILD_PEAK_BYTES, min(want, slice_max_bytes // 2))
+# A worker's CPU share (DESIGN §6 *A worker's share of the CPUs and of the
+# memory is one share*): the width of its affinity slot, resolved with the
+# memory caps (`_resolve_memory_caps`); None leaves every CPU visible.
+_WORKER_CPU_WIDTH: int | None = None
+# Slots this process holds, by index, for the pick when no host-wide slot
+# is free (or there is no host directory to hold them in).
+_CPU_SLOTS_IN_USE: dict[int, int] = {}
+
+
+def _host_cpu_list() -> list[int]:
+    """The CPUs this process may run on, sorted; empty when unknown."""
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return []
+
+
+def _cpu_share_width(host_cpus: int, max_parallel: int) -> int:
+    """`max(1, host_cpus // max_parallel)`: a worker's share of the CPUs."""
+    return max(1, int(host_cpus) // max(1, int(max_parallel)))
+
+
+def _configure_cpu_share(max_parallel: int) -> None:
+    """Resolve the CPU share every capped process of this run gets."""
+    global _WORKER_CPU_WIDTH
+    cpus = _host_cpu_list()
+    _WORKER_CPU_WIDTH = (_cpu_share_width(len(cpus), max_parallel)
+                         if cpus else None)
+
+
+def _take_cpu_share(name: str, host_dir: Path | None = None
+                    ) -> tuple[int | None, int | None, list[int]]:
+    """Take a CPU slot for the capped process `name`: `(fd, slot, cpus)`.
+
+    Slots are `width` consecutive CPUs of this process's own set. One is
+    taken host-wide as an open `flock` on `cpu-slots/w<width>-<i>` in the
+    host directory (the build slots' mechanism, `_acquire_build_slot`:
+    opened read-only, dropped by the kernel when the holder dies), starting
+    from the slot `name` hashes to; never waited for. With every slot held,
+    or no host directory, the slot this process uses least is shared.
+    `cpus` empty means no share applies (unknown CPUs, or a share as wide as
+    the host); `_release_cpu_share` undoes a take."""
+    width = _WORKER_CPU_WIDTH
+    cpus = _host_cpu_list()
+    if not width or not cpus or width >= len(cpus):
+        return None, None, []
+    n = len(cpus) // width
+    start = zlib.crc32(name.encode()) % n
+    d = host_dir
+    if d is None:
+        env = os.environ.get(_HOST_DIR_ENV, "").strip()
+        d = Path(env) if env else None
+    fd: int | None = None
+    slot: int | None = None
+    if d is not None:
+        sd = d / "cpu-slots"
+        with contextlib.suppress(OSError):
+            sd.mkdir(parents=True, exist_ok=True)
+        for k in range(n):
+            i = (start + k) % n
+            try:
+                f = os.open(str(sd / f"w{width}-{i}"),
+                            os.O_RDONLY | os.O_CREAT, 0o644)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(f)
+                continue
+            fd, slot = f, i
+            break
+    if slot is None:
+        slot = min(range(n), key=lambda j: (_CPU_SLOTS_IN_USE.get(j, 0),
+                                            (j - start) % n))
+    _CPU_SLOTS_IN_USE[slot] = _CPU_SLOTS_IN_USE.get(slot, 0) + 1
+    return fd, slot, cpus[slot * width:(slot + 1) * width]
+
+
+def _release_cpu_share(fd: int | None, slot: int | None) -> None:
+    """Undo `_take_cpu_share`. Never raises."""
+    _close_fd(fd)
+    if slot is not None and _CPU_SLOTS_IN_USE.get(slot, 0) > 0:
+        _CPU_SLOTS_IN_USE[slot] -= 1
+
+
+def _apply_cpu_share(pid: int, cpus: list[int], label: str) -> None:
+    """Confine the held process `pid` to `cpus` before its gate opens, so
+    every descendant inherits the set. A refusal is logged: the process then
+    sees every CPU, as before."""
+    if not cpus:
+        return
+    try:
+        os.sched_setaffinity(pid, cpus)
+    except OSError as e:
+        log(f"  {label}: could not set its CPU share "
+            f"({e.strerror or e}); it sees every CPU")
 
 
 def _auto_worker_memory_max_legacy(max_parallel: int) -> int:
@@ -10579,22 +10663,22 @@ def _auto_worker_memory_max(max_parallel: int) -> int:
     """Auto-derive a per-worker memory cap.
 
     Derived from the aggregate `leerie.slice` memory.max
-    (scripts/container-entry.sh) via `_worker_memory_ceiling` — a fixed
-    isolation ceiling, not a share. Cross-run contention is handled by
-    `_await_worker_memory_admission` (which measures real slice headroom),
-    NOT by shrinking this number: a cap is a ceiling, and shrinking it below
-    the build peak causes the exact OOM it is meant to prevent.
+    (scripts/container-entry.sh) via `_worker_memory_ceiling` — the run's
+    share of the slice, never below the build peak. Cross-run contention is
+    handled by `_await_worker_memory_admission` (which measures real slice
+    headroom), NOT by shrinking this number below the build peak, which
+    causes the exact OOM it is meant to prevent.
 
     Falls back to the legacy /proc/meminfo basis
     (`_auto_worker_memory_max_legacy`) when the shared-slice budget can't be
     read (no broker, no cgroup containment, `--dangerously-allow-uncapped`)
     — there the shared-slice enforcement this basis depends on is absent
-    anyway. `max_parallel` is used only on that fallback path."""
+    anyway."""
     info = _cgroup_slice_info()
     if info is None:
         return _auto_worker_memory_max_legacy(max_parallel)
     slice_max_bytes, _live_siblings, _unreclaimable = info
-    return _worker_memory_ceiling(slice_max_bytes)
+    return _worker_memory_ceiling(slice_max_bytes, max_parallel)
 
 
 def _reserve_worker_memory_admission() -> int:
@@ -10820,8 +10904,9 @@ def resolve_worker_demand_estimate(declared_heap_bytes: int | None) -> int:
 
     Deliberately raised ONLY when a heap is declared. Sizing admission on
     the resolved *ceiling* instead would tighten it for every repo (the auto
-    ceiling is ~9.45 GiB against a 6.3 GiB estimate), changing throughput
-    fleet-wide to fix a case most repos do not have."""
+    ceiling is the run's share of the slice, at least the 6.3 GiB estimate
+    and far above it on a large host), changing throughput fleet-wide to fix
+    a case most repos do not have."""
     if declared_heap_bytes is None:
         return _WORKER_BUILD_PEAK_BYTES
     return max(_WORKER_BUILD_PEAK_BYTES,
@@ -12149,6 +12234,7 @@ async def _run_streaming(
     line_prefix: str = "  | ",
     tail_lines: int = 40,
     cgroup_sid: str | None = None,
+    cpu_share: bool = False,
     sandbox: HeldOutSandbox | None = None,
     report_into: bytearray | None = None,
 ) -> tuple[int, str]:
@@ -12188,6 +12274,10 @@ async def _run_streaming(
     starts held behind the spawn gate until its pid is enrolled there, so
     every process it forks is inside (DESIGN §6 *Enrollment holds the
     spawn*). The caller owns the cgroup's lifetime (`_run_contained`).
+    `cpu_share`, for a cgroup with a memory ceiling: the held command also
+    gets its CPU share before it starts (`_take_cpu_share`, DESIGN §6 *A
+    worker's share of the CPUs and of the memory is one share*), held for
+    its life.
     Every command run here is the repository's, so it runs in
     `_repo_command_env` — without leerie's hooks-off git entry.
 
@@ -12250,6 +12340,8 @@ async def _run_streaming(
     taken = (_ShimTaken(label or " ".join(cmd))
              if sandbox is not None and (sandbox.place or sandbox.replace
                                          or sandbox.remove) else None)
+    cpu_fd: int | None = None
+    cpu_slot: int | None = None
     try:
         async with _exec_lock().shared():
             spawn_cmd = _confined_argv(grants, list(cmd), sandbox=sandbox,
@@ -12296,6 +12388,9 @@ async def _run_streaming(
                     _release_spawn_gate(gate_w, run=False)
                     await _terminate_proc_tree(proc)
                     raise
+                if cpu_share:
+                    cpu_fd, cpu_slot, cpus = _take_cpu_share(cgroup_sid)
+                    _apply_cpu_share(proc.pid, cpus, label or cmd[0])
                 _release_spawn_gate(gate_w)
 
             tail: deque[str] = deque(maxlen=tail_lines)
@@ -12373,6 +12468,7 @@ async def _run_streaming(
                 report_into += report_fh.read()
             return rc, "\n".join(tail)
     finally:
+        _release_cpu_share(cpu_fd, cpu_slot)
         if report_fh is not None:
             report_fh.close()
         try:
@@ -28673,6 +28769,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # of surfacing as an apparently-unrelated log line — see _cgroup_enroll's
     # docstring for the incident this closes.
     cgroup_enroll_failure: str | None = None
+    cpu_fd: int | None = None
+    cpu_slot: int | None = None
     if cgroup_sid is not None:
         try:
             cgroup_enroll_failure = await asyncio.to_thread(
@@ -28684,6 +28782,11 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 refusals.close()
             await exec_hold.aclose()
             raise
+        # The CPU half of the worker's share, set while it is still held
+        # (DESIGN §6 *A worker's share of the CPUs and of the memory is one
+        # share*).
+        cpu_fd, cpu_slot, cpus = _take_cpu_share(cgroup_sid)
+        _apply_cpu_share(proc.pid, cpus, f"[{sid}]")
         _release_spawn_gate(gate_w)
     # Track every descendant PID that ever appears under this worker. Claude
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
@@ -29135,6 +29238,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # cancellable, but the worker thread completes the round-trip
         # regardless, so the broker still receives the destroy.
         await asyncio.to_thread(_cgroup_destroy, cgroup_sid)
+        # Its processes are gone: so is its claim on a CPU slot.
+        _release_cpu_share(cpu_fd, cpu_slot)
 
         # Drop the staged prompt file. The child holds its own dup of the
         # descriptor, so this neither disturbs a still-running worker nor
@@ -35025,6 +35130,9 @@ def _resolve_memory_caps(caps: dict, repo_root: Path) -> None:
     # the ceiling above, and what both admission surfaces size on (N14-16).
     caps["worker_demand_estimate_bytes"] = resolve_worker_demand_estimate(
         declared)
+    # The CPU half of the same share (DESIGN §6 *A worker's share of the
+    # CPUs and of the memory is one share*).
+    _configure_cpu_share(caps["max_parallel"])
 
 
 def _resume_provision_env(st: "State",
@@ -49193,7 +49301,8 @@ async def _run_contained(argv: list[str], *, grants: WorkerGrants,
             rc, tail = await _run_streaming(
                 argv, grants=grants, cwd=cwd, env=env, timeout=timeout,
                 log_path=log_path, label=label, verbosity=verbosity,
-                cgroup_sid=cg, sandbox=sandbox)
+                cgroup_sid=cg, cpu_share=bool(memory_max_bytes),
+                sandbox=sandbox)
             out["rc"], out["tail"] = rc, tail
         except subprocess.TimeoutExpired as e:
             out["timed_out"] = True

@@ -141,7 +141,7 @@ def test_slice_values_feed_the_real_consumers(broker, leerie, monkeypatch):
     _feed(leerie, monkeypatch, broker._handle("slice"))
     slice_max, _live, unreclaimable = leerie._cgroup_slice_info()
 
-    assert leerie._worker_memory_ceiling(slice_max) >= \
+    assert leerie._worker_memory_ceiling(slice_max, 5) >= \
         leerie._WORKER_BUILD_PEAK_BYTES
     # ~54.9 GiB slice with ~7.6 GiB unreclaimable: ample headroom.
     assert slice_max - unreclaimable > leerie._WORKER_BUILD_PEAK_BYTES
