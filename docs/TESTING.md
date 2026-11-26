@@ -8798,7 +8798,13 @@ the mock that imports are the closure, production code and another test are
 not; a round that changes production, puts the original back exactly, adds a
 new test or edits a test outside the closure passes; one that edits the setup
 file, a mock, a helper, the case file other than back to base, or changes or
-deletes a test the run added breaches, and its group is rolled back.
+deletes a test the run added breaches, and its group is rolled back. A case
+file the run flipped a base case in and appended its own cases to (barnacle
+run c1b5b35a, issue #839) passes when the round puts the base's case back
+and keeps, moves or removes the run's cases; it breaches when the round edits,
+loosens or reorders the base's lines, removes a base line, changes a run case
+or writes a case of its own, and a helper only added to still breaches
+(`_base_form_case_file_kept`).
 
 The moved-literal classification (`_moved_literal_evidence`) runs over real git:
 a string and a plain `i` regex moved from production into a message file are

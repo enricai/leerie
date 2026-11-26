@@ -366,6 +366,91 @@ def test_a_round_that_changes_the_closure_or_a_run_test_breaches(
     assert len(got) == 1 and got[0].startswith(hit + " (")
 
 
+# A base-form case file the run flipped a pinned case in AND appended its own
+# cases to (barnacle run c1b5b35a, issue #839): the base-form measurement runs
+# the base's blob in its place, so the round may put the base's case back and
+# keep the run's cases. Every case below starts from that run's tree.
+PINNED = "it('pins a', () => { expect(a).toBe(1); });\n"
+FLIPPED = "it('pins a', () => { expect(a).toBe(2); });\n"
+RUN_CASE = "it('run case', () => { expect(b).toBe(3); });\n"
+HEAD = BASE_FILES["src/a.test.ts"].replace("it('pins a', () => {});\n", "")
+CASE_BASE = HEAD + PINNED
+
+
+def _flipped_and_appended(tmp_path) -> tuple:
+    r, git = _repo(tmp_path, {**BASE_FILES, "src/a.test.ts": CASE_BASE})
+    base = git("rev-parse", "HEAD")
+    start = _commit(r, git, {"src/a.test.ts": HEAD + FLIPPED + RUN_CASE,
+                             "src/a.ts": "export const a = 2;\n"})
+    return r, git, base, start
+
+
+@pytest.mark.parametrize("case_file", [
+    CASE_BASE + RUN_CASE,          # the base's case back, the run's kept
+    CASE_BASE,                     # written back exactly
+    RUN_CASE + CASE_BASE,          # the run's case moved above the base's
+], ids=["run-cases-kept", "exact", "run-case-moved"])
+def test_a_round_that_puts_the_base_case_back_and_keeps_the_run_s_passes(
+        leerie, tmp_path, case_file):
+    r, git, base, start = _flipped_and_appended(tmp_path)
+    post = _commit(r, git, {"src/a.test.ts": case_file,
+                            "src/a.ts": "export const a = 1;\n"})
+    assert leerie._base_form_closure_breach(
+        r, base, start, post, ["src/a.test.ts"]) == []
+
+
+@pytest.mark.parametrize("case_file", [
+    # The base's case edited to pass on the run's code.
+    HEAD + FLIPPED.replace("pins a", "pins a ") + RUN_CASE,
+    # The base's case loosened: a line the base had removed.
+    HEAD + "it('pins a', () => {\n});\n" + RUN_CASE,
+    # A base line removed (an import), the case itself back.
+    HEAD.split("\n", 1)[1] + PINNED + RUN_CASE,
+    # Base lines out of their order.
+    PINNED + HEAD + RUN_CASE,
+    # The base's case back, the run's own case changed by the round.
+    CASE_BASE + RUN_CASE.replace("toBe(3)", "toBeDefined()"),
+    # The base's case back, a case of the round's own written in.
+    CASE_BASE + RUN_CASE + "it('round', () => {});\n",
+], ids=["base-case-edited", "base-case-loosened", "base-line-removed",
+        "base-reordered", "run-case-changed", "round-case-added"])
+def test_a_round_that_changes_the_base_case_or_writes_its_own_breaches(
+        leerie, tmp_path, case_file):
+    r, git, base, start = _flipped_and_appended(tmp_path)
+    post = _commit(r, git, {"src/a.test.ts": case_file})
+    got = leerie._base_form_closure_breach(r, base, start, post,
+                                           ["src/a.test.ts"])
+    assert got == ["src/a.test.ts (a base-form case file whose base lines "
+                   "were changed or removed, or with lines neither the base "
+                   "nor the round's start had)"]
+
+
+@pytest.mark.parametrize("helper", [
+    "export const m = 2;\n",                              # edited
+    "export const m = 1;\nexport const extra = 2;\n",     # only added to
+], ids=["edited", "added-to"])
+def test_a_helper_is_still_only_put_back_exactly(leerie, tmp_path, helper):
+    # The case file kept as the rule allows; its helper is read from the
+    # tree by the base-form run, so even an addition there changes the test.
+    r, git, base, start = _flipped_and_appended(tmp_path)
+    post = _commit(r, git, {"src/a.test.ts": CASE_BASE + RUN_CASE,
+                            "test/helpers/m.ts": helper})
+    assert leerie._base_form_closure_breach(
+        r, base, start, post, ["src/a.test.ts"]) == [
+        "test/helpers/m.ts (its cases' test closure, not put back exactly "
+        "as at the run's base)"]
+
+
+def test_the_base_case_file_s_rule_on_the_lines(leerie):
+    kept = leerie._base_form_case_file_kept
+    assert kept("a\nb\n", "a\nX\nR\n", "a\nb\nR\n")
+    assert kept("a\nb\n", None, "a\nb\n")
+    assert not kept("a\nb\n", "a\nb\n", None)          # deleted
+    assert not kept("a\nb\n", "a\nb\n", "b\na\n")      # reordered
+    assert not kept("a\nb\n", "a\nb\nR\n", "a\nb\nS\n")  # its own line
+    assert not kept("a\nb\n", "a\nb\n", "a\nb")        # ending changed
+
+
 def test_a_round_that_breaches_the_closure_is_rolled_back(
         leerie, tmp_path, monkeypatch):
     w = _world(leerie, tmp_path, monkeypatch)

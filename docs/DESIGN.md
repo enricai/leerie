@@ -18878,25 +18878,42 @@ base-form notes may change only files outside its cases' **test closure**
 (`_base_form_closure`): the case files, every test-side file they import
 transitively (test files, the import graph's test-support modules,
 `__mocks__`), the runner's configuration and the setup or support files it
-names, and a Python case's `conftest.py` chain. A closure file may be
-written back exactly as it is at the run's base — that is putting the
-original test back — and nothing else; and a test file the run added may not
-be changed or deleted at all (`_base_form_closure_breach`). A round that
-does otherwise is void and rolled back. The rule needs no attribution: in
+names, and a Python case's `conftest.py` chain. A closure file the
+measurement reads from the tree may be written back exactly as it is at the
+run's base — that is putting the original test back — and nothing else. A
+base-form case file is not read from the tree: the measurement runs the
+base's own content in its place, so nothing a round writes there moves the
+verdict, and what the rule keeps there is the test itself. The round must
+keep every line the base's file had, in its order — it may put the base's
+case back, never change or remove one — and may write no line that neither
+the base's file nor the round's start had: it may undo the run's changes to
+the file or remove the run's own lines, never write test content of its own
+(`_base_form_case_file_kept`). Writing the file back exactly is one such
+round. A test file the run added may not be changed or deleted at all
+(`_base_form_closure_breach`). A round that does otherwise is void and
+rolled back. The rule needs no attribution: in
 T9 bench 4 the two harmful kept rounds changed the test's support (e0d101e3:
 the global message mock rewritten so old literal assertions pass, and a
 test the run added changed) and would have been rolled back by it, which a
 check of which cases still pass could not see, because the round's own mock
-change is what made the run's deleted cases fail.
+change is what made the run's deleted cases fail. Why the case file is not
+held to its whole blob: on barnacle run c1b5b35a (issue #839, 0.104.0) the
+run had flipped a base case and appended its own passing cases to the same
+file. A sonnet round and then the opus round restored the base case byte
+for byte and kept the run's cases; the base form passed and so did the
+selfcheck, and both rounds were rolled back because the file was not the
+base's blob. Writing the blob back would have deleted the run's passing
+cases, which the next rule voids, so no round could pass: a run that adds
+cases to the file of a base case it broke could only end unconverged.
 
-**And it may not drop a case that still holds.** Putting an original test
-file back exactly is allowed, and with it every case the run had added to
-that file goes. A case the restored behaviour contradicts may go; one that
-still passes may not: the round's commit is measured for the cases of each
-test file it modified whose form at the round's start passes on its commit
-but that the commit's own form no longer has (`_redrive_dropped_cases`); any
-such case, or a measurement with no report, voids the round. The closure
-rule does not catch this: in T9 bench 3 a kept round wrote a79384a4's
+**And it may not drop a case that still holds.** A round may remove the
+run's own cases from a base-form case file, and putting the original file
+back exactly removes every one of them. A case the restored behaviour
+contradicts may go; one that still passes may not: the round's commit is
+measured for the cases of each test file it modified whose form at the
+round's start passes on its commit but that the commit's own form no
+longer has (`_redrive_dropped_cases`); any such case, or a measurement
+with no report, voids the round. The closure rule does not catch this: in T9 bench 3 a kept round wrote a79384a4's
 original `flow-runner.post-click-settle.test.ts` back exactly (no breach) and
 dropped 10 of the 32 run-start cases still passing there, the task's own
 guards among them.
