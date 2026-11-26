@@ -6296,8 +6296,16 @@ the confinement check every entry runs (`_require_heldout_sandbox`, in
 `_require_confinement`) builds a network namespace (the held-out sandbox always had one),
 then runs an isolated process with `--egress` that must reach the egress
 proxy through its relay and be refused a loopback destination
-(`_require_egress_relay`); a runtime that cannot do either stops the run
-naming the fix. Fly, EC2 and Colima are unmeasured: they fail closed
+(`_require_egress_relay`), and must not reach a listener on the
+orchestrator's own loopback; a runtime that cannot do either stops the run
+naming the fix. The relay is the only listener in that namespace and the
+kernel picks its port, so it can take the very port the orchestrator's
+listener holds in the orchestrator's namespace: a direct connection to that
+port then reaches the relay, not the orchestrator. One namespace cannot hold
+two listeners on one loopback port, so a relay on the orchestrator's port is
+itself proof that the namespaces differ, and the probe reports it so instead
+of trying the port (barnacle #845, 2026-11-26: one launch of 19 stopped on
+it while its namespace was isolated). Fly, EC2 and Colima are unmeasured: they fail closed
 rather than run a confined process on the shared network.
 
 ### A held-out evaluation runs alone, in a world that dies with it (I3)

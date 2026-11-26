@@ -6043,10 +6043,15 @@ command, so it does not run: <step>: <errno>`). Functions, in call order:
   /, --, python, -I, -S, -c, _EGRESS_RELAY_PROBE, <port>]` (60 s): the
   probe sends `CONNECT 127.0.0.1:<port>` to `HTTPS_PROXY` and connects to
   `127.0.0.1:<port>` directly, printing `{"proxy": <status line>,
-  "outer_loopback": <errno name or "reached">}`. `die()`s (naming each
-  failure and `_sandbox_fix(stderr)`) unless the exit is 0, the status
-  line starts `HTTP/1.1 403` and the direct connection is
-  `ECONNREFUSED`. That refusal is pre-marked as logged
+  "outer_loopback": <errno name, "reached", or "relay_port">}`.
+  `"relay_port"`: the relay's own port (from `HTTPS_PROXY`) is `<port>`,
+  so the direct connection is not tried, since it would reach the relay;
+  the orchestrator's listener holding that port in its own namespace shows
+  the namespaces differ. `die()`s (naming each failure and
+  `_sandbox_fix(stderr)`) unless the exit is 0, the status line starts
+  `HTTP/1.1 403` and the direct connection is `ECONNREFUSED` or
+  `"relay_port"`. `_sandbox_fix("")` (the shim printed nothing) names the
+  DESIGN section, not a message above. That refusal is pre-marked as logged
   (`_EgressProxy._refused`). `tests/conftest.py`'s autouse
   `_no_real_heldout_sandbox` stubs it (opt-out
   `@pytest.mark.real_heldout_sandbox`, registered in `pytest.ini`) and
