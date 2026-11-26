@@ -72763,14 +72763,38 @@ def _base_form_closure(repo: str | Path, rev: str, case_files: list[str],
     return closure
 
 
+def _base_form_case_file_kept(base_text: str, pre_text: str | None,
+                              post_text: str | None) -> bool:
+    """Whether a round that left a base-form case file as `post_blob` kept
+    its test (DESIGN §8 *A round changes what the test is run against, never
+    the test*): every line the base's file had is still there, in its order,
+    and every line it has is one the base's file or the round's start had —
+    the round put base lines back or removed the run's, and wrote none of
+    its own. Whole lines with their endings, no parsing: the same for every
+    language."""
+    if post_text is None:
+        return False
+    base_lines = base_text.splitlines(keepends=True)
+    post_lines = post_text.splitlines(keepends=True)
+    rest = iter(post_lines)
+    # In order: each base line is found after the one matched before it.
+    if not all(any(p == b for p in rest) for b in base_lines):
+        return False
+    had = set(base_lines) | set((pre_text or "").splitlines(keepends=True))
+    return all(p in had for p in post_lines)
+
+
 def _base_form_closure_breach(repo: str | Path, base: str, pre_sha: str,
                               post_sha: str, case_files: list[str],
                               globs: list[str] | None = None) -> list[str]:
     """What a base-form round (`pre_sha`..`post_sha`) may not have done, in
     words: change a file of its cases' test closure at `pre_sha`
     (`_base_form_closure`) other than by writing it back exactly as it is at
-    the run's base, or modify or delete a test file the run added (present
-    at `pre_sha`, absent at `base`). `[]` when it did neither."""
+    the run's base — or, for a base-form case file, whose base content the
+    measurement runs in place of the tree's, other than as
+    `_base_form_case_file_kept` allows — or modify or delete a test file the
+    run added (present at `pre_sha`, absent at `base`). `[]` when it did
+    neither."""
     rows = _redrive_git(repo, "diff", "--name-status", "--no-renames", "-z",
                         pre_sha, post_sha).split("\0")
     changed = [f for f in rows[1::2] if f]
@@ -72780,7 +72804,16 @@ def _base_form_closure_breach(repo: str | Path, base: str, pre_sha: str,
     out: list[str] = []
     for f in sorted(changed):
         at_base = _redrive_exists_at(repo, base, f)
-        if f in closure:
+        if (f in closure and at_base and _base_form_case(f, globs)
+                and posixpath.splitext(f)[1] not in _BASE_FORM_NO_REPORT_EXT):
+            if not _base_form_case_file_kept(
+                    _git_blob_text(repo, base, f) or "",
+                    _git_blob_text(repo, pre_sha, f),
+                    _git_blob_text(repo, post_sha, f)):
+                out.append(f"{f} (a base-form case file whose base lines "
+                           "were changed or removed, or with lines neither "
+                           "the base nor the round's start had)")
+        elif f in closure:
             same = (at_base and _redrive_exists_at(repo, post_sha, f)
                     and _redrive_git(repo, "rev-parse", f"{base}:{f}")
                     == _redrive_git(repo, "rev-parse", f"{post_sha}:{f}"))
