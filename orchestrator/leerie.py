@@ -26107,6 +26107,10 @@ _SANDBOX_FIXES: tuple[tuple[str, str], ...] = (
 
 def _sandbox_fix(stderr: str) -> str:
     """The runtime fix for the shim's isolation failure in `stderr`."""
+    if not stderr.strip():
+        # The shim printed nothing: there is no message above to point at.
+        return ("DESIGN §6 *A held-out evaluation runs alone* lists what the "
+                "runtime must allow")
     for pattern, fix in _SANDBOX_FIXES:
         if re.search(pattern, stderr):
             return fix
@@ -26249,26 +26253,35 @@ def _sandbox_probe_failures(got: dict, placed_on_disk: bool) -> list[str]:
 # What `_require_egress_relay` runs inside an isolated namespace with
 # `--egress`: ask the egress proxy (through the relay the shim set
 # `HTTPS_PROXY` to) to CONNECT to a loopback address, then try the
-# orchestrator's own loopback listener directly. One line of JSON.
+# orchestrator's own loopback listener directly. One line of JSON. The
+# relay is the namespace's one listener and the kernel picks its port: when
+# that is the orchestrator's port, a direct connection reaches the relay,
+# and one namespace cannot hold two listeners on one port, so the namespaces
+# differ (`relay_port`; DESIGN §6 *Fail closed*).
 _EGRESS_RELAY_PROBE = r"""
 import errno, json, os, socket, sys
 out = {}
+relay = None
 try:
     u = os.environ["HTTPS_PROXY"].rsplit("/", 1)[-1].rsplit("@", 1)[-1]
     host, port = u.rsplit(":", 1)
-    s = socket.create_connection((host, int(port)), timeout=20)
+    relay = int(port)
+    s = socket.create_connection((host, relay), timeout=20)
     s.sendall(b"CONNECT 127.0.0.1:" + sys.argv[1].encode()
               + b" HTTP/1.1\r\nHost: x\r\n\r\n")
     out["proxy"] = s.recv(4096).split(b"\r\n", 1)[0].decode("latin-1")
     s.close()
 except Exception as e:
     out["proxy"] = "error: " + type(e).__name__ + ": " + str(e)
-try:
-    socket.create_connection(("127.0.0.1", int(sys.argv[1])),
-                             timeout=5).close()
-    out["outer_loopback"] = "reached"
-except OSError as e:
-    out["outer_loopback"] = errno.errorcode.get(e.errno, str(e.errno))
+if relay == int(sys.argv[1]):
+    out["outer_loopback"] = "relay_port"
+else:
+    try:
+        socket.create_connection(("127.0.0.1", int(sys.argv[1])),
+                                 timeout=5).close()
+        out["outer_loopback"] = "reached"
+    except OSError as e:
+        out["outer_loopback"] = errno.errorcode.get(e.errno, str(e.errno))
 print(json.dumps(out))
 """
 
@@ -26311,7 +26324,7 @@ def _require_egress_relay() -> None:
         failed.append("the egress proxy was not reached through the relay, "
                       f"or did not refuse a loopback destination "
                       f"({got.get('proxy')!r})")
-    if got.get("outer_loopback") != "ECONNREFUSED":
+    if got.get("outer_loopback") not in ("ECONNREFUSED", "relay_port"):
         failed.append("the orchestrator's loopback was "
                       f"{got.get('outer_loopback')!r} from a confined "
                       "process's namespace, not refused")

@@ -647,6 +647,79 @@ def test_preflight_checks_the_relay_and_fails_closed(leerie, proxy,
         leerie._require_egress_relay()
 
 
+@needs_isolation
+def test_preflight_passes_when_the_relay_takes_the_orchestrators_port(
+        leerie, proxy, tmp_path):
+    """#64 (barnacle #845): the kernel picks the relay's port and the
+    orchestrator's listener's port independently, one per namespace. When
+    they are equal, a direct connection inside the namespace reaches the
+    relay, which the probe once read as the orchestrator's loopback being
+    reached. Forced here on the real shim: the orchestrator's side listens
+    on the very port the relay took, and the probe targets it."""
+    p = subprocess.Popen(
+        [sys.executable, "-I", "-S", str(SHIM), "--isolate", *DEV,
+         "--egress", str(proxy.socket_path), "--ro", "/", "--",
+         sys.executable, "-I", "-S", "-c", textwrap.dedent("""
+            import os, socket, subprocess, sys
+            port = os.environ["HTTPS_PROXY"].rsplit(":", 1)[1]
+            print("RELAY", port, flush=True)
+            sys.stdin.readline()
+            # What the old probe did: the direct connection reaches the
+            # namespace's own relay.
+            socket.create_connection(("127.0.0.1", int(port)), 5).close()
+            print("DIRECT reached", flush=True)
+            subprocess.run([sys.executable, "-I", "-S", "-c",
+                            sys.argv[1], port])
+         """), leerie._EGRESS_RELAY_PROBE],
+        cwd=str(tmp_path), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    port = int(p.stdout.readline().split()[1])
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        try:
+            lst.bind(("127.0.0.1", port))
+        except OSError:
+            p.kill()
+            pytest.skip(f"127.0.0.1:{port} is taken on this host")
+        lst.listen(1)
+        # Two listeners on one port: only possible in two namespaces.
+        out, err = p.communicate("go\n", timeout=60)
+    finally:
+        lst.close()
+    assert p.returncode == 0, err
+    assert "DIRECT reached" in out, out
+    got = json.loads(out.strip().splitlines()[-1])
+    assert got["outer_loopback"] == "relay_port", got
+    assert got["proxy"].startswith("HTTP/1.1 403"), got
+
+
+def test_preflight_accepts_relay_port_and_still_fails_on_reached(
+        leerie, monkeypatch):
+    """The verdict reads the report: `relay_port` passes, `reached` stops
+    the run, and with no shim output the fix names no message above."""
+    msgs = []
+    monkeypatch.setattr(leerie, "die", lambda m, **k: msgs.append(m)
+                        or (_ for _ in ()).throw(SystemExit(1)))
+    monkeypatch.setattr(leerie, "_egress_server", lambda: type(
+        "P", (), {"_refused": set(), "socket_path": "/x"})())
+    for loop, ok in (("relay_port", True), ("ECONNREFUSED", True),
+                     ("reached", False)):
+        monkeypatch.setattr(subprocess, "run", lambda *a, _l=loop, **k:
+                            subprocess.CompletedProcess(a, 0, json.dumps(
+                                {"proxy": "HTTP/1.1 403 Forbidden",
+                                 "outer_loopback": _l}) + "\n", ""))
+        msgs.clear()
+        if ok:
+            leerie._require_egress_relay()
+            assert msgs == []
+        else:
+            with pytest.raises(SystemExit):
+                leerie._require_egress_relay()
+            assert "'reached' from a confined process's namespace" in msgs[0]
+            assert "message above" not in msgs[0]
+            assert "DESIGN §6 *A held-out evaluation runs alone*" in msgs[0]
+
+
 def test_preflight_names_each_failure(leerie, proxy, monkeypatch):
     """Without a namespace: the probe's report is read, not its exit."""
     msgs = []
