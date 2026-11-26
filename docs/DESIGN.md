@@ -9367,6 +9367,17 @@ mid-run even though the token itself never expires. `leerie` supports
   the run's first `claude -p` call, the preflight smoke test included —
   not round-robin, which would burn a nearly-exhausted token at the same
   rate as a fresh one.
+- **Every entry chooses, from the list configured for it.** A fresh run,
+  `resume` and `--phase` each select the token before their first
+  `claude -p` call, by the same ranking. The configured list is the
+  operator's statement of which tokens the run may use: a token an earlier
+  entry persisted is re-ranked like any other while it is listed and never
+  used once it is not, and with no list configured no persisted token
+  overrides the singular variable. Measured: runs paused on one token's
+  weekly limit and resumed with only another token configured kept
+  spawning on the paused token, which was no longer listed, and re-paused
+  at its reset within minutes while the listed token had 98% of its week
+  left.
 - **Mid-run failover.** If the active token gets rate-limited mid-run,
   leerie rotates to another token with runway and **continues in the same
   container** — no re-exec, no restart — by threading the active token
@@ -9405,7 +9416,16 @@ degrades to "use the current/first token and react to the next 429" rather
 than fail the run. A probe response missing an expected field (contract
 drift, distinct from an ordinary transient failure) is logged at WARNING
 with a stable marker so a silent endpoint-shape change doesn't quietly
-degrade this feature for weeks with no signal. Each token's probe result
+degrade this feature for weeks with no signal. **A window the probe reports
+nothing for is a window the token has not drawn on, not drift:** measured,
+a healthy token with 2% of its week used and no five-hour usage answers with
+the 7-day headers alone, and requiring the five-hour ones made rotation
+read that token as unprobeable and pause the run on a limited one. Such a
+window does not constrain the token; its reset is that of the window that
+binds it; drift is a response that reports no window at all. A token the
+header probe finds limited (a 429) carries the headers too, and they are
+read: they are that token's own reset, which the soonest-reset choice
+needs. Each token's probe result
 is cached for a floor of ~180 seconds and identified in logs only by a
 short fingerprint — the raw token value is never written to a log line,
 `calls.ndjson`, or `run.json`. `state.json`'s `active_oauth_token` field is

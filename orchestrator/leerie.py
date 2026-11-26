@@ -25366,40 +25366,69 @@ def _probe_token_usage_a(token: str) -> dict | None:
             f"({type(e).__name__}) for token {_token_fingerprint(token)}")
         return None
 
+    def _pct(value: float | None) -> float | None:
+        return None if value is None else value / 100.0
+
     def _sub(obj: dict | None) -> float | None:
-        if obj is None:
+        if not isinstance(obj, dict):
             return None
-        return obj.get("utilization")
+        return _pct(obj.get("utilization"))
 
-    five_hour = body.get("five_hour")
-    seven_day = body.get("seven_day")
-    if not isinstance(five_hour, dict) or not isinstance(seven_day, dict) \
-            or "utilization" not in five_hour or "resets_at" not in five_hour \
-            or "utilization" not in seven_day:
-        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A response missing "
-            f"five_hour/seven_day.utilization or five_hour.resets_at "
-            f"for token {_token_fingerprint(token)} — the undocumented "
-            "endpoint may have changed shape; probe code needs review")
+    windows: list[tuple[float | None, datetime | None]] = []
+    for name in ("five_hour", "seven_day"):
+        window = body.get(name)
+        if not isinstance(window, dict):
+            windows.append((None, None))
+            continue
+        raw_reset = window.get("resets_at")
+        try:
+            reset = (datetime.fromisoformat(raw_reset)
+                     if raw_reset is not None else None)
+        except (ValueError, TypeError):
+            log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A {name}.resets_at "
+                f"is not a parseable ISO-8601 timestamp for token "
+                f"{_token_fingerprint(token)}")
+            return None
+        windows.append((_pct(window.get("utilization")), reset))
+    usage = _usage_from_windows(
+        five_hour=windows[0], seven_day=windows[1],
+        seven_day_opus_util=_sub(body.get("seven_day_opus")),
+        seven_day_sonnet_util=_sub(body.get("seven_day_sonnet")))
+    if usage is None:
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A response reports no "
+            f"five_hour/seven_day.utilization for token "
+            f"{_token_fingerprint(token)} — the undocumented endpoint may "
+            "have changed shape; probe code needs review")
+    return usage
+
+
+def _usage_from_windows(
+        *, five_hour: tuple[float | None, datetime | None],
+        seven_day: tuple[float | None, datetime | None],
+        binding_reset: datetime | None = None,
+        seven_day_opus_util: float | None = None,
+        seven_day_sonnet_util: float | None = None) -> dict | None:
+    """One probe's (utilization, reset) per window, normalized to the shape
+    `_rank_tokens` reads (DESIGN §6 *Multi-token rotation*). A window the
+    probe reports no utilization for is one the token has not drawn on —
+    measured: a token with 2% of its week used and no five-hour usage is
+    answered with the 7-day headers alone — so it does not constrain the
+    token (utilization 0). `resets_at` is the reset of the window that
+    binds the token: the probe's own statement of it when it makes one
+    (`binding_reset`), else the most-utilized window's, else any window's.
+    None only when no window reports a utilization at all."""
+    present = [(u, r) for u, r in (five_hour, seven_day) if u is not None]
+    if not present:
         return None
-
-    try:
-        resets_at = datetime.fromisoformat(five_hour["resets_at"])
-    except (ValueError, TypeError):
-        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe A five_hour.resets_at "
-            f"is not a parseable ISO-8601 timestamp for token "
-            f"{_token_fingerprint(token)}")
-        return None
-
+    resets_at = (binding_reset
+                 or max(present, key=lambda w: w[0])[1]
+                 or next((r for _, r in present if r is not None), None))
     return {
-        "five_hour_util": five_hour["utilization"] / 100.0,
-        "seven_day_util": seven_day["utilization"] / 100.0,
+        "five_hour_util": five_hour[0] or 0.0,
+        "seven_day_util": seven_day[0] or 0.0,
         "resets_at": resets_at,
-        "seven_day_opus_util": (
-            lambda u: None if u is None else u / 100.0
-        )(_sub(body.get("seven_day_opus"))),
-        "seven_day_sonnet_util": (
-            lambda u: None if u is None else u / 100.0
-        )(_sub(body.get("seven_day_sonnet"))),
+        "seven_day_opus_util": seven_day_opus_util,
+        "seven_day_sonnet_util": seven_day_sonnet_util,
     }
 
 
@@ -25408,7 +25437,10 @@ def _probe_token_usage_b(token: str) -> dict | None:
     the anthropic-ratelimit-unified-* response headers. Works for
     user:inference-scoped tokens (setup-tokens) where Probe A 403s.
     /v1/messages/count_tokens does NOT carry these headers — a real
-    inference call is required (~1 output token cost).
+    inference call is required (~1 output token cost). A 429 (the token
+    limited) is read as well when it carries the headers, for the limited
+    token's reset; a window with no headers has not been drawn on
+    (`_usage_from_windows`).
 
     Returns the same normalized shape as _probe_token_usage_a (utilization
     0.0-1.0 fraction, resets_at as datetime) — Probe B's own headers use a
@@ -25434,49 +25466,56 @@ def _probe_token_usage_b(token: str) -> dict | None:
             "content-type": "application/json",
         },
     )
+    refused = False
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             headers = resp.headers
     except urllib.error.HTTPError as e:
-        # A non-2xx response carries no usable rate-limit data — always
-        # return None here rather than falling through to parse e.headers,
-        # which (unlike a successful response) is not guaranteed to carry
-        # the anthropic-ratelimit-unified-* fields at all.
-        if e.code == 401:
-            log(f"  token-probe: token {_token_fingerprint(token)} "
-                "rejected (401) — likely dead/expired")
-        elif e.code not in (429,):
-            log(f"  token-probe: Probe B transient failure "
-                f"(HTTP {e.code}) for token {_token_fingerprint(token)}")
-        return None
+        # A 429 is the token's own limit and carries the windows' headers
+        # (measured): read them, for the limited token's reset. Any other
+        # non-2xx carries no usable rate-limit data.
+        if e.code != 429:
+            if e.code == 401:
+                log(f"  token-probe: token {_token_fingerprint(token)} "
+                    "rejected (401) — likely dead/expired")
+            else:
+                log(f"  token-probe: Probe B transient failure "
+                    f"(HTTP {e.code}) for token {_token_fingerprint(token)}")
+            return None
+        headers = e.headers or {}
+        refused = True
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         log(f"  token-probe: Probe B transient failure "
             f"({type(e).__name__}) for token {_token_fingerprint(token)}")
         return None
 
-    five_h = headers.get("anthropic-ratelimit-unified-5h-utilization")
-    seven_d = headers.get("anthropic-ratelimit-unified-7d-utilization")
-    five_h_reset = headers.get("anthropic-ratelimit-unified-5h-reset")
-    if five_h is None or seven_d is None or five_h_reset is None:
-        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe B response missing "
-            f"anthropic-ratelimit-unified-* headers for token "
-            f"{_token_fingerprint(token)} — the undocumented headers may "
-            "have changed; probe code needs review")
-        return None
+    prefix = "anthropic-ratelimit-unified-"
+
+    def _util(window: str) -> float | None:
+        raw = headers.get(f"{prefix}{window}-utilization")
+        return None if raw is None else float(raw)
+
+    def _reset(name: str) -> datetime | None:
+        raw = headers.get(f"{prefix}{name}")
+        return (None if raw is None
+                else datetime.fromtimestamp(int(raw), tz=timezone.utc))
 
     try:
-        return {
-            "five_hour_util": float(five_h),
-            "seven_day_util": float(seven_d),
-            "resets_at": datetime.fromtimestamp(
-                int(five_h_reset), tz=timezone.utc),
-            "seven_day_opus_util": None,
-            "seven_day_sonnet_util": None,
-        }
-    except (ValueError, TypeError):
+        usage = _usage_from_windows(
+            five_hour=(_util("5h"), _reset("5h-reset")),
+            seven_day=(_util("7d"), _reset("7d-reset")),
+            # The server's own reset for the window that binds the token.
+            binding_reset=_reset("reset"))
+    except (ValueError, TypeError, OverflowError, OSError):
         log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe B header values not "
             f"parseable as expected for token {_token_fingerprint(token)}")
         return None
+    if usage is None and not refused:
+        log(f"  ⚠  {_TOKEN_PROBE_DRIFT_MARKER}: Probe B response carries no "
+            f"anthropic-ratelimit-unified-5h/7d-utilization header for "
+            f"token {_token_fingerprint(token)} — the undocumented headers "
+            "may have changed; probe code needs review")
+    return usage
 
 
 def _probe_token_usage(token: str, cache_sec: int) -> dict | None:
@@ -25628,11 +25667,9 @@ async def _rotate_oauth_token_or_raise(
     # preferred over its possibly-stale-or-absent cache entry.
     active = st.data.get("active_oauth_token")
     candidates: list[tuple[str, datetime]] = []
-    # The entry token first: it may no longer be listed (a resume under a
-    # changed CLAUDE_CODE_OAUTH_TOKENS), and its live reset still counts.
-    for t in dict.fromkeys([*limited, *oauth_tokens]):
-        if t is None:
-            continue
+    # Listed tokens only: a token the configured list does not name is never
+    # used (every entry selects from the list, `_select_active_oauth_token`).
+    for t in oauth_tokens:
         live = limited.get(t)
         if live is not None:
             candidates.append((t, live))
@@ -25707,16 +25744,24 @@ async def _spawn_with_token_rotation(
 
 
 async def _select_active_oauth_token(st: "State", caps: dict) -> None:
-    """Start-of-run smart token selection (DESIGN §6 *Multi-token
-    rotation*). Only runs when CLAUDE_CODE_OAUTH_TOKENS is present in the
-    environment — the singular-var-only path is entirely unaffected (no
-    `active_oauth_token` is ever set, so `_invoke`'s active_token stays
-    None and behavior is byte-identical to before this feature).
+    """The run's token, chosen on every entry that spawns workers — a fresh
+    run, `resume`, `--phase` — from the list configured for THIS entry
+    (DESIGN §6 *Multi-token rotation*). A token an earlier entry persisted
+    is re-ranked like any other when still listed and never used when not:
+    a resume relaunched with only another token configured otherwise kept
+    spawning on the token it paused on. With no CLAUDE_CODE_OAUTH_TOKENS,
+    no token is persisted either, so `_invoke`'s active_token is None and
+    the singular CLAUDE_CODE_OAUTH_TOKEN (or the mounted credentials) is
+    what every spawn uses.
 
     Best-effort: if every probe fails, the first token in the list is
     selected and the run proceeds — this function never die()s."""
     tokens = _parse_oauth_token_list(os.environ.get("CLAUDE_CODE_OAUTH_TOKENS"))
     if not tokens:
+        if st.data.pop("active_oauth_token", None) is not None:
+            log("  token-probe: no CLAUDE_CODE_OAUTH_TOKENS configured — "
+                "dropping the run's earlier token")
+            st.save()
         return
     cache_sec = caps.get("token_probe_cache_sec",
                           DEFAULT_CAPS["token_probe_cache_sec"])
@@ -84295,6 +84340,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
         log(f"per-worker logs: {_operator_path(st.run_dir / 'logs')}/")
+        # The token is this entry's choice, as on a fresh run, and before
+        # anything below can spawn (a completed run's PR composer included):
+        # the persisted one may be limited, or no longer configured.
+        await _select_active_oauth_token(st, caps)
         # A successfully finalized run must not re-execute phases 4→5→6.
         # Without this guard, `resume` on a completed run re-runs
         # setup-run.sh + finalize.sh + cleanup.sh, creating a window
@@ -84559,8 +84608,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # spawns with the selected token and rotates like any worker: run
         # after it, the smoke test used the launcher's seed (the list's
         # first token) and paused a run for 33 hours on that token's limit
-        # while another token had runway. Fresh-run only: on resume,
-        # active_oauth_token (if any) is already persisted in st.data.
+        # while another token had runway. `resume` and `--phase` select too,
+        # each at its own entry.
         await _select_active_oauth_token(st, caps)
         # The smoke test bills the tier the run's FIRST worker actually
         # spawns with (phase_classify is unconditional), rather than letting
@@ -86400,6 +86449,9 @@ def main() -> int | None:
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
         st.save()
+        # The phase's workers spawn with a token this entry chose from the
+        # list configured now, never the run's persisted one as is.
+        asyncio.run(_select_active_oauth_token(st, caps))
         phase_run_dir = st.run_dir
         judge_out_dir = phase_run_dir / args.judge_dir
         heal_out_dir = phase_run_dir / args.heal_dir
