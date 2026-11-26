@@ -4526,12 +4526,19 @@ floor) from handing V8 a non-positive or degenerately small ceiling. The
 variable is absent for a non-Node repo or when `worker_memory_max_bytes`
 is `None`.
 
-**Start-of-run probe + selection.** `_select_active_oauth_token(st, caps)`,
-on a fresh run, immediately before `preflight()` (whose smoke test is the
-run's first `claude -p` call; its probes precede preflight's own cheap
-checks) — after the cgroup containment gate: if
-`CLAUDE_CODE_OAUTH_TOKENS` is present, each token is probed for remaining
-runway and the winner becomes `st.data["active_oauth_token"]`:
+**Probe + selection on every entry.** `_select_active_oauth_token(st, caps)`
+runs on each entry that spawns workers, from the `CLAUDE_CODE_OAUTH_TOKENS`
+of that entry: on a fresh run immediately before `preflight()` (whose smoke
+test is the run's first `claude -p` call; its probes precede preflight's own
+cheap checks) — after the cgroup containment gate; on `resume` in
+`_run_phases`' resume branch right after `_validate_resume_state`, ahead of
+the completed-run short-circuit (whose PR composer spawns); on `--phase` in
+`main()`'s phase branch before its first worker. If the list is present,
+each token is probed for remaining runway and the winner becomes
+`st.data["active_oauth_token"]` — a persisted token is ranked like any other
+while listed and replaced when not. If it is absent, a persisted
+`active_oauth_token` is removed, so the singular `CLAUDE_CODE_OAUTH_TOKEN`
+is what spawns use:
 
 - **Probe A** (tried first): `GET https://api.anthropic.com/api/oauth/usage`
   with `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
@@ -4546,12 +4553,21 @@ runway and the winner becomes `st.data["active_oauth_token"]`:
 - **Probe B** (403 fallback): `POST /v1/messages` with `max_tokens: 1` and
   a one-character user message, reading the
   `anthropic-ratelimit-unified-5h-utilization` / `-5h-reset` /
-  `-7d-utilization` / `-7d-reset` / `-5h-status` response headers.
-  **These use a different representation than Probe A**: utilization is a
+  `-7d-utilization` / `-7d-reset` / `-reset` response headers, off a 200
+  or a 429 (the token limited; it carries them too). **These use a
+  different representation than Probe A**: utilization is a
   **0.0–1.0 fraction** and reset is **Unix epoch seconds**.
-  `_probe_token_usage` normalizes both onto one internal representation
-  (0.0–1.0 fraction, `datetime` reset). `/v1/messages/count_tokens` does
-  **not** carry these headers — a real inference call is required.
+  `/v1/messages/count_tokens` does **not** carry these headers — a real
+  inference call is required.
+- **Windows** (`_usage_from_windows`, both probes): each probe's per-window
+  (utilization, reset) is normalized onto one representation (0.0–1.0
+  fraction, `datetime` reset). A window with no utilization reported (a
+  Probe B header set without `-5h-*`, measured on a token with no
+  five-hour usage; a Probe A window object absent or `null`) has not been
+  drawn on and counts as utilization 0. `resets_at` is the binding
+  window's reset: Probe B's `-reset` header when present, else the
+  most-utilized window's, else any window's. `None` — contract drift on a
+  2xx — only when no window reports a utilization.
 - **Ranking** (`_rank_tokens`): sorts by `min(1 − five_hour_util, 1 −
   seven_day_util)` descending (accounting for the Opus sublimit, which
   leerie's Opus-default workers (`pr_reviewer`, `intent_resolver`,
@@ -4559,6 +4575,8 @@ runway and the winner becomes `st.data["active_oauth_token"]`:
   override draw on), tie-broken by furthest
   `resets_at`. A token whose probe failed entirely sorts last but remains
   eligible.
+- **Listed tokens only**: `_rotate_oauth_token_or_raise` rotates to, and
+  pauses on, only tokens in the current `CLAUDE_CODE_OAUTH_TOKENS`.
 - **Cache**: each token's probe result is cached, keyed by
   `_token_fingerprint(token)` (never the raw token), for
   `caps["token_probe_cache_sec"]` (default 180s) — shared by both
