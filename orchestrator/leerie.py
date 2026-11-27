@@ -14044,19 +14044,22 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
 WORKERS_DIR = "workers"
 CLAUDE_CONFIG_TEMPLATE = "claude-config"
 _CLAUDE_CONFIG_TEMPLATE_MARK = ".leerie-template"
-# Per-session state of the operator's CLI configuration, never copied into a
-# worker's: transcripts, session metadata, history, caches and backups.
-_CLAUDE_CONFIG_SKIP = frozenset({
-    "projects", "sessions", "session-env", "shell-snapshots", "history.jsonl",
-    "todos", "tasks", "plans", "file-history", "paste-cache", "telemetry",
-    "statsig", "debug", "downloads", "backups", "ide", "local",
-    "stats-cache.json", ".last-cleanup"})
+# What a worker's CLI reads from its configuration directory, by top-level
+# name (DESIGN §6 *What a config directory holds*): an allowlist, so every
+# session store (`projects`, `jobs`, `sessions`, history, caches, backups)
+# and any store the CLI adds later is left out by rule, not by name. This is
+# the one definition; the launcher's copy must hold the same names.
+_CLAUDE_CONFIG_READS = frozenset({
+    "settings.json", "settings.local.json", ".credentials.json",
+    ".claude.json", "CLAUDE.md", "agents", "skills", "commands", "hooks",
+    "output-styles", "rules", "plugins", "keybindings.json",
+    "mcp-needs-auth-cache.json", "policy-limits.json"})
 
 
 def _claude_config_template(run_dir: Path) -> Path:
     """`<run_dir>/claude-config/`: the run's snapshot of the operator's CLI
-    configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`, without its
-    per-session state, plus `~/.claude.json`), made once — at the run's
+    configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`, holding
+    only what a worker reads, plus `~/.claude.json`), made once — at the run's
     first worker — and kept for the run, so nothing a worker writes later
     reaches another worker's copy."""
     t = Path(run_dir) / CLAUDE_CONFIG_TEMPLATE
@@ -14069,7 +14072,7 @@ def _claude_config_template(run_dir: Path) -> Path:
     if src.is_dir():
         shutil.copytree(src, tmp, symlinks=True,
                         ignore=lambda d, names: (
-                            [n for n in names if n in _CLAUDE_CONFIG_SKIP]
+                            [n for n in names if n not in _CLAUDE_CONFIG_READS]
                             if Path(d) == src else []))
     else:
         tmp.mkdir(parents=True)

@@ -9247,55 +9247,39 @@ d.pop("projects", None)
 json.dump(d, open(sys.argv[2], "w"))
 PY
 
-# -- .claude/: copy with prior-session / history / bulk dirs skipped. --
-# Blacklist (not whitelist) so a newly-added capability dir Anthropic
-# ships in a future release rides along by default. Update this list
-# only when something *bulky and session-shaped* lands.
+# -- .claude/: copy only what the CLI reads (an allowlist). --
+# Top-level entries not named here are left out by rule, so every session
+# store (jobs, projects, sessions, history, caches, backups) and any store a
+# future release adds never rides into a copy. plugins/ holds only its
+# manifests: plugins/cache and plugins/marketplaces are rebuilt on the
+# remote by seed-auth.sh step 4 from installed_plugins.json and
+# known_marketplaces.json.
 mkdir "$STAGE_CLI/.claude"
-CLAUDE_SKIP=(
-  history.jsonl     # global prompt history (22+ MB)
-  projects          # per-project session transcripts
-  sessions          # session metadata
-  tasks plans todos # prior-session task state
-  file-history      # per-session file-edit snapshots
-  paste-cache       # per-session paste tracking
-  shell-snapshots   # per-shell snapshots
-  session-env       # per-session env snapshots
-  telemetry         # CLI telemetry (we own our own)
-  stats-cache.json  # per-session stats cache
-  debug             # debug dumps
-  downloads         # downloaded files
-  backups           # .claude.json backups (we own our copy)
-  chrome            # Chrome integration state
-  ralph-state       # plugin state from prior sessions
-  .last-cleanup     # cleanup marker (regenerates)
-  # ~400 MB host npm install of the CLI; the leerie image installs
-  # @anthropic-ai/claude-code globally via the Dockerfile, so this is
-  # pure dead weight on the wire to Fly. Local nerdctl runs bind-mount
-  # the host $HOME/.claude so they pick up the local install regardless.
-  local
-  # Skip the plugin cache and marketplaces (hundreds of MB on a typical
-  # host — vercel's node_modules alone is ~150 MB). These are rebuildable
-  # from the small JSON files we still seed (installed_plugins.json,
-  # known_marketplaces.json). seed_auth runs `claude plugin marketplace
-  # add` + `claude plugin install` on the remote after the tar pipe to
-  # repopulate them on the machine's fast public egress instead of the
-  # slow WireGuard wire.
-  plugins/cache
-  plugins/marketplaces
+CLAUDE_READS=(
+  settings.json settings.local.json CLAUDE.md .credentials.json
+  agents skills commands hooks output-styles rules keybindings.json plugins
+  mcp-needs-auth-cache.json policy-limits.json
 )
-if command -v rsync >/dev/null 2>&1; then
-  EXCLUDES=()
-  for s in "${CLAUDE_SKIP[@]}"; do EXCLUDES+=(--exclude="$s"); done
-  rsync -a "${EXCLUDES[@]}" --exclude='settings.json.*' \
-    "$HOME/.claude/" "$STAGE_CLI/.claude/"
-else
-  cp -aR "$HOME/.claude/." "$STAGE_CLI/.claude/"
-  for s in "${CLAUDE_SKIP[@]}"; do
-    rm -rf "$STAGE_CLI/.claude/$s"
-  done
-  rm -f "$STAGE_CLI"/.claude/settings.json.*
-fi
+_claude_copy() {  # _claude_copy <src> <dst>: rsync, else cp; same entries either way
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "$1" "$2"
+  else
+    cp -aR "$1" "$2"
+  fi
+}
+for s in "${CLAUDE_READS[@]}"; do
+  [ -e "$HOME/.claude/$s" ] || [ -L "$HOME/.claude/$s" ] || continue
+  if [ "$s" = plugins ]; then
+    mkdir "$STAGE_CLI/.claude/plugins"
+    for p in "$HOME/.claude/plugins"/* "$HOME/.claude/plugins"/.[!.]*; do
+      [ -e "$p" ] || [ -L "$p" ] || continue
+      case "${p##*/}" in cache|marketplaces) continue ;; esac
+      _claude_copy "${p%/}" "$STAGE_CLI/.claude/plugins/"
+    done
+  else
+    _claude_copy "$HOME/.claude/${s%/}" "$STAGE_CLI/.claude/"
+  fi
+done
 
 # -- Extract OAuth credentials for the staged $STAGE_CLI/.claude/. --
 # On macOS the CLI stores its OAuth token in the Keychain (service
