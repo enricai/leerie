@@ -56254,6 +56254,36 @@ def _delivery_unmet_parts(v: dict, tree: str | Path, record: str,
     return out
 
 
+def _delivery_unmet_locations(parts: list | None) -> list[dict]:
+    """Typed offending locations `[{path, start_line, end_line}]` of an
+    item's judge `unmet_parts` (their cites already verified): `RECORD`
+    and `ABSENT` cites name no file and are dropped; duplicates collapse."""
+    out: list[dict] = []
+    seen: set = set()
+    for p in parts or []:
+        for c in (p.get("cites") or []) if isinstance(p, dict) else []:
+            if not isinstance(c, dict):
+                continue
+            path = str(c.get("path") or "").strip()
+            if not path or path.upper() == "RECORD" \
+                    or path.upper().startswith("ABSENT"):
+                continue
+            loc: dict = {"path": path}
+            for src, dst in (("line_start", "start_line"),
+                             ("line_end", "end_line")):
+                try:
+                    n = int(c.get(src))
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    loc[dst] = n
+            key = (loc["path"], loc.get("start_line"), loc.get("end_line"))
+            if key not in seen:
+                seen.add(key)
+                out.append(loc)
+    return out
+
+
 def _relative_cites(v: dict, cwd: str | Path) -> dict:
     """A verdict with each part's citation paths made relative to `cwd`,
     the checkout its judge ran in (`_delivery_cite_rel`): the citations
@@ -69130,7 +69160,10 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
         if by:
             unmet_final.append({"item_index": i, "item": it.get("item", ""),
                                 "evidence": " | ".join(evidence)[:1200],
-                                "by": by, "evidence_by": evidence_by})
+                                "by": by, "evidence_by": evidence_by,
+                                "locations": _delivery_unmet_locations(
+                                    (details_by_idx.get(i) or {}).get(
+                                        "unmet_parts"))})
     _set_test_outcome_gap(st, unknown_tests,
                           (tid or {}).get("reason") or "")
     _set_unobservable_gap(st, unobservable_rows)
@@ -69183,6 +69216,7 @@ _REDRIVE_LOG = "delivery-redrive.log"
 # What a note shows of an item's evidence and a set file's case names.
 _REDRIVE_EVIDENCE_MAX = 1200
 _REDRIVE_CASES_MAX = 12
+_REDRIVE_LOCATIONS_MAX = 12
 
 
 def _item_claims(subtasks: dict | list) -> dict[int, dict]:
@@ -69213,8 +69247,15 @@ def _item_claims(subtasks: dict | list) -> dict[int, dict]:
     return out
 
 
+def _redrive_routable(path: str) -> bool:
+    """One filter for every re-drive routing path: any language, but never
+    a test file or a vendored / cache path."""
+    return bool(path.strip()) and not _is_test_file(path) \
+        and not _acceptance_is_cache_path(path)
+
+
 def _redrive_subtask_files(staging: Path, sid: str, spec: dict) -> list[str]:
-    """The source files `sid` changed: those its `leerie: integrate <sid>`
+    """The files `sid` changed: those its `leerie: integrate <sid>`
     merge brought in, else its `files_likely_touched` — never a test file."""
     files: list[str] = []
     merge = _integration_commit(staging, sid)
@@ -69227,14 +69268,12 @@ def _redrive_subtask_files(staging: Path, sid: str, spec: dict) -> list[str]:
     if not files:
         files = [f for f in (spec.get("files_likely_touched") or [])
                  if isinstance(f, str)]
-    return sorted({f for f in files
-                   if _CONTRACT_CODE_FILE_RE.search(f) and not _is_test_file(f)
-                   and "node_modules/" not in f})
+    return sorted({f for f in files if _redrive_routable(f)})
 
 
 def _redrive_kept_files(staging: Path, rec: dict,
                         sids: Iterable[str]) -> dict[str, set[str]]:
-    """sid -> the source files the kept re-drive groups it was a member of
+    """sid -> the files the kept re-drive groups it was a member of
     changed (`git diff --name-only <pre_sha> <post_sha>` of every group
     with both, not rolled back), filtered as `_redrive_subtask_files`
     filters a merge's. A group's commit is its members' diff as much as
@@ -69254,12 +69293,94 @@ def _redrive_kept_files(staging: Path, rec: dict,
             if r.returncode != 0:
                 continue
             files = {f for f in r.stdout.splitlines()
-                     if f.strip() and _CONTRACT_CODE_FILE_RE.search(f)
-                     and not _is_test_file(f) and "node_modules/" not in f}
+                     if _redrive_routable(f)}
             for m in ge.get("members") or []:
                 if str(m) in want:
                     out.setdefault(str(m), set()).update(files)
     return out
+
+
+def _redrive_location_owners(staging: Path, rec: dict,
+                             subfiles: dict[str, list[str]],
+                             locs: list) -> list[str]:
+    """The subtasks that wrote the lines a judge's typed `locations` cite.
+
+    A location with `start_line` is blamed at the staging HEAD
+    (`git --literal-pathspecs blame -L s,e --porcelain`; SHA-1 or SHA-256 headers); a blamed commit owns the line for the
+    subtask whose `leerie: integrate <sid>` merge (`<merge>^1..<merge>`) or
+    kept re-drive group (`pre_sha..post_sha`, members only) contains it.
+    A line blamed to any other commit routes to no one: a pre-run commit,
+    a conformer or acceptance-repair commit, or a subtask no longer
+    routed (blocked, accepted). Ownership is who wrote the line. A location
+    without line numbers falls back to whole-file matching
+    (`subfiles | _redrive_kept_files`). Test and vendored files never route.
+    Git only: no language knowledge."""
+    git = ["git", *_tree_git_args(staging)]
+
+    def routable(path: str) -> bool:
+        return _redrive_routable(path)
+
+    def revs(rng: str) -> set[str]:
+        r = subprocess.run([*git, "rev-list", rng], capture_output=True,
+                           text=True, check=False)
+        return set(r.stdout.split()) if r.returncode == 0 else set()
+
+    wrote: dict[str, set[str]] | None = None
+
+    def commits() -> dict[str, set[str]]:
+        nonlocal wrote
+        if wrote is None:
+            wrote = {}
+            for sid in subfiles:
+                m = _integration_commit(staging, sid)
+                if m:
+                    wrote.setdefault(sid, set()).update(revs(f"{m}^1..{m}"))
+            for rd in rec.get("rounds") or []:
+                for ge in ((rd.get("groups") or [])
+                           if isinstance(rd, dict) else []):
+                    if not isinstance(ge, dict) or ge.get("rolled_back"):
+                        continue
+                    pre, post = ge.get("pre_sha"), ge.get("post_sha")
+                    if not pre or not post or pre == post:
+                        continue
+                    cs = revs(f"{pre}..{post}")
+                    for m_ in ge.get("members") or []:
+                        if str(m_) in subfiles:
+                            wrote.setdefault(str(m_), set()).update(cs)
+        return wrote
+
+    whole: set[str] = set()
+    out: list[str] = []
+    for x in locs:
+        if not isinstance(x, dict) or not x.get("path"):
+            continue
+        path = os.path.normpath(str(x["path"]))
+        if not routable(path):
+            continue
+        s_, e_ = x.get("start_line"), x.get("end_line")
+        if not isinstance(s_, int) or isinstance(s_, bool) or s_ < 1:
+            whole.add(path)
+            continue
+        if not isinstance(e_, int) or isinstance(e_, bool) or e_ < s_:
+            e_ = s_
+        r = subprocess.run([*git, "--literal-pathspecs", "blame", "-L", f"{s_},{e_}", "--porcelain",
+                            "HEAD", "--", path], capture_output=True,
+                           text=True, check=False)
+        if r.returncode != 0:
+            continue
+        blamed = {ln.split()[0] for ln in r.stdout.splitlines()
+                  if re.match(r"^(?:[0-9a-f]{40}|[0-9a-f]{64}) \d+ \d+", ln)}
+        for sid, cs in commits().items():
+            if blamed & cs and sid not in out:
+                out.append(sid)
+    if whole:
+        touched = _redrive_kept_files(staging, rec, list(subfiles))
+        for sid in subfiles:
+            fs = {os.path.normpath(str(f)) for f in
+                  set(subfiles[sid]) | touched.get(sid, set())}
+            if whole & fs and sid not in out:
+                out.append(sid)
+    return [sid for sid in subfiles if sid in out]
 
 
 def _redrive_exercised(g: dict, set_: dict, rel: str) -> list[str]:
@@ -69628,6 +69749,14 @@ def _redrive_evidence_keys(u: dict, row: object, *,
     return sorted(out)
 
 
+def _redrive_typed_locations(u: dict) -> list[dict]:
+    """The typed offending locations ({path, ...}) of an `unmet_final`
+    entry; `[]` when it has none."""
+    raw = u.get("locations") if isinstance(u, dict) else None
+    return ([x for x in raw if isinstance(x, dict) and x.get("path")]
+            if isinstance(raw, list) else [])
+
+
 def _redrive_unrouted_entries(notes: Iterable[dict],
                               records: Iterable[dict]) -> list[dict]:
     """What `_redrive_unrouted_items` accounts, per still-open item, read
@@ -69750,6 +69879,8 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
                         contested: Iterable[int] = (),
                         suite: dict | None = None,
                         probe_owners: Callable[[dict], list[str]] | None
+                        = None,
+                        location_owners: Callable[[list], list[str]] | None
                         = None
                         ) -> tuple[list[dict], list[dict]]:
     """(notes, records) for the open unmet items (DESIGN §8 *Delivery
@@ -69767,10 +69898,19 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
     change, never one subtask's deliverable) is driven only on a shown
     probe, to the subtasks whose diff touches the code it exercises
     (`probe_owners(probe)`): a confirmed probe names the failing code, and
-    the diff names who changed it. With no such probe, or no owner, it is
+    the diff names who changed it. A process item whose judge named
+    offending code carries typed `locations` ({path, start_line, end_line});
+    `location_owners(locations)` maps them, language-agnostically, to the
+    subtasks that own the cited lines (blame of each range, mapped to the
+    commits of the integrate merge and kept groups; whole-file only for a
+    location with no line numbers), and those join the probe's
+    owners — the judge's evidence (`evidence_by["judge"]`) is then handed on
+    too, its evidence key the plain `judge`, never derived from the
+    locations, so one swing per item and key holds. The note carries the `locations`. With
+    no shown probe and no located owner, it is
     a record `{item_index, item, reason: "no_code_target"}` — or
     `unreproducible`, with `probed`, when its only evidence is a probe no
-    fixer may be shown. Its note carries the probe alone, `process: true`.
+    fixer may be shown. Its note carries `process: true`.
 
     Any other is an `unmet_item` note carrying those sources alone and
     only their evidence (`evidence_by`), plus the shown `probe` when the
@@ -69797,10 +69937,21 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
         keys = _redrive_evidence_keys(u, by_row.get(i),
                                       contested=i in contested)
         owners: list[str] = []
+        locs: list = []
         if process:
             owners = (list(probe_owners(probe))
                       if probe is not None and probe_owners else [])
             repro = ["falsifier"] if owners else []
+            raw = u.get("locations")
+            locs = ([x for x in raw if isinstance(x, dict) and x.get("path")]
+                    if isinstance(raw, list) else [])
+            if locs and "judge" in by and location_owners:
+                lo = list(location_owners(locs))
+                if lo:
+                    repro = repro + ["judge"]
+                    owners = owners + [o for o in lo if o not in owners]
+            else:
+                locs = []
         else:
             repro = [b for b in by if b not in _REDRIVE_UNREPRODUCIBLE_BY
                      or (b == "falsifier" and probe is not None)]
@@ -69825,21 +69976,24 @@ def _redrive_item_notes(unmet_final: list, claims: dict[int, dict],
             evidence = str(u.get("evidence") or "")
         else:
             evidence = ""
+        ek = _redrive_evidence_keys(
+            {"by": repro}, by_row.get(i))
         note = {"kind": "unmet_item", "key": f"item-{i}",
                 "item_index": i, "item": u.get("item", ""),
                 "evidence": evidence, "by": repro,
                 "claimed_by": (owners if process
                                else list(cl.get("claimed_by") or [])),
-                "evidence_keys": _redrive_evidence_keys(
-                    {"by": repro}, by_row.get(i))}
+                "evidence_keys": ek}
         if process:
             note["process"] = True
+        if locs:
+            note["locations"] = locs
         if probe is not None and "falsifier" in repro:
             note["probe"] = probe
         # Why the evidence the note does not carry reaches no fixer: a
-        # process item's is evidence that names no code a subtask changed
-        # (its note always carries its probe); any other item's is a probe
-        # no fixer may be shown.
+        # process item's is evidence (e.g. the judge's) that no located
+        # owner or shown probe carries to a fixer; any other item's is a
+        # probe no fixer may be shown.
         why = "no_code_target" if process else "unreproducible"
         note["keys"] = keys
         note["undriven"] = {"reason": why, "probed": (
@@ -74311,6 +74465,12 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
             e_ = {"kind": k, "item": n.get("item"),
                   "evidence": str(n.get("evidence") or "")
                   [:_REDRIVE_EVIDENCE_MAX]}
+            ls_ = [{"path": x.get("path"), "start_line": x.get("start_line"),
+                    "end_line": x.get("end_line")}
+                   for x in (n.get("locations") or [])
+                   if isinstance(x, dict) and x.get("path")]
+            if ls_:
+                e_["locations"] = ls_[:_REDRIVE_LOCATIONS_MAX]
             pf = n.get("previous_fix")
             if isinstance(pf, dict):
                 e_["previous_fix"] = {
@@ -74616,6 +74776,9 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                 if isinstance(details.get(i), dict):
                     out[i]["unmet_parts"] = list(
                         details[i].get("unmet_parts") or [])
+                if u is not None:
+                    out[i]["locations"] = _delivery_unmet_locations(
+                        out[i].get("unmet_parts"))
                 if u is None and i in human:
                     # A met resting only on a worker's run, or an item no
                     # sample read: unknown. Which one is kept: an item no
@@ -74640,6 +74803,8 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                                        str(p_.get("evidence") or ""))}
                 if kept is not None:
                     out[i]["evidence_by"] = {"judge": out[i]["evidence"]}
+                if p_.get("locations"):
+                    out[i]["locations"] = list(p_["locations"])
     for i in indices:
         if "falsifier" not in set((prior.get(i) or {}).get("by") or []):
             continue
@@ -75222,6 +75387,10 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
                 # A new verdict without each source's evidence: the old
                 # split would describe other sources.
                 row_.pop("evidence_by", None)
+            # The new verdict's locations replace the old; none -> none.
+            row_.pop("locations", None)
+            if v.get("locations"):
+                row_["locations"] = list(v["locations"])
             unmet.append(row_)
     # An item re-read unmet that was not on the list (one a failed ratchet
     # left unverified) joins it.
@@ -75237,7 +75406,9 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
                           "by": v["by"] or ["judge"],
                           **({"evidence_by": dict(v["evidence_by"])}
                              if isinstance(v.get("evidence_by"), dict)
-                             else {})})
+                             else {}),
+                          **({"locations": list(v["locations"])}
+                             if v.get("locations") else {})})
     rows = []
     for r in gate.get("items") or []:
         if isinstance(r, dict) and r.get("item_index") in verdicts:
@@ -75653,6 +75824,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         return [sid for sid in subfiles
                 if ex & (set(subfiles[sid]) | touched.get(sid, set()))]
 
+    def location_owners(locs: list) -> list[str]:
+        return _redrive_location_owners(staging, rec, subfiles, locs)
+
     def item_split() -> tuple[list[dict], list[dict]]:
         dg = st.data.get("delivery_gate") or {}
         # A probe is shown only when its sample read the sets every group's
@@ -75664,7 +75838,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             shown_idx={s_.get("index") for s_ in shown},
             contested=set(_redrive_contests_by_item(
                 rec["contested_probes"])),
-            suite=_browser_suite(st), probe_owners=probe_owners)
+            suite=_browser_suite(st), probe_owners=probe_owners,
+            location_owners=location_owners)
 
     def open_items() -> list[dict]:
         # Only an item its fixer can reproduce or read is a note (rule 4).

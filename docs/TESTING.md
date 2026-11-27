@@ -9069,3 +9069,34 @@ for the same run. Confirmation (`_falsifier_gates`) calls the same
 `_acceptance_run_placed` returns. `tests/test_probe_objections_recorded_only.py`:
 a probe objection is recorded and handed on as unverified, never ruled on, and
 the removed ruling worker, prompt and schema stay absent.
+
+## Re-drive ownership: line-level routing on real git
+
+`tests/test_delivery_redrive.py::test_line_and_file_ownership_disagree_in_the_redrive`
+drives `_run_delivery_redrive` end to end where the two ownership rules
+disagree: `s1` touched `src/a.ts` (file-level it owns the file) but only line 2
+is its own, line 1 predates the run. A process item citing line 1 routes to no
+one and is recorded in `delivery_redrive.unrouted_items` with
+`no_code_target`; the item citing line 2 routes to `s1`, so the single re-drive
+group's prompt names only the written-line item.
+
+`tests/test_process_item_typed_locations.py` pins `_redrive_location_owners`
+on real git repos (no mocked blame):
+
+- `test_real_git_unlisted_language_cite_routes_by_blame` and
+  `test_real_git_unlisted_language_whole_file_fallback`: `.c` / `.sh` files,
+  which no language table lists, route by blame for a line cite and
+  whole-file (subtask files, then a kept re-drive group's diff) otherwise.
+- `test_real_git_vendored_and_test_paths_never_route`: `node_modules/`,
+  `.venv/` and `tests/` paths route to no one, cited or whole-file.
+- `test_real_git_outside_subtask_commit_routes_to_no_one`: a line written by
+  a commit in no subtask's set (a conformer's) routes to no one, though `s1`
+  touched the file; `s1`'s own line in the same file still routes to `s1`.
+- `test_real_git_line_of_an_unrouted_subtask_routes_to_no_one`: a line an
+  unrouted subtask wrote through its own merge is never handed to another
+  subtask that touched the file.
+- `test_real_git_bracketed_path_blames_literally`: a path with `[` `]` is
+  blamed to its owner (regression guard only; `git blame` takes one file,
+  so it does not by itself prove `--literal-pathspecs`).
+- `test_real_git_sha256_repo_routes`: a `--object-format=sha256` repo routes
+  the same way (skipped where git cannot init one).

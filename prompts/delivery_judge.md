@@ -149,7 +149,10 @@ Per item:
   value, that part is `"unmet"`.
 - An `"unmet"` part cites the violating line, or the line where the
   required thing should be and is not (e.g. the filter that omits a
-  case, the string that is still hard-coded). Its parts are handed to
+  case, the string that is still hard-coded). An unmet part of a
+  whole-change item cites each offending line as a typed cite
+  (`path`, `line_start`, `line_end`), never only in prose `evidence`.
+  Its parts are handed to
   an execution-backed check as hypotheses, so name each one precisely.
 - `evidence`: one or two sentences summarising what you verified.
 

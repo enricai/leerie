@@ -111,3 +111,80 @@ def test_a_routed_item_is_rejudged_only_on_a_changed_tree(
     else:
         assert judged == []
         assert [u["item_index"] for u in left] == [0]
+
+
+LOC = [{"path": "a.py", "start_line": 3, "end_line": 4}]
+PARTS = [{"cites": [{"path": "a.py", "line_start": 3, "line_end": 4},
+                    {"path": "RECORD"}, {"path": "ABSENT x"},
+                    {"path": "a.py", "line_start": 3, "line_end": 4}]}]
+
+
+def _recheck(leerie, tmp_path, monkeypatch, *, unmet, details, prior,
+             crash=False):
+    st = leerie.State(tmp_path / "s", "r")
+    st.data = {"task": "t", "required_items": ["i0"],
+               "delivery_gate": {"unmet_final": prior, "items": []}}
+
+    async def fake_judge(*a, **kw):
+        if crash:
+            raise RuntimeError("boom")
+        kw["item_details"].update(details)
+        return unmet, 1, None
+    monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+    return asyncio.run(leerie._redrive_recheck_items(
+        tmp_path, st, dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS,
+        tmp_path, [0]))
+
+
+PRIOR = [{"item_index": 0, "item": "i0", "evidence": "old",
+          "by": ["judge"], "locations": [{"path": "old.py"}]}]
+
+
+def test_recheck_unmet_verdict_carries_typed_locations(
+        leerie, tmp_path, monkeypatch):
+    out = _recheck(leerie, tmp_path, monkeypatch,
+                   unmet=[{"item_index": 0, "evidence": "e"}],
+                   details={0: {"unmet_parts": PARTS}}, prior=PRIOR)
+    assert out[0]["unmet"] and out[0]["locations"] == LOC
+
+
+def test_recheck_unmet_without_cites_has_empty_locations(
+        leerie, tmp_path, monkeypatch):
+    out = _recheck(leerie, tmp_path, monkeypatch,
+                   unmet=[{"item_index": 0, "evidence": "e"}],
+                   details={0: {"unmet_parts": []}}, prior=PRIOR)
+    assert out[0]["locations"] == []
+
+
+def test_crashed_rejudge_keeps_prior_locations(
+        leerie, tmp_path, monkeypatch):
+    out = _recheck(leerie, tmp_path, monkeypatch, unmet=[], details={},
+                   prior=PRIOR, crash=True)
+    assert out[0]["crashed"] and out[0]["locations"] == [{"path": "old.py"}]
+
+
+def test_gate_rewrite_replaces_stale_locations_and_joins_item(
+        leerie, tmp_path, monkeypatch):
+    out = _recheck(leerie, tmp_path, monkeypatch,
+                   unmet=[{"item_index": 0, "evidence": "e"}],
+                   details={0: {"unmet_parts": PARTS}}, prior=PRIOR)
+    st = leerie.State(tmp_path / "g", "r")
+    st.data = {"required_items": ["i0"],
+               "delivery_gate": {"unmet_final": PRIOR, "items": []}}
+    leerie._redrive_apply_item_verdicts(st, out, "sha")
+    assert st.data["delivery_gate"]["unmet_final"][0]["locations"] == LOC
+    # An item not on the list joins it with the verdict's locations.
+    st.data["delivery_gate"]["unmet_final"] = []
+    leerie._redrive_apply_item_verdicts(st, out, "sha")
+    assert st.data["delivery_gate"]["unmet_final"][0]["locations"] == LOC
+
+
+def test_different_locations_keep_the_same_evidence_key(leerie):
+    a = {"by": ["judge"], "locations": [{"path": "a.py"}]}
+    b = {"by": ["judge"], "locations": [{"path": "b.py"}]}
+    assert leerie._redrive_evidence_keys(a, None) == ["judge"]
+    assert leerie._redrive_evidence_keys(b, None) == ["judge"]
+    assert leerie._redrive_evidence_keys({"by": ["judge"]}, None) == ["judge"]

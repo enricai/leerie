@@ -15642,16 +15642,36 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    B3; its `B134/RESULTS.md`). A process item
    (a constraint over the whole change: root causes only, no regressions)
    is no one subtask's deliverable, so its claimers are not its owners;
-   but a confirmed probe that it fails is a concrete defect in specific
-   code. It is driven on such a probe alone, when the probe is shown, to
-   the subtasks whose diff touches a production module the probe imports
-   (the import graph, as for a defect file): a subtask's diff is its
-   `leerie: integrate <sid>` merge and every kept re-drive group it was a
-   member of, since a group's commit is its members' change too. With no
-   shown probe, or no subtask whose diff it reaches, it is recorded as
-   reaching none (*An unmet item reaches its owner, or is recorded as
-   reaching none*, below), reason `no_code_target`: a judge's verdict on
-   "no band-aids" is prose, and code does not read a target out of it.
+   but a confirmed probe that it fails, or the verdict's typed offending
+   locations, name a concrete defect in specific code. It is driven on a
+   shown probe, or on the verdict's typed offending locations (path and
+   line range, taken from the verified cites of its unmet parts; routing
+   consults only the test-file check and the vendored / provisioned-path
+   rule `_acceptance_is_cache_path`, never a list of languages or source
+   extensions), to the subtasks whose diff touches a production module the
+   probe imports (the import graph, as for a defect file) or whose own
+   commits wrote the cited lines: ownership of a located path is
+   line-level. A subtask's diff is its `leerie: integrate <sid>` merge
+   and every kept re-drive group it was a member of, since a group's
+   commit is its members' change too, and a subtask owns a location when
+   that diff added or changed lines inside the cited range. Ownership is
+   who wrote the line, so a line blamed to any other commit has no owner:
+   a commit before the run, a conformer or acceptance-repair commit (it
+   is no subtask's work, and handing its lines to a subtask that merely
+   touched the file would drive the wrong worker), or a subtask no longer
+   routed (blocked, accepted). Such a line is recorded with reason
+   `no_code_target`, where the outcome shows it. Whole-file matching (any
+   change to the path) owns only a location with no line numbers, and uses
+   the same agnostic filter. A test file is
+   never routed this way.
+   Located judge evidence uses the same single judge key as every other
+   judge-routed item (not a hash of the locations), so each item and key
+   gets at most one swing. With no shown probe and no typed location, or
+   no subtask whose diff either reaches, it is recorded as reaching none (*An unmet item reaches its
+   owner, or is recorded as reaching none*, below), reason
+   `no_code_target`: the verdict's prose is never parsed for a target;
+   code reads only the typed locations (path and line range) the verdict
+   carries.
    Before this, a process item was never routed and never recorded. In
    barnacle 87580f62 (leerie 0.55.2) both subtasks claimed item 0 ("…
    root cause … Introduce no regressions in existing behavior …")
@@ -16504,8 +16524,8 @@ re-drive stopped on its budget), else `after_last_round` (the key was
 confirmed after the last round began — by the re-check of the tree that
 ships — and no wall time remained to swing at it), else `no_owner`; for a
 key no note may carry, `unreproducible` (a probe no fixer may be shown) or
-`no_code_target` (a process item's evidence that names no code a subtask
-changed). A key whose note was already handed and whose fix did not pass is
+`no_code_target` (a process item with no shown probe and no typed
+offending location, or none whose cited lines a subtask's own commits wrote). A key whose note was already handed and whose fix did not pass is
 not recorded here at all: it reached a worker, and its item stays unmet by
 the ordinary path. Before this, an item counted as reached once any round had
 driven it, whatever it was driven on. In 87580f62, item 8 was driven in

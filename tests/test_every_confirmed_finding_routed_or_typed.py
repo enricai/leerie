@@ -27,6 +27,7 @@ the confirmed probe the run recorded. Synthetic text.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -320,3 +321,75 @@ def test_a_driven_items_later_probe_reaches_a_worker(
     # Having reached a worker, its latest probe is not recorded unrouted.
     assert "unrouted_items" not in rec
     assert not any("unrouted_item" in r for r in reasons)
+
+
+# === a judge-only process item's typed locations route it ===================
+
+PY = "pkg/zz_mod.py"
+
+
+def _judge_located(w: World, locs: list[dict] | None) -> None:
+    """s2's newest integration merge brings `PY` (a non-JS file); item 0 is
+    unmet by the judge alone, with `locs` as its typed offending code."""
+    _git(w.staging, "checkout", "-q", "-b", "zz-s2-py")
+    (w.staging / "pkg").mkdir()
+    (w.staging / PY).write_text("def zz():\n    return 1\n")
+    _git(w.staging, "add", "-A")
+    _git(w.staging, "commit", "-qm", "s2 py")
+    _git(w.staging, "checkout", "-q", "leerie/runs/run-r")
+    _git(w.staging, "merge", "-q", "--no-ff", "-m", "leerie: integrate s2",
+         "zz-s2-py")
+    w.st.data["delivery_gate"].update(
+        final_sha=_git(w.staging, "rev-parse", "HEAD"),
+        final_tree=_git(w.staging, "rev-parse", "HEAD^{tree}"))
+    u = {"item_index": 0, "item": NO_REGRESSIONS, "evidence": "a band-aid",
+         "by": ["judge"], "evidence_by": {"judge": "a band-aid"}}
+    if locs:
+        u["locations"] = locs
+    w.st.data["delivery_gate"].update(
+        unmet_final=[u],
+        items=[{"item_index": 0, "verdict": "unmet", "by": ["judge"]}])
+    w.st.save()
+
+
+def test_a_judge_only_process_item_routes_by_its_typed_locations(
+        leerie, tmp_path, monkeypatch):
+    w = _process_world(leerie, tmp_path, monkeypatch, unmet=[], rows=[],
+                       item1_claim=False)
+    loc = {"path": PY, "start_line": 1, "end_line": 2}
+    _judge_located(w, [loc])
+    _recheck(monkeypatch, leerie, [{0: _verdict(None)}])
+
+    def edit(w):
+        (w.staging / PY).write_text("def zz():\n    return 2\n")
+        _git(w.staging, "commit", "-qam", "fix")
+    w.edits = [edit]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0"]
+    # s2's diff touches PY; s1's does not.
+    assert w.calls[0]["prompt"].startswith("Execute subtask `s2`.")
+    prompt = w.calls[0]["prompt"]
+    at = prompt.index("DELIVERY RE-DRIVE")
+    work, _ = json.JSONDecoder().raw_decode(
+        prompt, prompt.index("\n[", at) + 1)
+    assert [x["item"] for x in work] == [NO_REGRESSIONS]
+    assert work[0]["locations"] == [loc]
+    assert 0 in rec["items_driven"]
+    assert "unrouted_items" not in rec
+
+
+@pytest.mark.parametrize("shape", ["unowned_location", "no_location"])
+def test_a_judge_only_process_item_without_an_owned_location_is_typed(
+        leerie, tmp_path, monkeypatch, shape):
+    w = _process_world(leerie, tmp_path, monkeypatch, unmet=[], rows=[],
+                       item1_claim=False)
+    locs = ([{"path": "pkg/zz_other.py", "start_line": 1, "end_line": 2}]
+            if shape == "unowned_location" else None)
+    _judge_located(w, locs)
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert w.calls == [] and rec["rounds"] == []
+    assert rec["unrouted_items"] == [
+        {"item_index": 0, "item": NO_REGRESSIONS,
+         "reason": "no_code_target"}]

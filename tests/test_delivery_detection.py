@@ -2757,3 +2757,14 @@ def test_a_probe_sentinel_never_reaches_a_fixer_and_its_rerun_is_placed(
             and any(r == saved["file"] for _s, r in s["sandbox"].place)]
     assert runs and all(s["alone"] and not s["on_disk"] for s in runs)
     assert not (staging / saved["file"]).exists()
+
+
+def test_unmet_locations_typed_and_filtered(leerie):
+    parts = [{"cites": [
+        {"path": "a.py", "line_start": 3, "line_end": 5},
+        {"path": "a.py", "line_start": 3, "line_end": 5},
+        {"path": "RECORD"}, {"path": "ABSENT x"}, {"path": ""},
+        {"path": "b.py", "line_start": "x"}]}, "junk"]
+    assert leerie._delivery_unmet_locations(parts) == [
+        {"path": "a.py", "start_line": 3, "end_line": 5}, {"path": "b.py"}]
+    assert leerie._delivery_unmet_locations(None) == []
