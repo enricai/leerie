@@ -3973,3 +3973,105 @@ def test_task_section_without_items_names_the_task_only(leerie):
     text = leerie._format_acceptance_task_section("do the thing", [])
     assert text.startswith("TASK (") and "do the thing" in text
     assert "REQUIRED ITEMS" not in text
+
+
+# --- _acceptance_tree: bounded retry and typed failure ------------------------
+
+def _tree_run(leerie, st, caps, rev):
+    async def go():
+        async with leerie._acceptance_tree(st, caps, rev, "acc-tree-t",
+                                           "t") as wt:
+            return Path(wt).is_dir()
+    return asyncio.run(go())
+
+
+def test_a_transient_worktree_add_failure_is_retried(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    real = leerie._worktree_add_detached_async
+    calls = []
+
+    async def flaky(st_, wt, rev, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(["git"], 128, "", "boom")
+        return await real(st_, wt, rev, **kw)
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", flaky)
+    assert _tree_run(leerie, st, _caps(leerie, 1), head) is True
+    assert len(calls) == 2
+    assert not leerie._helper_worktree_path(st, "acc-tree-t").exists()
+
+
+def test_a_persistent_add_failure_is_a_typed_error_with_stderr(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    caps = _caps(leerie, 1)
+    caps["deps_install_retries"] = 2
+    calls = []
+
+    async def bad(st_, wt, rev, **kw):
+        calls.append(1)
+        return subprocess.CompletedProcess(["git"], 128, "", "no space left")
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", bad)
+    with pytest.raises(leerie.AcceptanceTreeError) as ei:
+        _tree_run(leerie, st, caps, head)
+    assert len(calls) == 3
+    assert "128" in str(ei.value) and "no space left" in str(ei.value)
+    assert not leerie._helper_worktree_path(st, "acc-tree-t").exists()
+
+
+def test_a_failed_install_is_retried_then_typed_with_its_reason(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    caps = _caps(leerie, 1)
+    caps["deps_install_retries"] = 1
+    calls = []
+
+    async def no_deps(wt, *a, **k):
+        calls.append(1)
+        leerie._DEPS_FAIL_REASON[os.path.realpath(wt)] = "install timed out"
+        return False
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
+    with pytest.raises(leerie.AcceptanceTreeError) as ei:
+        _tree_run(leerie, st, caps, head)
+    assert len(calls) == 2
+    assert "install timed out" in str(ei.value)
+    assert not leerie._helper_worktree_path(st, "acc-tree-t").exists()
+
+
+def test_the_audit_caller_skips_on_a_failed_build(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    caps = _caps(leerie, 1)
+    caps["deps_install_retries"] = 0
+
+    async def bad(st_, wt, rev, **kw):
+        return subprocess.CompletedProcess(["git"], 7, "", "denied")
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", bad)
+    res = asyncio.run(leerie._acceptance_audit_on_rev(
+        st, caps, {}, {}, head, {}, "t"))
+    assert res["samples"] == 0 and res["failing_cases"] == []
+    assert "audit tree not set up" in res["skipped"]
+    assert "denied" in res["skipped"]
+
+
+def test_the_bar_caller_reports_unmeasured_on_a_failed_build(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    caps = _caps(leerie, 1)
+    caps["deps_install_retries"] = 0
+    key = "k" * 16
+    leerie._save_settled_bar(Path(st.leerie_root), key, {"entries": [
+        {"run": "run-x", "set": 1, "defect": {"t.py": ["a"]}}]})
+
+    async def bad(st_, wt, rev, **kw):
+        return subprocess.CompletedProcess(["git"], 9, "", "bar denied")
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", bad)
+    rec = asyncio.run(leerie._settled_bar_check(key, st, caps, [], head))
+    assert rec["status"] == "unmeasured"
+    assert "bar denied" in rec["error"]

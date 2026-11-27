@@ -9110,3 +9110,17 @@ for the same run. Confirmation (`_falsifier_gates`) calls the same
 `_acceptance_run_placed` returns. `tests/test_probe_objections_recorded_only.py`:
 a probe objection is recorded and handed on as unverified, never ruled on, and
 the removed ruling worker, prompt and schema stay absent.
+
+## A view-build failure is unmeasured, never a discard
+
+`tests/test_acceptance_tree_build_failure.py` drives the real view-build
+producers (`git worktree add`, the install step, the acceptance runner) and
+pins that an infrastructure failure is recorded as unmeasured with its reason,
+never as a discarded (invalid) acceptance set. A persistent `add` failure
+carries git's stderr; a persistent install failure carries the install reason;
+a transient `add` failure is retried to a valid set; a failed build is not
+memoised for the next build.
+`tests/test_acceptance_validates_in_view.py` covers the same real-path split
+in the view, and `tests/test_acceptance_unmeasured_pr.py` pins that
+`phase_acceptance_write` records infrastructure-failed sets apart from
+discarded ones.
