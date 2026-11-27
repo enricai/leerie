@@ -16907,7 +16907,12 @@ forbids is no narrowing.
 **A change's reach is never guessed.** `_change_reach` walks the import graph
 (through test helpers too, which the coupling for a forbidden command does not),
 and adds any test file or helper whose text names a changed file's basename (a
-test that reads a source as text, or spawns it). Nothing else counts as "cannot
+test that reads a source as text, or spawns it). That holds for a changed path
+outside both graphs (a data, config or fixture file, of any language) as much
+as for a source: every test case whose text names it by path, by basename or by its
+directory's name (a path built from segments) is reached, whatever else it
+imports. Reaching those tests does not make the data
+file's own reach known; it stays unknown. Nothing else counts as "cannot
 reach". The whole command runs when any changed path is one no graph holds — a
 manifest, lockfile, config, fixture, document, a deleted file, every path of a
 language leerie has no graph for, so a Go or Rust repository keeps running
@@ -16933,7 +16938,9 @@ confirmed new on a shipped tree are inside the selection. So nothing is missed o
 the final tree, and the 98 are noise this stops chasing. Delayed, not missed: the
 per-subtask failures counted in §9 *A subtask runs the tests it names*.
 
-**A round's near tests are measured first.** *Designed 2026-11-07, after 0.46.0
+**A round's near tests are measured first.** (A test case whose text names a
+changed non-graph path, a data, config or fixture file, by path, basename or
+directory name is near that change, independent of its imports.) *Designed 2026-11-07, after 0.46.0
 removed the repeats: a round that edits a hub still re-ran nearly everything, and
 was then often rolled back for a test beside its own edit.* The invariant: *the
 tree that ships has every coupled test's result, once, and a round does not pay
@@ -22332,7 +22339,21 @@ Three layers follow, each derived from that one list:
   tree. The graph cannot say what it reads, so its text decides. It is
   coupled to a changed file whose basename it names. When it names no
   production file at all, it is coupled to every change. An unknown reach
-  is measured, never assumed empty. Measured on barnacle #800 (leerie
+  is measured, never assumed empty.
+  *A changed file outside both import graphs couples by its text too.* A
+  data, config or fixture file, of any language, is in no graph, so no
+  import reaches it. Every test case whose text names it, by its path, its
+  basename or its directory's name (delimited, so a test building the path
+  from segments is caught; the cost is that a directory every test imports
+  from couples more tests than read the file, which is extra measurement,
+  never a missed one), is coupled to it, whatever else that test imports and
+  however far its import closure reaches. Importing a production file
+  never exempts a test from reading a data file. The rule names no file
+  format. Reading a data file never takes the place of the rule above: a
+  test whose imports reach no production file and that names none is still
+  coupled to every change, the data file included. The path itself stays a path whose reach is unknown (§8 *A
+  change's reach is never guessed*), so it still runs whole where the
+  selection cannot scope it. Measured on barnacle #800 (leerie
   0.95.0): the run added a comment carrying a word the repository's own
   vocabulary guard forbids under `src/`. That guard reads every tracked
   file and imports nothing of the product, so it was not among the 666

@@ -58017,7 +58017,7 @@ def _py_source_graph(repo: str | Path, rev: str) -> dict:
     key = (str(repo), f"py:{rev}")
     if key in _SOURCE_GRAPHS:
         return _SOURCE_GRAPHS[key]
-    src, _allp = _git_tree_sources(repo, rev, (".py",))
+    src, allp = _git_tree_sources(repo, rev, (".py",))
     idx = _py_module_index(src)
     files = set(src)
     imp = {p: _py_imports(p, t, idx, files) for p, t in src.items()}
@@ -58025,11 +58025,57 @@ def _py_source_graph(repo: str | Path, rev: str) -> dict:
     for p, deps in imp.items():
         for q in deps:
             importers.setdefault(q, set()).add(p)
-    g = {"src": src, "files": files, "imp": imp, "importers": importers}
+    g = {"src": src, "files": files, "imp": imp, "importers": importers,
+         "all": allp}
     if len(_SOURCE_GRAPHS) > 8:
         _SOURCE_GRAPHS.clear()
     _SOURCE_GRAPHS[key] = g
     return g
+
+
+def _non_graph_paths(graphs: list[dict], paths: Iterable[str],
+                     deleted: bool = False) -> list[str]:
+    """The `paths` that exist at the graphs' rev (`all`) yet are source
+    files of no graph (`files`): data, config, fixtures, documents, of any
+    language. A path no graph lists at all (deleted) is not one, unless
+    `deleted`: then it is (a deleted fixture is still read by its tests)."""
+    held: set[str] = set()
+    every: set[str] = set()
+    for g in graphs:
+        held |= set(g.get("files") or ())
+        every |= set(g.get("all") or ())
+    return [p for p in paths if p not in held and (deleted or p in every)]
+
+
+def _data_path_needles(path: str) -> list[str]:
+    """What a test's text holds when it reads `path`: the path itself, its
+    basename, and its parent directory's name (a path built from segments)."""
+    parts = path.split("/")
+    out = [path, parts[-1]]
+    if len(parts) > 1 and parts[-2]:
+        # Delimited, so a short name ("en") does not match inside a word.
+        out.append("/" + parts[-2] + "/")
+        out.extend(f"{q}{parts[-2]}{q}" for q in ("'", '"', "`"))
+    return [n for n in dict.fromkeys(out) if n]
+
+
+def _data_readers(g: dict, data: Iterable[str],
+                  globs: list[str] | None) -> dict[str, set[str]]:
+    """Test case files of graph `g` whose text names a changed non-graph
+    path (`data`) by path, basename or directory segment, whatever they
+    import: test file -> the data paths it reads. No import shows a read."""
+    src = g.get("src") or {}
+    data = list(data)
+    out: dict[str, set[str]] = {}
+    if not data:
+        return out
+    for t, text in src.items():
+        if not _is_test_case_file(t, globs):
+            continue
+        hit = {d for d in data if any(n in text for n in _data_path_needles(d))}
+        if hit:
+            out[t] = hit
+    return out
 
 
 def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
@@ -58049,7 +58095,10 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
     out: dict[str, set[str]] = {} if direct else {
         c: set() for c in changed if _is_test_case_file(c, globs)}
     prods = [c for c in changed if not _is_test_file(c, globs)]
-    if not prods:
+    # Fixtures live under test directories: a non-test-case file there is
+    # a candidate data file too.
+    cands = [c for c in changed if not _is_test_case_file(c, globs)]
+    if not cands:
         return {t: sorted(v) for t, v in sorted(out.items())}
     graphs = []
     for build in (_js_source_graph, _py_source_graph):
@@ -58058,6 +58107,7 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
         except Exception as e:
             log(f"  coupled tests: import graph unreadable "
                 f"({type(e).__name__}: {e})")
+    data = _non_graph_paths(graphs, cands, deleted=True)
     for g in graphs:
         importers = g.get("importers") or {}
         for prod in prods:
@@ -58075,7 +58125,13 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
                     elif not direct:
                         stack.append(b)
         if not direct:
-            for t, ps in _unreached_test_coupling(g, prods, globs).items():
+            # Every changed production path, a data file's included: a
+            # test that names no production file is coupled to every change
+            # (DESIGN §9), even when a reader of that data is coupled too.
+            for t, ps in (_unreached_test_coupling(g, prods, globs).items()
+                          if prods else ()):
+                out.setdefault(t, set()).update(ps)
+            for t, ps in _data_readers(g, data, globs).items():
                 out.setdefault(t, set()).update(ps)
     return {t: sorted(v) for t, v in sorted(out.items())}
 
@@ -58182,9 +58238,13 @@ def _change_reach(repo: str | Path, rev: str, changed: Iterable[str],
     # A test whose reach nobody can say is reached by every change; it never
     # makes a changed path's own reach known.
     prods = [c for c in changed if not _is_test_file(c, globs)]
-    if prods:
+    cands = [c for c in changed if not _is_test_case_file(c, globs)]
+    if cands:
+        data = _non_graph_paths(graphs, cands, deleted=True)
         for g in graphs:
-            reached |= set(_unreached_test_coupling(g, prods, globs))
+            if prods:
+                reached |= set(_unreached_test_coupling(g, prods, globs))
+            reached |= set(_data_readers(g, data, globs))
     return reached, unknown
 
 
@@ -58197,16 +58257,26 @@ def _near_test_files(repo: str | Path, rev: str, changed: Iterable[str],
     closure."""
     changed = [c for c in changed if isinstance(c, str) and c]
     near = {c for c in changed if _is_test_case_file(c, globs)}
+    graphs: list[dict] = []
     for build in (_js_source_graph, _py_source_graph):
         try:
-            importers = build(repo, rev).get("importers") or {}
+            g = build(repo, rev)
+            importers = g.get("importers") or {}
         except Exception as e:
             log(f"  near tests: import graph unreadable "
                 f"({type(e).__name__}: {e})")
             continue
+        graphs.append(g)
         for c in changed:
             near |= {b for b in importers.get(c, ())
                      if _is_test_case_file(b, globs)}
+    # A test case reading a changed non-graph file (data, config) by path,
+    # basename or directory is near it too, whatever it imports.
+    cands = [c for c in changed if not _is_test_case_file(c, globs)]
+    data = _non_graph_paths(graphs, cands, deleted=True) if cands else []
+    if data:
+        for g in graphs:
+            near |= set(_data_readers(g, data, globs))
     return near
 
 
