@@ -44569,8 +44569,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                 f"{failing} held-out acceptance set(s) still fail",
                 f"{failing} held-out acceptance set(s) failing"))
     delivery = st.data.get("delivery_gate")
+    # An item a kept group's ratchet could not re-verify, and no later read
+    # settled, was not read on the tree that ships.
+    unverified = _ratchet_record(st).get("unverified")
+    if unverified:
+        reasons.append(f"{len(unverified)} required item(s) not re-verified "
+                       "on the tree that ships")
     verdict = _delivery_latest_verdict(delivery)
-    if verdict is not None:
+    dropped = (isinstance(delivery, dict)
+               and bool(delivery.get("verdict_dropped"))
+               and bool(st.data.get("required_items")))
+    if dropped:
+        reasons.append("the required items were not read on the tree that "
+                       "ships: staging's HEAD moved after the delivery verdict "
+                       "and the items were not read there")
+    if verdict is not None and not dropped:
         # A delivery verdict counts only on the tree it was measured on
         # (review round 14 M2): an earlier tree's "nothing unmet" says
         # nothing of what ships.
@@ -68882,16 +68895,23 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     `final_sha` is staging's HEAD; on any other commit it is dropped and
     detection runs again (DESIGN §8 *A finished verdict is reused only on
     the commit it was measured on*). Advisory: never stops a run."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
     if st.data.get("skip_coverage_check"):
+        await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
         return
     items = st.data.get("required_items") or []
     if not items or not _diff_base(st):
+        await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
         return
     gate = dict(st.data.get("delivery_gate") or {})
-    staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
+        await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
         return
     sha = await _branch_head_sha(str(staging))
+    if not sha:
+        log("  delivery detection skipped — staging HEAD unreadable")
+        await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
+        return
     if "unmet_final" in gate and sha and gate.get("final_sha") == sha:
         log("phase 5: delivery detection already complete on "
             f"{sha[:12]} — skipping (resume)")
@@ -68904,14 +68924,10 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             f"{str(gate.get('final_sha') or '(unknown)')[:12]}, not "
             f"staging's HEAD {(sha or '(unreadable)')[:12]}; dropped, "
             "detection runs again")
-        for k_ in ("unmet_final", "items", "final_sha", "final_tree",
-                   "final_judge", "falsifier"):
+        for k_ in _FINAL_VERDICT_KEYS:
             gate.pop(k_, None)
         st.data["delivery_gate"] = gate
         st.save()
-    if not sha:
-        log("  delivery detection skipped — staging HEAD unreadable")
-        return
     st.data["current_phase"] = "phase 5: delivery detection"
     st.save()
     normalized = [_delivery_norm_item(it) for it in items]
@@ -69146,6 +69162,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
         _set_ratchet_unverified_gap(st)
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
+    gate.pop("verdict_dropped", None)
     stamp = _stamp(st, sha)
     gate.update(items=rows, unmet_final=unmet_final, final_sha=stamp["sha"],
                 final_tree=stamp["tree"],
@@ -75043,6 +75060,7 @@ async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
             # only once per commit (a resume reuses the answer).
             if (not head or not kept or dg.get("final_sha") != head
                     or gate.get("item_flip_checked") == head):
+                await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
                 return
             steps = [({"round": int(e.get("round") or 0)},
                       f"acc-r{e.get('round')}",
@@ -75103,6 +75121,7 @@ async def _acceptance_item_flips(leerie_dir: Path, st: "State", caps: dict,
             save_gate(gate)
             log("  WARNING: acceptance gate: a flip's rollback did not land "
                 "— the round's commits stay on staging")
+            await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts, staging)
             return
         by_round: dict[int, list[dict]] = {}
         for c in pending.get("culprits") or []:
@@ -75535,6 +75554,134 @@ def _redrive_rollback_reason(ge: dict) -> str:
                               "fixed no held-back case or broke a control")
 
 
+async def _resolve_in_flight_redrive(st: "State", staging: Path) -> bool:
+    """Undo a delivery re-drive round a crash interrupted (rolled back to
+    its `pre_sha`, self-check dirs removed, `in_flight` popped). Runs before
+    any phase-5 judging so detection reads the kept tree. Idempotent: a
+    no-op (False) when nothing is in flight."""
+    rec = dict(st.data.get("delivery_redrive") or {})
+    flight = rec.get("in_flight")
+    if not isinstance(flight, dict):
+        return False
+    # A crash mid-group: what it left is unknown, so it is undone; its
+    # self-check directory (never in staging) goes too.
+    _rmtree_owned(st.run_dir / "selfcheck")
+    _rmtree_owned(st.run_dir / TREES_DIRNAME / SELFCHECK_COPIES_NAME)
+    if flight.get("pre_sha"):
+        await _roll_back_round(
+            st, staging, flight["pre_sha"],
+            worker="delivery re-drive",
+            label=f"r{flight.get('round')}g{flight.get('group')}",
+            reason="interrupted before it reached a verdict",
+            where="re-drive rollback",
+            branch=_compute_run_branch(st.run_id))
+    rec.pop("in_flight", None)
+    st.data["delivery_redrive"] = rec
+    st.save()
+    return True
+
+
+_FINAL_VERDICT_KEYS = ("unmet_final", "items", "final_sha", "final_tree",
+                       "final_judge", "falsifier")
+
+
+async def _restamp_verdict_on_head(leerie_dir: Path, st: "State", caps: dict,
+                                   models: dict, efforts: dict,
+                                   staging: Path) -> None:
+    """The final verdict is of the tree that ships (DESIGN §8). When
+    `delivery_gate.final_sha` is not staging's HEAD — a kept re-drive group, a
+    flip rollback or a detection that could not judge moved it — the open and
+    met items are read again on that HEAD (`_redrive_recheck_items`), applied
+    (`_redrive_apply_read`) and `final_sha` / `final_tree` stamped with it.
+    Only a read that fails drops the final verdict's keys (the fallback),
+    recording `verdict_dropped` so `_decide_outcome` says the read failed.
+    `unmet_before` / `unmet_after` describe earlier trees on purpose and are
+    never touched. A row the observability check made unknown (a part that
+    cannot be observed) is not re-judged: it stays unknown. A read clears
+    the items it settled from `delivery_ratchet.unverified`. A no-op when
+    the verdict is already of HEAD."""
+    gate = st.data.get("delivery_gate")
+    if not isinstance(gate, dict) or "unmet_final" not in gate:
+        return
+    head = (await _branch_head_sha(str(staging))
+            if Path(staging).is_dir() else None)
+    if head and gate.get("final_sha") == head:
+        return
+    items = st.data.get("required_items") or []
+    idx = sorted({u["item_index"] for u in gate.get("unmet_final") or []
+                  if isinstance(u, dict)
+                  and isinstance(u.get("item_index"), int)}
+                 | {r["item_index"] for r in gate.get("items") or []
+                    if isinstance(r, dict)
+                    and r.get("verdict") in ("met", "unmet", "unknown")
+                    and not r.get("unobservable")
+                    and isinstance(r.get("item_index"), int)})
+    idx = [i for i in idx if 0 <= i < len(items)]
+    ver: dict[int, dict] | None = None
+    why = "staging's HEAD is unreadable"
+    if head and not st.data.get("skip_coverage_check") and idx:
+        try:
+            ver = await _redrive_recheck_items(
+                leerie_dir, st, caps, models, efforts, staging, idx)
+        except Exception as e:
+            ver, why = None, f"the re-read raised {type(e).__name__}: {e}"
+        else:
+            if any(v.get("crashed") for v in ver.values()):
+                ver, why = None, "an item's re-read crashed"
+    elif head and not idx:
+        ver = {}  # nothing to read there: the read cannot have failed
+    elif head:
+        why = "the coverage check is skipped"
+    if ver is None:
+        log(f"  delivery verdict: recorded for "
+            f"{str(gate.get('final_sha') or '(unknown)')[:12]}, not staging's "
+            f"HEAD {(head or '(unreadable)')[:12]}; {why} — dropped")
+        kept = {k: v for k, v in gate.items() if k not in _FINAL_VERDICT_KEYS}
+        kept["verdict_dropped"] = ["unmet_final"]
+        st.data["delivery_gate"] = kept
+        st.save()
+        return
+    tree = await _committed_tree_sha(str(staging))
+    _redrive_apply_read(st, ver, head, tree)
+    _resettle_test_outcome_rows(st, tree)
+    rr = _ratchet_record(st)
+    if rr.get("unverified"):
+        left = {k: v for k, v in rr["unverified"].items()
+                if not (str(k).isdigit() and int(k) in ver)}
+        if left:
+            rr["unverified"] = left
+        else:
+            rr.pop("unverified", None)
+        st.data["delivery_ratchet"] = rr
+        st.save()
+        _set_ratchet_unverified_gap(st)
+    dg = dict(st.data.get("delivery_gate") or {})
+    dg.pop("verdict_dropped", None)
+    dg.update(final_sha=head, final_tree=_shipping_tree(st))
+    st.data["delivery_gate"] = dg
+    st.save()
+    log(f"  delivery verdict: re-read on staging's HEAD {head[:12]} and "
+        "re-stamped")
+
+
+async def _settle_delivery_verdict(leerie_dir: Path, st: "State", caps: dict,
+                                   models: dict, efforts: dict) -> None:
+    """After the delivery re-drive, however it ended: undo a round it left in
+    flight (`_resolve_in_flight_redrive`), so no half-done group is ever
+    judged, then make the verdict of the tree that ships
+    (`_restamp_verdict_on_head`). Advisory: an exception is logged and
+    finalize proceeds."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    try:
+        if staging.is_dir():
+            await _resolve_in_flight_redrive(st, staging)
+        await _restamp_verdict_on_head(leerie_dir, st, caps, models, efforts,
+                                       staging)
+    except Exception as e:
+        log(f"delivery verdict re-stamp raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, finalize proceeds")
+
+
 async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
@@ -75555,22 +75702,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         st.data["delivery_redrive"] = rec
         st.save()
 
-    flight = rec.get("in_flight")
-    if isinstance(flight, dict):
-        # A crash mid-group: what it left is unknown, so it is undone; its
-        # self-check directory (never in staging) goes too.
-        _rmtree_owned(st.run_dir / "selfcheck")
-        _rmtree_owned(st.run_dir / TREES_DIRNAME / SELFCHECK_COPIES_NAME)
-        if flight.get("pre_sha"):
-            await _roll_back_round(
-                st, staging, flight["pre_sha"],
-                worker="delivery re-drive",
-                label=f"r{flight.get('round')}g{flight.get('group')}",
-                reason="interrupted before it reached a verdict",
-                where="re-drive rollback",
-                branch=_compute_run_branch(st.run_id))
-        rec.pop("in_flight", None)
-        _save()
+    if await _resolve_in_flight_redrive(st, staging):
+        rec = dict(st.data.get("delivery_redrive") or {})
     head = await _branch_head_sha(str(staging))
     if not head:
         return
@@ -75834,7 +75967,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     # reached no worker (`_redrive_unrouted_items`).
     start_items = sorted({u["item_index"] for u in open_items()
                           + unreproducible_items()})
-    reread = False
+    # A verdict stamped on another commit than the one staging stands on (an
+    # in-flight round rolled back, detection on an older commit) describes a
+    # tree that does not ship: every open item is read again on `head`.
+    reread = bool(det_sha and det_sha != head)
 
     async def roll_back_flips(culprits: list[tuple[dict, dict]]) -> bool:
         # The earliest culprit goes, and every kept group after it, which
@@ -85427,6 +85563,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # confirmed-unmet items to the final-conformer pass below. Advisory
     # at this call site for the same reason as the conformance pass.
     unmet_delivery: list[dict] = []
+    # A re-drive round a crash interrupted is undone before ANY phase-5
+    # judge reads the tree (prejudge, recheck, acceptance, detection).
+    try:
+        staging_wt0 = (leerie_dir / "worktrees" / "staging").resolve()
+        if staging_wt0.is_dir():
+            await _resolve_in_flight_redrive(st, staging_wt0)
+    except Exception as e:
+        log(f"in-flight re-drive resolution raised {type(e).__name__}: {e}"
+            " — surfaced as advisory, continuing")
     try:
         unmet_delivery = await _run_delivery_prejudge(
             leerie_dir, st, caps, models, efforts)
@@ -85486,6 +85631,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"acceptance gate raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # A re-drive round a crash interrupted is undone before anything judges
+    # the tree, so detection's verdict is of the head that is kept.
+    try:
+        staging_wt = (leerie_dir / "worktrees" / "staging").resolve()
+        if staging_wt.is_dir() and not (st.data.get("delivery_redrive")
+                                        or {}).get("done"):
+            await _resolve_in_flight_redrive(st, staging_wt)
+    except Exception as e:
+        log(f"in-flight re-drive resolution raised {type(e).__name__}: {e}"
+            " — surfaced as advisory, finalize proceeds")
     # Its repair rounds commit to staging: detection and the re-drive judge
     # the tree the diff describes (DESIGN §8 *The final diff describes the
     # tree that ships*).
@@ -85534,6 +85689,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"delivery re-drive raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # Not in a `finally`: a BaseException (a signal) ends the run, and
+    # resume resolves the round before any judge.
+    await _settle_delivery_verdict(leerie_dir, st, caps, models, efforts)
     # The outcome reads the diff: it must be of the tree that ships, whatever
     # moved HEAD since it was measured (DESIGN §8 *The final diff describes
     # the tree that ships*). Nothing moves HEAD between here and the
