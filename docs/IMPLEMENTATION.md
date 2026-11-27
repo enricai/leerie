@@ -12150,7 +12150,17 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `via_browser_suite` from the probe, the shape `_redrive_recheck_items`
   re-runs too, with the sample's —
   through one `_evaluate_acceptance_sets`; recorded as `probes_after
-  {"<i>": verdict}`), and the repo's test
+  {"<i>": verdict}`; the verdict itself is the one function `_probe_verdict`,
+  DESIGN §8 *A probe has one verdict*: fail only at the quoted assertion,
+  a failure in setup or teardown is a broken probe, read `unmeasured`.
+  At the final re-check a broken probe does not keep its item unmet: the
+  item goes to `_redrive_falsify_met`, which re-runs the falsifier; a run
+  that produced no measurement at all still keeps the item unmet.
+  Its callers are the falsifier's confirmation re-run,
+  `_redrive_probe_verdicts`, the final re-check and `_redrive_probe_flips`
+  (through `_rerun_probe_verdict`, which maps broken to `unmeasured` at a
+  re-check); `_acceptance_run_placed` also returns `failing_run_messages`
+  for the broken case; none reads an exit status itself), and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`, which is
   `_ratchet_test_ids` on staging, measured in its committed view, with the re-drive log: a command the task
   forbids is replaced by its `_scoped_test_replacement`, or no verdict when

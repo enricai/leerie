@@ -9048,3 +9048,16 @@ cgroup is destroyed. `tests/test_slice_aware_memory.py` pins the memory half:
 never below the build peak at any slice or `max_parallel`, exactly
 `slice_max // max_parallel` above it, and independent of the live sibling
 count. On the pre-change code 12 of the two files' tests fail and 3 error.
+
+## One probe verdict
+
+`tests/test_probe_verdict_recheck.py` (DESIGN §8 *Delivery re-drive* rule 4): a probe
+failing at its quoted assertion is `fail`; one failing in setup or teardown
+is `broken`, never `fail`; `_redrive_probe_verdicts`, the final re-check
+(`_redrive_recheck_items`) and `_redrive_probe_flips` each return that verdict
+for the same run. Confirmation (`_falsifier_gates`) calls the same
+`_probe_verdict`; no test here drives confirmation end to end. Those tests stub
+`_evaluate_acceptance_sets` with the `failing_run_messages` shape that
+`_acceptance_run_placed` returns. `tests/test_probe_objections_recorded_only.py`:
+a probe objection is recorded and handed on as unverified, never ruled on, and
+the removed ruling worker, prompt and schema stay absent.

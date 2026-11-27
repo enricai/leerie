@@ -472,6 +472,10 @@ _LEERIE_OWN = {
     "_set_production_imports", "_acceptance_mechanical_findings",
     "_acceptance_scope_judge_sets", "_audit_case_key", "_acceptance_audit_in",
     "_redrive_exercised", "_heldout_fingerprints", "_falsifier_place_leads",
+    # A saved probe's copy its callers made in a private temp file of
+    # leerie's own (`_saved_probe_rerun_verdict`, `_redrive_probe_flips`),
+    # from `_read_beneath`.
+    "_rerun_probe_verdict",
     # A repository's worktree registrations, read by git's own listing of
     # what it is about to prune (the user's repository, or the run's).
     "_prune_leerie_worktrees_locked",

@@ -15813,8 +15813,9 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    and the fixer is told not to do it. Code keeps only an objection naming
    a probe the group was handed, records it
    (`delivery_redrive.probe_objections[]`) and puts it in the PR as the
-   fixer's unverified words; it changes no routing and no verdict. The
-   first form of this rule (lane XC's branch, never released) accepted a
+   fixer's unverified words; it changes no routing and no verdict.
+
+   The first form of this rule (lane XC's branch, never released) accepted a
    `contradicts_task` contest whose `task_quote` was verbatim in the task
    or a required item, and an accepted one removed the probe from later
    groups. A quote check filters how a claim is worded; it is no evidence
@@ -15823,6 +15824,14 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    nothing about the behaviour, such as "We need to fix the root cost. No
    band-aids please.", a sentence in every task of that repository. The
    measured conflict is the evidence: the check runs the tests.
+
+   *A probe has one verdict.* A probe fails only at its quoted assertion.
+   A failure elsewhere, such as in setup or teardown, means the probe is
+   broken and is never a fail. One function (`_probe_verdict`) defines this
+   and is used at confirmation and at every re-check: the re-drive's
+   `_redrive_probe_verdicts`, the delivery re-check, the end-of-run
+   re-check and `_redrive_probe_flips`. No caller keeps its own reading of
+   a probe's exit status.
 
    Neither the conflict nor the objection judges whether the probe is
    right. A probe can be right and the existing test wrong, a test that
