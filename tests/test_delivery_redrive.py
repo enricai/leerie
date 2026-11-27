@@ -1476,3 +1476,75 @@ def test_a_note_outside_the_selfcheck_is_raised_never_driven(
     with pytest.raises(RuntimeError, match=f"1:{ONE}"):
         w.run()
     assert w.calls == []
+
+
+def test_apply_item_verdicts_carries_and_clears_locations(leerie, tmp_path):
+    """A verdict's typed locations replace the row's old ones; a verdict
+    without any drops them rather than leaving stale ones."""
+    loc = [{"path": "a.py", "start_line": 3, "end_line": 4}]
+    st = leerie.State(tmp_path / "state", "run-l")
+    st.data = {"required_items": ["i0", "i1"],
+               "delivery_gate": {
+                   "unmet_final": [{"item_index": 0, "item": "i0",
+                                    "evidence": "e", "by": ["judge"],
+                                    "locations": [{"path": "old.py"}]}],
+                   "items": []}}
+    leerie._redrive_apply_item_verdicts(st, {
+        0: {"unmet": True, "by": ["judge"], "evidence": "e",
+            "locations": loc},
+        1: {"unmet": True, "by": ["judge"], "evidence": "f",
+            "locations": loc}}, "sha")
+    rows = {r["item_index"]: r
+            for r in st.data["delivery_gate"]["unmet_final"]}
+    assert rows[0]["locations"] == loc and rows[1]["locations"] == loc
+    leerie._redrive_apply_item_verdicts(st, {
+        0: {"unmet": True, "by": ["judge"], "evidence": "e"}}, "sha2")
+    rows = {r["item_index"]: r
+            for r in st.data["delivery_gate"]["unmet_final"]}
+    assert "locations" not in rows[0]
+
+
+def test_line_and_file_ownership_disagree_in_the_redrive(
+        leerie, tmp_path, monkeypatch):
+    """s1 touched src/a.ts (file-level it owns it), but only line 2 is its
+    own: line 1 predates the run. A process item citing line 1 routes to no
+    one (`no_code_target`); one citing line 2 routes to s1."""
+    items = [{"item": "pre-run line is clean", "span": "S1",
+              "verifiability": "tree"},
+             {"item": "written line is clean", "span": "S2",
+              "verifiability": "tree"}]
+    unmet = [{"item_index": 0, "item": items[0]["item"], "evidence": "bad 1",
+              "by": ["judge"],
+              "locations": [{"path": "src/a.ts", "start_line": 1,
+                             "end_line": 1}]},
+             {"item_index": 1, "item": items[1]["item"], "evidence": "bad 2",
+              "by": ["judge"],
+              "locations": [{"path": "src/a.ts", "start_line": 2,
+                             "end_line": 2}]}]
+    w = World(leerie, tmp_path, n_sets=0, items=items, unmet=unmet,
+              claims={"s1": [{"item_index": 0, "kind": "process"},
+                             {"item_index": 1, "kind": "process"}]})
+    w.st.data["delivery_gate"]["items"] = [
+        {"item_index": i, "item": it["item"], "verdict": "unmet",
+         "by": ["judge"]} for i, it in enumerate(items)]
+    w.st.save()
+    w.install(monkeypatch)
+    w.edits = [lambda w: w.write("export const a = 1; // BUG\n// work\n// ok\n")]
+
+    async def fake_judge(task, its, staging, st, caps, models, efforts,
+                         phase_label, **kw):
+        return [{"item_index": 0, "item": items[0]["item"],
+                 "evidence": "still bad 1"}
+                for _ in [0] if 0 in kw["only"]], 1, None
+    monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+    w.run()
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0"]
+    p = w.calls[0]["prompt"]
+    assert p.startswith("Execute subtask `s1`.")
+    assert "written line is clean" in p and "pre-run line is clean" not in p
+    assert w.st.data["delivery_redrive"]["unrouted_items"] == [
+        {"item_index": 0, "item": "pre-run line is clean",
+         "reason": "no_code_target"}]
