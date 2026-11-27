@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import fcntl
+import functools
 import inspect
 import os
 import subprocess
@@ -20,7 +21,9 @@ import threading
 import time
 import types
 from pathlib import Path
-import functools
+
+import pytest
+
 from tests.conftest import run_git_out  # noqa: E402
 
 
@@ -243,3 +246,32 @@ def test_a_cancelled_tree_is_removed_after_its_add_not_before(
     listed = _git(st.run_dir / "repo", "worktree", "list", "--porcelain")
     assert not wt.exists(), "the cancelled tree was left on disk"
     assert str(wt) not in listed, listed
+
+
+def test_acceptance_tree_raises_typed_error_when_add_fails(
+        leerie, tmp_path, monkeypatch):
+    """A failing worktree add is retried a bounded number of times, then
+    surfaces as AcceptanceTreeError carrying the add's stderr."""
+    import asyncio
+    import subprocess as sp
+    calls: list[int] = []
+
+    async def bad_add(st, wt, rev):
+        calls.append(1)
+        return sp.CompletedProcess([], 128, "", "fatal: boom")
+
+    st = type("S", (), {"data": {}, "run_dir": tmp_path})()
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", bad_add)
+    monkeypatch.setattr(leerie, "_helper_worktree_path",
+                        lambda st, n: tmp_path / n)
+    monkeypatch.setattr(leerie, "_run_repo", lambda st: tmp_path / "nogit")
+    monkeypatch.setattr(leerie, "_rmtree_owned", lambda p: None)
+    monkeypatch.setattr(leerie, "log", lambda *a, **k: None)
+
+    async def go():
+        async with leerie._acceptance_tree(st, {"deps_install_retries": 1},
+                                           "HEAD", "t", "t"):
+            raise AssertionError("entered")
+    with pytest.raises(leerie.AcceptanceTreeError, match="boom"):
+        asyncio.run(go())
+    assert len(calls) == 2

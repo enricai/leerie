@@ -423,3 +423,15 @@ def test_a_real_timeout_is_recorded_as_one(leerie, tmp_path):
     assert v is False
     assert obs.get("resource") is True and obs.get("timed_out") is True
     assert "killed" not in obs
+
+
+def test_an_infrastructure_failed_set_is_listed_for_a_human(leerie, tmp_path):
+    st = _st(leerie, tmp_path)
+    st.data["acceptance"] = {
+        "sets": [], "written": 1, "discarded": [],
+        "unmeasured": [{"index": 1, "error": "worktree add failed: boom"}]}
+    body = leerie._format_pr_end_state_section(st.data)
+    line = _nhv_line(body, "held-out set")
+    assert "never measured" in line and "boom" in line
+    assert leerie._acceptance_all_fixed_by_execution(
+        st.data["acceptance"]) is False

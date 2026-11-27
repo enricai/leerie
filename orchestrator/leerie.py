@@ -22896,6 +22896,13 @@ class WorktreeSetupError(WorkerError):
     """
 
 
+class AcceptanceTreeError(WorkerError):
+    """`_acceptance_tree` could not build its measuring tree (worktree add or
+    dependency install failed on every bounded attempt). Infrastructure, not
+    a verdict about the held-out set: the message carries the add's
+    returncode/stderr or the install's failure reason."""
+
+
 class PidExhaustedError(WorkerError):
     """The worker's cgroup exhausted its PID table (fork denials climbing or
     `pids.current` at `pids.max`) — every shell-spawning tool call then fails
@@ -49050,6 +49057,10 @@ _DEPS_INSTALLED: set[str] = set()
 # measurement*). A successful install drops the entry. Stale entries are
 # harmless — a tree not in `_DEPS_INSTALLED` installs afresh.
 _DEPS_FAILED: dict[str, int] = {}
+# Why the last install in a tree failed (timeout / non-zero exit / error),
+# beside `_DEPS_FAILED`; read by `_acceptance_tree` so the reason travels
+# in `AcceptanceTreeError` instead of being dropped.
+_DEPS_FAIL_REASON: dict[str, str] = {}
 
 
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
@@ -49233,6 +49244,8 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                             files = None
                 if rc != 0 and e.get("kind") == "install":
                     ok = False
+                    _DEPS_FAIL_REASON[key] = (
+                        f"install exited {rc}: {' '.join(e['command'])}")
                 if e.get("kind") == "install" and made is not None:
                     post = await asyncio.to_thread(_ignored_paths, tree)
                     made = (made | (post - pre)
@@ -49241,10 +49254,17 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                     snap_due = True
             except subprocess.TimeoutExpired:
                 ok = ok and e.get("kind") != "install"
+                if e.get("kind") == "install":
+                    _DEPS_FAIL_REASON[key] = (
+                        f"install timed out: {' '.join(e['command'])}")
                 log(f"  {log_prefix}: install timed out: "
                     f"{' '.join(e['command'])}")
             except Exception as ex:  # non-fatal: the BLT run shows it
                 ok = ok and e.get("kind") != "install"
+                if e.get("kind") == "install":
+                    _DEPS_FAIL_REASON[key] = (
+                        f"install error ({type(ex).__name__}: {ex}): "
+                        f"{' '.join(e['command'])}")
                 log(f"  {log_prefix}: install error "
                     f"({type(ex).__name__}): {' '.join(e['command'])}")
         if snap_due:
@@ -49256,8 +49276,10 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
             st, key, (frozenset(files), frozenset(opened)))
     if ok:
         _DEPS_FAILED.pop(key, None)
+        _DEPS_FAIL_REASON.pop(key, None)
     else:
         _DEPS_FAILED[key] = _DEPS_FAILED.get(key, 0) + 1
+        _DEPS_FAIL_REASON.setdefault(key, "install failed (refused or unknown)")
     return ok
 
 
@@ -60464,9 +60486,16 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
 
     async def _view() -> Path | None:
         if not made_view:
-            made_view.append(await views.enter_async_context(
-                _acceptance_tree(st, caps, base, f"{name}-view",
-                                 f"{dest_name}-view")))
+            # A failed build is NOT memoised and not read as a verdict: it
+            # propagates (as `AcceptanceTreeError`) to the writer's
+            # infrastructure arm, and the own-start retry builds again.
+            try:
+                made_view.append(await views.enter_async_context(
+                    _acceptance_tree(st, caps, base, f"{name}-view",
+                                     f"{dest_name}-view")))
+            except AcceptanceTreeError as ex:
+                log(f"  acceptance: validity tree not built — {ex}")
+                raise
         return made_view[0]
     # Outside every try: budget exhaustion must propagate, not read as an
     # invalid set (the same discipline as the no_work_judge call).
@@ -60478,7 +60507,9 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     made = await asyncio.to_thread(_acceptance_writer_checkout, st, wt, base,
                                    writer="acceptance_writer")
     if made.startswith("failed"):
-        out["reason"] = made
+        # A tree that could not be built is a measurement failure, not a
+        # verdict: unmeasured, never a discard.
+        out["infrastructure"] = made
         return out
     try:
         # The report is usually an untracked file in the user's checkout,
@@ -60490,7 +60521,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 label_prefix=name, log_prefix="acceptance"):
             # Validated without its dependencies, a defect file "fails" on
             # the base for the wrong reason and could never pass anywhere.
-            out["reason"] = "dependency install failed in the writer worktree"
+            out["infrastructure"] = (
+                "dependency install failed in the writer worktree")
             return out
         # The writer is promised a database only when one comes up here,
         # and its session then requires its own (`claude_p(db_required=)`):
@@ -60597,7 +60629,12 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         return out
     except _BudgetStop as e:
         raise e.err from None
-    except (WorkerError, subprocess.TimeoutExpired) as e:
+    except (AcceptanceTreeError, subprocess.TimeoutExpired) as e:
+        # Infrastructure, not a verdict on the set: typed, never `reason`
+        # (so never a discard or `fixed_on_head_by_execution`).
+        out["infrastructure"] = _brief_worker_exc(e)
+        return out
+    except WorkerError as e:
         out["reason"] = _brief_worker_exc(e)
         return out
     except Exception as e:
@@ -60804,9 +60841,6 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                       for rel in sorted(must | set(support))
                       if rel not in missing)
         view = await view_of() if declared else None
-        if declared and view is None:
-            out["reason"] = "the validity tree could not be set up"
-            return out
         defect, control, cases, modes = [], [], {}, {}
         base_failing: dict[str, list[str]] = {}
         case_status: dict[str, dict] = {}
@@ -61191,12 +61225,21 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     for r in results:
         r.pop("declared_defect", None)
     sets = [r for r in results if r.get("valid")]
+    # A set whose measuring tree could not be built was never measured: it
+    # is neither valid nor a discard.
+    unmeasured = [{"index": r["index"], "error": str(r["infrastructure"])}
+                  for r in results
+                  if not r.get("valid") and r.get("infrastructure")]
+    for u in unmeasured:
+        log(f"  WARNING: acceptance set {u['index']} UNMEASURED "
+            f"(infrastructure): {u['error']}")
     # Kept, not only logged: a discard on executed evidence is what the
     # no-work settle records as its basis (DESIGN §8 *No work is declared
     # on executed evidence*).
     discarded = [{"index": r["index"],
                   "reason": str(r.get("reason") or "invalid")}
-                 for r in results if not r.get("valid")]
+                 for r in results
+                 if not r.get("valid") and not r.get("infrastructure")]
     for d in discarded:
         log(f"  acceptance set {d['index']} discarded: {d['reason']}")
     log(f"  acceptance: {len(sets)} of {n} set(s) valid")
@@ -61209,6 +61252,7 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
                                           written=n)
     return {"validity_base": base, "report_base": report_base,
             "sets": sets, "written": n, "discarded": discarded,
+            **({"unmeasured": unmeasured} if unmeasured else {}),
             **({"settled_bar_key": key} if key else {}),
             **({"settled_bar": bar} if bar else {})}
 
@@ -61995,6 +62039,14 @@ def _acceptance_unmeasured_lines(state: dict) -> list[str]:
     gate = acc.get("gate") if isinstance(acc.get("gate"), dict) else {}
     final = gate.get("final")
     out: list[str] = []
+    for u in acc.get("unmeasured") or []:
+        if isinstance(u, dict):
+            out.append(
+                f"- [ ] held-out set {_pr_entry(str(u.get('index')))}: not "
+                "written or measured ("
+                + str(u.get("error") or "no error recorded")[:200]
+                + "), so the behaviour it was to check has no held-out "
+                "test: verify it by hand before merging.")
     if not isinstance(final, list):
         idx = [k for k, s_ in sets.items() if counts(s_)]
         if idx:
@@ -62799,9 +62851,10 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
 @contextlib.asynccontextmanager
 async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
                            label: str
-                           ) -> AsyncIterator[Path | None]:
+                           ) -> AsyncIterator[Path]:
     """A disposable worktree of `rev` under the run dir with dependencies
-    installed: yields `wt` or None when it cannot be set up (no evidence).
+    installed: yields `wt`; raises `AcceptanceTreeError` carrying the add's
+    or install's error when it cannot be built after bounded retries.
     Each command run there that needs a database has its own
     (`_test_db_argv`)."""
     wt = _helper_worktree_path(st, name)
@@ -62811,16 +62864,36 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
         subprocess.run(["git", "--git-dir", str(_run_repo(st)), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
         _rmtree_owned(wt)
-        _DEPS_INSTALLED.discard(os.path.realpath(wt))
-    _teardown()
+        real = os.path.realpath(wt)
+        _DEPS_INSTALLED.discard(real)
+        _DEPS_FAILED.pop(real, None)
+        _DEPS_FAIL_REASON.pop(real, None)
+    attempts = 1 + max(0, int(caps.get(
+        "deps_install_retries", DEFAULT_CAPS["deps_install_retries"])))
     try:
-        add = await _worktree_add_detached_async(st, wt, rev)
-        if add.returncode != 0 or not await _ensure_worktree_deps(
-                str(wt), st, caps, log_path=log_path,
-                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix=f"acceptance-{label}", log_prefix="acceptance"):
-            yield None
-            return
+        error = ""
+        for attempt in range(1, attempts + 1):
+            _teardown()
+            add = await _worktree_add_detached_async(st, wt, rev)
+            if add.returncode != 0:
+                error = (f"git worktree add exited {add.returncode}: "
+                         f"{(add.stderr or '').strip()}")
+            elif await _ensure_worktree_deps(
+                    str(wt), st, caps, log_path=log_path,
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix=f"acceptance-{label}",
+                    log_prefix="acceptance"):
+                error = ""
+                break
+            else:
+                error = _DEPS_FAIL_REASON.get(
+                    os.path.realpath(wt), "dependency install failed")
+            log(f"  acceptance tree {name}: attempt {attempt} of "
+                f"{attempts} failed — {error}")
+        if error:
+            raise AcceptanceTreeError(
+                f"acceptance tree {name} (rev {rev}) not built after "
+                f"{attempts} attempt(s): {error}")
         yield wt
     finally:
         _teardown()
@@ -62831,16 +62904,17 @@ async def _acceptance_audit_on_rev(st: "State", caps: dict, models: dict,
                                    label: str) -> dict:
     """`_acceptance_audit_in` on a fresh worktree of `rev` (the integrated
     tree): none of the set lands in staging."""
-    async with _acceptance_tree(st, caps, rev, "acceptance-audit",
-                                label) as wt:
-        if wt is None:
-            return {"failing_cases": [], "findings": [], "kinds": [],
-                    "sample_kinds": [], "samples": 0,
-                    "skipped": "audit tree not set up"}
-        return await _acceptance_audit_in(
-            st, caps, models, efforts, wt, set_, label=label,
-            harness_rev=rev,
-            tree_note="after the run's implementation and repair rounds")
+    try:
+        async with _acceptance_tree(st, caps, rev, "acceptance-audit",
+                                    label) as wt:
+            return await _acceptance_audit_in(
+                st, caps, models, efforts, wt, set_, label=label,
+                harness_rev=rev,
+                tree_note="after the run's implementation and repair rounds")
+    except AcceptanceTreeError as ex:
+        return {"failing_cases": [], "findings": [], "kinds": [],
+                "sample_kinds": [], "samples": 0,
+                "skipped": f"audit tree not set up: {ex}"}
 
 
 async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
@@ -63049,13 +63123,16 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                         st, caps, models, efforts, own) or {"abstained":
                                                             "not set up"})
                     if sur.get("rev"):
-                        view = await sur_view.enter_async_context(
-                            _acceptance_tree(st, caps, sur["rev"],
-                                             "acceptance-surrogate-view",
-                                             "surrogate-view"))
-                        if view is None:
+                        try:
+                            view = await sur_view.enter_async_context(
+                                _acceptance_tree(st, caps, sur["rev"],
+                                                 "acceptance-surrogate-view",
+                                                 "surrogate-view"))
+                        except AcceptanceTreeError as ex:
+                            view = None
                             sur["abstained"] = ("the independent fix's tree "
                                                 "could not be set up")
+                            sur["error"] = str(ex)
                         else:
                             sur["view"] = view
                     if sur.get("abstained"):
@@ -63691,12 +63768,15 @@ async def _settled_bar_check(key: str | None, st: "State", caps: dict,
         if not landed and not bar["entries"]:
             rec["status"] = "unlanded"
             return rec
-    async with _acceptance_tree(st, caps, base, "acceptance-bar",
-                                "settled-bar") as wt:
-        if wt is None:
+    async with contextlib.AsyncExitStack() as _bar_tree:
+        try:
+            wt = await _bar_tree.enter_async_context(
+                _acceptance_tree(st, caps, base, "acceptance-bar",
+                                 "settled-bar"))
+        except AcceptanceTreeError as ex:
             log("  settled bar: the own-start tree could not be set up — "
-                "the fresh sets stand as typed")
-            return {**rec, "status": "unmeasured"}
+                f"the fresh sets stand as typed ({ex})")
+            return {**rec, "status": "unmeasured", "error": str(ex)}
         runs: list[tuple[dict, Path, dict]] = []   # (entry, dir, per file)
         changed = False
         for entry in bar["entries"]:
@@ -65278,7 +65358,7 @@ def _acceptance_all_fixed_by_execution(acc: dict) -> bool:
     """Whether every held-out set written was discarded as
     `fixed_on_head_by_execution` — no valid set, at least one written, and
     each of the `written` indices in `discarded` with that reason."""
-    if acc.get("sets"):
+    if acc.get("sets") or acc.get("unmeasured"):
         return False
     try:
         written = int(acc.get("written") or 0)

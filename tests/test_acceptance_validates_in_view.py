@@ -354,8 +354,7 @@ def test_a_placed_file_at_the_probe_s_name_takes_it(leerie, tmp_path):
 def test_the_own_start_retry_reuses_the_one_tree(leerie, tmp_path,
                                                  monkeypatch):
     """The writer's one own-start retry is validated in the same tree,
-    made once and removed once, and a tree that cannot be set up discards
-    the set with its reason."""
+    made once and removed once."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     async def writer(**kw):
@@ -391,14 +390,76 @@ def test_the_own_start_retry_reuses_the_one_tree(leerie, tmp_path,
     assert trees == [view] * 4          # two files, two collections
     assert not Path(view).exists()
 
-    @contextlib.asynccontextmanager
-    async def no_tree(*_a, **_k):
-        yield None
-    monkeypatch.setattr(leerie, "_acceptance_tree", no_tree)
-    s = asyncio.run(leerie._write_acceptance_set(
-        1, st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS, head))
-    assert s["valid"] is False
-    assert s["reason"] == "the validity tree could not be set up"
+
+def _real_build_set(leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+        "acc/test_control_zero.py": ("control", CONTROL_TEST, ["zero"]),
+    }})
+    return st, head
+
+
+def _run_set(leerie, st, head, retries=1):
+    caps = _caps(leerie, 1)
+    caps["deps_install_retries"] = retries
+    return asyncio.run(leerie._write_acceptance_set(
+        1, st.data["task"], st, caps, MODELS, EFFORTS, head))
+
+
+def test_a_failed_worktree_add_is_infrastructure_not_an_invalid_set(
+        leerie, tmp_path, monkeypatch):
+    st, head = _real_build_set(leerie, tmp_path, monkeypatch)
+    calls = []
+
+    async def add(st_, wt, rev):
+        calls.append(rev)
+        return type("R", (), {"returncode": 128,
+                              "stderr": "fatal: boom-add", "stdout": ""})()
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", add)
+    s = _run_set(leerie, st, head)
+    assert calls                      # the real _acceptance_tree ran
+    assert s.get("infrastructure")
+    assert "128" in str(s["infrastructure"])
+    assert s.get("reason") != "the validity tree could not be set up"
+
+
+def test_a_failed_install_is_infrastructure_not_an_invalid_set(
+        leerie, tmp_path, monkeypatch):
+    st, head = _real_build_set(leerie, tmp_path, monkeypatch)
+    real_deps = leerie._ensure_worktree_deps
+    installs = []
+
+    async def deps(path, *a, **k):
+        if not str(path).endswith("-view"):
+            return await real_deps(path, *a, **k)
+        installs.append(path)
+        return False
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", deps)
+    s = _run_set(leerie, st, head)
+    assert installs
+    assert s.get("infrastructure")
+    assert s.get("reason") != "the validity tree could not be set up"
+
+
+def test_a_transient_build_failure_is_rebuilt_to_a_valid_set(
+        leerie, tmp_path, monkeypatch):
+    st, head = _real_build_set(leerie, tmp_path, monkeypatch)
+    real_add = leerie._worktree_add_detached_async
+    calls = []
+
+    async def flaky(st_, wt, rev):
+        calls.append(rev)
+        if len(calls) == 1:
+            return type("R", (), {"returncode": 1, "stderr": "transient",
+                                  "stdout": ""})()
+        return await real_add(st_, wt, rev)
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", flaky)
+    s = _run_set(leerie, st, head)
+    assert len(calls) == 2            # the failed build was not memoised
+    assert not s.get("infrastructure")
+    assert s["valid"] is True
 
 
 def test_a_failure_mid_validation_leaves_nothing_behind(leerie, tmp_path,
@@ -859,3 +920,84 @@ def test_a_file_lacked_in_an_earlier_pass_still_withholds_the_retry(
     assert len(calls) == 1
     assert s["valid"] is False and "own_start_rewrite" not in s
     assert s.get("reason") != "fixed_on_head_by_execution"
+
+
+# --- the phase consumer: infrastructure is not a discard --------------------
+
+FAILING_CONTROL = "def test_zero():\n    assert False\n"
+
+
+def _phase_three_sets(leerie, tmp_path, monkeypatch):
+    """Set 1 is valid, set 2 has a control that fails at the own start (a
+    genuine invalid set), set 3 is the one whose measuring tree breaks."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {
+        1: {"acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+            "acc/test_control_zero.py": ("control", CONTROL_TEST, ["zero"])},
+        2: {"acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+            "acc/test_control_zero.py": ("control", FAILING_CONTROL,
+                                         ["zero"])},
+        3: {"acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+            "acc/test_control_zero.py": ("control", CONTROL_TEST, ["zero"])},
+    })
+    return st
+
+
+def _phase(leerie, st, monkeypatch, raising=None):
+    """Run the real phase with the per-file verdict scripted: a defect file
+    fails on the base, a control passes — except set 2's control, which fails
+    (a genuinely invalid set). `raising` maps a set's view to an exception."""
+    async def run(st_, caps, tree, rel, *a, **kw):
+        k = int(str(tree).rsplit("acceptance-", 1)[1].split("-")[0])
+        if raising and k in raising:
+            raise raising[k]
+        if "defect" in rel:
+            return False
+        return k != 2
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    return asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, {**_caps(leerie, 3), "max_parallel": 1}, MODELS,
+        EFFORTS))
+
+
+def test_phase_records_a_build_failure_apart_from_a_discard(
+        leerie, tmp_path, monkeypatch):
+    st = _phase_three_sets(leerie, tmp_path, monkeypatch)
+    real_add = leerie._worktree_add_detached_async
+
+    async def add(st_, wt, rev):
+        if str(wt).endswith("acceptance-3-view"):
+            return type("R", (), {"returncode": 128,
+                                  "stderr": "fatal: boom-add",
+                                  "stdout": ""})()
+        return await real_add(st_, wt, rev)
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", add)
+    acc = _phase(leerie, st, monkeypatch)
+    assert [s["index"] for s in acc["sets"]] == [1]
+    # The unmeasured set is recorded with its error, and is not a discard.
+    (u,) = acc["unmeasured"]
+    assert u["index"] == 3
+    assert "128" in u["error"] and "boom-add" in u["error"]
+    assert 3 not in [d["index"] for d in acc["discarded"]]
+    # The genuinely invalid set is still discarded, with a real reason.
+    (d,) = acc["discarded"]
+    assert d["index"] == 2
+    assert d["reason"] and d["reason"] != "invalid"
+    # Nothing was dropped silently: every written set is accounted for.
+    assert (len(acc["sets"]) + len(acc["unmeasured"])
+            + len(acc["discarded"])) == acc["written"] == 3
+    # An unmeasured set keeps the no-work settle from reading all as fixed.
+    assert leerie._acceptance_all_fixed_by_execution(acc) is False
+
+
+def test_phase_classifies_a_validation_timeout_as_infrastructure(
+        leerie, tmp_path, monkeypatch):
+    import subprocess
+    st = _phase_three_sets(leerie, tmp_path, monkeypatch)
+    acc = _phase(leerie, st, monkeypatch,
+                 raising={3: subprocess.TimeoutExpired(["pytest"], 7)})
+    (u,) = acc["unmeasured"]
+    assert u["index"] == 3 and u["error"]
+    assert [d["index"] for d in acc["discarded"]] == [2]
+    assert [s["index"] for s in acc["sets"]] == [1]
