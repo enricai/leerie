@@ -310,11 +310,11 @@ def test_ec2_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
 def test_ec2_seed_auth_plugin_cache_and_marketplaces_not_re_excluded_by_tar(tmp_path):
     """seed-auth.sh (the Fly original) does not itself exclude
     plugins/cache or plugins/marketplaces in its tar command — those
-    are excluded upstream by the launcher's $STAGE assembly (CLAUDE_SKIP,
+    are excluded upstream by the launcher's $STAGE assembly (the CLAUDE_READS allowlist,
     documented in IMPLEMENTATION.md and seed-auth.sh's own header) before
     seed_auth ever runs, and rebuilt afterward in step 4. ec2_seed_auth
     is a byte-identical port of that payload logic, so if $STAGE (the
-    test's stand-in for a post-CLAUDE_SKIP stage) happens to contain
+    test's stand-in for a post-allowlist stage) happens to contain
     those dirs, the tar step delivers them uncritically — proving the
     tar-exclude list was ported verbatim rather than gaining a new
     exclusion this script was never asked to own."""

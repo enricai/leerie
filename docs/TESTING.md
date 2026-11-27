@@ -6890,9 +6890,22 @@ own `TMPDIR`, gone once the call returns; a `--resume` runs in the
 directories that hold its session; and `_remove_worker_dirs`
 removes them all and the template. Falsified, each turning a test red: one
 shared `<wid>`, `CLAUDE_CONFIG_DIR` or `TMPDIR` left unset, the resume
-lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_SKIP`,
+lookup bypassed, the `tmp` removal dropped, an empty `_CLAUDE_CONFIG_READS` allowlist,
 directories copied instead of linked, the template left writable, and the
 template kept at finalize.
+
+`tests/test_claude_config_template_allowlist.py` (2 tests, DESIGN §6 *What a
+config directory holds*). The real `_claude_config_template` against a fixture
+HOME holds only the names in the `_CLAUDE_CONFIG_READS` allowlist (settings,
+credentials, `skills`, `agents`, `commands`, `hooks`), with no session store
+(`jobs`, `projects`, `sessions`, or an unnamed future one); and the launcher's
+`.claude` copy keeps the same names as the orchestrator's allowlist.
+
+`tests/test_launcher_config_copy.py` (1 test, two cases: `rsync` and `cp`).
+The real `$STAGE_CLI/.claude` assembly block extracted from `leerie` runs
+under bash against a fixture HOME, once with rsync on PATH and once with it
+hidden; the copy holds the allowlisted names only, and a large `jobs/` tree
+and unnamed stores are absent.
 
 `tests/test_confined_cli_env.py` (8 tests, DESIGN §6 *Every confined CLI is
 given its own directories, by one builder*; review round 22 exec H2). The

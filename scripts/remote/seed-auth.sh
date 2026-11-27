@@ -297,7 +297,7 @@ seed_auth() {
     >/dev/null 2>&1 || true
 
   # --- 4. Rebuild plugin cache on the remote -----------------------------
-  # The launcher's CLAUDE_SKIP excludes plugins/cache and
+  # The launcher's allowlisted .claude copy leaves out plugins/cache and
   # plugins/marketplaces from the tar pipe (hundreds of MB on a typical
   # host). Repopulate them on the machine's fast public egress using the
   # small JSON files we did seed:

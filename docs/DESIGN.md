@@ -2121,8 +2121,14 @@ directory is.
 template, `<run-dir>/claude-config/`: a read-only snapshot, taken once
 when the run's first worker starts and kept for the run, of the
 operator's CLI configuration (`$CLAUDE_CONFIG_DIR`, else `~/.claude`)
-without its per-session state (transcripts, sessions, shell snapshots,
-history, caches, backups), plus `~/.claude.json`, which the CLI reads
+holding only what the CLI reads, derived as an allowlist and not as a
+list of names to leave out: settings, credentials, agents, skills,
+commands, hooks, output styles, plugin manifests and the state files
+leerie seeds. Anything not on the list is left out by that rule, so every
+session store (`projects`, `jobs`, `sessions`, transcripts, shell
+snapshots, history, caches, backups) and any store the CLI adds later is
+excluded without being named, and a launch never copies a store that
+grows with the operator's past sessions. Also `~/.claude.json`, which the CLI reads
 from the configuration directory when one is set. A worker's
 configuration directory holds a writable copy of each of the template's
 top-level files (settings, credentials, account state: what the CLI and a
