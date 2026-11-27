@@ -260,3 +260,109 @@ def test_crash_after_each_save_never_ships_half_done_work(
     st2 = _resume(leerie, root, repo)
     _run(leerie, st2, None, [])
     _assert_nothing_half_done_shipped(leerie, repo, st2)
+
+
+# --- the real `_run_phases` resume order -------------------------------------
+
+class _Args:
+    """Every flag unset, like a bare `resume`."""
+    resume = True
+    task = None
+    answers = None
+
+    def __getattr__(self, name):
+        return False
+
+
+class _Stop(BaseException):   # not swallowed by the advisory `except`s
+    pass
+
+
+def test_run_phases_resume_resolves_the_in_flight_round_before_any_judge(
+        leerie, tmp_path, monkeypatch):
+    """The real `_run_phases` on a resume over a state holding a re-drive
+    round a crash interrupted: the real `_resolve_in_flight_redrive` runs
+    before the pre-judge and again before detection, and the tree detection
+    reads is the rolled-back head, not the half-done commit. Removing either
+    call from `_run_phases`, or moving it after detection, turns this red."""
+    from tests.test_met_items_refalsified_after_kept_rounds import (
+        Replay, _fix_mul)
+    from tests.conftest import run_git_out as git
+    r = Replay(leerie, tmp_path, monkeypatch, edit=_fix_mul)
+    kept = git(r.staging, "rev-parse", "HEAD")
+    (r.staging / "half.txt").write_text("half\n")
+    git(r.staging, "add", "-A")
+    git(r.staging, "commit", "-qm", "half-done")
+    half = git(r.staging, "rev-parse", "HEAD")
+    assert half != kept
+    st = r.st
+    st.data.update({"waves": [["s1"]], "completed_waves": 1,
+                    "current_phase": "phase 5: conformance",
+                    "worker_count": 1, "task": "t"})
+    st.data["delivery_redrive"] = {"in_flight": {
+        "round": 1, "group": 1, "pre_sha": kept}}
+    st.data.pop("finished_at", None)
+    st.save()
+
+    log: list[tuple] = []
+    real_resolve = leerie._resolve_in_flight_redrive
+
+    async def resolve(s, staging):
+        log.append(("resolve", git(staging, "rev-parse", "HEAD")))
+        out = await real_resolve(s, staging)
+        log.append(("resolved", git(staging, "rev-parse", "HEAD"), out))
+        return out
+
+    async def prejudge(leerie_dir, s, *a, **k):
+        log.append(("prejudge", git(r.staging, "rev-parse", "HEAD")))
+        # A later phase's re-drive round dies mid-round the same way: a
+        # half-done commit on staging and its marker in the state.
+        (r.staging / "half2.txt").write_text("half\n")
+        git(r.staging, "add", "-A")
+        git(r.staging, "commit", "-qm", "half-done again")
+        s.data.setdefault("delivery_redrive", {})["in_flight"] = {
+            "round": 2, "group": 1, "pre_sha": kept}
+        s.save()
+        return []
+
+    async def detection(leerie_dir, s, *a, **k):
+        log.append(("detection", git(r.staging, "rev-parse", "HEAD")))
+        raise _Stop
+
+    async def noop(*a, **k):
+        return None
+
+    async def none_list(*a, **k):
+        return []
+    monkeypatch.setattr(leerie, "_resolve_in_flight_redrive", resolve)
+    monkeypatch.setattr(leerie, "_run_delivery_prejudge", prejudge)
+    monkeypatch.setattr(leerie, "_run_delivery_detection", detection)
+    for name in ("phase_execute", "_extract_contract_literals",
+                 "_run_pr_review", "_run_final_conformance",
+                 "_run_delivery_recheck", "_run_acceptance_gate",
+                 "_refresh_shipping_test_id_diff",
+                 "_select_active_oauth_token"):
+        monkeypatch.setattr(leerie, name, noop)
+    monkeypatch.setattr(leerie, "_enforce_and_record_cgroup_containment",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_stop_for_intent_questions",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_apply_set_aside_answers",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(leerie, "_delivery_recheck_due", lambda *a: False)
+    try:
+        asyncio.run(leerie._run_phases(
+            _Args(), dict(r.caps), st.run_dir, st, "codebase", "normal",
+            {}, {}))
+    except _Stop:
+        pass
+    finally:
+        st.release_lock()
+
+    kinds = [e[0] for e in log]
+    assert kinds == ["resolve", "resolved", "prejudge",
+                     "resolve", "resolved", "detection"], log
+    assert log[0][1] == half and log[1][1:] == (kept, True)
+    assert log[2][1] == kept        # the pre-judge reads the rolled-back head
+    assert log[3][1] != kept and log[4][1:] == (kept, True)
+    assert log[5][1] == kept        # detection reads the rolled-back head

@@ -2420,6 +2420,34 @@ PATH additions (mise's shims dir) — a source pin, an argv-capture pin,
 and a regression control reproducing the PATH-loss mechanism against
 real subprocesses.
 
+### Delivery verdict is of the tree that ships
+
+`tests/test_delivery_verdict_tree.py` pins DESIGN §6 *Every statement
+about the result is keyed to the commit it was made on*: whatever
+delivery verdict stands in `delivery_gate` is of `_shipping_tree`, or no
+verdict stands, and `_decide_outcome` never gives the reason that the
+required items were "not read on the tree that ships". It drives the real
+`_resolve_in_flight_redrive`, `_run_delivery_detection`,
+`_run_delivery_redrive`, `_acceptance_item_flips`,
+`_delivery_latest_verdict` and `_decide_outcome` over a real run repo and
+staging (the `Replay` harness of
+`tests/test_met_items_refalsified_after_kept_rounds.py`); only `claude_p`
+(and the judge in some cases) is scripted. Paths covered:
+- a plain run whose kept group leaves an item unverified, with the read on
+  HEAD failing (the verdict is dropped in its own words) and succeeding
+  (the item is no longer listed unverified);
+- a pass that raises mid-group, through `_settle_delivery_verdict`: the
+  round is rolled back to its `pre_sha` and nothing is read on the half-done
+  commit;
+- detection that cannot judge the moved head;
+- `_acceptance_item_flips` returning early on a moved head (re-read and
+  re-stamped).
+
+Both `_settle_delivery_verdict` cases fail with their fix removed (no
+in-flight resolution; no `unverified` clear). Resume rolling back an
+in-flight round before any judge is pinned through the real `_run_phases` in
+`tests/test_resume_interrupted_redrive.py`.
+
 ### AWS credentials, EC2 preflight, and the release workflow
 
 The standalone AWS credential/profile/region resolver

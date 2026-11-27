@@ -17890,6 +17890,37 @@ shipping-tree verdicts and stay as they are: the delivery gate's
 conformer — detection reuses their `judged_*` only on that same sha) and
 the acceptance gate's pre-repair `initial`.
 
+Two rules make that reuse sound. First, every in-flight round is settled
+before anything judges the tree, a resume included: a delivery re-drive's
+`in_flight` (`_run_delivery_redrive`) is resolved, rolled back or verified
+before `_run_delivery_detection` or `_delivery_latest_verdict` read the
+tree. A coverage re-drive's `redrive_in_flight` is not settled by detection:
+`_undo_interrupted_redrives` takes it back at the top of the execute wave
+loop, before `subtask_status` is read, so it is gone before the finalize side
+runs — a verdict never describes a tree a half-finished round is still
+moving.
+
+Second, the contract: the final verdict is of the tree that ships. Several
+steps move staging's HEAD after the last final-verdict stamp — a kept
+re-drive group, a flip rollback that did not land, a re-drive that exits by
+raise, conflict or unverified, and a detection that cannot judge the head.
+Each leaves `final_sha` / `final_tree` on the old commit without re-reading
+the items. So each such step re-reads the open and met items on the new head
+and re-stamps `final_sha` / `final_tree`. A re-drive that exits by raise may
+leave a group in flight on a half-done commit, so at its exit the first rule
+runs again: that round is undone before anything is read, and the read is of
+the kept tree. A signal is not such an exit: it ends the run, and resume
+settles the round before any judge. A read that settles an item a kept
+group's ratchet left unverified clears it, since the item was then read on
+the tree that ships. A row unknown because a part of it cannot be observed is
+not re-judged; it stays unknown. A drop is only the fallback for a
+read that fails, and the outcome then says so in its own words (the
+delivery gate records `verdict_dropped`, and `_decide_outcome` reads a
+dropped verdict as not measured, never as nothing unmet). `unmet_before` /
+`unmet_after` describe earlier trees on purpose and are never dropped by
+these steps. The outcome (`_decide_outcome`) is decided only on a verdict of
+the shipped tree.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator
