@@ -61449,11 +61449,16 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         # The runner's last message per failing case of each file, for what
         # the finished run shows (`_record_unmet_evidence`) and nothing else.
         case_msgs: dict[str, dict[str, str]] = {}
+        # Every failing run's message per failing case of each file, so a
+        # re-check can apply `_probe_verdict` to all of them.
+        all_msgs: dict[str, dict[str, list[str]]] = {}
 
         def _note(rel: str, obs: dict, _s=s_, _seen=seen,
                   _asserted=asserted, _ids=asserted_ids,
-                  _msgs=case_msgs) -> bool:
+                  _msgs=case_msgs, _all=all_msgs) -> bool:
             for cid, m in (obs.get("failing_messages") or {}).items():
+                _all.setdefault(rel, {}).setdefault(str(cid), []).append(
+                    str(m or ""))
                 if str(m or "").strip():
                     _msgs.setdefault(rel, {})[str(cid)] = str(m)
             hit, saw = _acceptance_held_signals(_s, rel, obs)
@@ -61592,6 +61597,10 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 "passed": not failing and not unmeasured,
                 "unmeasured": unmeasured and not failing,
                 "failing_files": failing}
+        if all_msgs:
+            res_["failing_run_messages"] = {
+                r: {c: list(v) for c, v in d.items()}
+                for r, d in all_msgs.items() if r in failing}
         if resource_affected:
             res_["resource_affected_files"] = resource_affected
         if res_["unmeasured"]:
@@ -68232,11 +68241,12 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             # provisions*): some failing run names no line of the probe, or
             # names one of the lines the quoted assertion is, or a line of a
             # statement whose value it reads.
-            g["at_assertion"] = _falsifier_failed_at_assertion(
-                runs_msgs.get(cid) or [], rel,
+            g["at_assertion"] = _probe_verdict(
+                runs_msgs.get(cid) or [""], rel,
                 probe_bytes.decode(errors="replace"),
                 str(res.get("assertion_quote") or ""),
-                steps=facts.get("steps"), asserts=facts.get("asserts"))
+                steps=facts.get("steps"),
+                asserts=facts.get("asserts")) == "fail"
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(src)
@@ -68305,6 +68315,22 @@ def _falsifier_quoted_assertion_lines(source: str, quote: str,
             if len(ln) >= 6 and (ln in q or (len(q) >= 6 and q in ln)):
                 out.add(n)
     return out
+
+
+def _probe_verdict(messages: list[str], rel: str, source: str,
+                   quote: str, steps: list | None = None,
+                   asserts: list | None = None) -> str:
+    """The one verdict on a falsifier probe, from the messages of its
+    failing runs (one per failing run) and the AST facts of its source:
+    "pass" when no run failed, "fail" when some failing run failed at the
+    quoted assertion (`_falsifier_failed_at_assertion`, the one predicate),
+    "broken" when it failed only elsewhere (setup, environment). The
+    confirmation and every re-check use this definition."""
+    if not messages:
+        return "pass"
+    return ("fail" if _falsifier_failed_at_assertion(
+        messages, rel, source, quote, steps=steps, asserts=asserts)
+        else "broken")
 
 
 def _falsifier_failed_at_assertion(messages: list[str], rel: str,
@@ -69771,6 +69797,7 @@ def _redrive_probe_sets(notes: Iterable[dict]) -> list[dict]:
             out[i] = {"index": f"probe-i{i}", "item_index": i,
                       "dir": p_["dir"], "defect_files": [p_["file"]],
                       "control_files": [], "support_files": [],
+                      "assertion_quote": str(p_.get("assertion_quote") or ""),
                       **({"via_browser_suite": True}
                          if p_.get("via_browser_suite") else {})}
     return [out[i] for i in sorted(out)]
@@ -69792,6 +69819,60 @@ def _falsifier_probe_set(item_index: int, dir_: str, rel: str, *,
             **({"via_browser_suite": True} if via_browser_suite else {})}
 
 
+async def _rerun_probe_verdict(st: "State", tree: str | Path, src: str,
+                               rel: str, quote: str,
+                               failing: dict[str, list[str]]) -> str:
+    """The shared verdict (`_probe_verdict`) on a saved probe's re-run that
+    failed: `failing` is case id -> the messages of its failing runs. `fail`
+    when some case failed at the quoted assertion, else `broken` (it failed
+    only in its own setup or teardown). Read from the probe's AST facts
+    (`_probe_case_facts_placed`) and the saved `quote`; a probe whose source
+    or facts cannot be read, or a re-run that carried no message, reads
+    `fail`, as before this verdict was shared."""
+    try:
+        source = Path(src).read_text(errors="replace")
+    except OSError:
+        return "fail"
+    if not failing:
+        return "fail"
+    for cid, msgs in failing.items():
+        title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
+        facts = await _probe_case_facts_placed(st, tree, src, rel, title)
+        if str(facts.get("error") or "").startswith("facts_failed"):
+            return "fail"
+        if _probe_verdict(list(msgs) or [""], rel, source, quote,
+                          steps=facts.get("steps"),
+                          asserts=facts.get("asserts")) == "fail":
+            return "fail"
+    return "broken"
+
+
+async def _saved_probe_rerun_verdict(st: "State", staging: Path,
+                                     probe_dir: str, rel: str, quote: str,
+                                     r: dict) -> str:
+    """`pass` | `fail` | `unmeasured` for one `_evaluate_acceptance_sets`
+    result `r` of a saved probe: a run that failed only outside the quoted
+    assertion is `unmeasured` (no evidence either way), never `fail`."""
+    if r.get("unmeasured"):
+        return "unmeasured"
+    if r.get("passed"):
+        return "pass"
+    per = (r.get("failing_run_messages") or {}).get(rel) or {}
+    if not per:
+        return "fail"
+    with tempfile.TemporaryDirectory(prefix="leerie-rerun-") as td:
+        src = Path(td) / Path(rel).name
+        try:
+            src.write_bytes(_read_beneath(Path(probe_dir), Path(probe_dir)
+                                          / rel, limit=READ_LIMIT_TEXT))
+        except OSError:
+            return "fail"
+        v = await _rerun_probe_verdict(st, staging, str(src), rel, quote,
+                                       {str(c): list(m) for c, m in
+                                        per.items()})
+    return "fail" if v == "fail" else "unmeasured"
+
+
 async def _redrive_probe_verdicts(st: "State", caps: dict, staging: Path,
                                   probes: list[dict], label: str, *,
                                   rev: str) -> dict[int, str]:
@@ -69811,8 +69892,9 @@ async def _redrive_probe_verdicts(st: "State", caps: dict, staging: Path,
     out: dict[int, str] = {}
     for p_, s_ in zip(probes, sets):
         r = by.get(s_["index"]) or {"unmeasured": True}
-        out[p_["item_index"]] = ("unmeasured" if r.get("unmeasured")
-                                 else "pass" if r.get("passed") else "fail")
+        out[p_["item_index"]] = await _saved_probe_rerun_verdict(
+            st, staging, p_["dir"], p_["defect_files"][0],
+            str(p_.get("assertion_quote") or ""), r)
     return out
 
 
@@ -74505,7 +74587,13 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
             res = await _evaluate_acceptance_sets(
                 st, caps, str(staging), [probe], f"redrive-probe-i{i}")
             r = res[0] if res else {"unmeasured": True}
-            still = bool(r.get("unmeasured") or not r.get("passed"))
+            v = await _saved_probe_rerun_verdict(
+                st, staging, str(saved.get("dir")), str(saved["file"]),
+                str(smp.get("assertion_quote") or ""), r)
+            # A probe that failed only in its own setup or teardown is not
+            # a failure of the item; no measurement keeps it unmet.
+            still = bool(r.get("unmeasured") or (
+                v == "fail" and not r.get("passed")))
         cur = out.setdefault(i, {"unmet": False, "by": [], "evidence": ""})
         if still:
             p_ = prior.get(i) or {}
@@ -74687,6 +74775,7 @@ async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
     timeout = float(caps.get("worker_timeout_sec")
                     or DEFAULT_CAPS["worker_timeout_sec"])
     trees: dict[str, Path] = {}
+    post_msgs: dict[str, str] = {}
     try:
         for side, sha in (("post", post_sha), ("pre", pre_sha)):
             wt = await asyncio.to_thread(_falsifier_checkout, st,
@@ -74719,6 +74808,9 @@ async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
                     suite=suite)
                 if got is None:
                     return None
+                if side == "post":
+                    post_msgs.update({str(k): str(v) for k, v in
+                                      (got.get("messages") or {}).items()})
                 return _SideResult(
                     frozenset(str(x) for x in got.get("ids") or []),
                     frozenset(str(x) for x in got.get("passed") or ()))
@@ -74731,6 +74823,15 @@ async def _redrive_probe_flips(st: "State", caps: dict, smp: dict,
                                     "fail" if side == "pre" else "pass")
                 out[side] = ("unmeasured" if got is None
                              else "fail" if cid in got else "pass")
+                if side == "post" and out[side] == "fail":
+                    # Failing only in its own setup or teardown is not a
+                    # pass-to-fail flip: the shared verdict, unmeasured.
+                    v = await _rerun_probe_verdict(
+                        st, trees["post"], src, rel,
+                        str(smp.get("assertion_quote") or ""),
+                        {cid: [post_msgs.get(cid, "")]})
+                    if v != "fail":
+                        out[side] = "unmeasured"
             if out["post"] != "fail" or out["pre"] != "pass":
                 return out
             # The case was seen failing on the commit just above.

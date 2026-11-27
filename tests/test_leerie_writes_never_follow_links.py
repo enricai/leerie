@@ -463,6 +463,9 @@ _LEERIE_ONLY = {
     "_falsifier_gates", "_drop_lying_index", "_move_view",
     # The saved probe's copy, a temp file of leerie's own, as the gates'.
     "_redrive_probe_flips",
+    # The same copy, made through `_read_beneath` into a private
+    # `TemporaryDirectory` of leerie's own.
+    "_saved_probe_rerun_verdict",
     # A kept clone's `.git` made again (`keep=True`): cloned into the run's
     # `clone-gits/` and renamed to `<tree>/.git`, the tree a directory of
     # the run's `worktrees/` (which no grant names) and its worker's
