@@ -8963,7 +8963,15 @@ batches).
 forbids*) runs the real `_coupled_test_files` and `_measure_axes` (only the
 command run stubbed) over a real git tree. A test that imports nothing of the
 product and names no production file (a tree-reading guard, a test of a
-test-support module) is coupled to every change. A test that names a
+test-support module) is coupled to every change. A test case whose text
+names a changed data, config or fixture file (outside both import graphs, any
+language) by path, basename or directory name is coupled to it, and near it,
+whatever else it imports; the data file's own reach stays unknown in
+`_change_reach` (`tests/test_data_file_test_coupling.py`,
+`tests/test_data_file_near_reach.py`). A data file's readers never displace a
+tree-reading guard: `tests/test_data_change_keeps_tree_guard.py` keeps a test
+that imports nothing and names nothing coupled to a data-only change, a data
+plus source change and a document change (barnacle #800). A test that names a
 production file (an end-to-end test spawning a script, in JS/TS or Python) is
 coupled to that file only. An import-coupled test keeps its import coupling,
 `direct=True` stays imports-only, and a forbidden suite's scoped replacement
