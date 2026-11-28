@@ -2639,7 +2639,7 @@ def _no_cases(results):
     knows), for comparing with `_failing`/`_passing`."""
     return [{k: v for k, v in r.items()
              if k not in ("failing_cases", "failing_case_evidence",
-                          "failing_basis")}
+                          "failing_basis", "failing_run_messages")}
             for r in results]
 
 

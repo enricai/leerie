@@ -237,7 +237,9 @@ def test_a_worker_only_met_at_the_redrive_is_read(leerie, st):
 
 def test_an_item_the_ratchet_lists_unverified_is_not_read(leerie, st):
     """The ratchet marked a met row unknown after a move; the row still
-    carries an earlier re-check's stamp. Not read on the commit."""
+    carries an earlier re-check's stamp. Not read on the commit, and the
+    outcome says so (DESIGN §8: being listed unverified makes the outcome
+    say it was not read on the tree that ships)."""
     _judged(st, {"item_index": 1, "verdict": "met", "by": [],
                  "redrive_recheck": {"sha": "e" * 40,
                                      "not_inspected": False}})
@@ -245,7 +247,8 @@ def test_an_item_the_ratchet_lists_unverified_is_not_read(leerie, st):
     assert st.data["delivery_gate"]["items"][1]["verdict"] == "unknown"
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
     assert st.data["outcome_reasons"] == [
-        "1 subtask(s) unconverged: feat-002"]
+        "1 subtask(s) unconverged: feat-002",
+        "1 required item(s) not re-verified on the tree that ships"]
 
 
 def test_an_unreadable_tree_that_ships_keeps_the_subtask_reason(

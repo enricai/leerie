@@ -162,9 +162,12 @@ def test_the_flip_reads_the_probe_on_both_commits_under_b_star(
     r.run()
     g = r.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
     flip = g["flip_regressed"][0]
+    # A confirmed sample always carries the assertion it quoted (the
+    # falsifier's gates require it), which the shared verdict reads.
     smp = leerie._redrive_flip_probe({"falsifier": {"samples": [{
         "confirmed": True, "case_id": flip["case_id"],
-        "probe_saved": flip["probe_saved"]}]}})
+        "probe_saved": flip["probe_saved"],
+        "assertion_quote": "assert add(2, 3) == 5"}]}})
     assert smp is not None
     yes = asyncio.run(leerie._redrive_probe_flips(
         r.st, r.caps, smp, g["pre_sha"], g["post_sha"], label="t-yes"))
